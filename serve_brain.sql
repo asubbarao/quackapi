@@ -32,6 +32,7 @@ int pthread_cond_broadcast(pcond*);
 int pthread_join(pthread_t, void**);
 void *dlsym(void*, const char*);
 void *dlopen(const char*, int);
+void *signal(int, void*);
 
 typedef struct { char _pad[256]; } ddb_result;
 typedef int (*ddb_open_t)(const char*, void**);
@@ -146,6 +147,13 @@ void handle_conn_on(void *con, void *stmt, int fd){
   j = 0;
   while(req[i] && req[i] != 32 && j < 2047){ path[j++] = req[i++]; }
   path[j] = 0;
+  /* DIAGNOSTIC fast-path: /ping returns a fixed reply with ZERO DuckDB calls.
+     Isolates pure socket-layer throughput from per-query engine overhead so we
+     can tell whether the ceiling is the C layer or the query layer. */
+  if(strcmp(path, "/ping") == 0){
+    char pong[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong";
+    write(fd, pong, sizeof(pong)-1); close(fd); return;
+  }
   if(strstr(path, "slow")) usleep(300000); /* demo knob: any path containing "slow" naps 300ms to SIMULATE awaited handler IO */
   char *sep = strstr(req, "\r\n\r\n");
   if(sep){
@@ -370,6 +378,13 @@ static void *worker_main(void *arg){
   void *con = 0;
   void *stmt = 0;
   if(g_ddb_connect(g_db, &con) != 0) return 0;
+  /* OLTP tuning: each request is a tiny point query. DuckDB defaults threads to
+     the core count, so 16 worker connections each launching a query that wants
+     the whole pool thrash the global task scheduler down to ~1 effective core.
+     threads=1 makes each query single-threaded (no morsel/scheduler overhead);
+     the 16 CONNECTIONS supply the parallelism. This is global config, set once
+     per worker (idempotent). */
+  { ddb_result ign; g_ddb_query(con, "SET threads=1", &ign); g_ddb_destroy_result(&ign); }
   { ddb_result ign; g_ddb_query(con, "LOAD shellfs", &ign); g_ddb_destroy_result(&ign); }
   /* HTTP CLIENT POLICY: curl_httpfs is the soldered default on EVERY worker conn.
      Handlers reading remote data over http (read_text/read_csv/read_parquet) then
@@ -399,6 +414,7 @@ static void *worker_main(void *arg){
 void *accept_loop(void *arg){
   for(;;){
     int c = accept(g_listen, 0, 0); if(c < 0) continue;
+    { int nd = 1; setsockopt(c, 6, 1, &nd, 4); } /* TCP_NODELAY: flush the small JSON reply immediately, no Nagle coalescing wait */
     pthread_mutex_lock(&g_qm);
     if(g_qcount < 4096){
       g_q[g_qtail] = c; g_qtail = (g_qtail + 1) % 4096; g_qcount = g_qcount + 1;
@@ -414,6 +430,7 @@ void *accept_loop(void *arg){
 
 const char *serve_brain(int port, const char *db_path){
   if(g_listen < 0){
+    signal(13, (void*)1); /* SIG_IGN SIGPIPE: a write() to a client-closed socket must set EPIPE, never kill the duckdb process */
     g_listen = socket(2, 1, 0);
     int one = 1; setsockopt(g_listen, 0xffff, 0x0004, &one, 4);
     struct sockaddr_in a; char *pp = (char*)&a; int k; for(k = 0; k < 16; k++) pp[k] = 0;

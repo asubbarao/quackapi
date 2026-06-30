@@ -253,3 +253,66 @@ cat probes/dispatch_local.sql probes/8_write_throughput.sql | duckdb :memory:
 ```
 
 **Verdict: REAL (bounded by single writer) with the numbers.** Dispatch + C threads fan the requests (and help latency under load), but the DB writer serializes; OCC conflicts are real (6/16 without retry) and dispatch_retry recovers them (16/16). The abstraction does not give "true async high throughput" beyond the single-writer ceiling.
+
+---
+
+## 9. Per-request HTTP throughput — **REAL (bounded by DuckDB per-statement overhead)**
+
+**Hypothesis:** the threaded C front door (16-worker accept loop, one persistent connection + prepared
+statement per worker) serves small JSON fast enough that the socket layer (keep-alive, buffers,
+multi-accept) is worth tuning. Measure first; optimize only the layer that dominates.
+
+**Probe (re-runnable):** boot on an isolated port + throwaway db, hammer with ApacheBench, kill by the
+exact PID listening on that port only (never the live `:9494`/`:9495`):
+```
+PORT=18099; DB=quackapi_bench.db; rm -f "$DB"*
+duckdb "$DB" <<SQL &
+.read framework.sql
+.read app.sql
+.read serve_brain.sql
+SELECT serve_brain($PORT,'$DB');
+SELECT block_forever(0);
+SQL
+curl --retry-connrefused --retry 25 --retry-delay 1 -fsS "http://127.0.0.1:$PORT/health"
+ab -t 10 -c 50 "http://127.0.0.1:$PORT/health"   # static, 1 prepared query
+ab -t 10 -c 50 "http://127.0.0.1:$PORT/ping"     # pure C, ZERO DuckDB (diagnostic fast-path)
+kill $(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t)
+```
+
+**Measured (16 logical cores, c=50):**
+
+| path | exercises | req/s | p50 | p99 |
+|------|-----------|------:|----:|----:|
+| `/ping` | pure C socket layer, no DuckDB | **38,268** | 1ms | 2ms |
+| `/health` | 1 prepared `handle_request` | 1,095 | 45ms | 62ms |
+| `/users/1` | 2 queries (`handle_request` + handler) | 1,029 | 48ms | 60ms |
+
+**Three fixes shipped, three dead-ends ruled out — all by measurement, not intuition:**
+
+- **Crash under load — FIXED (real defect).** The baseline server *died* mid-benchmark with **exit 141
+  (SIGPIPE)**: a `write()` to a client-closed socket raised SIGPIPE with no handler installed, killing the
+  whole DuckDB process. Fix: `signal(SIGPIPE, SIG_IGN)` at startup. Now survives sustained load.
+- **`SET threads=1` — +43%.** DuckDB defaults `threads` to the core count, so 16 worker connections each
+  launching a query that wants the whole pool thrash the global task scheduler to ~1 effective core.
+  threads=1 makes each tiny query single-threaded; throughput 774→1106 req/s, p99 103ms→56ms.
+- **TCP_NODELAY** on accepted sockets — flush the small JSON immediately, no Nagle coalescing wait.
+- **Keep-alive — RULED OUT.** `/ping` does 38k req/s *with* connection-close; `ab -k` adds nothing on
+  loopback (no RTT to amortize). The socket layer has 35× headroom — keep-alive would optimize a non-bottleneck.
+- **Macro simplification — RULED OUT.** 50,000 `handle_request` evaluations inside one query = 0.275s =
+  **5.5µs each**. The macro is not the cost.
+- **More workers — RULED OUT.** The pool already idles; the query layer is saturated, not the C layer.
+
+**Where the wall actually is:** `/ping` (no DuckDB) = 38k req/s; any single-query path = ~1,100 req/s,
+which equals exactly *one core* of 0.9ms services — 16 workers deliver single-core throughput. The macro
+costs 5.5µs, so **~99% of the 0.9ms per request is DuckDB's per-statement overhead** (transaction
+begin/commit + plan instantiation + result-set marshalling through the C API), and it *serializes*.
+Sharding to two independent instances scaled **sub-linearly** — 673+671 = 1,344 req/s vs 1,095 single,
+only **1.23×** — so even separate processes contend; the tiny-query ceiling of a DuckDB-backed server is
+fundamentally ~1–1.5k req/s.
+
+**Verdict: REAL.** The HTTP front door is fast (38k req/s of pure transport); *request* throughput is
+capped near ~1,100/s per instance by DuckDB's per-statement cost, because a web request is an OLTP point
+query and DuckDB is an analytical engine. This is not a bug to optimize away — it is the defining edge of
+"FastAPI, but the brain is an OLAP database." The socket layer was tuned (SIGPIPE, threads=1, NODELAY) and
+the engine wall was *located and quantified*. Breaking past it would mean caching responses, batching
+requests into one query, or fronting DuckDB with an OLTP store — i.e. no longer "pure DuckDB."
