@@ -1,4 +1,4 @@
-.read /Users/aloksubbarao/quackapi/client_fanout.sql
+.read client_fanout.sql
 .timer on
 SELECT  1 AS threads, http_fanout(18099, 4096,  1) AS ok_200s;
 SELECT  8 AS threads, http_fanout(18099, 4096,  8) AS ok_200s;

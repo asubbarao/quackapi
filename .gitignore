@@ -1,0 +1,10 @@
+# Runtime data — created when the server runs, never committed.
+*.db
+*.db.wal
+*.wal
+uploads/
+*.log
+quackapi_bg_log.txt
+
+# OS / editor cruft
+.DS_Store

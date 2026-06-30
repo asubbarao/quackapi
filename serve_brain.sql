@@ -3,7 +3,7 @@ INSTALL ducktinycc FROM community; LOAD ducktinycc;
 -- ============================================================================
 -- quackapi — serve_brain: threaded C accept loop + per-request call into the
 -- DuckDB C API (via dlsym(RTLD_DEFAULT)) to invoke the PURE SQL handle_request
--- TABLE macro. The DB is the same file-backed instance (/tmp/quackapi.db).
+-- TABLE macro. The DB is the file-backed instance passed in: serve_brain(port, db_path).
 -- No routing in C. Full path+query passed. Uses prepared stmt for safety.
 -- ============================================================================
 
@@ -16,6 +16,7 @@ int accept(int,void*,void*); long read(int,void*,unsigned long);
 long write(int,const void*,unsigned long); int close(int);
 int snprintf(char*,unsigned long,const char*,...); int usleep(unsigned int);
 char *strstr(const char*, const char*);
+int strcmp(const char*, const char*);
 unsigned long strlen(const char*);
 void *memcpy(void*, const void*, unsigned long);
 typedef void* pthread_t; int pthread_create(pthread_t*,void*,void*(*)(void*),void*); int pthread_detach(pthread_t);
@@ -47,6 +48,16 @@ typedef int (*ddb_value_int32_t)(void*, unsigned long long, unsigned long long);
 typedef char* (*ddb_value_varchar_t)(void*, unsigned long long, unsigned long long);
 typedef void (*ddb_free_t)(void*);
 typedef int (*ddb_query_t)(void*, const char*, void*);
+typedef const char* (*ddb_result_error_t)(void*);
+
+/* streaming result symbols (resolved if present) */
+typedef int (*ddb_execute_prepared_streaming_t)(void*, void*);
+typedef void* (*ddb_fetch_chunk_t)(void*);
+typedef void (*ddb_destroy_data_chunk_t)(void**);
+typedef unsigned long long (*ddb_chunk_get_size_t)(void*);
+typedef void* (*ddb_chunk_get_vector_t)(void*, unsigned long long);
+typedef void* (*ddb_vector_get_data_t)(void*);
+typedef unsigned long long* (*ddb_vector_get_validity_t)(void*);
 
 void* resolve_sym(const char* name) {
   void* h = dlsym((void*)-2, name);
@@ -71,7 +82,20 @@ void* resolve_sym(const char* name) {
     h = dlsym(m, name);
     if (h) return h;
   }
-  m = dlopen("/Users/aloksubbarao/.local/bin/duckdb", 2);
+  /* Linux / split-lib fallbacks. On most setups RTLD_DEFAULT above already
+     resolves every duckdb_* symbol from the running duckdb process, so these
+     only matter when serving against a separately-installed libduckdb. */
+  m = dlopen("libduckdb.so", 2);
+  if (m) {
+    h = dlsym(m, name);
+    if (h) return h;
+  }
+  m = dlopen("/usr/local/lib/libduckdb.dylib", 2);
+  if (m) {
+    h = dlsym(m, name);
+    if (h) return h;
+  }
+  m = dlopen("/usr/local/lib/libduckdb.so", 2);
   if (m) {
     h = dlsym(m, name);
     if (h) return h;
@@ -95,6 +119,14 @@ static ddb_value_int32_t g_ddb_value_int32 = 0;
 static ddb_value_varchar_t g_ddb_value_varchar = 0;
 static ddb_free_t g_ddb_free = 0;
 static ddb_query_t g_ddb_query = 0;
+static ddb_result_error_t g_ddb_result_error = 0;
+static ddb_execute_prepared_streaming_t g_ddb_execute_prepared_streaming = 0;
+static ddb_fetch_chunk_t g_ddb_fetch_chunk = 0;
+static ddb_destroy_data_chunk_t g_ddb_destroy_data_chunk = 0;
+static ddb_chunk_get_size_t g_ddb_chunk_get_size = 0;
+static ddb_chunk_get_vector_t g_ddb_chunk_get_vector = 0;
+static ddb_vector_get_data_t g_ddb_vector_get_data = 0;
+static ddb_vector_get_validity_t g_ddb_vector_get_validity = 0;
 
 #define NWORKERS 16
 static int g_q[4096]; static int g_qhead=0, g_qtail=0, g_qcount=0;
@@ -124,11 +156,110 @@ void handle_conn_on(void *con, void *stmt, int fd){
   } else {
     body[0] = 0;
   }
+  /* parse headers into json; lower keys; escape " and \ in values; add _cookies */
+  char headers_json[8192];
+  int hpos = 0;
+  headers_json[hpos++] = ''{'' ;
+  int hfirst = 1;
+  char cookie_val[4096]; cookie_val[0] = 0;
+  char *hstart = strstr(req, "\r\n");
+  if (hstart) hstart += 2;
+  char *hend = sep ? sep : (req + n);
+  char *hp = hstart ? hstart : req;
+  while (hp && hp < hend) {
+    char *eol = strstr(hp, "\r\n");
+    if (!eol || eol > hend) eol = hend;
+    if (eol == hp) break;
+    char *colon = 0;
+    char *cp = hp;
+    while (cp < eol) { if (*cp == '':'' ) { colon = cp; break; } cp++; }
+    if (colon) {
+      char kbuf[256]; int ki = 0;
+      char *ks = hp;
+      while (ks < colon && ki < 255) {
+        char ch = *ks;
+        if (ch >= ''A'' && ch <= ''Z'') ch += 32;
+        if (ch != '' '' && ch != ''\t'') kbuf[ki++] = ch;
+        ks++;
+      }
+      kbuf[ki] = 0;
+      char *vs = colon + 1;
+      while (vs < eol && (*vs == '' '' || *vs == ''\t'')) vs++;
+      char vbuf[4096]; int vi = 0;
+      char *ve = eol;
+      while (vs < ve && vi < 4095) vbuf[vi++] = *vs++;
+      while (vi > 0 && (vbuf[vi-1] == '' '' || vbuf[vi-1] == ''\t'')) vi--;
+      vbuf[vi] = 0;
+      if (strcmp(kbuf, "cookie") == 0) {
+        int cvi = 0; while (vbuf[cvi] && cvi < 4095) { cookie_val[cvi] = vbuf[cvi]; cvi++; } cookie_val[cvi] = 0;
+      }
+      if (!hfirst) headers_json[hpos++] = '','' ;
+      hfirst = 0;
+      headers_json[hpos++] = ''"'' ;
+      int kii = 0; while (kbuf[kii] && hpos < 8190) headers_json[hpos++] = kbuf[kii++];
+      headers_json[hpos++] = ''"'' ; headers_json[hpos++] = '':'' ;
+      headers_json[hpos++] = ''"'' ;
+      char *vp = vbuf;
+      while (*vp && hpos < 8190) {
+        if (*vp == ''"'' ) { headers_json[hpos++] = ''\\'' ; headers_json[hpos++] = ''"'' ; }
+        else if (*vp == ''\\'' ) { headers_json[hpos++] = ''\\'' ; headers_json[hpos++] = ''\\'' ; }
+        else headers_json[hpos++] = *vp;
+        vp++;
+      }
+      headers_json[hpos++] = ''"'' ;
+    }
+    if (eol >= hend) break;
+    hp = eol + 2;
+  }
+  if (cookie_val[0]) {
+    if (!hfirst) headers_json[hpos++] = '','' ;
+    const char *ckpre = "\"_cookies\":{";
+    int cpi=0; while(ckpre[cpi] && hpos<8190){ headers_json[hpos++]=ckpre[cpi++]; }
+    int cfirst = 1;
+    char *cp = cookie_val;
+    while (*cp) {
+      while (*cp && (*cp=='';'' || *cp=='' '' || *cp==''\t'')) cp++;
+      if (!*cp) break;
+      char *eqp = 0; char *cep = cp;
+      while (*cep && *cep != '';'') { if (!eqp && *cep==''='') eqp = cep; cep++; }
+      char ckb[256]; int cki=0;
+      char *ckpp = cp; char *ckend = eqp ? eqp : cep;
+      while (ckpp < ckend && cki<255) {
+        char ch=*ckpp; if(ch>=''A''&&ch<=''Z'') ch+=32; if(ch!='' ''&&ch!='' \t'') ckb[cki++]=ch; ckpp++;
+      }
+      ckb[cki]=0;
+      char cvb[1024]; int cvi=0;
+      if (eqp) {
+        char *cvpp = eqp+1; while(cvpp<cep && (*cvpp=='' ''||*cvpp==''\t'')) cvpp++;
+        char *cvend = cep; while(cvend>cvpp && (cvend[-1]=='' ''||cvend[-1]==''\t'')) cvend--;
+        while(cvpp < cvend && cvi<1023) cvb[cvi++]=*cvpp++;
+      }
+      cvb[cvi]=0;
+      if (!cfirst) headers_json[hpos++] = '','' ;
+      cfirst = 0;
+      headers_json[hpos++] = ''"'' ;
+      int ckii=0; while(ckb[ckii]&&hpos<8190) headers_json[hpos++]=ckb[ckii++];
+      headers_json[hpos++] = ''"'' ; headers_json[hpos++] = '':'' ;
+      headers_json[hpos++] = ''"'' ;
+      char *cvp = cvb; while(*cvp && hpos<8190){
+        if(*cvp==''"''){ headers_json[hpos++]=''\\''; headers_json[hpos++]='' "''; }
+        else if(*cvp==''\\''){ headers_json[hpos++]=''\\''; headers_json[hpos++]=''\\''; }
+        else headers_json[hpos++] = *cvp;
+        cvp++;
+      }
+      headers_json[hpos++] = ''"'' ;
+      cp = *cep ? cep + 1 : cep;
+    }
+    headers_json[hpos++] = ''}'' ;
+  }
+  headers_json[hpos++] = ''}'' ;
+  headers_json[hpos] = 0;
+  if (hpos <= 2) { headers_json[0]='' {''; headers_json[1]='' }''; headers_json[2]=0; }
   /* con + stmt are PERSISTENT per worker (built once in worker_main): no connect / LOAD / prepare per request */
   ddb_result res;
   int rc = g_ddb_bind_varchar(stmt, 1, method);
   rc |= g_ddb_bind_varchar(stmt, 2, path);
-  rc |= g_ddb_bind_varchar(stmt, 3, "{}");
+  rc |= g_ddb_bind_varchar(stmt, 3, headers_json);
   rc |= g_ddb_bind_varchar(stmt, 4, body);
   if(rc != 0){
     char e[] = "HTTP/1.1 500 OK\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"bind\"}";
@@ -136,8 +267,14 @@ void handle_conn_on(void *con, void *stmt, int fd){
   }
   rc = g_ddb_execute_prepared(stmt, &res);
   if(rc != 0){
-    char e[] = "HTTP/1.1 500 OK\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"error\":\"execute\"}";
-    write(fd, e, sizeof(e)-1); close(fd); return;
+    const char *errmsg = g_ddb_result_error ? g_ddb_result_error(&res) : 0;
+    if(!errmsg) errmsg = "(no detail)";
+    char ebody[4096];
+    int ebl = snprintf(ebody, 4096, "{\"error\":\"execute\",\"detail\":\"%s\"}", errmsg);
+    char eresp[4608];
+    int erl = snprintf(eresp, 4608, "HTTP/1.1 500 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", ebl, ebody);
+    write(fd, eresp, erl);
+    g_ddb_destroy_result(&res); close(fd); return;
   }
   int status = g_ddb_value_int32(&res, 0ULL, 0ULL);
   char *ct = g_ddb_value_varchar(&res, 1ULL, 0ULL);
@@ -148,6 +285,43 @@ void handle_conn_on(void *con, void *stmt, int fd){
   const char *reason = "OK";
   if(status == 404) reason = "Not Found";
   else if(status == 422) reason = "Unprocessable Entity";
+  const char *ctype = (ct && ct[0]) ? ct : "application/json";
+  int is_stream = (strcmp(ctype, "text/event-stream") == 0);
+  if (is_stream && hsql && hsql[0]) {
+    char hdr[1024];
+    int hl = snprintf(hdr, 1024, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n", status, reason, ctype);
+    write(fd, hdr, hl);
+    ddb_result res2;
+    int rc2 = g_ddb_query(con, hsql, &res2);
+    if (rc2 != 0) {
+      char em[] = "data: {\"error\":\"stream_handler\"}\n\n";
+      char lhex[32]; int lh = snprintf(lhex,32,"%x\r\n", (int)(sizeof(em)-1));
+      write(fd, lhex, lh); write(fd, em, sizeof(em)-1); write(fd, "\r\n0\r\n\r\n", 7);
+      if (ct) g_ddb_free(ct); if (bod) g_ddb_free(bod); if (hsql) g_ddb_free(hsql);
+      g_ddb_destroy_result(&res); close(fd); return;
+    }
+    unsigned long long n2 = g_ddb_row_count(&res2);
+    unsigned long long r;
+    for (r = 0; r < n2; r++) {
+      char *rowv = g_ddb_value_varchar(&res2, 0ULL, r);
+      if (rowv) {
+        char ev[8192]; int evl = snprintf(ev, 8192, "data: %s\n\n", rowv);
+        char lhex[32]; int lh = snprintf(lhex, 32, "%x\r\n", evl);
+        write(fd, lhex, lh);
+        write(fd, ev, evl);
+        write(fd, "\r\n", 2);
+        g_ddb_free(rowv);
+      }
+    }
+    write(fd, "0\r\n\r\n", 5);
+    g_ddb_destroy_result(&res2);
+    if (ct) g_ddb_free(ct);
+    if (bod) g_ddb_free(bod);
+    if (hsql) g_ddb_free(hsql);
+    g_ddb_destroy_result(&res);
+    close(fd);
+    return;
+  }
   if (hsql && hsql[0]) {
     ddb_result res2;
     int rc2 = g_ddb_query(con, hsql, &res2);
@@ -172,14 +346,13 @@ void handle_conn_on(void *con, void *stmt, int fd){
     char *hbody = g_ddb_value_varchar(&res2, 0ULL, 0ULL);
     if (bod) g_ddb_free(bod);
     final_bod = hbody;
-    final_status = 200;
-    reason = "OK";
+    final_status = status;
+    reason = (status == 201) ? "Created" : "OK";
     g_ddb_destroy_result(&res2);
     if (hsql) { g_ddb_free(hsql); hsql = 0; }
   }
   int bl = final_bod ? strlen(final_bod) : 0;
   char hdr[1024];
-  const char *ctype = (ct && ct[0]) ? ct : "application/json";
   int hl = snprintf(hdr, 1024, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", final_status, reason, ctype, bl);
   write(fd, hdr, hl);
   if(bl > 0){
@@ -239,7 +412,7 @@ void *accept_loop(void *arg){
   return 0;
 }
 
-const char *serve_brain(int port){
+const char *serve_brain(int port, const char *db_path){
   if(g_listen < 0){
     g_listen = socket(2, 1, 0);
     int one = 1; setsockopt(g_listen, 0xffff, 0x0004, &one, 4);
@@ -263,12 +436,20 @@ const char *serve_brain(int port){
     g_ddb_value_varchar = (ddb_value_varchar_t) resolve_sym("duckdb_value_varchar");
     g_ddb_free = (ddb_free_t) resolve_sym("duckdb_free");
     g_ddb_query = (ddb_query_t) resolve_sym("duckdb_query");
+    g_ddb_result_error = (ddb_result_error_t) resolve_sym("duckdb_result_error");
+    g_ddb_execute_prepared_streaming = (ddb_execute_prepared_streaming_t) resolve_sym("duckdb_execute_prepared_streaming");
+    g_ddb_fetch_chunk = (ddb_fetch_chunk_t) resolve_sym("duckdb_fetch_chunk");
+    g_ddb_destroy_data_chunk = (ddb_destroy_data_chunk_t) resolve_sym("duckdb_destroy_data_chunk");
+    g_ddb_chunk_get_size = (ddb_chunk_get_size_t) resolve_sym("duckdb_data_chunk_get_size");
+    g_ddb_chunk_get_vector = (ddb_chunk_get_vector_t) resolve_sym("duckdb_data_chunk_get_vector");
+    g_ddb_vector_get_data = (ddb_vector_get_data_t) resolve_sym("duckdb_vector_get_data");
+    g_ddb_vector_get_validity = (ddb_vector_get_validity_t) resolve_sym("duckdb_vector_get_validity");
     if(!g_ddb_open || !g_ddb_connect || !g_ddb_disconnect || !g_ddb_close ||
        !g_ddb_prepare || !g_ddb_bind_varchar || !g_ddb_execute_prepared || !g_ddb_destroy_prepare ||
        !g_ddb_destroy_result || !g_ddb_row_count || !g_ddb_value_int32 || !g_ddb_value_varchar || !g_ddb_free || !g_ddb_query){
       close(g_listen); g_listen = -1; return "SYM_FAIL";
     }
-    int oret = g_ddb_open("/tmp/quackapi.db", &g_db);
+    int oret = g_ddb_open(db_path, &g_db);
     if(oret != 0){
       close(g_listen); g_listen = -1; g_db = 0; return "DBOPEN_FAIL";
     }
@@ -292,7 +473,7 @@ const char *serve_brain(int port){
 int block_forever(int x){ for(;;) usleep(1000000); return 0; }
 ',
   symbol := 'serve_brain', sql_name := 'serve_brain',
-  return_type := 'varchar', arg_types := ['i32'], stability := 'volatile', library := 'c');
+  return_type := 'varchar', arg_types := ['i32','varchar'], stability := 'volatile', library := 'c');
 
 SELECT ok, code FROM tcc_module(mode := 'quick_compile',
   source := 'int usleep(unsigned int); int block_forever(int x){ for(;;) usleep(1000000); return 0; }',

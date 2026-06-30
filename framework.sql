@@ -39,7 +39,8 @@ CREATE OR REPLACE TABLE routes (
   pattern VARCHAR,
   handler VARCHAR,
   kind VARCHAR,
-  summary VARCHAR
+  summary VARCHAR,
+  status INTEGER
 );
 
 CREATE OR REPLACE TABLE param_schema (
@@ -51,6 +52,19 @@ CREATE OR REPLACE TABLE param_schema (
   constraint_json VARCHAR
 );
 
+-- register_route macro: app.sql calls this to produce route rows (no VALUES-literal hardcode of config rows in app).
+-- Usage: INSERT INTO routes SELECT * FROM register_route('id', 'GET', '/p', 'HANDLER', 'dynamic', 'sum', 200);
+CREATE OR REPLACE MACRO register_route(route_id, method, pattern, handler, kind, summary, status := 200) AS TABLE (
+  SELECT
+    route_id AS route_id,
+    method,
+    pattern,
+    handler,
+    kind,
+    summary,
+    status
+);
+
 -- Seed routes from JSON array literal (config-as-data)
 INSERT INTO routes
 SELECT
@@ -59,8 +73,9 @@ SELECT
   json_extract_string(value, '$.pattern'),
   json_extract_string(value, '$.handler'),
   json_extract_string(value, '$.kind'),
-  json_extract_string(value, '$.summary')
-FROM json_each('[ {"route_id":"get_user","method":"GET","pattern":"/users/{id}","handler":"SELECT to_json(u) AS body FROM users u WHERE u.id = {id}","kind":"dynamic","summary":"Get a user by id"}, {"route_id":"list_users","method":"GET","pattern":"/users","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM users u","kind":"dynamic","summary":"List users"}, {"route_id":"get_post","method":"GET","pattern":"/users/{id}/posts/{post_id}","handler":"SELECT to_json({''user_id'': {id}, ''post_id'': {post_id}}) AS body","kind":"dynamic","summary":"Get a post"}, {"route_id":"search","method":"GET","pattern":"/search","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM (SELECT * FROM users WHERE starts_with(lower(name), lower({q})) ORDER BY id LIMIT coalesce({limit}, 100)) u","kind":"dynamic","summary":"Search"}, {"route_id":"create_user","method":"POST","pattern":"/users","handler":"INSERT INTO users(name, age) VALUES ({name}, {age}) RETURNING to_json(users) AS body","kind":"dynamic","summary":"Create a user"}, {"route_id":"whoami","method":"GET","pattern":"/whoami","handler":"SELECT to_json({''whoami'': rtrim(c.content, chr(10))}) AS body FROM read_text(''whoami |'') c","kind":"dynamic","summary":"Shell: whoami"}, {"route_id":"openapi","method":"GET","pattern":"/openapi.json","handler":"openapi","kind":"openapi","summary":"OpenAPI schema"}, {"route_id":"docs","method":"GET","pattern":"/docs","handler":"docs","kind":"html","summary":"Swagger UI"} ]'::JSON);
+  json_extract_string(value, '$.summary'),
+  CASE WHEN try_cast(json_extract_string(value, '$.status') AS INTEGER) IS NULL THEN 200 ELSE try_cast(json_extract_string(value, '$.status') AS INTEGER) END
+FROM json_each('[ {"route_id":"get_user","method":"GET","pattern":"/users/{id}","handler":"SELECT to_json(u) AS body FROM users u WHERE u.id = {id}","kind":"dynamic","summary":"Get a user by id","status":200}, {"route_id":"list_users","method":"GET","pattern":"/users","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM users u","kind":"dynamic","summary":"List users","status":200}, {"route_id":"get_post","method":"GET","pattern":"/users/{id}/posts/{post_id}","handler":"SELECT to_json({''user_id'': {id}, ''post_id'': {post_id}}) AS body","kind":"dynamic","summary":"Get a post","status":200}, {"route_id":"search","method":"GET","pattern":"/search","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM (SELECT * FROM users WHERE starts_with(lower(name), lower({q})) ORDER BY id LIMIT coalesce({limit}, 100)) u","kind":"dynamic","summary":"Search","status":200}, {"route_id":"create_user","method":"POST","pattern":"/users","handler":"INSERT INTO users(name, age) VALUES ({name}, {age}) RETURNING to_json(users) AS body","kind":"dynamic","summary":"Create a user","status":201}, {"route_id":"whoami","method":"GET","pattern":"/whoami","handler":"SELECT to_json({''whoami'': rtrim(c.content, chr(10))}) AS body FROM read_text(''whoami |'') c","kind":"dynamic","summary":"Shell: whoami","status":200}, {"route_id":"openapi","method":"GET","pattern":"/openapi.json","handler":"openapi","kind":"openapi","summary":"OpenAPI schema","status":200}, {"route_id":"docs","method":"GET","pattern":"/docs","handler":"docs","kind":"html","summary":"Swagger UI","status":200} ]'::JSON);
 
 -- Seed param_schema from JSON array literal (config-as-data)
 INSERT INTO param_schema
@@ -110,6 +125,7 @@ candidates AS (
     r.pattern,
     r.kind,
     r.summary,
+    r.status,
     list_filter(string_split(r.pattern, '/'), lambda x: len(x) > 0) AS pat_segs,
     req.req_segs AS req_segs
   FROM routes r
@@ -123,6 +139,7 @@ matched AS (
     c.pattern,
     c.kind,
     c.summary,
+    c.status,
     c.pat_segs,
     c.req_segs,
     (len(c.req_segs) = len(c.pat_segs)) AS len_match,
@@ -256,19 +273,21 @@ params_obj AS (
   SELECT json_group_object(name, val) AS params_json FROM casted_params
 ),
 -- OpenAPI 3.0 document built by querying routes + param_schema (no hardcode).
--- Body params omitted from parameters (TODO: use requestBody in OpenAPI for body).
+-- Generation is a query over tables (strictly easier than FastAPI introspection).
 ops AS (
   SELECT
     r.pattern,
     lower(r.method) AS meth,
     r.summary,
-    r.route_id
+    r.route_id,
+    r.status
   FROM routes r
 ),
 ops_with_params AS (
   SELECT
     o.pattern,
     o.meth,
+    o.status,
     json_object(
       'summary', o.summary,
       'parameters', COALESCE((
@@ -288,7 +307,11 @@ ops_with_params AS (
         )
         FROM param_schema ps
         WHERE ps.route_id = o.route_id AND ps.location IN ('path', 'query')
-      ), '[]'::JSON)
+      ), '[]'::JSON),
+      'responses', json_object(
+        CAST(o.status AS VARCHAR), json_object('description', CASE WHEN o.status=201 THEN 'Created' ELSE 'OK' END, 'content', json_object('application/json', json_object('schema', json_object('type','object')))),
+        '422', json_object('description', 'Validation Error', 'content', json_object('application/json', json_object('schema', json_object('type','object'))))
+      )
     ) AS op_obj
   FROM ops o
 ),
@@ -307,7 +330,7 @@ openapi_body AS (
   ) AS oai
 ),
 docs_html AS (
-  SELECT '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Swagger UI</title><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"></head><body><div id="swagger-ui"></div><script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" charset="UTF-8"></script><script>SwaggerUIBundle({url: "/openapi.json", dom_id: "#swagger-ui"});</script></body></html>' AS html
+  SELECT '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>quackapi - Swagger UI</title><link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"></head><body><div id="swagger-ui"></div><script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" charset="UTF-8"></script><script>SwaggerUIBundle({url:"/openapi.json",dom_id:"#swagger-ui",presets:[SwaggerUIBundle.presets.apis],layout:"BaseLayout"});</script></body></html>' AS html
 ),
 -- Handler rendering CTEs (A3): only for matched dynamic routes. Use replace + list_reduce (no regex).
 -- param_literals built from the same param_values data used by validation (path/query/body all covered).
@@ -352,11 +375,13 @@ SELECT
   CASE
     WHEN (SELECT COUNT(*) FROM best) = 0 THEN 404
     WHEN (SELECT COUNT(*) FROM err_rows) > 0 THEN 422
-    ELSE 200
+    ELSE (SELECT status FROM best)
   END AS status_code,
   CASE
     WHEN (SELECT COUNT(*) FROM best) = 0 OR (SELECT COUNT(*) FROM err_rows) > 0 THEN 'application/json'
     WHEN (SELECT kind FROM best) = 'html' THEN 'text/html'
+    WHEN (SELECT kind FROM best) = 'static' THEN 'application/json'
+    WHEN (SELECT kind FROM best) = 'stream' THEN 'text/event-stream'
     ELSE 'application/json'
   END AS content_type,
   CASE
@@ -368,7 +393,9 @@ SELECT
       cast((SELECT oai FROM openapi_body) AS VARCHAR)
     WHEN (SELECT kind FROM best) = 'html' THEN
       (SELECT html FROM docs_html)
-    WHEN (SELECT kind FROM best) = 'dynamic' THEN
+    WHEN (SELECT kind FROM best) = 'static' THEN
+      (SELECT handler FROM route_handler)
+    WHEN (SELECT kind FROM best) = 'dynamic' OR (SELECT kind FROM best) = 'stream' THEN
       NULL
     ELSE
       cast(json_object(
@@ -379,8 +406,8 @@ SELECT
   END AS body,
   CASE
     WHEN (SELECT COUNT(*) FROM best) = 0 OR (SELECT COUNT(*) FROM err_rows) > 0 THEN NULL
-    WHEN (SELECT kind FROM best) = 'openapi' OR (SELECT kind FROM best) = 'html' THEN NULL
-    WHEN (SELECT kind FROM best) = 'dynamic' THEN
+    WHEN (SELECT kind FROM best) = 'openapi' OR (SELECT kind FROM best) = 'html' OR (SELECT kind FROM best) = 'static' THEN NULL
+    WHEN (SELECT kind FROM best) = 'dynamic' OR (SELECT kind FROM best) = 'stream' THEN
       (SELECT hsql FROM handler_rendered)
     ELSE NULL
   END AS handler_sql
