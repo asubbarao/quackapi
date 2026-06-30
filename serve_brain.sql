@@ -154,6 +154,15 @@ void handle_conn_on(void *con, void *stmt, int fd){
     char pong[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong";
     write(fd, pong, sizeof(pong)-1); close(fd); return;
   }
+  /* DIAGNOSTIC: /q1 runs a TRIVIAL query (no macro, no params) on the worker
+     connection. Splits DuckDB per-statement floor (parse+plan+exec of SELECT 42)
+     from the fat handle_request macro per-execute bind/optimize cost. */
+  if(strcmp(path, "/q1") == 0){
+    ddb_result rq; int rcq = g_ddb_query(con, "SELECT 42", &rq);
+    if(rcq == 0) g_ddb_destroy_result(&rq);
+    char q[] = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"q1\":true}";
+    write(fd, q, sizeof(q)-1); close(fd); return;
+  }
   if(strstr(path, "slow")) usleep(300000); /* demo knob: any path containing "slow" naps 300ms to SIMULATE awaited handler IO */
   char *sep = strstr(req, "\r\n\r\n");
   if(sep){

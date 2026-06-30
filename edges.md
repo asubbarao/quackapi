@@ -284,7 +284,8 @@ kill $(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t)
 | path | exercises | req/s | p50 | p99 |
 |------|-----------|------:|----:|----:|
 | `/ping` | pure C socket layer, no DuckDB | **38,268** | 1ms | 2ms |
-| `/health` | 1 prepared `handle_request` | 1,095 | 45ms | 62ms |
+| `/q1` | trivial query `SELECT 42`, **no macro** | **34,259** | 1ms | 2ms |
+| `/health` | 1 prepared `handle_request` macro | 1,082 | 45ms | 62ms |
 | `/users/1` | 2 queries (`handle_request` + handler) | 1,029 | 48ms | 60ms |
 
 **Three fixes shipped, three dead-ends ruled out — all by measurement, not intuition:**
@@ -298,21 +299,25 @@ kill $(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t)
 - **TCP_NODELAY** on accepted sockets — flush the small JSON immediately, no Nagle coalescing wait.
 - **Keep-alive — RULED OUT.** `/ping` does 38k req/s *with* connection-close; `ab -k` adds nothing on
   loopback (no RTT to amortize). The socket layer has 35× headroom — keep-alive would optimize a non-bottleneck.
-- **Macro simplification — RULED OUT.** 50,000 `handle_request` evaluations inside one query = 0.275s =
-  **5.5µs each**. The macro is not the cost.
+- **Macro *execution* is cheap (5.5µs)** — 50,000 `handle_request` evals in one query = 0.275s. But that
+  amortizes the *bind* across the whole query. The per-request cost is the macro's **bind + optimize on
+  every `execute_prepared`**, which the `/q1` control isolates below. So simplifying/replacing the
+  hot-path macro IS the lever (this corrects an earlier wrong "ruled out").
 - **More workers — RULED OUT.** The pool already idles; the query layer is saturated, not the C layer.
 
-**Where the wall actually is:** `/ping` (no DuckDB) = 38k req/s; any single-query path = ~1,100 req/s,
-which equals exactly *one core* of 0.9ms services — 16 workers deliver single-core throughput. The macro
-costs 5.5µs, so **~99% of the 0.9ms per request is DuckDB's per-statement overhead** (transaction
-begin/commit + plan instantiation + result-set marshalling through the C API), and it *serializes*.
-Sharding to two independent instances scaled **sub-linearly** — 673+671 = 1,344 req/s vs 1,095 single,
-only **1.23×** — so even separate processes contend; the tiny-query ceiling of a DuckDB-backed server is
-fundamentally ~1–1.5k req/s.
+**Where the wall actually is — CORRECTED by the `/q1` control (an earlier draft of this entry called it an
+intrinsic DuckDB wall; that was wrong):** a *trivial* query (`SELECT 42`) through the same C-API path does
+**34,259 req/s** — 31× `/health`, essentially `/ping`. So DuckDB's per-statement floor is ~29µs and is
+**not** the bottleneck. The entire ~0.9ms of `/health` is the `handle_request` macro being **re-bound and
+re-optimized on every `execute_prepared`** — a large CTE (router + validation + OpenAPI + docs) the binder
+re-plans each call. It *serializes* because binding reads the catalog under a lock: 16 connections binding
+the big macro at once queue on it, while trivial queries bind instantly and parallelize to 34k (proof the
+engine itself does not serialize). The "sharding only got 1.23×" result was the same lock, cross-process.
 
-**Verdict: REAL.** The HTTP front door is fast (38k req/s of pure transport); *request* throughput is
-capped near ~1,100/s per instance by DuckDB's per-statement cost, because a web request is an OLTP point
-query and DuckDB is an analytical engine. This is not a bug to optimize away — it is the defining edge of
-"FastAPI, but the brain is an OLAP database." The socket layer was tuned (SIGPIPE, threads=1, NODELAY) and
-the engine wall was *located and quantified*. Breaking past it would mean caching responses, batching
-requests into one query, or fronting DuckDB with an OLTP store — i.e. no longer "pure DuckDB."
+**Verdict: REAL but BREAKABLE — and I over-called it "intrinsic" first; that was wrong.** The transport
+does ~38k req/s and the engine does ~34k req/s of *real* queries; the 1,082 req/s for `/health` is
+entirely the fat macro re-binding per request under the catalog lock. The fix is a lean, plan-cacheable
+hot path — a precomputed route lookup + minimal per-request validation, with OpenAPI/docs generation moved
+off the hot path — and there is no fundamental reason quackapi can't approach uvicorn-class throughput.
+Shipped so far: SIGPIPE-ignore (crash fix), threads=1 (+43%), TCP_NODELAY, and the `/ping` + `/q1`
+diagnostics that *located* the real cost. The hot-path rebuild is the next work item.
