@@ -120,6 +120,12 @@ SELECT 'create_user', 'name', 'body', 'string', true, NULL
 UNION ALL
 SELECT 'create_user', 'age', 'body', 'int', true, NULL;
 
+-- Rebuild the precomputed routing structures from THIS app's routes (framework.sql
+-- defines _route_index_src / _response_cache_src; we re-materialize after re-seeding
+-- so route_index + response_cache reflect the app, not the framework demo seed).
+CREATE OR REPLACE TABLE route_index AS SELECT * FROM _route_index_src();
+CREATE OR REPLACE TABLE response_cache AS SELECT * FROM _response_cache_src();
+
 -- Self-checks for this app (run at load; use structural checks only).
 -- These demonstrate the registered endpoints. Full asserts happen in test session after load.
 SELECT status_code, content_type, body IS NULL AS body_null, handler_sql IS NOT NULL AS has_sql FROM handle_request('GET','/users/1','{}','');

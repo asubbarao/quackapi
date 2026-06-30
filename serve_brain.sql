@@ -133,6 +133,7 @@ static ddb_vector_get_validity_t g_ddb_vector_get_validity = 0;
 static int g_q[4096]; static int g_qhead=0, g_qtail=0, g_qcount=0;
 static pmutex g_qm; static pcond g_qcv;
 static int g_pool_started = 0;
+static int g_brain_params = 4; /* 3 when the macroless brain_sql path is used (method,path,body); 4 for the handle_request macro fallback (method,path,headers,body) */
 
 void handle_conn_on(void *con, void *stmt, int fd){
   char req[65536];
@@ -161,6 +162,22 @@ void handle_conn_on(void *con, void *stmt, int fd){
     ddb_result rq; int rcq = g_ddb_query(con, "SELECT 42", &rq);
     if(rcq == 0) g_ddb_destroy_result(&rq);
     char q[] = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"q1\":true}";
+    write(fd, q, sizeof(q)-1); close(fd); return;
+  }
+  /* DIAGNOSTIC: /q2 runs a SINGLE-table point query (one catalog object: users)
+     via duckdb_query. Isolates "does touching ANY table serialize?" from the full
+     brain (which binds route_index + param_schema + response_cache + users). */
+  if(strcmp(path, "/q2") == 0){
+    ddb_result rq; int rcq = g_ddb_query(con, "SELECT to_json(u) FROM users u WHERE u.id = 1", &rq);
+    if(rcq == 0) g_ddb_destroy_result(&rq);
+    char q[] = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"q2\":true}";
+    write(fd, q, sizeof(q)-1); close(fd); return;
+  }
+  /* DIAGNOSTIC: /q3 touches one catalog object with the simplest possible read. */
+  if(strcmp(path, "/q3") == 0){
+    ddb_result rq; int rcq = g_ddb_query(con, "SELECT count(*) FROM route_index", &rq);
+    if(rcq == 0) g_ddb_destroy_result(&rq);
+    char q[] = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"q3\":true}";
     write(fd, q, sizeof(q)-1); close(fd); return;
   }
   if(strstr(path, "slow")) usleep(300000); /* demo knob: any path containing "slow" naps 300ms to SIMULATE awaited handler IO */
@@ -276,8 +293,12 @@ void handle_conn_on(void *con, void *stmt, int fd){
   ddb_result res;
   int rc = g_ddb_bind_varchar(stmt, 1, method);
   rc |= g_ddb_bind_varchar(stmt, 2, path);
-  rc |= g_ddb_bind_varchar(stmt, 3, headers_json);
-  rc |= g_ddb_bind_varchar(stmt, 4, body);
+  if(g_brain_params == 4){
+    rc |= g_ddb_bind_varchar(stmt, 3, headers_json);
+    rc |= g_ddb_bind_varchar(stmt, 4, body);
+  } else {
+    rc |= g_ddb_bind_varchar(stmt, 3, body);
+  }
   if(rc != 0){
     char e[] = "HTTP/1.1 500 OK\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"bind\"}";
     write(fd, e, sizeof(e)-1); close(fd); return;
@@ -406,7 +427,22 @@ static void *worker_main(void *arg){
   { ddb_result ign; g_ddb_query(con, "SET http_retries=3", &ign); g_ddb_destroy_result(&ign); }
   { ddb_result ign; g_ddb_query(con, "SET httpfs_retries_file_operation=3", &ign); g_ddb_destroy_result(&ign); }
   { ddb_result ign; g_ddb_query(con, "SET http_timeout=30000", &ign); g_ddb_destroy_result(&ign); }
+  /* MACROLESS HOT PATH: prefer the precompiled plain pipeline in brain_sql. A
+     table macro is re-expanded + re-bound on every execute_prepared (catalog-lock
+     serialized, ~0.9 ms/req); a plain prepared statement binds its plan once. We
+     read the SAME pipeline as plain SQL ($1=method,$2=path,$3=body) and prepare
+     THAT. Falls back to the handle_request macro if brain_sql is absent. edges.md #9. */
+  char brainbuf[32768];
   const char *bsql = "SELECT * FROM handle_request(?, ?, ?, ?)";
+  { ddb_result bq;
+    if(g_ddb_query(con, "SELECT stmt FROM brain_sql LIMIT 1", &bq) == 0){
+      if(g_ddb_row_count(&bq) > 0){
+        char *s = g_ddb_value_varchar(&bq, 0ULL, 0ULL);
+        if(s){ int li=0; while(s[li] && li<32767){ brainbuf[li]=s[li]; li++; } brainbuf[li]=0; g_ddb_free(s); bsql = brainbuf; g_brain_params = 3; }
+      }
+      g_ddb_destroy_result(&bq);
+    }
+  }
   if(g_ddb_prepare(con, bsql, &stmt) != 0) return 0;
   for(;;){
     pthread_mutex_lock(&g_qm);

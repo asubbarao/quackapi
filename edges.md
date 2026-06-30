@@ -321,3 +321,55 @@ hot path — a precomputed route lookup + minimal per-request validation, with O
 off the hot path — and there is no fundamental reason quackapi can't approach uvicorn-class throughput.
 Shipped so far: SIGPIPE-ignore (crash fix), threads=1 (+43%), TCP_NODELAY, and the `/ping` + `/q1`
 diagnostics that *located* the real cost. The hot-path rebuild is the next work item.
+
+### Round 2 — the macroless rebuild, and the `/q2` control that found the *real* cost
+
+The Round-1 verdict blamed "the fat macro re-binding under the catalog lock" and predicted a lean,
+macroless, plan-cached hot path would approach uvicorn-class throughput. **Two of those three claims were
+wrong.** Built and measured:
+
+1. **Lean macro** — moved the OpenAPI-doc build and Swagger HTML out of the per-request path into a
+   load-time `response_cache` table, and pre-split every route pattern into a `route_index` table so the
+   request path never re-splits patterns.
+2. **Macroless Tier-2** — stored the *same* pipeline as plain SQL with bind params (`$1`/`$2`/`$3`) in a
+   `brain_sql` table; the worker reads it once at startup and prepares it. No table macro in the request
+   path at all — exactly the macroless execution self-dispatch already uses for handler SQL.
+3. **`MATERIALIZED`** on the multi-reference CTEs (`best`, `param_values`, `err_rows`).
+
+| path | exercises | req/s | scales with c? |
+|------|-----------|------:|----------------|
+| `/q2` | `SELECT to_json(u) FROM users WHERE id=1` — **one table, point query** | **34,261** | **yes** — c16 29k → c64 33k |
+| `/q3` | `SELECT count(*) FROM route_index` — one catalog object | **35,233** | — |
+| `/users/1` (Round 1, fat macro) | baseline | 1,029 | collapses (c32 → 691) |
+| `/users/1` (macroless lean) | brain_sql, no MATERIALIZED | 1,480 | collapses (c32 → 691) |
+| `/users/1` (macroless lean + MATERIALIZED) | current | **1,720** | **flat** — c16 1720 / c32 1748 / c64 1726 |
+| `/health` (macroless lean + MATERIALIZED) | static, response_cache | **1,886** | flat |
+
+**What each number proves:**
+
+- **The macro was only ~37% of the cost.** Killing the macro (macroless prepared statement, same pipeline)
+  moved `/users/1` 1,029 → 1,480, not 1,029 → 30k. A plain prepared statement re-binds/re-optimizes per
+  execute in v1.5.3 almost as much as a table macro does. The macro was a *contributor*, not *the* wall.
+- **Table access is NOT the serialization point — the Round-1 catalog-lock theory was wrong.** `/q2` and
+  `/q3` each touch a real table and do **34–35k req/s AND scale cleanly to c=64.** A single-table point query
+  is ~30µs and fully concurrent. DuckDB does not serialize table reads; it is a perfectly good OLTP *executor*.
+- **`MATERIALIZED` fixed the concurrency *collapse* but not the throughput.** The convoy (c32 → 691) was the
+  ~10 scalar subqueries over `best` in the final `SELECT` each re-running the routing subtree; materializing
+  it makes the curve flat. But absolute throughput rose only ~9% — so re-execution was ~1.1× of the cost,
+  not 10×.
+- **The dominant cost (≈19×) is the *single pass* through the 13-CTE pipeline.** One execution of the brain
+  is ~580µs; `/q2` is ~30µs. The gap is the brain's intrinsic per-operator overhead — a window function
+  (`QUALIFY row_number`), `list_zip`/`list_filter`/`list_transform`/`list_reduce` lambdas, two
+  `map_from_entries`, `json_group_array`/`json_object` building — ~30 operators, each with a fixed setup cost
+  DuckDB amortizes over millions of rows but a 1-row request pays in full. This is the OLAP-engine tax on a
+  point workload, and it is in the *shape of the query*, not the macro and not the catalog.
+
+**Verdict (Round 2): REAL, and the lever is the query shape, not the macro.** Net so far: 1,029 → 1,720
+req/s (+67%) on the dynamic hot route, 1,082 → 1,886 (+74%) on static, and — more importantly — the
+pathological concurrency collapse is gone (flat to c=64). But 1,720 is still 20× short of the proven 34k
+that `/q2` shows is available. Closing that gap requires making the **per-request query as simple as `/q2`**:
+push all structural work (segment matching, validation, handler templating) *upstream* to load/registration
+time so the request executes a single near-trivial lookup — or move routing+validation into the C worker
+(what uvicorn itself does; routing tables stay SQL data, only the match loop is C) and let the DB run only
+the precompiled handler, which already does 34k. The Tier-1 `handle_request` macro stays as the ergonomic
+pure-SQL surface; `brain_sql` is the surface the server runs. That rebuild is edge #9 Round 3.
