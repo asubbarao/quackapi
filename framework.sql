@@ -228,11 +228,11 @@ matched AS (
     AND len(list_filter(list_zip(r.req_segs, ri.pat_segs), lambda p: NOT (starts_with(p[2], '{') OR p[1] = p[2]))) = 0
   QUALIFY row_number() OVER (ORDER BY ri.literal_count DESC, ri.route_id) = 1
 ),
-best AS MATERIALIZED (
+best AS (
   SELECT m.*, map_from_entries(list_transform(list_filter(list_zip(m.req_segs, m.pat_segs), lambda p: starts_with(p[2], '{')), lambda p: struct_pack(key := substr(p[2], 2, len(p[2]) - 2), value := p[1]))) AS pmap
   FROM matched m
 ),
-param_values AS MATERIALIZED (
+param_values AS (
   SELECT ps.route_id, ps.name, ps.location, ps.type, ps.required, ps.constraint_json,
     CASE ps.location
       WHEN 'path'  THEN b.pmap[ps.name]
@@ -262,12 +262,13 @@ validation_errors AS (
     END AS constr_err_code
   FROM param_values pv
 ),
-err_rows AS MATERIALIZED (
+err_rows AS (
   SELECT name, location, type, required, constraint_json, val_str, COALESCE(err_code, constr_err_code) AS err_code, err_code AS type_err_code, constr_err_code
   FROM validation_errors WHERE COALESCE(err_code, constr_err_code) IS NOT NULL
 ),
-err_json AS (
-  SELECT json_group_array(json_object('type', er.err_code, 'loc', json_array(er.location, er.name), 'msg',
+err_agg AS (
+  SELECT count(*) AS n_err,
+    json_group_array(json_object('type', er.err_code, 'loc', json_array(er.location, er.name), 'msg',
     CASE er.err_code
       WHEN 'missing' THEN 'Field required'
       WHEN 'int_parsing' THEN 'Input should be a valid integer, unable to parse string as an integer'
@@ -292,18 +293,29 @@ handler_rendered AS (
       lambda acc, stp: struct_pack(s := replace(acc.s, '{' || stp.name || '}', stp.literal), name := '', literal := ''),
       struct_pack(s := (SELECT handler FROM best), name := '', literal := '')
     )).s AS hsql
+),
+-- Collapse to ONE row: LEFT JOIN best/err_agg/response_cache/handler_rendered so the
+-- final projection reads COLUMNS, not ~10 scalar subqueries that each re-ran routing.
+-- This is the structural fix MATERIALIZED was papering over — best now executes once.
+result AS (
+  SELECT b.route_id, b.kind, b.status, ea.n_err, ea.detail_arr, rc.content_type AS rc_ct, rc.body AS rc_body, hr.hsql
+  FROM (SELECT 1) z
+  LEFT JOIN best b ON true
+  LEFT JOIN err_agg ea ON true
+  LEFT JOIN response_cache rc ON rc.route_id = b.route_id
+  LEFT JOIN handler_rendered hr ON true
 )
 SELECT
-  CASE WHEN (SELECT COUNT(*) FROM best) = 0 THEN 404 WHEN (SELECT COUNT(*) FROM err_rows) > 0 THEN 422 ELSE (SELECT status FROM best) END AS status_code,
-  CASE WHEN (SELECT COUNT(*) FROM best) = 0 OR (SELECT COUNT(*) FROM err_rows) > 0 THEN 'application/json'
-       WHEN (SELECT kind FROM best) IN ('openapi', 'static', 'html') THEN (SELECT rc.content_type FROM response_cache rc WHERE rc.route_id = (SELECT route_id FROM best))
-       WHEN (SELECT kind FROM best) = 'stream' THEN 'text/event-stream' ELSE 'application/json' END AS content_type,
-  CASE WHEN (SELECT COUNT(*) FROM best) = 0 THEN cast(json_object('detail', 'Not Found') AS VARCHAR)
-       WHEN (SELECT COUNT(*) FROM err_rows) > 0 THEN cast(json_object('detail', (SELECT detail_arr FROM err_json)) AS VARCHAR)
-       WHEN (SELECT kind FROM best) IN ('openapi', 'static', 'html') THEN (SELECT rc.body FROM response_cache rc WHERE rc.route_id = (SELECT route_id FROM best))
-       ELSE NULL END AS body,
-  CASE WHEN (SELECT COUNT(*) FROM best) = 0 OR (SELECT COUNT(*) FROM err_rows) > 0 THEN NULL
-       WHEN (SELECT kind FROM best) IN ('dynamic', 'stream') THEN (SELECT hsql FROM handler_rendered) ELSE NULL END AS handler_sql
+  CASE WHEN route_id IS NULL THEN 404 WHEN n_err > 0 THEN 422 ELSE status END AS status_code,
+  CASE WHEN route_id IS NULL OR n_err > 0 THEN 'application/json'
+       WHEN kind IN ('openapi', 'static', 'html') THEN rc_ct
+       WHEN kind = 'stream' THEN 'text/event-stream' ELSE 'application/json' END AS content_type,
+  CASE WHEN route_id IS NULL THEN cast(json_object('detail', 'Not Found') AS VARCHAR)
+       WHEN n_err > 0 THEN cast(json_object('detail', detail_arr) AS VARCHAR)
+       WHEN kind IN ('openapi', 'static', 'html') THEN rc_body ELSE NULL END AS body,
+  CASE WHEN route_id IS NULL OR n_err > 0 THEN NULL
+       WHEN kind IN ('dynamic', 'stream') THEN hsql ELSE NULL END AS handler_sql
+FROM result
 $BRAIN$ AS stmt;
 
 -- ============================================================================
@@ -358,7 +370,7 @@ matched AS (
         )) = 0
   QUALIFY row_number() OVER (ORDER BY ri.literal_count DESC, ri.route_id) = 1
 ),
-best AS MATERIALIZED (
+best AS (
   SELECT
     m.*,
     map_from_entries(
@@ -432,8 +444,8 @@ err_rows AS (
   FROM validation_errors
   WHERE COALESCE(err_code, constr_err_code) IS NOT NULL
 ),
-err_json AS (
-  SELECT json_group_array(
+err_agg AS (
+  SELECT count(*) AS n_err, json_group_array(
     json_object(
       'type', er.err_code,
       'loc', json_array(er.location, er.name),
@@ -483,34 +495,32 @@ handler_rendered AS (
         struct_pack( s := (SELECT handler FROM best), name := '', literal := '' )
       )
     ).s AS hsql
+),
+-- Collapse to ONE row (see brain_sql for the rationale): LEFT JOIN best/err_agg/
+-- response_cache/handler_rendered so the final projection reads COLUMNS, not ~10
+-- scalar subqueries that each re-ran routing. The structural fix for the convoy.
+result AS (
+  SELECT b.route_id, b.kind, b.status, ea.n_err, ea.detail_arr, rc.content_type AS rc_ct, rc.body AS rc_body, hr.hsql
+  FROM (SELECT 1) z
+  LEFT JOIN best b ON true
+  LEFT JOIN err_agg ea ON true
+  LEFT JOIN response_cache rc ON rc.route_id = b.route_id
+  LEFT JOIN handler_rendered hr ON true
 )
 SELECT
-  CASE
-    WHEN (SELECT COUNT(*) FROM best) = 0 THEN 404
-    WHEN (SELECT COUNT(*) FROM err_rows) > 0 THEN 422
-    ELSE (SELECT status FROM best)
-  END AS status_code,
-  CASE
-    WHEN (SELECT COUNT(*) FROM best) = 0 OR (SELECT COUNT(*) FROM err_rows) > 0 THEN 'application/json'
-    WHEN (SELECT kind FROM best) IN ('openapi', 'static', 'html') THEN (SELECT rc.content_type FROM response_cache rc WHERE rc.route_id = (SELECT route_id FROM best))
-    WHEN (SELECT kind FROM best) = 'stream' THEN 'text/event-stream'
-    ELSE 'application/json'
-  END AS content_type,
-  CASE
-    WHEN (SELECT COUNT(*) FROM best) = 0 THEN
-      cast(json_object('detail', 'Not Found') AS VARCHAR)
-    WHEN (SELECT COUNT(*) FROM err_rows) > 0 THEN
-      cast(json_object('detail', (SELECT detail_arr FROM err_json)) AS VARCHAR)
-    WHEN (SELECT kind FROM best) IN ('openapi', 'static', 'html') THEN
-      (SELECT rc.body FROM response_cache rc WHERE rc.route_id = (SELECT route_id FROM best))
-    ELSE NULL
-  END AS body,
-  CASE
-    WHEN (SELECT COUNT(*) FROM best) = 0 OR (SELECT COUNT(*) FROM err_rows) > 0 THEN NULL
-    WHEN (SELECT kind FROM best) IN ('dynamic', 'stream') THEN
-      (SELECT hsql FROM handler_rendered)
-    ELSE NULL
-  END AS handler_sql
+  CASE WHEN route_id IS NULL THEN 404 WHEN n_err > 0 THEN 422 ELSE status END AS status_code,
+  CASE WHEN route_id IS NULL OR n_err > 0 THEN 'application/json'
+       WHEN kind IN ('openapi', 'static', 'html') THEN rc_ct
+       WHEN kind = 'stream' THEN 'text/event-stream'
+       ELSE 'application/json' END AS content_type,
+  CASE WHEN route_id IS NULL THEN cast(json_object('detail', 'Not Found') AS VARCHAR)
+       WHEN n_err > 0 THEN cast(json_object('detail', detail_arr) AS VARCHAR)
+       WHEN kind IN ('openapi', 'static', 'html') THEN rc_body
+       ELSE NULL END AS body,
+  CASE WHEN route_id IS NULL OR n_err > 0 THEN NULL
+       WHEN kind IN ('dynamic', 'stream') THEN hsql
+       ELSE NULL END AS handler_sql
+FROM result
 );
 
 -- GATE self-checks (must produce expected results). Note: dynamic routes now return handler_sql (col3), body=NULL (C layer executes).
