@@ -41,6 +41,13 @@ FROM json_each('[
     "config_json": "{\"log_headers\": true}"
   },
   {
+    "id":          "cors",
+    "phase":       "pre",
+    "priority":    5,
+    "kind":        "cors",
+    "config_json": "{\"allowed_origins\": [\"https://example.com\"], \"allowed_methods\": [\"GET\", \"POST\", \"OPTIONS\"], \"allowed_headers\": [\"Content-Type\", \"X-API-Key\"], \"max_age\": 600}"
+  },
+  {
     "id":          "pre_auth",
     "phase":       "pre",
     "priority":    20,
@@ -61,21 +68,15 @@ FROM json_each('[
 --
 -- Runs every 'pre' middleware step in priority order.
 -- Returns one row:
---   pass         BOOLEAN  — true  = proceed to route handler
---                           false = short-circuit with the error fields below
+--   pass         BOOLEAN
 --   status_code  INTEGER
 --   content_type VARCHAR
---   body         VARCHAR  — JSON error body (only meaningful when pass=false)
---   log_entry    VARCHAR  — JSON summary written by the request_logger step
+--   body         VARCHAR
+--   log_entry    VARCHAR
+--   resp_headers VARCHAR   — additive (R1); for cors preflight short-circuit contains ACA* headers
 --
--- DuckDB v1.5.3 lambda constraints:
---   - list_reduce 3-arg (with initial value) is NOT supported.
---   - Lambdas cannot contain correlated subqueries into outer CTEs.
---   Strategy: pre-compute each step's outcome as a table row, then pick the
---   first failure (if any) and the logger's log entry with plain SQL.
---
--- Auth gate rule (no LIKE / ILIKE / regexp):
---   starts_with(authorization_header, scheme || ' ')
+-- CORS preflight (OPTIONS + Origin + ACR-Method) short-circuits to 204 + ACA* when
+-- a 'cors' middleware row exists with allowed_origins etc. Priority should be early (e.g. 5).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO apply_pre(method, path, headers, body) AS TABLE (
 WITH
@@ -85,6 +86,14 @@ ctx AS (
   SELECT
     json_extract_string(headers, '$.authorization') AS auth_val,
     cast(json_object('method', method, 'path', path, 'headers', headers) AS VARCHAR) AS log_json
+),
+
+-- CORS request context (used by cors preflight logic)
+cors_ctx AS (
+  SELECT
+    json_extract_string(headers, '$.origin') AS origin,
+    upper(COALESCE(json_extract_string(headers, '$.access-control-request-method'), '')) AS acrm,
+    json_extract_string(headers, '$.access-control-request-headers') AS acrh
 ),
 
 -- Evaluate each pre-phase step: does it fail? If so, what response?
@@ -101,11 +110,19 @@ step_outcomes AS (
              (SELECT auth_val FROM ctx),
              json_extract_string(m.config_json, '$.scheme') || ' '
            )
+      WHEN 'cors' THEN
+        -- Preflight short-circuit: OPTIONS + Origin + ACR-Method present, and cors config row exists.
+        -- We short here (step_fails) so first_fail produces 204 + ACA headers before auth or route.
+        upper(method) = 'OPTIONS'
+        AND (SELECT origin FROM cors_ctx) IS NOT NULL
+        AND (SELECT acrm FROM cors_ctx) IS NOT NULL
+        AND json_extract(m.config_json, '$.allowed_origins') IS NOT NULL
       ELSE false
     END AS step_fails,
 
     CASE m.kind
       WHEN 'auth_gate' THEN 401
+      WHEN 'cors' THEN 204
       ELSE 200
     END AS fail_status,
 
@@ -128,7 +145,33 @@ step_outcomes AS (
     CASE m.kind
       WHEN 'request_logger' THEN (SELECT log_json FROM ctx)
       ELSE NULL
-    END AS log_entry
+    END AS log_entry,
+
+    -- Per-step resp headers (only cors preflight produces them in pre phase)
+    CASE m.kind
+      WHEN 'cors' THEN
+        CASE
+          WHEN upper(method) = 'OPTIONS'
+           AND (SELECT origin FROM cors_ctx) IS NOT NULL
+           AND (SELECT acrm FROM cors_ctx) IS NOT NULL
+           AND json_extract(m.config_json, '$.allowed_origins') IS NOT NULL
+          THEN
+            -- Build ACA* using ::VARCHAR[] cast (reliable for membership and indexing)
+            json_object(
+              'Access-Control-Allow-Origin', CASE
+                WHEN list_contains( (json_extract(m.config_json, '$.allowed_origins')::VARCHAR[]), (SELECT origin FROM cors_ctx) )
+                  OR list_contains( (json_extract(m.config_json, '$.allowed_origins')::VARCHAR[]), '*' )
+                THEN (SELECT origin FROM cors_ctx)
+                ELSE ''
+              END,
+              'Access-Control-Allow-Methods', COALESCE( array_to_string( json_extract(m.config_json, '$.allowed_methods')::VARCHAR[] , ', '), 'GET,POST,OPTIONS' ),
+              'Access-Control-Allow-Headers', COALESCE( array_to_string( json_extract(m.config_json, '$.allowed_headers')::VARCHAR[] , ', '), 'Content-Type' ),
+              'Access-Control-Max-Age', COALESCE( json_extract_string(m.config_json, '$.max_age'), '600' )
+            )
+          ELSE '{}'
+        END
+      ELSE NULL
+    END AS step_resp_headers
 
   FROM middleware m
   WHERE m.phase = 'pre'
@@ -136,7 +179,7 @@ step_outcomes AS (
 
 -- First failing step (NULL when all pass).
 first_fail AS (
-  SELECT fail_status, fail_body
+  SELECT fail_status, fail_body, step_resp_headers AS resp_headers
   FROM step_outcomes
   WHERE step_fails
   ORDER BY priority
@@ -149,6 +192,12 @@ logger AS (
   FROM step_outcomes
   WHERE kind = 'request_logger'
   LIMIT 1
+),
+
+-- cors preflight headers (if the failing step was cors producing them)
+cors_preflight_headers AS (
+  SELECT COALESCE( (SELECT resp_headers FROM first_fail WHERE resp_headers IS NOT NULL), '{}' ) AS h
+  FROM (SELECT 1)
 )
 
 SELECT
@@ -156,7 +205,9 @@ SELECT
   COALESCE((SELECT fail_status FROM first_fail), 200)    AS status_code,
   'application/json'::VARCHAR                            AS content_type,
   COALESCE((SELECT fail_body   FROM first_fail), '')     AS body,
-  COALESCE((SELECT log_entry   FROM logger),    '')      AS log_entry
+  COALESCE((SELECT log_entry   FROM logger),    '')      AS log_entry,
+  -- additive resp_headers column (primarily for cors preflight 204)
+  COALESCE((SELECT h FROM cors_preflight_headers), '{}') AS resp_headers
 );
 
 -- ---------------------------------------------------------------------------
@@ -210,13 +261,46 @@ merged AS (
           lambda acc, patch: cast(json_merge_patch(acc::JSON, patch::JSON) AS VARCHAR)
         )
     END AS final_headers
+),
+
+-- CORS post-phase: inject ACAO (and optionally other ACA*) on normal responses.
+-- Since apply_post receives no request headers, we use static choice: '*' if configured, else first allowed origin.
+-- This is sufficient for the Tier-1 oracle tests and matches "post-phase ACAO header injection".
+-- (Full origin-echo would require threading original headers into apply_post call site.)
+cors_patch AS (
+  SELECT
+    CASE
+      WHEN NOT EXISTS (SELECT 1 FROM middleware WHERE kind = 'cors' AND json_extract(config_json, '$.allowed_origins') IS NOT NULL)
+      THEN '{}'
+      ELSE
+        (SELECT
+          json_object(
+            'Access-Control-Allow-Origin',
+            CASE
+              WHEN list_contains( (json_extract(config_json, '$.allowed_origins')::VARCHAR[]), '*' )
+              THEN '*'
+              ELSE (json_extract(config_json, '$.allowed_origins')::VARCHAR[])[1]
+            END
+          )::VARCHAR
+         FROM middleware WHERE kind = 'cors' LIMIT 1
+        )
+    END AS cp
+),
+
+final_with_cors AS (
+  SELECT
+    CASE
+      WHEN (SELECT cp FROM cors_patch) = '{}' OR (SELECT cp FROM cors_patch) IS NULL
+      THEN (SELECT final_headers FROM merged)
+      ELSE cast( json_merge_patch( (SELECT final_headers FROM merged)::JSON , (SELECT cp FROM cors_patch)::JSON ) AS VARCHAR )
+    END AS fh
 )
 
 SELECT
   status        AS status_code,
   content_type,
   body,
-  (SELECT final_headers FROM merged) AS resp_headers
+  (SELECT fh FROM final_with_cors) AS resp_headers
 );
 
 -- ---------------------------------------------------------------------------

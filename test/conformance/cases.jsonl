@@ -1,0 +1,87 @@
+{"id": "health_get", "method": "GET", "path": "/health", "headers": {}, "body": null, "expect_note": "200 static JSON {status:ok}"}
+{"id": "health_head", "method": "HEAD", "path": "/health", "headers": {}, "body": null, "expect_note": "HEAD on GET route -> 200 empty body"}
+{"id": "health_post_405", "method": "POST", "path": "/health", "headers": {}, "body": null, "expect_note": "405 Method Not Allowed, Allow header present"}
+{"id": "health_delete_405", "method": "DELETE", "path": "/health", "headers": {}, "body": null, "expect_note": "405 Method Not Allowed"}
+{"id": "health_options_405", "method": "OPTIONS", "path": "/health", "headers": {}, "body": null, "expect_note": "OPTIONS -> 405 (no CORS middleware)"}
+{"id": "health_put_405", "method": "PUT", "path": "/health", "headers": {}, "body": null, "expect_note": "405"}
+{"id": "get_user_1", "method": "GET", "path": "/users/1", "headers": {}, "body": null, "expect_note": "200 {id:1,name:alice,age:30}"}
+{"id": "get_user_2", "method": "GET", "path": "/users/2", "headers": {}, "body": null, "expect_note": "200 {id:2,name:bob,age:25}"}
+{"id": "get_user_3", "method": "GET", "path": "/users/3", "headers": {}, "body": null, "expect_note": "200 {id:3,name:carol,age:40}"}
+{"id": "get_user_404", "method": "GET", "path": "/users/9999", "headers": {}, "body": null, "expect_note": "quackapi returns 200 empty; FastAPI returns 200 null - both return 200 but body differs"}
+{"id": "get_user_head", "method": "HEAD", "path": "/users/1", "headers": {}, "body": null, "expect_note": "HEAD treated as GET -> 200 no body"}
+{"id": "get_user_bad_int", "method": "GET", "path": "/users/abc", "headers": {}, "body": null, "expect_note": "422 int_parsing loc=[path,id]"}
+{"id": "get_user_bad_float", "method": "GET", "path": "/users/1.5", "headers": {}, "body": null, "expect_note": "422 int_parsing (1.5 is not int)"}
+{"id": "get_user_bad_negative", "method": "GET", "path": "/users/-1", "headers": {}, "body": null, "expect_note": "200 or empty - no min constraint, -1 is valid int"}
+{"id": "get_user_overflow", "method": "GET", "path": "/users/99999999999999999999", "headers": {}, "body": null, "expect_note": "422 int_parsing on overflow"}
+{"id": "get_user_zero", "method": "GET", "path": "/users/0", "headers": {}, "body": null, "expect_note": "200 or empty - 0 is valid int"}
+{"id": "get_user_leading_zero", "method": "GET", "path": "/users/01", "headers": {}, "body": null, "expect_note": "422 or 200 - leading zero handling differs"}
+{"id": "get_user_space", "method": "GET", "path": "/users/%20", "headers": {}, "body": null, "expect_note": "422 int_parsing for URL-encoded space"}
+{"id": "list_users", "method": "GET", "path": "/users", "headers": {}, "body": null, "expect_note": "200 JSON array of 3 users"}
+{"id": "list_users_head", "method": "HEAD", "path": "/users", "headers": {}, "body": null, "expect_note": "HEAD -> 200 empty body"}
+{"id": "list_users_trailing_slash", "method": "GET", "path": "/users/", "headers": {}, "body": null, "expect_note": "FastAPI 307 redirects trailing slash; quackapi 404"}
+{"id": "search_happy", "method": "GET", "path": "/search?q=al&limit=2", "headers": {}, "body": null, "expect_note": "200 [alice]"}
+{"id": "search_no_limit", "method": "GET", "path": "/search?q=b", "headers": {}, "body": null, "expect_note": "200 [bob]"}
+{"id": "search_limit_max", "method": "GET", "path": "/search?q=a&limit=100", "headers": {}, "body": null, "expect_note": "200 limit=100 is OK (le=100)"}
+{"id": "search_limit_over", "method": "GET", "path": "/search?q=a&limit=101", "headers": {}, "body": null, "expect_note": "422 less_than_equal loc=[query,limit]"}
+{"id": "search_limit_999", "method": "GET", "path": "/search?q=hi&limit=999", "headers": {}, "body": null, "expect_note": "422 less_than_equal"}
+{"id": "search_missing_q", "method": "GET", "path": "/search?limit=5", "headers": {}, "body": null, "expect_note": "422 missing loc=[query,q]"}
+{"id": "search_limit_bad_int", "method": "GET", "path": "/search?q=a&limit=abc", "headers": {}, "body": null, "expect_note": "422 int_parsing loc=[query,limit]"}
+{"id": "search_limit_float", "method": "GET", "path": "/search?q=a&limit=1.5", "headers": {}, "body": null, "expect_note": "422 int_parsing (float not valid int)"}
+{"id": "search_empty_q", "method": "GET", "path": "/search?q=", "headers": {}, "body": null, "expect_note": "200 with q=empty string - all users start with empty prefix"}
+{"id": "search_limit_zero", "method": "GET", "path": "/search?q=a&limit=0", "headers": {}, "body": null, "expect_note": "200 with empty result (limit=0)"}
+{"id": "search_limit_neg", "method": "GET", "path": "/search?q=a&limit=-1", "headers": {}, "body": null, "expect_note": "200 or 422 - no ge constraint on limit"}
+{"id": "search_no_params", "method": "GET", "path": "/search", "headers": {}, "body": null, "expect_note": "422 missing q"}
+{"id": "search_repeated_param", "method": "GET", "path": "/search?q=a&q=b", "headers": {}, "body": null, "expect_note": "behavior with repeated param - quackapi takes first"}
+{"id": "post_users_happy", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"dave\",\"age\":35}", "expect_note": "201 created user with id>=100"}
+{"id": "post_users_missing_age", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"noage\"}", "expect_note": "422 missing age loc=[body,age]"}
+{"id": "post_users_missing_name", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name_typo\":\"x\",\"age\":5}", "expect_note": "422 missing name loc=[body,name]"}
+{"id": "post_users_both_missing", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{}", "expect_note": "422 with 2 errors in detail[]"}
+{"id": "post_users_bad_age_type", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":\"notint\"}", "expect_note": "422 int_parsing loc=[body,age]"}
+{"id": "post_users_age_float_str", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":\"1.5\"}", "expect_note": "422 int_parsing"}
+{"id": "post_users_null_body", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "null", "expect_note": "422 missing both fields (null body)"}
+{"id": "post_users_empty_body", "method": "POST", "path": "/users", "headers": {}, "body": "", "expect_note": "422 missing both fields (empty body)"}
+{"id": "post_users_wrong_ct", "method": "POST", "path": "/users", "headers": {"content-type": "text/plain"}, "body": "{\"name\":\"x\",\"age\":5}", "expect_note": "FastAPI rejects non-JSON CT for body model; quackapi still parses"}
+{"id": "post_users_array_body", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "[{\"name\":\"x\",\"age\":5}]", "expect_note": "422 - array instead of object for body"}
+{"id": "post_users_malformed_json", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{not json}", "expect_note": "422 - malformed JSON body"}
+{"id": "post_users_ct_charset", "method": "POST", "path": "/users", "headers": {"content-type": "application/json; charset=utf-8"}, "body": "{\"name\":\"x\",\"age\":5}", "expect_note": "201 - charset suffix in CT should work"}
+{"id": "not_found_root", "method": "GET", "path": "/", "headers": {}, "body": null, "expect_note": "404"}
+{"id": "not_found_path", "method": "GET", "path": "/nope", "headers": {}, "body": null, "expect_note": "404"}
+{"id": "not_found_deep", "method": "GET", "path": "/users/1/deep/nesting/not/registered", "headers": {}, "body": null, "expect_note": "404"}
+{"id": "not_found_head", "method": "HEAD", "path": "/nonexistent-xyz", "headers": {}, "body": null, "expect_note": "404"}
+{"id": "method_mismatch_users_delete", "method": "DELETE", "path": "/users", "headers": {}, "body": null, "expect_note": "405 - path exists (GET+POST) but not DELETE"}
+{"id": "method_mismatch_users_put", "method": "PUT", "path": "/users", "headers": {}, "body": null, "expect_note": "405"}
+{"id": "method_mismatch_health_delete", "method": "DELETE", "path": "/health", "headers": {}, "body": null, "expect_note": "405 - path exists GET only"}
+{"id": "method_mismatch_getuser_post", "method": "POST", "path": "/users/1", "headers": {}, "body": null, "expect_note": "405 - /users/{id} only has GET"}
+{"id": "secure_happy", "method": "GET", "path": "/secure", "headers": {"x_api_key": "k-123"}, "body": null, "expect_note": "200 {ok:true,key:k-123}"}
+{"id": "secure_missing_key", "method": "GET", "path": "/secure", "headers": {}, "body": null, "expect_note": "422 missing x_api_key loc=[header,x_api_key]"}
+{"id": "profile_happy", "method": "GET", "path": "/profile", "headers": {"cookie": "session=sess-abc"}, "body": null, "expect_note": "200 {user:sess-abc}"}
+{"id": "profile_missing_cookie", "method": "GET", "path": "/profile", "headers": {}, "body": null, "expect_note": "422 missing session loc=[cookie,session]"}
+{"id": "form_submit_happy", "method": "POST", "path": "/form-submit", "headers": {"content-type": "application/x-www-form-urlencoded"}, "body": "name=zed&age=31", "expect_note": "200 {received_name:zed,received_age:31}"}
+{"id": "form_submit_bad_age", "method": "POST", "path": "/form-submit", "headers": {"content-type": "application/x-www-form-urlencoded"}, "body": "name=zed&age=abc", "expect_note": "422 int_parsing loc=[body,age]"}
+{"id": "form_submit_missing_age", "method": "POST", "path": "/form-submit", "headers": {"content-type": "application/x-www-form-urlencoded"}, "body": "name=zed", "expect_note": "422 missing age"}
+{"id": "form_submit_url_encoded", "method": "POST", "path": "/form-submit", "headers": {"content-type": "application/x-www-form-urlencoded"}, "body": "name=hello+world&age=25", "expect_note": "200 with + decoded as space"}
+{"id": "redirect_old_home", "method": "GET", "path": "/old-home", "headers": {}, "body": null, "expect_note": "307 redirect Location=/new-home"}
+{"id": "login_set_cookie", "method": "POST", "path": "/login", "headers": {}, "body": null, "expect_note": "200 + Set-Cookie header"}
+{"id": "upload_happy", "method": "POST", "path": "/upload", "headers": {"content-type": "multipart/form-data; boundary=testbnd"}, "body": "--testbnd\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\r\nhello world\r\n--testbnd--", "expect_note": "200 {filename:test.txt,size:11,preview:hello world}"}
+{"id": "upload_missing_file", "method": "POST", "path": "/upload", "headers": {"content-type": "multipart/form-data; boundary=bnd99"}, "body": "--bnd99\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\nsome content\r\n--bnd99--", "expect_note": "422 missing file param"}
+{"id": "upload_no_ct", "method": "POST", "path": "/upload", "headers": {}, "body": "some plain body", "expect_note": "422 missing file (no multipart CT)"}
+{"id": "upload_malformed_mp", "method": "POST", "path": "/upload", "headers": {"content-type": "multipart/form-data; boundary=ghostbnd"}, "body": "this body has no boundary", "expect_note": "422 multipart parse error"}
+{"id": "openapi_json", "method": "GET", "path": "/openapi.json", "headers": {}, "body": null, "expect_note": "200 {openapi:3.0.0,...}"}
+{"id": "docs_get", "method": "GET", "path": "/docs", "headers": {}, "body": null, "expect_note": "200 HTML swagger UI"}
+{"id": "search_limit_1e2", "method": "GET", "path": "/search?q=a&limit=1e2", "headers": {}, "body": null, "expect_note": "422 int_parsing - scientific notation not valid int"}
+{"id": "search_limit_padded", "method": "GET", "path": "/search?q=a&limit=+5", "headers": {}, "body": null, "expect_note": "200 or 422 - whitespace-padded int"}
+{"id": "post_users_age_bool_true", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":true}", "expect_note": "FastAPI coerces bool->int; quackapi may 422"}
+{"id": "post_users_age_bool_false", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":false}", "expect_note": "FastAPI coerces bool->int 0; quackapi may 422"}
+{"id": "search_limit_str_int", "method": "GET", "path": "/search?q=a&limit=5", "headers": {}, "body": null, "expect_note": "200 normal case for comparison baseline"}
+{"id": "post_users_extra_fields", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":5,\"extra\":\"ignored\"}", "expect_note": "201 - extra fields ignored by both"}
+{"id": "get_user_unicode_path", "method": "GET", "path": "/users/%E4%B8%AD%E6%96%87", "headers": {}, "body": null, "expect_note": "422 int_parsing for unicode path param"}
+{"id": "search_q_unicode", "method": "GET", "path": "/search?q=%E4%B8%AD", "headers": {}, "body": null, "expect_note": "200 empty result - unicode prefix not in names"}
+{"id": "post_users_name_long", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"age\":5}", "expect_note": "201 - long string accepted (no max_length constraint)"}
+{"id": "post_users_age_overflow", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":99999999999999999999}", "expect_note": "422 int overflow handling"}
+{"id": "post_users_age_neg", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":-5}", "expect_note": "201 - negative int valid (no ge constraint)"}
+{"id": "events_stream", "method": "GET", "path": "/events", "headers": {}, "body": null, "expect_note": "200 text/event-stream content-type"}
+{"id": "health_trailing_slash", "method": "GET", "path": "/health/", "headers": {}, "body": null, "expect_note": "FastAPI 307 trailing slash; quackapi 404"}
+{"id": "not_found_method_delete_nonexistent", "method": "DELETE", "path": "/nonexistent-xyz-123", "headers": {}, "body": null, "expect_note": "404 not 405 - path doesn't exist at all"}
+{"id": "post_users_null_name", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":null,\"age\":5}", "expect_note": "FastAPI 422 null not str; quackapi may 422"}
+{"id": "post_users_age_string_int", "method": "POST", "path": "/users", "headers": {"content-type": "application/json"}, "body": "{\"name\":\"x\",\"age\":\"5\"}", "expect_note": "FastAPI 422 str not int; quackapi may coerce"}
+{"id": "get_user_plus_in_path", "method": "GET", "path": "/users/1+2", "headers": {}, "body": null, "expect_note": "422 int_parsing - +2 not pure int path"}

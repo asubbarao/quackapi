@@ -133,8 +133,6 @@ static ddb_vector_get_validity_t g_ddb_vector_get_validity = 0;
 static int g_q[4096]; static int g_qhead=0, g_qtail=0, g_qcount=0;
 static pmutex g_qm; static pcond g_qcv;
 static int g_pool_started = 0;
-static int g_brain_params = 4; /* 3 when the macroless brain_sql path is used (method,path,body); 4 for the handle_request macro fallback (method,path,headers,body) */
-
 void handle_conn_on(void *con, void *stmt, int fd){
   char req[65536];
   char method[16];
@@ -175,7 +173,7 @@ void handle_conn_on(void *con, void *stmt, int fd){
   }
   /* DIAGNOSTIC: /q3 touches one catalog object with the simplest possible read. */
   if(strcmp(path, "/q3") == 0){
-    ddb_result rq; int rcq = g_ddb_query(con, "SELECT count(*) FROM route_index", &rq);
+    ddb_result rq; int rcq = g_ddb_query(con, "SELECT count(*) FROM routes", &rq);
     if(rcq == 0) g_ddb_destroy_result(&rq);
     char q[] = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"q3\":true}";
     write(fd, q, sizeof(q)-1); close(fd); return;
@@ -289,16 +287,15 @@ void handle_conn_on(void *con, void *stmt, int fd){
   headers_json[hpos++] = ''}'' ;
   headers_json[hpos] = 0;
   if (hpos <= 2) { headers_json[0]='' {''; headers_json[1]='' }''; headers_json[2]=0; }
-  /* con + stmt are PERSISTENT per worker (built once in worker_main): no connect / LOAD / prepare per request */
+  /* con + stmt are PERSISTENT per worker (built once in worker_main): no connect / LOAD / prepare per request.
+     PURE TRACK: stmt is the handle_request(method,path,headers,body) TABLE macro. Routing, validation,
+     OpenAPI and handler templating all happen INSIDE that single SQL call over the routes/param_schema
+     registry — no precomputed/materialized route tables, no fast-lane hash probe. The router IS the query. */
   ddb_result res;
   int rc = g_ddb_bind_varchar(stmt, 1, method);
   rc |= g_ddb_bind_varchar(stmt, 2, path);
-  if(g_brain_params == 4){
-    rc |= g_ddb_bind_varchar(stmt, 3, headers_json);
-    rc |= g_ddb_bind_varchar(stmt, 4, body);
-  } else {
-    rc |= g_ddb_bind_varchar(stmt, 3, body);
-  }
+  rc |= g_ddb_bind_varchar(stmt, 3, headers_json);
+  rc |= g_ddb_bind_varchar(stmt, 4, body);
   if(rc != 0){
     char e[] = "HTTP/1.1 500 OK\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"bind\"}";
     write(fd, e, sizeof(e)-1); close(fd); return;
@@ -404,7 +401,7 @@ void handle_conn_on(void *con, void *stmt, int fd){
 }
 
 static void *worker_main(void *arg){
-  /* one PERSISTENT connection + prepared statement per worker; shellfs loaded once */
+  /* one PERSISTENT connection + prepared statements per worker; shellfs loaded once */
   void *con = 0;
   void *stmt = 0;
   if(g_ddb_connect(g_db, &con) != 0) return 0;
@@ -427,22 +424,13 @@ static void *worker_main(void *arg){
   { ddb_result ign; g_ddb_query(con, "SET http_retries=3", &ign); g_ddb_destroy_result(&ign); }
   { ddb_result ign; g_ddb_query(con, "SET httpfs_retries_file_operation=3", &ign); g_ddb_destroy_result(&ign); }
   { ddb_result ign; g_ddb_query(con, "SET http_timeout=30000", &ign); g_ddb_destroy_result(&ign); }
-  /* MACROLESS HOT PATH: prefer the precompiled plain pipeline in brain_sql. A
-     table macro is re-expanded + re-bound on every execute_prepared (catalog-lock
-     serialized, ~0.9 ms/req); a plain prepared statement binds its plan once. We
-     read the SAME pipeline as plain SQL ($1=method,$2=path,$3=body) and prepare
-     THAT. Falls back to the handle_request macro if brain_sql is absent. edges.md #9. */
-  char brainbuf[32768];
+  /* PURE TRACK hot path: prepare the handle_request TABLE macro once per worker.
+     Everything — routing, validation, OpenAPI, handler templating — lives inside
+     that one SQL call over the routes/param_schema registry. No brain_sql/exact_sql/
+     route_* precompute tables: the router IS the query. This is the deliberately
+     honest, slower path; the compiled-extension track moves routing into C to cross
+     the per-request OLAP-query wall (edges.md #9). */
   const char *bsql = "SELECT * FROM handle_request(?, ?, ?, ?)";
-  { ddb_result bq;
-    if(g_ddb_query(con, "SELECT stmt FROM brain_sql LIMIT 1", &bq) == 0){
-      if(g_ddb_row_count(&bq) > 0){
-        char *s = g_ddb_value_varchar(&bq, 0ULL, 0ULL);
-        if(s){ int li=0; while(s[li] && li<32767){ brainbuf[li]=s[li]; li++; } brainbuf[li]=0; g_ddb_free(s); bsql = brainbuf; g_brain_params = 3; }
-      }
-      g_ddb_destroy_result(&bq);
-    }
-  }
   if(g_ddb_prepare(con, bsql, &stmt) != 0) return 0;
   for(;;){
     pthread_mutex_lock(&g_qm);

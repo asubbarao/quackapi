@@ -198,6 +198,29 @@ SELECT assert_true(
 );
 
 -- ---------------------------------------------------------------------------
+-- R1 CORS tests (pre flight short + post ACAO)
+-- Uses the seeded cors row (priority 5, allowed example.com)
+-- ---------------------------------------------------------------------------
+SELECT assert_true(
+  pass = false AND status_code = 204
+  AND json_extract_string(resp_headers, '$.Access-Control-Allow-Origin') = 'https://example.com'
+  AND json_extract_string(resp_headers, '$.Access-Control-Allow-Methods') LIKE '%POST%',
+  'R1: cors preflight OPTIONS short-circuits 204 with ACA* headers'
+)
+FROM apply_pre(
+  'OPTIONS',
+  '/anything',
+  '{"origin":"https://example.com","access-control-request-method":"POST"}',
+  ''
+);
+
+SELECT assert_true(
+  json_extract_string(resp_headers, '$.Access-Control-Allow-Origin') = 'https://example.com',
+  'R1: cors post injects ACAO on normal response'
+)
+FROM apply_post(200, 'application/json', '{}', '{}');
+
+-- ---------------------------------------------------------------------------
 -- Summary banner
 -- ---------------------------------------------------------------------------
 SELECT '=== ALL MIDDLEWARE TESTS PASSED ===' AS result;

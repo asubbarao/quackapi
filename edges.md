@@ -373,3 +373,162 @@ time so the request executes a single near-trivial lookup — or move routing+va
 (what uvicorn itself does; routing tables stay SQL data, only the match loop is C) and let the DB run only
 the precompiled handler, which already does 34k. The Tier-1 `handle_request` macro stays as the ergonomic
 pure-SQL surface; `brain_sql` is the surface the server runs. That rebuild is edge #9 Round 3.
+
+### Round 3 — the materialization mirage, and the real pure-SQL floor
+
+Round 2 ended pointing at "push all structural work upstream to load time." Round 3 did exactly that, and
+the result is a cautionary tale worth more than the speedup was.
+
+**The experiment.** Precompute every no-param route (`/health`, `/openapi.json`, `/docs`, `/users` list,
+`/whoami`, `/events`) into a table `route_exact` keyed by `'METHOD /path'`, plus `route_index` (pre-split
+pattern segments), `response_cache` (the prebuilt OpenAPI doc + Swagger HTML), and `brain_sql`/`exact_sql`
+(the pipeline stored as prepared-statement text). The C worker then probes `route_exact` **first** with one
+prepared hash lookup; 0 rows → fall through to the full pipeline. Measured (ApacheBench, keep-alive):
+
+| Route | Path taken | c=8 | c=64 |
+|---|---|---:|---:|
+| `/health`  | materialized hash probe, precomputed body | 27,187 | **28,786** |
+| `/users`   | materialized probe, then execute the handler | 17,597 | 23,991 |
+| `/users/1` | materialized `route_index` + single-row restructure | 1,895 | 2,274 |
+
+28k, uvicorn class. And it was **the wrong answer** — a mirage. Every one of those five tables is *derived
+state persisted as a relation*: a router materialized into a cache. That is not what a web framework's router
+is (FastAPI walks an in-memory structure; it caches the OpenAPI doc in a RAM attribute, not a table), it
+violates the project's own "no materialized derived state" rule, and — the tell — the server ran on a *file*
+DB, so the "router" was literally on disk. The 28k measured the speed of a **cache lookup**, not of routing.
+Storing the pipeline SQL itself as table rows (`brain_sql`) was the ugliest instance: SQL-as-data so C could
+read it back, with no analog in any real framework. The number was real; the architecture was a lie.
+
+**The correction.** Rip out all five derived tables. The only tables that remain are `users` (app data) and
+`routes`/`param_schema` (the registry — config-as-data, the honest analog of decorators). `handle_request`
+becomes fully self-contained: it splits pattern segments inline from `routes`, builds the OpenAPI doc as a
+SELECT (only for the matched `/openapi.json` route, so it never runs on the hot path), and templates handlers
+in place. The router **is** the SQL query, every request, with nothing cached. Re-measured, same box:
+
+| Route | c=8 | c=64 |
+|---|---:|---:|
+| `/health`  | 1,068 | — |
+| `/users`   | 1,039 | — |
+| `/users/1` | 1,050 | 1,244 |
+
+**~1k req/s, flat. That is the true pure-SQL floor** — the honest "DuckDB as far as it goes" number. Routing
+as a table-macro over the registry costs ~1 ms/req regardless of route shape: the segment-match window
+function (`QUALIFY row_number()`), the list lambdas (`list_zip`/`list_filter`/`list_transform`/`list_reduce`),
+`map_from_entries`, and the per-execute macro re-bind. No SQL rewrite erases the per-operator tax of an
+analytical engine serving one row.
+
+**Verdict (Round 3): pure-SQL routing tops out at ~1k req/s, and the only on-thesis way past it is to stop
+doing routing in SQL.** The 28k was reachable *only* by turning the router into a materialized cache — which
+is a category error, not an optimization. So the ledger's honest split is:
+- **Pure track (this repo, ~1k):** SQL brain + a thin ducktinycc C accept loop that only shuttles bytes and
+  calls the macro. The router is a query; the number is low; the honesty is the point. This is the reference.
+- **Proper C track (next build):** move the match loop + `try_cast` validation into compiled C — first
+  prototyped via ducktinycc (still no build, tcc-JIT), then shipped as a real optimized `quackapi.duckdb_extension`.
+  Routing tables stay SQL *data* loaded once; the DB runs only the rendered handler (the point query `/q2`
+  clocks at 34k); static routes skip the DB. Same tier split uvicorn draws between its compiled router and the
+  Python handler. This is the crossing — the first edge in the ledger that pure SQL genuinely cannot cross
+  without native code, which is precisely the thesis.
+
+### Round 4 — the crossing, built and measured
+
+Round 3 named the wall and the only honest way past it: stop doing routing in SQL. Round 4 did it — as a
+**real compiled `quackapi.duckdb_extension`** (the C++ full-API path, built against DuckDB v1.5.3 from the
+extension template; the C-API would have been lighter but C++ was chosen for the eventual `ROUTE` custom-SQL
+syntax). Two build phases:
+
+- **B1 — parity port.** Scaffold the extension, port the entire accept loop out of the ducktinycc JIT string
+  into a compiled `.cpp` (delete the `dlsym(RTLD_DEFAULT)` symbol forest — the extension links DuckDB
+  directly), register `serve_brain(port, db)` + `block_forever`. Workers still prepared
+  `SELECT * FROM handle_request(?,?,?,?)`. Result: LOADs, serves correctly, **~1.4k req/s** — parity with the
+  macro, as expected. This proved the migration without changing behavior.
+- **B2 — routing into C++.** Implement the Round-3 design in the worker: load `routes`/`param_schema` into C
+  structs once at boot (read-only after → lockless), and per request do the segment match + most-literal
+  tie-break, param extraction, `try_cast`-equivalent validation (FastAPI-shaped `detail[]`), and `{param}`→
+  literal templating (`''`-escaped) **in C++**. DuckDB then runs *only* the rendered handler; static/openapi/
+  docs/404/422 are served with **zero DB calls**. The `handle_request` macro stays as the Tier-1 surface and
+  as the **parity oracle**.
+
+**Parity (the gate before any perf claim):** a harness compares the C++ router's decision against
+`SELECT * FROM handle_request(...)` across a 16-case matrix (path/query/body params, all three 422 variants,
+201 create, 404 method-mismatch, openapi/docs/events/health). **16/16 byte-identical** — the sole deviation
+is the ordering of keys inside the OpenAPI `paths` object, which is non-deterministic in the SQL macro itself
+(`json_group_object` over an unordered scan); semantically equal, and the C++ version is actually the more
+stable of the two. Independently re-run and confirmed.
+
+**Measured (independently reproduced, ApacheBench, 0 failed requests):**
+
+| Route | path taken | c=8 | c=64 | vs pure (~1k) |
+|---|---|---:|---:|---:|
+| `/health` | static, zero DB | 38,606 | **41,398** | ~29× |
+| `/users` | list → 1 handler query | 25,618 | 32,789 | ~23× |
+| `/users/1` | param → 1 handler point query | 26,206 | 27,877 | ~19× |
+| `/search` | query params → filtered handler | 14,757 | 19,624 | ~11× |
+
+**Verdict (Round 4): the edge is crossed, and the thesis holds exactly.** The *same framework* — same routes
+registry, same validation semantics, same FastAPI-shaped errors, byte-identical outputs — goes from ~1k req/s
+(routing as an OLAP query) to **static ~41k / dynamic ~26–28k** (routing as compiled C++, DuckDB running only
+the handler point query that `/q2` already clocked at 34k). Static throughput *exceeds* uvicorn; parameterized
+routes are squarely uvicorn-class. Crucially this is **not** Round 3's materialized-cache mirage — nothing is
+precomputed into a relation; it is real native code owning the hot loop, exactly the split uvicorn draws
+between its compiled router and the Python handler. The one thing pure SQL provably could not do — serve a
+parameterized route at native speed — is done, and the ledger now has both artifacts: the pure clone-and-run
+reference (~1k, honest) and the compiled `quackapi.duckdb_extension` (uvicorn-class). What remains (B3) is
+pure ergonomics — a `ROUTE 'GET /users/{id}' AS <sql>` ParserExtension — not another perf wall.
+
+### Round 5 — the "unrecoverable" /search wall demolished (allocator + instance pool)
+
+Round 4 left `/search` at ~20k while the hardware allows ~13× a single thread. Two measure-gates
+(B4, B5 in `ext-cpp/`) killed two proposed builds and concluded the wall was DuckDB-internal and
+config-immune. **B6 proved that conclusion wrong**: the wall was two *stacked* process-wide
+bottlenecks — shared-DatabaseInstance bookkeeping AND the macOS system allocator — and fixing
+either alone shows only +26–49%, which is why every single-variable probe under-read it. Fixing
+both (16 separate `:memory:` instances + mimalloc) hit 51–55k in the microbench, ~11× of 16
+threads. B7 shipped it end-to-end (`ext-cpp/B7_RESULT.md`):
+
+- **Allocator**: `ext-cpp/scripts/serve.sh` interposes mimalloc at process start (an extension
+  cannot self-interpose). macOS traps handled: hardened-runtime CLI strips DYLD vars (wrapper
+  re-signs a cached copy ad-hoc); any SIP-protected intermediary (`/usr/bin/env`) re-strips them.
+  Linux builds bundle jemalloc — no-op there. Wrapper alone: /search +33%, /users/1 +45%.
+- **Instance pool**: 1 writer + 16 per-worker `:memory:` replicas hydrated via
+  CHECKPOINT → `ATTACH (READ_ONLY)` → `COPY FROM DATABASE`, generation-tracked. Writes bump the
+  generation BEFORE the response is written, so read-your-writes holds (stale reads route to the
+  writer until the refresher republishes). Pool is a pure optimization: any hydrate failure
+  degrades that worker to the writer path.
+- Also found & fixed while benching: a keep-alive poller wakeup race (condvar cannot interrupt
+  `poll()`; rare requests stalled the full 5 s idle timeout — p50 3 ms, max 5001 ms). Standard
+  self-pipe fix. This bug made low-concurrency /search read 1.4k req/s; fast endpoints masked it.
+
+**Measured (real HTTP, ab -k c64, zero failures):** `/search` 20,280 → **49,091** (pool+mimalloc;
+pool alone 20,367 — the allocator binds first, exactly B6's stacking), `/users/1` **136k**,
+`/health` **134k** (both now at ab's own single-threaded ceiling). Verified: 67/67 unit, 54/54
+conformance MATCH unchanged, 50 concurrent writes under 47k req/s read load — zero lost, zero
+errors, read-your-writes observed live.
+
+**New REAL (but standard) caveat introduced by the pool:** a GET handler that *writes* mutates a
+replica copy, not the writer — identical to any read-replica deployment; HTTP semantics already
+require GET to be safe. Memory cost is up to 16× the data (portfolio-scale fine; a shared-replica
+variant is the knob if it matters). Next ceiling-breaker: set-based request batching, gated at
+≥59k (+20% over 49k).
+
+## Deliberate divergences
+
+The conformance harness (test/conformance/driver_pure.py + run_all.sh) classifies certain DIVERGE results
+as INTENTIONAL (pinned with id, matcher, one-line rationale) or FASTAPI-QUIRK so they are reported
+separately and do not count toward FAIL. Pins are the source of truth for what is deliberate.
+
+### Pinned divergences (id, matcher, rationale)
+- list_users_trailing_slash (exact): FastAPI Starlette auto-redirects trailing slash (307); quackapi correctly 404s (no trailing-slash normalization by design)
+- health_trailing_slash (exact): FastAPI Starlette auto-redirects trailing slash (307); quackapi 404s
+- health_head (exact): quackapi auto-serves HEAD for all GET routes (spec); FastAPI mirror 405. quackapi more RFC-correct
+- get_user_head (exact): HEAD auto-answered 200 (FastAPI mirror 405s; quackapi more RFC-correct)
+- list_users_head (exact): Same HEAD auto-registration divergence
+- health_post_405 etc (exact): quackapi Allow header includes HEAD (auto-registered with GET); FastAPI omits
+- post_users_age_bool_true (exact): bool->int rejected (Pydantic coerces true->1; quackapi stricter)
+- post_users_age_bool_false (exact): bool->int rejected (Pydantic coerces false->0; quackapi stricter)
+- upload_malformed_mp (exact): multipart 400 vs 422
+- (and ~20 more state, coercion, granularity, and schema-gen differences — see INTENTIONAL_PINS in driver_pure.py for full list with rationales)
+
+### Known conformance gap (not fixed)
+Query values are not percent-decoded: ?value=a%40b reaches handlers with the encoded form (a%40b); FastAPI decodes to a@b. This is recorded as a gap; do not "fix" without updating the entire param surface and tests.
+
+After content-type gate (JSON body only when CT absent or matches application/*json / +json), post_users_wrong_ct flipped from INTENTIONAL to MATCH. Suite counts only BUG-class as failures.

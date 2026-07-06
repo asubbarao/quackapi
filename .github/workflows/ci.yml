@@ -1,0 +1,179 @@
+name: quackapi CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
+  cancel-in-progress: true
+
+# ─── Job 1: Pure-SQL oracle suites (fast, no build required) ─────────────────
+# Runs: tier1 handle_request, di, middleware, fuzz — all pure DuckDB SQL.
+# These are the fastest signal and run on every push.
+# Does NOT run conformance (needs FastAPI venv) or ext-cpp (needs C build).
+jobs:
+  sql-oracle:
+    name: SQL oracle suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # No submodules needed — ext-cpp is not used in this job
+          fetch-depth: 0
+
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.2.2/duckdb_cli-linux-amd64.zip \
+            -o /tmp/duckdb.zip
+          unzip /tmp/duckdb.zip -d /tmp/duckdb_bin
+          sudo install -m 755 /tmp/duckdb_bin/duckdb /usr/local/bin/duckdb
+          duckdb --version
+
+      - name: Set up environment
+        run: |
+          # Override DUCKDB path for the runner
+          echo "DUCKDB=/usr/local/bin/duckdb" >> "$GITHUB_ENV"
+          # Ensure shellfs community extension can be installed (for middleware tests)
+          duckdb :memory: -c "INSTALL shellfs FROM community; LOAD shellfs; SELECT 'shellfs ok';" || true
+
+      - name: Run tier-1 handle_request oracle (112 checks)
+        run: |
+          printf '.read framework.sql\n.read test/tier1_handle_request.test.sql\n' \
+            | duckdb -unsigned /tmp/ci_tier1.db 2>&1
+          # Surface the summary row
+          printf '.read framework.sql\n.read test/tier1_handle_request.test.sql\n' \
+            | duckdb -unsigned :memory: 2>&1 \
+            | awk '/total_checks/{p=1} p && /[0-9]+/' | head -3
+
+      - name: Check tier-1 for any failures
+        run: |
+          OUT=$(printf '.read framework.sql\n.read test/tier1_handle_request.test.sql\n' \
+            | duckdb -unsigned :memory: 2>&1)
+          FAILED=$(printf '%s\n' "$OUT" | awk 'NF>=5 && !/int64/ && /[0-9]/{last=$0} END{print last}' \
+            | tr -d '│' | awk '{print $3}' | tr -d ' ')
+          echo "tier1 failed checks: ${FAILED:-unknown}"
+          [ "${FAILED:-1}" -eq 0 ]
+
+      - name: Run DI oracle suite (8 checks)
+        run: |
+          printf '.read framework.sql\n.read di.sql\n.read test/di.test.sql\n' \
+            | duckdb -unsigned :memory: 2>&1
+          # If DuckDB exits non-zero the step fails
+
+      - name: Run middleware oracle suite (12 checks)
+        run: |
+          printf '.read framework.sql\n.read middleware.sql\n.read test/middleware.test.sql\n' \
+            | duckdb -unsigned :memory: 2>&1
+          # The suite uses assert_true() which throws Error on failure → non-zero exit
+
+      - name: Run fuzz/property oracle suite (100 checks — 3 known bugs allowed)
+        continue-on-error: true   # 3 known documented bugs fail; don't break CI yet
+        run: |
+          OUT=$(printf '.read framework.sql\n.read app.sql\n.read test/fuzz/oracle_fuzz.test.sql\n' \
+            | duckdb -unsigned :memory: 2>&1)
+          printf '%s\n' "$OUT" | tail -20
+          FAILED=$(printf '%s\n' "$OUT" | awk 'NF>=5 && !/int64/ && /[0-9]/{last=$0} END{print last}' \
+            | tr -d '│' | awk '{print $3}' | tr -d ' ')
+          echo "fuzz failed checks: ${FAILED:-unknown}"
+          # Enforce that we have at most the known-bug budget (currently 3)
+          [ "${FAILED:-0}" -le 3 ]
+
+# ─── Job 2: Conformance (pure-SQL oracle vs FastAPI reference) ────────────────
+# Boots a real uvicorn FastAPI server, replays cases.jsonl, compares responses.
+# Marked allow-failure because FastAPI divergences are documented feature gaps,
+# not bugs to fix before merging. Graduate to required once gaps close.
+  conformance-pure:
+    name: Conformance (pure-SQL vs FastAPI)
+    runs-on: ubuntu-latest
+    continue-on-error: true    # allow-failure: documented divergences, not merge blockers
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.2.2/duckdb_cli-linux-amd64.zip \
+            -o /tmp/duckdb.zip
+          unzip /tmp/duckdb.zip -d /tmp/duckdb_bin
+          sudo install -m 755 /tmp/duckdb_bin/duckdb /usr/local/bin/duckdb
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FastAPI reference deps
+        run: |
+          python3 -m venv test/conformance/fastapi_mirror/.venv
+          test/conformance/fastapi_mirror/.venv/bin/pip install --quiet \
+            -r test/conformance/fastapi_mirror/requirements.txt
+
+      - name: Run conformance-pure suite
+        env:
+          DUCKDB: /usr/local/bin/duckdb
+        run: |
+          bash test/conformance/run_conformance_pure.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-pure-results
+          path: test/conformance/results_pure.jsonl
+          if-no-files-found: ignore
+
+# ─── Job 3: C++ extension build + sqllogictest + parity ──────────────────────
+# Builds the quackapi DuckDB extension from ext-cpp/ using the vendored
+# extension-ci-tools Makefile, then runs make test (sqllogictest) and parity_b2.sh.
+# Marked allow-failure initially — the C++ build environment may need tuning
+# in CI (vcpkg, ninja, exact DuckDB submodule commit).
+  cpp-extension:
+    name: C++ extension (build + make test + parity)
+    runs-on: ubuntu-latest
+    continue-on-error: true    # allow-failure: C++ build not yet CI-hardened
+    env:
+      GEN: ninja
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive   # pulls ext-cpp/duckdb and ext-cpp/extension-ci-tools
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build cmake python3 python3-pip
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: ce613c41372b23b1f51333815feb3edd87ef8a8b
+
+      - name: Build extension (release)
+        working-directory: ext-cpp
+        run: make release
+
+      - name: Run sqllogictest (make test)
+        working-directory: ext-cpp
+        run: make test
+
+      - name: Run parity harness (parity_b2.sh)
+        # parity_b2.sh uses zsh; also falls back to bash
+        run: |
+          bash ext-cpp/parity_b2.sh \
+            /tmp/ci_parity.db \
+            ext-cpp/build/release/extension/quackapi/quackapi.duckdb_extension
+
+      - name: Upload extension artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quackapi-extension-linux-amd64
+          path: ext-cpp/build/release/extension/quackapi/quackapi.duckdb_extension

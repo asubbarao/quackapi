@@ -7,6 +7,7 @@
 -- Clear any framework-seeded demo routes (app owns the registration as DATA).
 TRUNCATE TABLE routes;
 TRUNCATE TABLE param_schema;
+TRUNCATE TABLE route_headers;
 
 -- Demo data: initial users (framework may have seeded; ensure here with minimal).
 -- Business rows use table; handlers do not hardcode data literals.
@@ -35,7 +36,7 @@ INSERT INTO routes SELECT * FROM register_route(
   'search',
   'GET',
   '/search',
-  'SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM (SELECT * FROM users WHERE starts_with(lower(name), lower({q})) ORDER BY id LIMIT coalesce({limit}, 100)) u',
+  'SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM (SELECT * FROM users WHERE starts_with(lower(name), lower({q})) ORDER BY id LIMIT greatest(coalesce({limit}, 100), 0)) u',
   'dynamic',
   'Search users by name prefix with limit cap',
   200
@@ -120,11 +121,83 @@ SELECT 'create_user', 'name', 'body', 'string', true, NULL
 UNION ALL
 SELECT 'create_user', 'age', 'body', 'int', true, NULL;
 
--- Rebuild the precomputed routing structures from THIS app's routes (framework.sql
--- defines _route_index_src / _response_cache_src; we re-materialize after re-seeding
--- so route_index + response_cache reflect the app, not the framework demo seed).
-CREATE OR REPLACE TABLE route_index AS SELECT * FROM _route_index_src();
-CREATE OR REPLACE TABLE response_cache AS SELECT * FROM _response_cache_src();
+-- ============================================================================
+-- R1 request-surface demos (header, cookie, form, redirect, Set-Cookie example)
+-- ============================================================================
+-- header param: X-API-Key required (loc=header -> 422 on missing matches ["header","x-api-key"])
+INSERT INTO routes SELECT * FROM register_route(
+  'secure_ping',
+  'GET',
+  '/secure',
+  'SELECT to_json({''ok'': true, ''key'': {x_api_key}}) AS body',
+  'dynamic',
+  'Header auth demo',
+  200
+);
+INSERT INTO param_schema (route_id, name, location, type, required, constraint_json)
+VALUES ('secure_ping', 'x_api_key', 'header', 'string', true, NULL);
+
+-- cookie param: session from _cookies (loc=cookie)
+INSERT INTO routes SELECT * FROM register_route(
+  'profile',
+  'GET',
+  '/profile',
+  'SELECT to_json({''user'': {session}}) AS body',
+  'dynamic',
+  'Cookie param demo',
+  200
+);
+INSERT INTO param_schema (route_id, name, location, type, required, constraint_json)
+VALUES ('profile', 'session', 'cookie', 'string', true, NULL);
+
+-- form POST: body params resolved from application/x-www-form-urlencoded via parse
+INSERT INTO routes SELECT * FROM register_route(
+  'form_submit',
+  'POST',
+  '/form-submit',
+  'SELECT to_json({''received_name'': {name}, ''received_age'': {age}}) AS body',
+  'dynamic',
+  'Form body demo',
+  200
+);
+INSERT INTO param_schema (route_id, name, location, type, required, constraint_json)
+VALUES ('form_submit', 'name', 'body', 'string', true, NULL)
+UNION ALL
+SELECT 'form_submit', 'age', 'body', 'int', true, NULL;
+
+-- redirect demo + Set-Cookie example route (via route_headers)
+INSERT INTO routes SELECT * FROM register_redirect('old_home', 'GET', '/old-home', '/new-home', 307);
+INSERT INTO route_headers VALUES ('old_home', 'Location', '/new-home');
+-- Set-Cookie as just another header row on a route
+INSERT INTO routes SELECT * FROM register_route(
+  'login_set_cookie',
+  'POST',
+  '/login',
+  '{}',
+  'static',
+  'Set-Cookie demo',
+  200
+);
+INSERT INTO route_headers VALUES ('login_set_cookie', 'Set-Cookie', 'session=abc123; Path=/; HttpOnly');
+
+-- POST /upload : multipart/form-data file upload demo (R2: multipart support).
+-- Accepts a 'file' part (type='file', required) and returns filename, size, content preview.
+-- Binary safety: DuckDB VARCHAR is text-safe only (no null bytes); see MULTIPART_SPEC.md §6.
+INSERT INTO routes SELECT * FROM register_route(
+  'upload',
+  'POST',
+  '/upload',
+  'SELECT to_json({''filename'': {file__filename}, ''size'': len({file}), ''preview'': substr({file},1,80)}) AS body',
+  'dynamic',
+  'Multipart file upload demo (text-safe content only)',
+  200
+);
+INSERT INTO param_schema (route_id, name, location, type, required, constraint_json)
+SELECT 'upload', 'file', 'body', 'file', true, NULL;
+
+-- Nothing to rebuild: handle_request is self-contained over routes/param_schema.
+-- The pure track has no route_index/response_cache/route_exact/brain_sql to
+-- re-materialize — re-seeding routes above is enough for the macro to reflect them.
 
 -- Self-checks for this app (run at load; use structural checks only).
 -- These demonstrate the registered endpoints. Full asserts happen in test session after load.
@@ -132,3 +205,9 @@ SELECT status_code, content_type, body IS NULL AS body_null, handler_sql IS NOT 
 SELECT status_code, content_type, body IS NULL AS body_null, handler_sql IS NOT NULL AS has_sql FROM handle_request('GET','/health','{}','');
 SELECT status_code, content_type, substr(body,1,30) AS body_preview, handler_sql IS NULL AS no_sql FROM handle_request('GET','/openapi.json','{}','');
 SELECT status_code, content_type, starts_with(body, '<!DOCTYPE') AS is_html, handler_sql IS NULL AS no_sql FROM handle_request('GET','/docs','{}','');
+-- Multipart upload self-check: simple two-field upload should return 200 with handler_sql
+SELECT status_code, handler_sql IS NOT NULL AS has_sql FROM handle_request(
+  'POST','/upload',
+  '{"content-type":"multipart/form-data; boundary=testbnd"}',
+  E'--testbnd\r\nContent-Disposition: form-data; name="file"; filename="test.txt"\r\n\r\nhello\r\n--testbnd--'
+);
