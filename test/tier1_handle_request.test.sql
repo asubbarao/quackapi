@@ -662,6 +662,83 @@ INSERT INTO _test_results
   SELECT 'AUTH injection-shaped token → NULL', (SELECT c FROM v) IS NULL, '' FROM v;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- ORACLE AUTH WIRING (BACKLOG §3.9 P1): FULL handle_request macro on policed routes.
+-- All seeds use register_* sugar (no raw route INSERTs for these assertions).
+-- Policies use forms the oracle special-cases (''/true or 'false'); this is sufficient
+-- for the required parity matrix and matches C literal fast-path before prepared eval.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Policied routes via sugar (additive; ids chosen not to collide)
+INSERT INTO routes SELECT * FROM register_route('p_jwt', 'GET', '/p/jwt', 'SELECT to_json({''sub'': claims[''sub'']}) AS body', 'dynamic', 'jwt policed', 200);
+INSERT INTO routes SELECT * FROM register_route('p_deny', 'GET', '/p/deny', 'SELECT 1 AS body', 'dynamic', 'restr deny', 200);
+INSERT INTO routes SELECT * FROM register_route('p_key', 'GET', '/p/key', 'SELECT to_json({''sub'': claims[''sub'']}) AS body', 'dynamic', 'apikey policed', 200);
+
+-- Policies via sugar. Reuse already-registered 'bearer' (verify_exp true) and 'apikey'.
+INSERT INTO policies SELECT * FROM register_policy('p_jwt_allow', 'GET /p/jwt', 'PERMISSIVE', '', NULL, 'bearer');
+INSERT INTO policies SELECT * FROM register_policy('p_deny_all', 'GET /p/deny', 'RESTRICTIVE', 'false', NULL, 'bearer');
+INSERT INTO policies SELECT * FROM register_policy('p_key_allow', 'GET /p/key', 'PERMISSIVE', 'true', NULL, 'apikey');
+
+-- NEW A13: no token on policed JWT route via handle_request macro → 401
+WITH r AS (SELECT * FROM handle_request('GET','/p/jwt','{}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro no-token /p/jwt → 401', r.status_code=401, 'got '||r.status_code::VARCHAR FROM r
+  UNION ALL
+  SELECT 'AUTH macro no-token body Unauthorized', json_extract_string(r.body,'$.detail')='Unauthorized', coalesce(r.body,'<null>') FROM r
+  UNION ALL
+  SELECT 'AUTH macro no-token handler_sql NULL', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- NEW A14: valid JWT (far-future exp matching seeded bearer secret) → 200 + _ctx wrap with claims
+WITH r AS (SELECT * FROM handle_request('GET','/p/jwt','{"authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0aHJ1LWF1dGgiLCJleHAiOjk5OTk5OTk5OTl9.K1lIlSabHymAleKdO2AX8BrdkpJdaFP2sfGLCVM1P2k"}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro valid-jwt /p/jwt → 200', r.status_code=200, 'got '||r.status_code::VARCHAR FROM r
+  UNION ALL
+  SELECT 'AUTH macro valid-jwt handler wrapped _ctx', starts_with(COALESCE(r.handler_sql,''), 'WITH _ctx AS (SELECT '''), coalesce(r.handler_sql,'<null>') FROM r
+  UNION ALL
+  SELECT 'AUTH macro valid-jwt wrap contains claims sub', instr(COALESCE(r.handler_sql,''), 'thru-auth')>0, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- NEW A15: expired + verify_exp (real-world expired token) → 401 on policed
+WITH r AS (SELECT * FROM handle_request('GET','/p/jwt','{"authorization":"Bearer eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAidGllcjFfZXhwaXJlZF9zdWJqZWN0IiwgImV4cCI6IDEwMDAwMDAwMDB9.Z2CNaGXPTCbwfslIe3P9lOEBv69zFXkkDKW0USvyyxI"}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro expired+verify /p/jwt → 401', r.status_code=401, 'got '||r.status_code::VARCHAR FROM r;
+
+-- NEW A16: RESTRICTIVE false policy + valid token → 403, handler null
+WITH r AS (SELECT * FROM handle_request('GET','/p/deny','{"authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0aHJ1LWF1dGgiLCJleHAiOjk5OTk5OTk5OTl9.K1lIlSabHymAleKdO2AX8BrdkpJdaFP2sfGLCVM1P2k"}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro restr-false /p/deny → 403', r.status_code=403, 'got '||r.status_code::VARCHAR FROM r
+  UNION ALL
+  SELECT 'AUTH macro restr-false body Forbidden', json_extract_string(r.body,'$.detail')='Forbidden', coalesce(r.body,'<null>') FROM r
+  UNION ALL
+  SELECT 'AUTH macro restr-false handler_sql NULL', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- NEW A17: valid api-key on policed apikey route → 200 (wrap or at least hsql)
+WITH r AS (SELECT * FROM handle_request('GET','/p/key','{"x-api-key":"k-123"}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro apikey-valid /p/key → 200', r.status_code=200, 'got '||r.status_code::VARCHAR FROM r
+  UNION ALL
+  SELECT 'AUTH macro apikey-valid produces hsql', r.handler_sql IS NOT NULL, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- NEW A18: wrong api-key → 401
+WITH r AS (SELECT * FROM handle_request('GET','/p/key','{"x-api-key":"nope-wrong"}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro apikey-wrong → 401', r.status_code=401, 'got '||r.status_code::VARCHAR FROM r;
+
+-- NEW A19: injection-shaped token on policed → 401 (no error, treated invalid)
+WITH r AS (SELECT * FROM handle_request('GET','/p/jwt','{"authorization":"Bearer x'' OR ''1''=''1"}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro injection-token → 401', r.status_code=401, 'got '||r.status_code::VARCHAR FROM r;
+
+-- NEW A20: HONEST BOUNDARY — a NON-literal predicate (the common "require authenticated
+-- user" idiom) FAIL-CLOSES to 403 on the oracle/pure-track, EVEN with a valid token,
+-- because a macro cannot EXECUTE a dynamic predicate. This pins the documented limitation
+-- so it can't be silently turned into a false pass. The compiled ext-cpp track evaluates
+-- the full predicate (→ 200); see docs/AUTH_ORACLE_WIRING_RESULT.md "HONEST BOUNDARY".
+INSERT INTO routes SELECT * FROM register_route('p_nonlit', 'GET', '/p/nonlit', 'SELECT to_json({''sub'': claims[''sub'']}) AS body FROM _ctx', 'dynamic', 'non-literal pred', 200);
+INSERT INTO policies SELECT * FROM register_policy('p_nonlit_allow', 'GET /p/nonlit', 'PERMISSIVE', 'claims[''sub''] IS NOT NULL', NULL, 'bearer');
+WITH r AS (SELECT * FROM handle_request('GET','/p/nonlit','{"authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0aHJ1LWF1dGgiLCJleHAiOjk5OTk5OTk5OTl9.K1lIlSabHymAleKdO2AX8BrdkpJdaFP2sfGLCVM1P2k"}',''))
+INSERT INTO _test_results
+  SELECT 'AUTH macro non-literal pred fail-closes → 403 (documented boundary)', r.status_code=403, 'got '||r.status_code::VARCHAR FROM r;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT check_name, pass, detail FROM _test_results ORDER BY pass ASC, check_name;

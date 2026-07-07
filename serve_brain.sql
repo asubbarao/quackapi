@@ -413,6 +413,14 @@ static void *worker_main(void *arg){
      per worker (idempotent). */
   { ddb_result ign; g_ddb_query(con, "SET threads=1", &ign); g_ddb_destroy_result(&ign); }
   { ddb_result ign; g_ddb_query(con, "LOAD shellfs", &ign); g_ddb_destroy_result(&ign); }
+  /* json + crypto are REQUIRED by handle_request: json for every route (to_json,
+     JSON casts) and crypto for the auth path — _ct_eq_str is now an HMAC keyed-hash
+     constant-time compare (crypto_hmac) and _verify_jwt_hs256 needs it too. Static /
+     community-ext builds do NOT autoload these, so a worker conn that skips them 500s
+     EVERY request with "crypto_hmac does not exist". Any new connection surface
+     (workers, admin conns, replicas) MUST LOAD both. */
+  { ddb_result ign; g_ddb_query(con, "LOAD json", &ign); g_ddb_destroy_result(&ign); }
+  { ddb_result ign; g_ddb_query(con, "LOAD crypto", &ign); g_ddb_destroy_result(&ign); }
   /* HTTP CLIENT POLICY: curl_httpfs is the soldered default on EVERY worker conn.
      Handlers reading remote data over http (read_text/read_csv/read_parquet) then
      fetch CONCURRENTLY via connection pool + HTTP/2 + async IO. To revert to the

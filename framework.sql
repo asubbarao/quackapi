@@ -116,6 +116,11 @@ CREATE OR REPLACE TABLE policies (
   auth_name VARCHAR        -- which CREATE AUTH to use for verification on matching requests
 );
 
+-- api_keys backing store for CREATE AUTH ... AS API_KEY (subject becomes claims['sub'])
+-- Created here so handle_request macro (which may reference it inside CASE) parses even when no policies yet.
+-- Tests and app DDL may CREATE OR REPLACE / populate; empty by default (no keys → auth fail for apikey schemes).
+CREATE OR REPLACE TABLE api_keys (key VARCHAR, subject VARCHAR);
+
 -- register_auth / register_policy: pure-SQL writers (oracle path + tests)
 CREATE OR REPLACE MACRO register_auth(name, kind, config_json) AS TABLE (
   SELECT name AS name, kind AS kind, config_json AS config_json
@@ -134,9 +139,24 @@ CREATE OR REPLACE MACRO _b64url_decode(s) AS (
   )
 );
 
--- Constant-time compare helper (v1 SQL uses built-in = after len for b64url sigs; C path uses explicit byte loop, no memcmp early-out).
--- The folded-XOR form triggered binder "subqueries in lambda" in some macro expansion contexts; this form keeps oracle working.
-CREATE OR REPLACE MACRO _ct_eq_str(x, y) AS ( (length(x) = length(y)) AND (x = y) );
+-- Constant-time string equality. A naive `x = y` on strings is a byte memcmp with an
+-- early-out: the time-to-false grows with the shared prefix, a remote timing oracle an
+-- attacker walks byte-by-byte to forge an API key or HMAC signature. A true elementwise
+-- XOR-fold needs a lambda/unnest over the bytes, which trips DuckDB's "subqueries in
+-- lambda" binder inside macro expansion — so instead we compare KEYED HASHES:
+-- hmac(salt,x) = hmac(salt,y). One changed byte in x avalanches the whole digest, so
+-- digest-prefix timing no longer tracks x's prefix, and forcing the digests equal needs an
+-- HMAC 2nd-preimage (infeasible). The salt is a PUBLIC domain-separation constant, not a
+-- secret — security rests on HMAC 2nd-preimage resistance, not salt secrecy. Same true/false
+-- result as `=`. This is the SINGLE choke point: _verify_jwt_hs256 (sig check) and the
+-- api-key lookup both call it, and the C worker invokes this same SQL macro (no separate
+-- native compare — brain.cpp:1360), so hardening here hardens every auth path.
+CREATE OR REPLACE MACRO _ct_eq_str(x, y) AS (
+  x IS NOT NULL AND y IS NOT NULL
+  AND length(x) = length(y)
+  AND crypto_hmac('sha2-256', 'quackapi-ctcmp-domain-v1', x)
+    = crypto_hmac('sha2-256', 'quackapi-ctcmp-domain-v1', y)
+);
 
 -- Verify HS256 JWT. Returns claims MAP on success, NULL on any failure.
 CREATE OR REPLACE MACRO _verify_jwt_hs256(token, secret, verify_exp, leeway) AS (
@@ -158,7 +178,11 @@ CREATE OR REPLACE MACRO _verify_jwt_hs256(token, secret, verify_exp, leeway) AS 
   SELECT CASE WHEN (SELECT ok FROM vok) AND (SELECT ok FROM ex) THEN (SELECT m FROM cm) ELSE NULL END
 );
 
--- (api_key verification is inlined in handle_request verified_claims using api_keys table + _ct_eq_str)
+-- Auth (JWT via _verify_jwt_hs256 + api_key via api_keys+_ct_eq_str) + policy (PERM/REST) enforcement
+-- is performed inside handle_request AFTER best (when policies match the request path).
+-- Only then: 401 on missing/invalid credential, 403 on valid-cred but policy deny,
+-- and successful dynamic handler_sql is wrapped as: WITH _ctx AS (SELECT <claims>::JSON::MAP... , '{}'::JSON AS request) <hsql>
+-- No policy match for the route: zero change to prior behavior (unpoliced fast path).
 
 -- Build a request context JSON from the pieces we have at auth time (method, path params, query, body, headers).
 -- body may be large; for v1 we pass the raw body string (json or form text).
@@ -562,6 +586,144 @@ best AS (
     ) AS pmap
   FROM matched m
 ),
+-- ============================================================================
+-- AUTHENTICATE → AUTHORIZE → CLAIMS-BIND (oracle path, parity with C brain.cpp ~1293-1469)
+-- Injection after `best` (route_id+pmap available) and before validation/result.
+-- If >=1 policy pattern matches the request (segment+method, {}=wild), enforce:
+--   * extract cred (Authorization bearer stripped, else X-API-Key variants)
+--   * pick scheme from quackapi_auth (header match > jwt-kind > first)
+--   * verify: api_key uses `SELECT subject FROM api_keys WHERE _ct_eq_str(?,key)`; jwt uses _verify_jwt_hs256
+--   *  !vok (no/missing/bad cred) → 401 + {"detail":"Unauthorized"} + handler_sql=NULL
+--   *  vok but policies deny (RESTRICTIVE all-true AND + PERMISSIVE any-true OR; restr present → default-deny)
+--      → 403 + {"detail":"Forbidden"} + handler_sql=NULL
+--   *  vok + allowed and dynamic → wrap hsql: WITH _ctx AS (SELECT '<claims>'::JSON::MAP(VARCHAR,VARCHAR) AS claims, '{}'::JSON AS request) <orig>
+--   *  NO matching policy for path → identical prior behavior (no _ctx, no 401/403 from auth)
+-- Request json built via _build_request_json (for predicate eval); wrap always uses '{}' for request to match C bytes.
+-- ============================================================================
+effm AS (
+  SELECT CASE WHEN method='HEAD' THEN 'GET' ELSE method END AS m
+),
+pol_idx AS (
+  SELECT
+    policy_id, pattern, as_mode, using_pred, with_check_pred, auth_name,
+    CASE WHEN instr(pattern,' ')>0 THEN upper(list_element(string_split(pattern,' '),1)) ELSE '' END AS p_m,
+    list_filter(string_split( CASE WHEN instr(pattern,' ')>0 THEN COALESCE(list_element(string_split(pattern,' '),2),pattern) ELSE pattern END , '/'), lambda s: len(s)>0) AS p_segs
+  FROM policies
+),
+policy_matches AS (
+  SELECT pi.*
+  FROM pol_idx pi, req r, effm e
+  WHERE len(pi.p_segs) = len(r.req_segs)
+    AND (pi.p_m='' OR pi.p_m = upper(e.m))
+    AND len(list_filter(list_zip(r.req_segs, pi.p_segs), lambda z: NOT (starts_with(z[2],'{') OR z[1]=z[2]))) = 0
+),
+nm AS (SELECT count(*) AS n FROM policy_matches),
+cred AS (
+  SELECT
+    CASE WHEN (SELECT n FROM nm)=0 THEN NULL
+         ELSE COALESCE(
+                -- Authorization (any case key): strip leading/trailing ws + " + optional "Bearer " prefix (case-insens)
+                CASE
+                  WHEN COALESCE(json_extract_string(headers,'$.authorization'),json_extract_string(headers,'$.Authorization')) IS NOT NULL THEN
+                    (WITH raw AS (SELECT COALESCE(json_extract_string(headers,'$.authorization'),json_extract_string(headers,'$.Authorization')) AS r),
+                          nob AS (SELECT trim(replace((SELECT r FROM raw), '"', '')) AS s),
+                          up AS (SELECT upper((SELECT s FROM nob)) AS u, (SELECT s FROM nob) AS s),
+                          cut AS (SELECT CASE WHEN starts_with((SELECT u FROM up), 'BEARER ') THEN substr((SELECT s FROM up), 8) ELSE (SELECT s FROM up) END AS t)
+                     SELECT trim((SELECT t FROM cut)))
+                  ELSE NULL
+                END,
+                trim(replace(COALESCE(json_extract_string(headers,'$.x-api-key'),json_extract_string(headers,'$.X-API-Key'),json_extract_string(headers,'$.x_api_key'),''), '"', ''))
+              )
+    END AS tok
+),
+sch AS (
+  SELECT name, kind, config_json,
+    json_extract_string(config_json,'$.header') AS cfg_h,
+    json_extract_string(config_json,'$.secret') AS secret,
+    COALESCE(try_cast(json_extract_string(config_json,'$.verify_exp')AS BOOLEAN), true) AS verify_exp,
+    COALESCE(try_cast(json_extract_string(config_json,'$.leeway')AS INTEGER), 0) AS leeway
+  FROM quackapi_auth
+  WHERE (SELECT n FROM nm)>0
+  ORDER BY
+    -- Prefer the scheme whose KIND matches the credential header actually present in
+    -- this request (kind is the reliable discriminator, not a substring of the header
+    -- name). Exact equality on the known enum ('jwt_hs256' | 'api_key') — no LIKE.
+    CASE
+      WHEN (SELECT tok FROM cred) IS NOT NULL AND kind = 'api_key'   AND instr(lower(headers),'x-api-key')     > 0 THEN 0
+      WHEN (SELECT tok FROM cred) IS NOT NULL AND kind = 'jwt_hs256' AND instr(lower(headers),'authorization') > 0 THEN 0
+      ELSE 1
+    END,
+    CASE WHEN kind = 'jwt_hs256' THEN 0 ELSE 1 END,
+    name
+  LIMIT 1
+),
+vok AS (
+  SELECT
+    (SELECT n FROM nm)>0 AND (SELECT tok FROM cred) IS NOT NULL AND (SELECT tok FROM cred)<>'' AND (SELECT kind FROM sch) IS NOT NULL AND
+    CASE
+      WHEN (SELECT kind FROM sch) = 'api_key' THEN
+        EXISTS(SELECT 1 FROM api_keys k WHERE _ct_eq_str((SELECT tok FROM cred), k.key))
+      ELSE
+        _verify_jwt_hs256( (SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0) ) IS NOT NULL
+    END AS ok,
+    CASE
+      WHEN (SELECT kind FROM sch) = 'api_key' THEN
+        (SELECT to_json(map_from_entries([struct_pack(key:='sub',value:=COALESCE(k.subject,''))]))::VARCHAR FROM api_keys k WHERE _ct_eq_str((SELECT tok FROM cred),k.key) LIMIT 1)
+      ELSE
+        (SELECT to_json( _verify_jwt_hs256((SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0)) )::VARCHAR )
+    END AS cj
+),
+-- Policy predicate eval — LITERALS ONLY on the oracle/pure-track, by architectural
+-- necessity: a SQL macro cannot EXECUTE a dynamic predicate expression over runtime
+-- claims (the same limit that forces self-dispatch for handler execution). So a literal
+-- ''/true/1 → allow, false/0 → deny, and any NON-literal predicate (e.g. the common
+-- `claims['sub'] IS NOT NULL` "require authenticated user" idiom, or `claims['role']='admin'`)
+-- FAIL-CLOSES to deny (pass=false → 403). This is safe (never grants on an unevaluatable
+-- predicate) but is NOT parity with the compiled ext-cpp track, which evaluates the full
+-- predicate via a prepared statement. Full pure-track predicate eval would require a
+-- self-dispatched auth-check query. See docs/AUTH_ORACLE_WIRING_RESULT.md "HONEST BOUNDARY".
+pol_p AS (
+  SELECT
+    pm.policy_id,
+    upper(COALESCE(pm.as_mode,'PERMISSIVE')) AS mode,
+    CASE
+      WHEN pm.using_pred IS NULL OR trim(pm.using_pred)='' OR lower(trim(pm.using_pred)) IN ('true','1') THEN true
+      WHEN lower(trim(pm.using_pred)) IN ('false','0') THEN false
+      ELSE false  -- non-literal predicate: fail-closed (deny). Compiled track does full eval.
+    END AS pass
+  FROM policy_matches pm
+),
+pol_a AS (
+  SELECT
+    (SELECT n FROM nm)>0 AS has_pol,
+    bool_or(mode='RESTRICTIVE') AS has_restr,
+    list_count(list_filter(list(CASE WHEN mode='RESTRICTIVE' THEN (CASE WHEN pass THEN 1 ELSE 0 END) ELSE NULL END), x->x IS NOT NULL)) AS restr_n,
+    list_count(list_filter(list(CASE WHEN mode='RESTRICTIVE' THEN (CASE WHEN pass THEN 1 ELSE 0 END) ELSE NULL END), x->x=0)) = 0 AS all_restr,
+    bool_or(mode<>'RESTRICTIVE') AS has_perm,
+    bool_or(mode<>'RESTRICTIVE' AND pass) AS any_perm,
+    (SELECT ok FROM vok) AS vok,
+    (SELECT cj FROM vok) AS claims_j,
+    (SELECT _build_request_json((SELECT m FROM effm), (SELECT clean_path FROM path_query), COALESCE((SELECT pmap FROM best),map()), (SELECT qmap FROM query_map), headers, body) FROM (SELECT 1)) AS req_j
+  FROM pol_p
+),
+auth_dec AS (
+  SELECT
+    has_pol,
+    vok,
+    claims_j,
+    CASE WHEN has_pol AND NOT vok THEN 401
+         WHEN has_pol AND vok THEN (CASE
+           WHEN has_restr THEN (CASE WHEN all_restr AND (NOT has_perm OR any_perm) THEN 200 ELSE 403 END)
+           ELSE (CASE WHEN NOT has_perm OR any_perm THEN 200 ELSE 403 END)
+         END)
+         ELSE 0
+    END AS forced_status,
+    CASE WHEN has_pol AND NOT vok THEN '{"detail":"Unauthorized"}'
+         WHEN has_pol AND vok AND ( (has_restr AND NOT (all_restr AND (NOT has_perm OR any_perm))) OR (NOT has_restr AND has_perm AND NOT any_perm) ) THEN '{"detail":"Forbidden"}'
+         ELSE NULL
+    END AS forced_body
+  FROM pol_a
+),
 -- Extract values for path/query/header/cookie/body params of the matched route.
 -- header: top-level key in headers_json (C provides lowercased names)
 -- cookie: nested under _cookies sub-object (already parsed by C layer into headers_json)
@@ -844,15 +1006,20 @@ result AS (
   SELECT b.route_id, b.kind, b.status, ea.n_err, ea.detail_arr, rs.content_type AS rc_ct, rs.body AS rc_body, hr.hsql,
     -- resp_headers from route_headers side table (additive). For 404 -> '{}'; for matched (incl 422 errs) emit the route's static headers.
     COALESCE((SELECT json_group_object(name, value) FROM route_headers WHERE route_id = b.route_id), '{}') AS resp_headers,
-    (SELECT yes FROM is_malformed_multipart) AS malformed_mp
+    (SELECT yes FROM is_malformed_multipart) AS malformed_mp,
+    ad.forced_status, ad.forced_body, ad.has_pol, ad.vok, ad.claims_j
   FROM (SELECT 1) z
   LEFT JOIN best b ON true
   LEFT JOIN err_agg ea ON true
   LEFT JOIN rendered_static rs ON rs.route_id = b.route_id
   LEFT JOIN handler_rendered hr ON true
+  LEFT JOIN auth_dec ad ON true
 )
 SELECT
+  -- Auth decisions override route/validation decisions (C does the same after quack_route)
   CASE
+    WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) = 401 THEN 401
+    WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) = 403 THEN 403
     WHEN malformed_mp THEN 422
     WHEN route_id IS NULL AND (SELECT path_exists FROM allow_methods) THEN 405
     WHEN route_id IS NULL THEN 404
@@ -860,12 +1027,15 @@ SELECT
     ELSE status
   END AS status_code,
   CASE
+    WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) IN (401,403) THEN 'application/json'
     WHEN malformed_mp OR route_id IS NULL OR n_err > 0 THEN 'application/json'
     WHEN kind IN ('openapi', 'static', 'html') THEN rc_ct
     WHEN kind = 'stream' THEN 'text/event-stream'
     ELSE 'application/json'
   END AS content_type,
   CASE
+    WHEN (SELECT forced_status FROM result WHERE forced_status=401 LIMIT 1) = 401 THEN (SELECT forced_body FROM result LIMIT 1)
+    WHEN (SELECT forced_status FROM result WHERE forced_status=403 LIMIT 1) = 403 THEN (SELECT forced_body FROM result LIMIT 1)
     WHEN malformed_mp THEN cast(json_object('detail', json_array(
         json_object('type', 'multipart_parse', 'loc', json_array('body'), 'msg', 'Malformed multipart body: boundary not found')
       )) AS VARCHAR)
@@ -878,8 +1048,15 @@ SELECT
     ELSE NULL
   END AS body,
   CASE
+    WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) IN (401,403) THEN NULL
     WHEN malformed_mp OR route_id IS NULL OR n_err > 0 THEN NULL
-    WHEN kind IN ('dynamic', 'stream') THEN hsql
+    WHEN kind IN ('dynamic', 'stream') THEN
+      CASE
+        -- wrap ONLY if a policy matched this path AND we are emitting a handler_sql (dynamic) AND auth passed
+        WHEN (SELECT has_pol FROM result LIMIT 1) AND (SELECT vok FROM result LIMIT 1) AND hsql IS NOT NULL THEN
+          'WITH _ctx AS (SELECT ''' || replace(COALESCE((SELECT claims_j FROM result LIMIT 1), '{}'), '''', '''''') || '''::JSON::MAP(VARCHAR,VARCHAR) AS claims, ''{}''::JSON AS request) ' || hsql
+        ELSE hsql
+      END
     WHEN kind = 'redirect' THEN NULL
     ELSE NULL
   END AS handler_sql,
