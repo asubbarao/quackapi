@@ -1,0 +1,24 @@
+# FastAPI's Most-Wanted Features — quackapi Scoreboard
+
+**Thesis.** quackapi's pitch is "the data layer IS the framework." The sharpest proof is that FastAPI's most-upvoted feature requests of all time — which FastAPI closed UNRESOLVED — are things quackapi either already ships or can ship as a few lines of SQL/DDL. This is the scoreboard.
+
+| 👍 | Issue | FastAPI request | FastAPI outcome | quackapi status | How (the DDL / mechanism) |
+|----|-------|-----------------|-----------------|-----------------|---------------------------|
+| 83 | [#214](https://github.com/fastapi/fastapi/issues/214) | Bridge Pydantic ↔ SQLAlchemy models | closed unresolved | DISSOLVED | Handlers are SQL directly over the DB; there is no ORM impedance layer to bridge. |
+| 75 | [#754](https://github.com/fastapi/fastapi/issues/754) | First-class session support | closed unresolved (highest real feature request) | BUILDING (Wave A) | Server-side session store IS a table; `CREATE SESSION` sugar + cookie issue/verify + CSRF; see [docs/specs/SESSION_CSRF_SPEC.md](docs/specs/SESSION_CSRF_SPEC.md). |
+| 65 | [#617](https://github.com/fastapi/fastapi/issues/617) | Further develop startup/shutdown events | closed | PARTIAL→BUILDING | Graceful SIGTERM drain already shipped (R4, port clears cleanly); `CREATE LIFECYCLE ON STARTUP|SHUTDOWN AS <sql>` planned. |
+| 62 | [#1907](https://github.com/fastapi/fastapi/issues/1907) | Built-in readiness/liveness/startup probes | closed | BUILDING | `CREATE HEALTH CHECK` + `/livez` `/readyz` + `/metrics` as a SELECT over the access/query-log tables. |
+| 57 | [#335](https://github.com/fastapi/fastapi/issues/335) | OAuth2 Authorization-Code flow tutorial/support | closed | BUILDING | `CREATE AUTH ... AS OAUTH2` (authorize redirect + token exchange + JWKS verify). |
+| 50 | [#1357](https://github.com/fastapi/fastapi/issues/1357) | Response model include/exclude fields | closed | BUILDING (trivial) | In SQL, field include/exclude is just column projection over the handler result; `CREATE ROUTE ... FIELDS(...)`. |
+| 49 | [#1773](https://github.com/fastapi/fastapi/issues/1773) | Automatically support HEAD for all GET routes | closed | SHIPPED (R4) | HEAD auto-answers every GET, zero-length body, Allow header computed. Parity 40/40; tier-1 112/112; live-verified (HEAD zero-body w/ correct CL, `Allow: GET, HEAD, POST`). See [docs/CHRONICLE.md](docs/CHRONICLE.md) (R4 section) and [framework.sql](framework.sql):533 (HEAD auto-included), :561 (HEAD matches GET routes). |
+| 47 | [#1664](https://github.com/fastapi/fastapi/issues/1664) | "Very poor performance does not align with marketing" | closed | ANSWERED | Measured 42.6k req/s (health c8), 108k keep-alive (health c64 -k); 0 failures. See [bench/BENCH_HEADTOHEAD.md](bench/BENCH_HEADTOHEAD.md) and [docs/CHRONICLE.md](docs/CHRONICLE.md) (keep-alive ship + starvation gate: c64 -k `/health` 108,111 req/s). |
+| 39 | [#270](https://github.com/fastapi/fastapi/issues/270) | Class-based views as first-class | closed | DEFERRED | Routing sugar; low leverage (note honestly). |
+| 37 | [#1428](https://github.com/fastapi/fastapi/issues/1428) | Keycloak/OIDC integration | closed | BUILDING | Same OAuth2 machinery + an OIDC discovery URL. |
+| 35 | [#10177](https://github.com/fastapi/fastapi/issues/10177) | HTTPBearer returns 403 instead of 401 | closed | CORRECT | Returns 401 for missing/invalid bearer. See [ext-cpp/A1_AUTH_RESULT.md](ext-cpp/A1_AUTH_RESULT.md) (11-case matrix, verified 2026-07-06): no-token/garbage/badsig/expired/injection → 401 "Unauthorized"; only valid+deny policy case → 403 "Forbidden". |
+| 26-35 | [#11143](https://github.com/fastapi/fastapi/issues/11143) / [#10719](https://github.com/fastapi/fastapi/issues/10719) / [#1474](https://github.com/fastapi/fastapi/issues/1474) | Depends context-managers / Annotated deps / BaseModel-as-dependency | closed | HONEST EDGE | Request-scoped dependency injection with setup/teardown is the real tear in a stateless one-shot SQL model (see edge-ledger #6, [probes/6_di_setup_teardown.sql](probes/6_di_setup_teardown.sql), [docs/FEATURE_GAP_MATRIX.md](docs/FEATURE_GAP_MATRIX.md)). Do NOT overclaim; this is the deferred hard edge. |
+
+## Honest edges
+
+quackapi does not (yet) solve everything. The real architectural edge is request-scoped DI with true setup/teardown lifetime across a handler (the one-shot SQL dispatch model makes object resources and cross-statement transactions the hard case). TLS (direct) and WebSockets are specced and in progress; gzip and a few polish items remain. The scoreboard above is only about the historic FastAPI "most wanted, closed unresolved" list.
+
+Mirror to Notion (personal projects DB) per docs rule.
