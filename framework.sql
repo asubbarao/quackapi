@@ -151,7 +151,7 @@ CREATE OR REPLACE MACRO _b64url_decode(s) AS (
 -- result as `=`. This is the SINGLE choke point: _verify_jwt_hs256 (sig check) and the
 -- api-key lookup both call it, and the C worker invokes this same SQL macro (no separate
 -- native compare — brain.cpp:1360), so hardening here hardens every auth path.
-CREATE OR REPLACE MACRO _ct_eq_str(x, y) AS (
+CREATE OR REPLACE MACRO _constant_time_str_equals(x, y) AS (
   x IS NOT NULL AND y IS NOT NULL
   AND length(x) = length(y)
   AND crypto_hmac('sha2-256', 'quackapi-ctcmp-domain-v1', x)
@@ -167,7 +167,7 @@ CREATE OR REPLACE MACRO _verify_jwt_hs256(token, secret, verify_exp, leeway) AS 
     si AS (SELECT (SELECT v FROM hh) || '.' || (SELECT v FROM pp) AS si, (SELECT v FROM ss) AS sb),
     cb AS (SELECT crypto_hmac('sha2-256', secret, (SELECT si FROM si)) AS b),
     cu AS (SELECT replace(replace(rtrim(base64((SELECT b FROM cb)), '='), '+', '-'), '/', '_') AS c),
-    vok AS (SELECT _ct_eq_str( (SELECT sb FROM si), (SELECT c FROM cu) ) AS ok),
+    vok AS (SELECT _constant_time_str_equals( (SELECT sb FROM si), (SELECT c FROM cu) ) AS ok),
     pd AS (SELECT CASE WHEN (SELECT ok FROM vok) THEN _b64url_decode((SELECT v FROM pp)) END AS b),
     -- decode(), NOT ::VARCHAR: casting BLOB to VARCHAR renders quote bytes as literal
     -- \x22 escapes, so every real-world payload fails the JSON cast and verification
@@ -178,7 +178,7 @@ CREATE OR REPLACE MACRO _verify_jwt_hs256(token, secret, verify_exp, leeway) AS 
   SELECT CASE WHEN (SELECT ok FROM vok) AND (SELECT ok FROM ex) THEN (SELECT m FROM cm) ELSE NULL END
 );
 
--- Auth (JWT via _verify_jwt_hs256 + api_key via api_keys+_ct_eq_str) + policy (PERM/REST) enforcement
+-- Auth (JWT via _verify_jwt_hs256 + api_key via api_keys+_constant_time_str_equals) + policy (PERM/REST) enforcement
 -- is performed inside handle_request AFTER best (when policies match the request path).
 -- Only then: 401 on missing/invalid credential, 403 on valid-cred but policy deny,
 -- and successful dynamic handler_sql is wrapped as: WITH _ctx AS (SELECT <claims>::JSON::MAP... , '{}'::JSON AS request) <hsql>
@@ -592,7 +592,7 @@ best AS (
 -- If >=1 policy pattern matches the request (segment+method, {}=wild), enforce:
 --   * extract cred (Authorization bearer stripped, else X-API-Key variants)
 --   * pick scheme from quackapi_auth (header match > jwt-kind > first)
---   * verify: api_key uses `SELECT subject FROM api_keys WHERE _ct_eq_str(?,key)`; jwt uses _verify_jwt_hs256
+--   * verify: api_key uses `SELECT subject FROM api_keys WHERE _constant_time_str_equals(?,key)`; jwt uses _verify_jwt_hs256
 --   *  !vok (no/missing/bad cred) → 401 + {"detail":"Unauthorized"} + handler_sql=NULL
 --   *  vok but policies deny (RESTRICTIVE all-true AND + PERMISSIVE any-true OR; restr present → default-deny)
 --      → 403 + {"detail":"Forbidden"} + handler_sql=NULL
@@ -662,13 +662,13 @@ vok AS (
     (SELECT n FROM nm)>0 AND (SELECT tok FROM cred) IS NOT NULL AND (SELECT tok FROM cred)<>'' AND (SELECT kind FROM sch) IS NOT NULL AND
     CASE
       WHEN (SELECT kind FROM sch) = 'api_key' THEN
-        EXISTS(SELECT 1 FROM api_keys k WHERE _ct_eq_str((SELECT tok FROM cred), k.key))
+        EXISTS(SELECT 1 FROM api_keys k WHERE _constant_time_str_equals((SELECT tok FROM cred), k.key))
       ELSE
         _verify_jwt_hs256( (SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0) ) IS NOT NULL
     END AS ok,
     CASE
       WHEN (SELECT kind FROM sch) = 'api_key' THEN
-        (SELECT to_json(map_from_entries([struct_pack(key:='sub',value:=COALESCE(k.subject,''))]))::VARCHAR FROM api_keys k WHERE _ct_eq_str((SELECT tok FROM cred),k.key) LIMIT 1)
+        (SELECT to_json(map_from_entries([struct_pack(key:='sub',value:=COALESCE(k.subject,''))]))::VARCHAR FROM api_keys k WHERE _constant_time_str_equals((SELECT tok FROM cred),k.key) LIMIT 1)
       ELSE
         (SELECT to_json( _verify_jwt_hs256((SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0)) )::VARCHAR )
     END AS cj

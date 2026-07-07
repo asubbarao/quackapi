@@ -621,11 +621,11 @@ WITH has_deny AS (SELECT count(*) > 0 FROM policies WHERE policy_id='deny_all' A
 INSERT INTO _test_results SELECT 'AUTH valid+policy-false → 403', (SELECT * FROM has_deny), '' FROM has_deny;
 
 -- CHECK A6: API key valid
-WITH ok AS (SELECT count(*) > 0 FROM api_keys k WHERE _ct_eq_str('k-123', k.key))
+WITH ok AS (SELECT count(*) > 0 FROM api_keys k WHERE _constant_time_str_equals('k-123', k.key))
 INSERT INTO _test_results SELECT 'AUTH apikey valid → ok', (SELECT * FROM ok), '' FROM ok;
 
 -- CHECK A7: API key invalid
-WITH nok AS (SELECT count(*) > 0 FROM api_keys k WHERE _ct_eq_str('nope', k.key))
+WITH nok AS (SELECT count(*) > 0 FROM api_keys k WHERE _constant_time_str_equals('nope', k.key))
 INSERT INTO _test_results SELECT 'AUTH apikey invalid → not ok', NOT (SELECT * FROM nok), '' FROM nok;
 
 -- claims visible to handler simulation (wrap + eval)
