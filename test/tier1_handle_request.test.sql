@@ -804,9 +804,6 @@ INSERT INTO _test_results
   SELECT 'H6 /readyz handler NULL (special cased) post create', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- SUMMARY — print all results, then a pass/fail aggregate
--- ─────────────────────────────────────────────────────────────────────────────
--- ─────────────────────────────────────────────────────────────────────────────
 -- #1357  Response field include / exclude projection (FastAPI response_model_*)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Unit: _apply_field_projection over the two body shapes handlers produce (object + array).
@@ -851,6 +848,7 @@ INSERT INTO _test_results
   SELECT 'FIELDS end-to-end: projected user body omits age',
          _apply_field_projection(body, NULL, ['age']) = '{"id":1,"name":"alice"}',
          coalesce(_apply_field_projection(body, NULL, ['age']), '<null>') FROM _raw;
+
 -- DI ASSERTIONS (setup binds value visible to handler; teardown helper; phase macro)
 -- These run inside the tier1 script (stateful); prove oracle macros + sequencing model.
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -885,6 +883,23 @@ INSERT INTO _test_results
 DELETE FROM route_dependencies WHERE route_id='get_user';
 DELETE FROM dependencies WHERE name='test_marker';
 DROP TABLE IF EXISTS _di_marker;
+
+-- CHECK L1: lifecycle_hooks table + run_lifecycle(phase) oracle helper
+-- (for #617: registry + helper; C worker executes the returned sql bodies)
+-- ─────────────────────────────────────────────────────────────────────────────
+INSERT INTO lifecycle_hooks SELECT * FROM register_lifecycle('boot_marker', 'STARTUP', 'INSERT INTO _lifecycle_markers(name, phase) VALUES (''boot'', ''STARTUP'')', 10);
+INSERT INTO lifecycle_hooks SELECT * FROM register_lifecycle('drain_marker', 'SHUTDOWN', 'INSERT INTO _lifecycle_markers(name, phase) VALUES (''drain'', ''SHUTDOWN'')', 20);
+CREATE OR REPLACE TABLE _lifecycle_markers (name VARCHAR, phase VARCHAR);
+WITH h AS (SELECT * FROM run_lifecycle('STARTUP'))
+INSERT INTO _test_results
+  SELECT 'run_lifecycle(STARTUP) returns boot_marker', (SELECT name FROM h LIMIT 1) = 'boot_marker', (SELECT name FROM h LIMIT 1) FROM (SELECT 1) dummy
+  UNION ALL
+  SELECT 'run_lifecycle(STARTUP) sql present', length((SELECT sql FROM h LIMIT 1)) > 10, 'len=' || length((SELECT sql FROM h LIMIT 1))::VARCHAR FROM (SELECT 1) dummy;
+WITH h2 AS (SELECT * FROM run_lifecycle('SHUTDOWN'))
+INSERT INTO _test_results
+  SELECT 'run_lifecycle(SHUTDOWN) returns drain_marker', (SELECT name FROM h2 LIMIT 1) = 'drain_marker', (SELECT name FROM h2 LIMIT 1) FROM (SELECT 1) dummy
+  UNION ALL
+  SELECT 'run_lifecycle(SHUTDOWN) sql present', length((SELECT sql FROM h2 LIMIT 1)) > 10, 'len=' || length((SELECT sql FROM h2 LIMIT 1))::VARCHAR FROM (SELECT 1) dummy;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate

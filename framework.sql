@@ -39,6 +39,8 @@ SET http_timeout = 30000;
 -- If extension not present, JWT auth paths will fail verification at runtime (expected).
 INSTALL crypto FROM community; LOAD crypto;
 
+CREATE TYPE IF NOT EXISTS lifecycle_phase AS ENUM ('STARTUP', 'SHUTDOWN');
+
 CREATE SEQUENCE IF NOT EXISTS users_id_seq START 100;
 CREATE TABLE IF NOT EXISTS users (id INTEGER DEFAULT nextval('users_id_seq'), name VARCHAR, age INTEGER);
 TRUNCATE TABLE users;
@@ -195,12 +197,27 @@ CREATE OR REPLACE MACRO register_health_check(name, probe_sql) AS TABLE (
   SELECT name AS name, probe_sql AS probe_sql
 );
 
+-- lifecycle_hooks: STARTUP and SHUTDOWN hooks registered via CREATE LIFECYCLE sugar (or register_lifecycle).
+-- Run by serve_brain at boot (STARTUP after framework load, before accept) and on SIGTERM drain (SHUTDOWN after in-flight drain).
+CREATE OR REPLACE TABLE lifecycle_hooks (
+  name VARCHAR,
+  phase lifecycle_phase,
+  sql VARCHAR,
+  ordering INTEGER
+);
+
 -- register_auth / register_policy: pure-SQL writers (oracle path + tests)
 CREATE OR REPLACE MACRO register_auth(name, kind, config_json) AS TABLE (
   SELECT name AS name, kind AS kind, config_json AS config_json
 );
 CREATE OR REPLACE MACRO register_policy(policy_id, pattern, as_mode, using_pred, with_check_pred := NULL, auth_name := NULL) AS TABLE (
   SELECT policy_id, pattern, as_mode, using_pred, with_check_pred, auth_name
+);
+
+-- register_lifecycle: pure-SQL writer for oracle/tests (sugar path is CREATE LIFECYCLE in C++ parser).
+-- phase must be 'STARTUP' or 'SHUTDOWN' (maps to ENUM).
+CREATE OR REPLACE MACRO register_lifecycle(name, phase, sql, ordering := 100) AS TABLE (
+  SELECT name AS name, phase AS phase, sql AS sql, ordering AS ordering
 );
 
 -- ── crypto / b64url / JWT helpers (lean on DuckDB 'crypto' ext + json) ──────
@@ -1221,6 +1238,17 @@ SELECT
     ELSE resp_headers
   END AS resp_headers
 FROM result
+);
+
+-- run_lifecycle(phase): oracle helper returning ordered (name, sql) for a phase.
+-- Worker (C) calls SELECT sql FROM run_lifecycle('STARTUP') then g_ddb_query each;
+-- same for 'SHUTDOWN'. Pure SQL path (tests) can SELECT * FROM run_lifecycle(...) to inspect.
+-- Does not itself execute the hook sql bodies (the caller does via query exec).
+CREATE OR REPLACE MACRO run_lifecycle(p) AS TABLE (
+  SELECT name, sql, ordering
+  FROM lifecycle_hooks
+  WHERE phase = p
+  ORDER BY ordering, name
 );
 
 -- GATE self-checks (must produce expected results). Dynamic routes return handler_sql (col4),
