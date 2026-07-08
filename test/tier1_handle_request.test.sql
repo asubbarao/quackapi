@@ -739,6 +739,71 @@ INSERT INTO _test_results
   SELECT 'AUTH macro non-literal pred fail-closes → 403 (documented boundary)', r.status_code=403, 'got '||r.status_code::VARCHAR FROM r;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- #1907 HEALTH / READINESS / LIVENESS + METRICS + CREATE HEALTH CHECK
+-- Assertions for livez/readyz/metrics + CREATE sugar + 503 simulation
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- CHECK H1: /livez static 200 (cheap, always up while serving)
+WITH r AS (SELECT * FROM handle_request('GET','/livez','{}',''))
+INSERT INTO _test_results
+  SELECT 'H1 /livez → status 200', r.status_code=200, 'got '||r.status_code FROM r
+  UNION ALL
+  SELECT 'H1 /livez → static body alive', json_extract_string(r.body,'$.status')='alive', coalesce(r.body,'<null>') FROM r
+  UNION ALL
+  SELECT 'H1 /livez → handler_sql NULL (static)', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- CHECK H2: /readyz 200 when ready (registry+writer+probes) -- dynamic: body NULL, handler_sql set (C execs for real body)
+WITH r AS (SELECT * FROM handle_request('GET','/readyz','{}',''))
+INSERT INTO _test_results
+  SELECT 'H2 /readyz → status 200 when ready', r.status_code=200, 'got '||r.status_code FROM r
+  UNION ALL
+  SELECT 'H2 /readyz → body NULL (dynamic special)', r.body IS NULL, coalesce(r.body,'<null>') FROM r
+  UNION ALL
+  SELECT 'H2 /readyz → handler_sql NULL (special cased for status override)', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- CHECK H3: simulate not-ready via table → /readyz 503 (key probe)
+UPDATE quackapi_readiness SET ready=false WHERE component='registry';
+WITH r AS (SELECT * FROM handle_request('GET','/readyz','{}',''))
+INSERT INTO _test_results
+  SELECT 'H3 /readyz → status 503 when registry not ready', r.status_code=503, 'got '||r.status_code FROM r
+  UNION ALL
+  SELECT 'H3 /readyz 503 → body Not Ready override', json_extract_string(r.body,'$.detail')='Not Ready', coalesce(r.body,'<null>') FROM r
+  UNION ALL
+  SELECT 'H3 /readyz 503 → handler_sql NULL', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
+-- restore
+UPDATE quackapi_readiness SET ready=true WHERE component='registry';
+
+-- CHECK H4: after restore /readyz back to 200
+WITH r AS (SELECT * FROM handle_request('GET','/readyz','{}',''))
+INSERT INTO _test_results
+  SELECT 'H4 /readyz restored → 200', r.status_code=200, 'got '||r.status_code FROM r
+  UNION ALL
+  SELECT 'H4 /readyz restored → handler_sql NULL (special)', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- CHECK H5: /metrics 200 + prometheus-style (dynamic: body NULL, handler_sql produces the text on exec)
+WITH r AS (SELECT * FROM handle_request('GET','/metrics','{}',''))
+INSERT INTO _test_results
+  SELECT 'H5 /metrics → status 200', r.status_code=200, 'got '||r.status_code FROM r
+  UNION ALL
+  SELECT 'H5 /metrics → body NULL (dynamic)', r.body IS NULL, coalesce(r.body,'<null>') FROM r
+  UNION ALL
+  SELECT 'H5 /metrics → handler_sql not null', r.handler_sql IS NOT NULL, coalesce(r.handler_sql,'<null>') FROM r
+  UNION ALL
+  SELECT 'H5 /metrics → handler contains routes_total text', instr(coalesce(r.handler_sql,''),'quackapi_routes_total')>0, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- CHECK H6: CREATE HEALTH CHECK sugar registers probe (oracle path via direct insert + macro for parity test)
+-- (DDL sugar itself tested via C++ parser in extension; here exercise the table+macro path)
+INSERT INTO health_checks SELECT * FROM register_health_check('tier1_probe', 'SELECT 1 AS ok');
+WITH c AS (SELECT count(*) AS n FROM health_checks)
+INSERT INTO _test_results
+  SELECT 'H6 CREATE HEALTH CHECK → health_checks increased', (SELECT n FROM c) >= 2, 'count='||(SELECT n FROM c)::VARCHAR FROM c;
+WITH r AS (SELECT * FROM handle_request('GET','/readyz','{}',''))
+INSERT INTO _test_results
+  SELECT 'H6 /readyz after create health → still 200', r.status_code=200, 'got '||r.status_code FROM r
+  UNION ALL
+  SELECT 'H6 /readyz handler NULL (special cased) post create', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ─────────────────────────────────────────────────────────────────────────────
