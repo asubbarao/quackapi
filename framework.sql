@@ -96,6 +96,36 @@ CREATE OR REPLACE MACRO register_redirect(route_id, method, pattern, target, sta
 );
 
 -- ============================================================================
+-- DEPENDENCIES: request-scoped setup/teardown (FastAPI yield equiv)
+-- CREATE DEPENDENCY name AS SETUP '...' TEARDOWN '...'  (via ParserExtension)
+-- Attach: CREATE ROUTE ... USING depname AS ...
+-- Oracle: dependencies + route_dependencies tables + run_dependency_phase helper.
+-- Worker (C) sequences on exec_con: setup; handler; teardown (always).
+-- ============================================================================
+
+CREATE OR REPLACE TABLE dependencies (
+  name VARCHAR PRIMARY KEY,
+  setup_sql VARCHAR,
+  teardown_sql VARCHAR
+);
+
+CREATE OR REPLACE TABLE route_dependencies (
+  route_id VARCHAR,
+  dep_name VARCHAR
+);
+
+-- run_dependency_phase(dep_name, phase) returns the sql text for that phase.
+-- Called by C worker (and tests) to retrieve phase SQL then execute on same con.
+-- Use dep_name to avoid column name conflict with dependencies.name .
+CREATE OR REPLACE MACRO run_dependency_phase(dep_name, phase) AS (
+  CASE phase
+    WHEN 'setup' THEN (SELECT setup_sql FROM dependencies d WHERE d.name = dep_name)
+    WHEN 'teardown' THEN (SELECT teardown_sql FROM dependencies d WHERE d.name = dep_name)
+    ELSE NULL
+  END
+);
+
+-- ============================================================================
 -- AUTH + POLICY registries (v1: JWT HS256 bearer + API_KEY header)
 -- Source of truth tables; no precomputed caches. Introspectable and mutable.
 -- CREATE AUTH / CREATE POLICY DDL (C++) and register_* (pure) write here.
