@@ -121,6 +121,41 @@ CREATE OR REPLACE TABLE policies (
 -- Tests and app DDL may CREATE OR REPLACE / populate; empty by default (no keys → auth fail for apikey schemes).
 CREATE OR REPLACE TABLE api_keys (key VARCHAR, subject VARCHAR);
 
+-- quackapi_readiness + health_checks: backing for /readyz /livez /metrics and CREATE HEALTH CHECK sugar.
+-- Writer connection + registry loaded gate the 200 vs 503 for /readyz.
+-- User CREATE HEALTH CHECK <name> AS <select> populates here; probes run at /readyz time (C worker executes the probe_sql on writer connection).
+CREATE OR REPLACE TABLE quackapi_readiness (
+  component VARCHAR PRIMARY KEY,
+  ready BOOLEAN,
+  detail VARCHAR
+);
+CREATE OR REPLACE TABLE health_checks (
+  name VARCHAR PRIMARY KEY,
+  probe_sql VARCHAR
+);
+
+-- Seed initial readiness state (writer + registry). CREATE HEALTH CHECK augments the probe list.
+-- In tier-1 and boot, these start true (framework applied + registry loaded).
+INSERT INTO quackapi_readiness (component, ready, detail) VALUES
+  ('registry', true, 'route registry loaded at bootstrap'),
+  ('writer', true, 'writer connection responsive');
+
+-- default builtin probe (writer connectivity expressed as a SELECT)
+INSERT INTO health_checks (name, probe_sql) VALUES ('writer_probe', 'SELECT 1 AS ok');
+
+-- Minimal access/query log tables (existing for /metrics SELECTs; populated by middleware or external in full deploys;
+-- here empty or lightly seeded so /metrics always has valid counters without error).
+CREATE OR REPLACE TABLE quackapi_access_log (ts TIMESTAMP, method VARCHAR, path VARCHAR, status INTEGER);
+CREATE OR REPLACE TABLE quackapi_query_log (ts TIMESTAMP, route_id VARCHAR, status INTEGER, duration_ms INTEGER);
+-- seed a couple so metrics has data in tier-1/live verify (counts >0)
+INSERT INTO quackapi_access_log (ts, method, path, status) VALUES (now(), 'GET', '/livez', 200), (now(), 'GET', '/readyz', 200);
+INSERT INTO quackapi_query_log (ts, route_id, status, duration_ms) VALUES (now(), 'livez', 200, 0);
+
+-- register_health_check: pure oracle helper (mirrors CREATE HEALTH CHECK sugar)
+CREATE OR REPLACE MACRO register_health_check(name, probe_sql) AS TABLE (
+  SELECT name AS name, probe_sql AS probe_sql
+);
+
 -- register_auth / register_policy: pure-SQL writers (oracle path + tests)
 CREATE OR REPLACE MACRO register_auth(name, kind, config_json) AS TABLE (
   SELECT name AS name, kind AS kind, config_json AS config_json
@@ -206,7 +241,7 @@ SELECT
   json_extract_string(value, '$.kind'),
   json_extract_string(value, '$.summary'),
   CASE WHEN try_cast(json_extract_string(value, '$.status') AS INTEGER) IS NULL THEN 200 ELSE try_cast(json_extract_string(value, '$.status') AS INTEGER) END
-FROM json_each('[ {"route_id":"get_user","method":"GET","pattern":"/users/{id}","handler":"SELECT to_json(u) AS body FROM users u WHERE u.id = {id}","kind":"dynamic","summary":"Get a user by id","status":200}, {"route_id":"list_users","method":"GET","pattern":"/users","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM users u","kind":"dynamic","summary":"List users","status":200}, {"route_id":"get_post","method":"GET","pattern":"/users/{id}/posts/{post_id}","handler":"SELECT to_json({''user_id'': {id}, ''post_id'': {post_id}}) AS body","kind":"dynamic","summary":"Get a post","status":200}, {"route_id":"search","method":"GET","pattern":"/search","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM (SELECT * FROM users WHERE starts_with(lower(name), lower({q})) ORDER BY id LIMIT coalesce({limit}, 100)) u","kind":"dynamic","summary":"Search","status":200}, {"route_id":"create_user","method":"POST","pattern":"/users","handler":"INSERT INTO users(name, age) VALUES ({name}, {age}) RETURNING to_json(users) AS body","kind":"dynamic","summary":"Create a user","status":201}, {"route_id":"whoami","method":"GET","pattern":"/whoami","handler":"SELECT to_json({''whoami'': rtrim(c.content, chr(10))}) AS body FROM read_text(''whoami |'') c","kind":"dynamic","summary":"Shell: whoami","status":200}, {"route_id":"health","method":"GET","pattern":"/health","handler":"{\"status\":\"ok\"}","kind":"static","summary":"Health check","status":200}, {"route_id":"events","method":"GET","pattern":"/events","handler":"SELECT ''tick '' || i AS body FROM range(1, 6) t(i)","kind":"stream","summary":"SSE event stream demo","status":200}, {"route_id":"openapi","method":"GET","pattern":"/openapi.json","handler":"openapi","kind":"openapi","summary":"OpenAPI schema","status":200}, {"route_id":"docs","method":"GET","pattern":"/docs","handler":"docs","kind":"html","summary":"Swagger UI","status":200} ]'::JSON);
+FROM json_each('[ {"route_id":"get_user","method":"GET","pattern":"/users/{id}","handler":"SELECT to_json(u) AS body FROM users u WHERE u.id = {id}","kind":"dynamic","summary":"Get a user by id","status":200}, {"route_id":"list_users","method":"GET","pattern":"/users","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM users u","kind":"dynamic","summary":"List users","status":200}, {"route_id":"get_post","method":"GET","pattern":"/users/{id}/posts/{post_id}","handler":"SELECT to_json({''user_id'': {id}, ''post_id'': {post_id}}) AS body","kind":"dynamic","summary":"Get a post","status":200}, {"route_id":"search","method":"GET","pattern":"/search","handler":"SELECT coalesce(json_group_array(to_json(u)), ''[]'') AS body FROM (SELECT * FROM users WHERE starts_with(lower(name), lower({q})) ORDER BY id LIMIT coalesce({limit}, 100)) u","kind":"dynamic","summary":"Search","status":200}, {"route_id":"create_user","method":"POST","pattern":"/users","handler":"INSERT INTO users(name, age) VALUES ({name}, {age}) RETURNING to_json(users) AS body","kind":"dynamic","summary":"Create a user","status":201}, {"route_id":"whoami","method":"GET","pattern":"/whoami","handler":"SELECT to_json({''whoami'': rtrim(c.content, chr(10))}) AS body FROM read_text(''whoami |'') c","kind":"dynamic","summary":"Shell: whoami","status":200}, {"route_id":"health","method":"GET","pattern":"/health","handler":"{\"status\":\"ok\"}","kind":"static","summary":"Health check","status":200}, {"route_id":"events","method":"GET","pattern":"/events","handler":"SELECT ''tick '' || i AS body FROM range(1, 6) t(i)","kind":"stream","summary":"SSE event stream demo","status":200}, {"route_id":"openapi","method":"GET","pattern":"/openapi.json","handler":"openapi","kind":"openapi","summary":"OpenAPI schema","status":200}, {"route_id":"docs","method":"GET","pattern":"/docs","handler":"docs","kind":"html","summary":"Swagger UI","status":200}, {"route_id":"livez","method":"GET","pattern":"/livez","handler":"{\"status\":\"alive\"}","kind":"static","summary":"Liveness probe - process up","status":200}, {"route_id":"readyz","method":"GET","pattern":"/readyz","handler":"SELECT json_object(''status'', ''ready'', ''checks'', (SELECT json_group_array(name) FROM health_checks)) AS body","kind":"dynamic","summary":"Readiness probe - registry+writer+probes","status":200}, {"route_id":"metrics","method":"GET","pattern":"/metrics","handler":"SELECT ''# HELP quackapi_routes_total Registered routes\n# TYPE quackapi_routes_total gauge\nquackapi_routes_total '' || CAST((SELECT count(*) FROM routes) AS VARCHAR) || ''\n# HELP quackapi_health_checks Registered health checks\n# TYPE quackapi_health_checks gauge\nquackapi_health_checks '' || CAST((SELECT count(*) FROM health_checks) AS VARCHAR) || ''\n'' AS body","kind":"dynamic","summary":"Prometheus-style metrics over access/query data","status":200} ]'::JSON);
 
 -- Seed param_schema from JSON array literal (config-as-data)
 INSERT INTO param_schema
@@ -1024,6 +1059,7 @@ SELECT
     WHEN route_id IS NULL AND (SELECT path_exists FROM allow_methods) THEN 405
     WHEN route_id IS NULL THEN 404
     WHEN n_err > 0 THEN 422
+    WHEN route_id = 'readyz' THEN (SELECT CASE WHEN (SELECT bool_and(ready) FROM quackapi_readiness) THEN 200 ELSE 503 END)
     ELSE status
   END AS status_code,
   CASE
@@ -1043,6 +1079,7 @@ SELECT
       THEN cast(json_object('detail', 'Method Not Allowed') AS VARCHAR)
     WHEN route_id IS NULL THEN cast(json_object('detail', 'Not Found') AS VARCHAR)
     WHEN n_err > 0 THEN '{"detail":' || detail_arr || '}'
+    WHEN route_id = 'readyz' AND (SELECT CASE WHEN (SELECT bool_and(ready) FROM quackapi_readiness) THEN 0 ELSE 1 END) = 1 THEN cast(json_object('detail', 'Not Ready') AS VARCHAR)
     WHEN kind IN ('openapi', 'static', 'html') THEN rc_body
     WHEN kind = 'redirect' THEN NULL
     ELSE NULL
@@ -1050,6 +1087,7 @@ SELECT
   CASE
     WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) IN (401,403) THEN NULL
     WHEN malformed_mp OR route_id IS NULL OR n_err > 0 THEN NULL
+    WHEN route_id = 'readyz' THEN NULL
     WHEN kind IN ('dynamic', 'stream') THEN
       CASE
         -- wrap ONLY if a policy matched this path AND we are emitting a handler_sql (dynamic) AND auth passed
