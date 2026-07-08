@@ -51,7 +51,12 @@ CREATE OR REPLACE TABLE routes (
   handler VARCHAR,
   kind VARCHAR,
   summary VARCHAR,
-  status INTEGER
+  status INTEGER,
+  -- #1357 response field include/exclude (FastAPI response_model_include / response_model_exclude).
+  -- NULL = no projection. Applied to the handler's JSON `body` at response time. See
+  -- _apply_field_projection / _compose_handler_sql below.
+  include_fields VARCHAR[],
+  exclude_fields VARCHAR[]
 );
 
 CREATE OR REPLACE TABLE param_schema (
@@ -74,7 +79,7 @@ CREATE OR REPLACE TABLE route_headers (
 
 -- register_route macro: app.sql calls this to produce route rows (no VALUES-literal hardcode of config rows in app).
 -- Usage: INSERT INTO routes SELECT * FROM register_route('id', 'GET', '/p', 'HANDLER', 'dynamic', 'sum', 200);
-CREATE OR REPLACE MACRO register_route(route_id, method, pattern, handler, kind, summary, status := 200) AS TABLE (
+CREATE OR REPLACE MACRO register_route(route_id, method, pattern, handler, kind, summary, status := 200, include_fields := NULL, exclude_fields := NULL) AS TABLE (
   SELECT
     route_id AS route_id,
     method AS method,
@@ -82,7 +87,11 @@ CREATE OR REPLACE MACRO register_route(route_id, method, pattern, handler, kind,
     handler AS handler,
     kind AS kind,
     summary AS summary,
-    status AS status
+    status AS status,
+    -- #1357 response projection (default NULL = no projection). CAST pins the column type so
+    -- `INSERT INTO routes SELECT * FROM register_route(...)` keeps matching the routes schema.
+    CAST(include_fields AS VARCHAR[]) AS include_fields,
+    CAST(exclude_fields AS VARCHAR[]) AS exclude_fields
 );
 
 -- register_redirect: convenience for 3xx redirects. Inserts a route row (kind='redirect', status=3xx).
@@ -197,7 +206,9 @@ CREATE OR REPLACE MACRO _build_request_json(method, clean_path, pmap, qmap, head
 );
 
 -- Seed routes from JSON array literal (config-as-data)
-INSERT INTO routes
+-- Explicit column list: routes now carries include_fields/exclude_fields (#1357) which the
+-- seed leaves NULL, so a positional 7-column INSERT would no longer line up.
+INSERT INTO routes (route_id, method, pattern, handler, kind, summary, status)
 SELECT
   json_extract_string(value, '$.route_id'),
   json_extract_string(value, '$.method'),
@@ -218,6 +229,76 @@ SELECT
   json_extract_string(value, '$.required')::BOOLEAN,
   json_extract_string(value, '$.constraint_json')
 FROM json_each('[ {"route_id":"get_user","name":"id","location":"path","type":"int","required":true,"constraint_json":null}, {"route_id":"get_post","name":"id","location":"path","type":"int","required":true,"constraint_json":null}, {"route_id":"get_post","name":"post_id","location":"path","type":"int","required":true,"constraint_json":null}, {"route_id":"search","name":"q","location":"query","type":"string","required":true,"constraint_json":null}, {"route_id":"search","name":"limit","location":"query","type":"int","required":false,"constraint_json":"{\"le\":100}"}, {"route_id":"create_user","name":"name","location":"body","type":"string","required":true,"constraint_json":null}, {"route_id":"create_user","name":"age","location":"body","type":"int","required":true,"constraint_json":null} ]'::JSON);
+
+-- ── #1357 response field include/exclude (FastAPI response_model_include / _exclude) ──────
+-- The handler's response `body` is a JSON string — either an object (`to_json(u)`) or an array
+-- of objects (`json_group_array(...)`). Projection keeps only include_fields (whitelist) and/or
+-- drops exclude_fields (blacklist), per top-level key, applied element-wise when body is an array.
+-- NULL/NULL = passthrough; non-JSON or scalar-JSON bodies pass through untouched.
+--
+-- _project_object_fields is intentionally pure, flat, and subquery-free so it is safe to call
+-- inside a list_transform lambda (the array case) without tripping DuckDB's "subqueries in
+-- lambda" binder error. to_json(MAP(VARCHAR, JSON)) round-trips nested JSON without re-encoding.
+CREATE OR REPLACE MACRO _project_object_fields(obj, include_fields, exclude_fields) AS (
+  to_json(map_from_entries(list_filter(
+    map_entries(obj::MAP(VARCHAR, JSON)),
+    lambda e: (include_fields IS NULL OR list_contains(include_fields, e.key))
+          AND (exclude_fields IS NULL OR NOT list_contains(exclude_fields, e.key))
+  )))
+);
+
+CREATE OR REPLACE MACRO _apply_field_projection(body, include_fields, exclude_fields) AS (
+  CASE
+    WHEN body IS NULL THEN body
+    WHEN include_fields IS NULL AND exclude_fields IS NULL THEN body
+    WHEN json_valid(body) AND json_type(body) = 'ARRAY'
+      THEN to_json(list_transform((body::JSON)::JSON[],
+             lambda row: _project_object_fields(row, include_fields, exclude_fields)::JSON))::VARCHAR
+    WHEN json_valid(body) AND json_type(body) = 'OBJECT'
+      THEN _project_object_fields(body::JSON, include_fields, exclude_fields)::VARCHAR
+    ELSE body
+  END
+);
+
+-- Render a VARCHAR[] as a SQL array literal for embedding into a generated handler_sql string
+-- (single quotes doubled). NULL -> the bare token NULL (so the emitted call is well-formed).
+CREATE OR REPLACE MACRO _sql_str_array_literal(arr) AS (
+  CASE WHEN arr IS NULL THEN 'NULL'
+       ELSE '[' || array_to_string(
+              list_transform(arr, lambda x: '''' || replace(x, '''', '''''') || ''''), ', ') || ']'
+  END
+);
+
+-- Projection wraps the handler output in an outer SELECT, which is only legal for SELECT-shaped
+-- handlers (SELECT / WITH). DuckDB forbids DML inside a CTE, so INSERT/UPDATE/DELETE ... RETURNING
+-- handlers are not projectable in v1 (documented follow-up). starts_with, not LIKE/regex.
+CREATE OR REPLACE MACRO _handler_is_projectable(hsql) AS (
+  hsql IS NOT NULL
+  AND (starts_with(upper(ltrim(hsql)), 'SELECT') OR starts_with(upper(ltrim(hsql)), 'WITH'))
+);
+
+-- Compose the emitted handler_sql from the raw handler + optional auth claims CTE (_ctx) +
+-- optional #1357 projection (_raw CTE + _apply_field_projection over body). When both apply,
+-- _ctx and _raw are sibling CTEs so the handler can read claims AND still be projected. The
+-- auth-only branch is byte-identical to the prior inline wrap (keeps existing parity green).
+CREATE OR REPLACE MACRO _compose_handler_sql(hsql, do_auth, claims_j, include_fields, exclude_fields) AS (
+  CASE
+    WHEN hsql IS NULL THEN NULL
+    WHEN (include_fields IS NOT NULL OR exclude_fields IS NOT NULL) AND _handler_is_projectable(hsql) THEN
+      'WITH '
+      || CASE WHEN do_auth THEN
+           '_ctx AS (SELECT ''' || replace(COALESCE(claims_j, '{}'), '''', '''''')
+           || '''::JSON::MAP(VARCHAR,VARCHAR) AS claims, ''{}''::JSON AS request), '
+         ELSE '' END
+      || '_raw AS (' || hsql || ') '
+      || 'SELECT _apply_field_projection(body, ' || _sql_str_array_literal(include_fields)
+      || ', ' || _sql_str_array_literal(exclude_fields) || ') AS body FROM _raw'
+    WHEN do_auth THEN
+      'WITH _ctx AS (SELECT ''' || replace(COALESCE(claims_j, '{}'), '''', '''''')
+      || '''::JSON::MAP(VARCHAR,VARCHAR) AS claims, ''{}''::JSON AS request) ' || hsql
+    ELSE hsql
+  END
+);
 
 -- ============================================================================
 -- handle_request — the ONE SQL brain, self-contained. No materialized derived
@@ -533,6 +614,7 @@ route_idx AS (
   -- identifier with the argument value, turning the column into a literal).
   SELECT
     route_id, routes.method AS method, pattern, handler, kind, summary, status,
+    include_fields, exclude_fields,
     list_filter(string_split(pattern, '/'), lambda x: len(x) > 0) AS pat_segs,
     len(list_filter(string_split(pattern, '/'), lambda x: len(x) > 0)) AS seg_count,
     len(list_filter(list_filter(string_split(pattern, '/'), lambda x: len(x) > 0), lambda s: NOT starts_with(s, '{'))) AS literal_count
@@ -565,6 +647,7 @@ allow_methods AS (
 matched AS (
   SELECT
     ri.route_id, ri.method, ri.pattern, ri.handler, ri.kind, ri.summary, ri.status,
+    ri.include_fields, ri.exclude_fields,
     ri.pat_segs, r.req_segs
   FROM route_idx ri, req r
   WHERE (ri.method = method OR (method = 'HEAD' AND ri.method = 'GET'))
@@ -1003,7 +1086,7 @@ rendered_static AS (
 -- re-run routing. best executes once.
 -- is_malformed_multipart carries into result for short-circuit 422 (structural body error).
 result AS (
-  SELECT b.route_id, b.kind, b.status, ea.n_err, ea.detail_arr, rs.content_type AS rc_ct, rs.body AS rc_body, hr.hsql,
+  SELECT b.route_id, b.kind, b.status, b.include_fields, b.exclude_fields, ea.n_err, ea.detail_arr, rs.content_type AS rc_ct, rs.body AS rc_body, hr.hsql,
     -- resp_headers from route_headers side table (additive). For 404 -> '{}'; for matched (incl 422 errs) emit the route's static headers.
     COALESCE((SELECT json_group_object(name, value) FROM route_headers WHERE route_id = b.route_id), '{}') AS resp_headers,
     (SELECT yes FROM is_malformed_multipart) AS malformed_mp,
@@ -1051,12 +1134,16 @@ SELECT
     WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) IN (401,403) THEN NULL
     WHEN malformed_mp OR route_id IS NULL OR n_err > 0 THEN NULL
     WHEN kind IN ('dynamic', 'stream') THEN
-      CASE
-        -- wrap ONLY if a policy matched this path AND we are emitting a handler_sql (dynamic) AND auth passed
-        WHEN (SELECT has_pol FROM result LIMIT 1) AND (SELECT vok FROM result LIMIT 1) AND hsql IS NOT NULL THEN
-          'WITH _ctx AS (SELECT ''' || replace(COALESCE((SELECT claims_j FROM result LIMIT 1), '{}'), '''', '''''') || '''::JSON::MAP(VARCHAR,VARCHAR) AS claims, ''{}''::JSON AS request) ' || hsql
-        ELSE hsql
-      END
+      -- Compose emitted handler_sql: optional auth (_ctx claims CTE) + optional #1357 response
+      -- field projection (_raw CTE + _apply_field_projection over body). Both become sibling CTEs
+      -- so a handler can read claims AND be projected. See _compose_handler_sql above.
+      _compose_handler_sql(
+        hsql,
+        (SELECT has_pol FROM result LIMIT 1) AND (SELECT vok FROM result LIMIT 1),
+        (SELECT claims_j FROM result LIMIT 1),
+        include_fields,
+        exclude_fields
+      )
     WHEN kind = 'redirect' THEN NULL
     ELSE NULL
   END AS handler_sql,

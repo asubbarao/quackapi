@@ -741,6 +741,55 @@ INSERT INTO _test_results
 -- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
 -- ─────────────────────────────────────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────────────────────────
+-- #1357  Response field include / exclude projection (FastAPI response_model_*)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Unit: _apply_field_projection over the two body shapes handlers produce (object + array).
+INSERT INTO _test_results
+  SELECT 'FIELDS exclude drops key (object)',
+         _apply_field_projection('{"id":1,"name":"al","age":30}', NULL, ['age']) = '{"id":1,"name":"al"}',
+         coalesce(_apply_field_projection('{"id":1,"name":"al","age":30}', NULL, ['age']), '<null>')
+  UNION ALL
+  SELECT 'FIELDS include keeps only listed (object)',
+         _apply_field_projection('{"id":1,"name":"al","age":30}', ['name'], NULL) = '{"name":"al"}',
+         coalesce(_apply_field_projection('{"id":1,"name":"al","age":30}', ['name'], NULL), '<null>')
+  UNION ALL
+  SELECT 'FIELDS exclude is element-wise (array)',
+         _apply_field_projection('[{"id":1,"age":30},{"id":2,"age":25}]', NULL, ['age']) = '[{"id":1},{"id":2}]',
+         coalesce(_apply_field_projection('[{"id":1,"age":30},{"id":2,"age":25}]', NULL, ['age']), '<null>')
+  UNION ALL
+  SELECT 'FIELDS null/null is passthrough',
+         _apply_field_projection('{"id":1,"age":30}', NULL, NULL) = '{"id":1,"age":30}',
+         coalesce(_apply_field_projection('{"id":1,"age":30}', NULL, NULL), '<null>')
+  UNION ALL
+  SELECT 'FIELDS null body stays null',
+         _apply_field_projection(NULL, NULL, ['age']) IS NULL,
+         '<null>';
+
+-- Wiring: a route registered with exclude_fields emits a handler_sql that wraps the handler
+-- in a _raw CTE and projects the body via _apply_field_projection (with the array literal baked).
+INSERT INTO routes SELECT * FROM register_route('proj_excl','GET','/proj/{id}','SELECT to_json(u) AS body FROM users u WHERE u.id = {id}','dynamic','proj',200, exclude_fields := ['age']);
+INSERT INTO param_schema VALUES ('proj_excl','id','path','int',true,NULL);
+WITH r AS (SELECT * FROM handle_request('GET','/proj/1','{}',''))
+INSERT INTO _test_results
+  SELECT 'FIELDS route → handler_sql wraps handler in _raw', instr(r.handler_sql, '_raw AS (') > 0, coalesce(r.handler_sql,'<null>') FROM r
+  UNION ALL
+  SELECT 'FIELDS route → handler_sql projects body via _apply_field_projection',
+         instr(r.handler_sql, '_apply_field_projection(body') > 0 AND instr(r.handler_sql, '[''age'']') > 0,
+         coalesce(r.handler_sql,'<null>') FROM r
+  UNION ALL
+  SELECT 'FIELDS route → still 200', r.status_code = 200, 'got '||r.status_code::VARCHAR FROM r;
+
+-- End-to-end (eval the emitted shape): the real get_user body projects to omit age.
+WITH _raw AS (SELECT to_json(u) AS body FROM users u WHERE u.id = 1)
+INSERT INTO _test_results
+  SELECT 'FIELDS end-to-end: projected user body omits age',
+         _apply_field_projection(body, NULL, ['age']) = '{"id":1,"name":"alice"}',
+         coalesce(_apply_field_projection(body, NULL, ['age']), '<null>') FROM _raw;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SUMMARY — print all results, then a pass/fail aggregate
+-- ─────────────────────────────────────────────────────────────────────────────
 SELECT check_name, pass, detail FROM _test_results ORDER BY pass ASC, check_name;
 
 SELECT
