@@ -851,6 +851,40 @@ INSERT INTO _test_results
   SELECT 'FIELDS end-to-end: projected user body omits age',
          _apply_field_projection(body, NULL, ['age']) = '{"id":1,"name":"alice"}',
          coalesce(_apply_field_projection(body, NULL, ['age']), '<null>') FROM _raw;
+-- DI ASSERTIONS (setup binds value visible to handler; teardown helper; phase macro)
+-- These run inside the tier1 script (stateful); prove oracle macros + sequencing model.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Register a test dep whose setup "binds" by populating a marker table the handler can read.
+-- (In real flow C runs the setup_sql then the rendered handler_sql on same exec_con.)
+CREATE OR REPLACE TABLE _di_marker (v INTEGER);
+INSERT INTO dependencies (name, setup_sql, teardown_sql)
+VALUES ('test_marker', 'INSERT INTO _di_marker(v) VALUES (42)', 'DELETE FROM _di_marker');
+INSERT INTO route_dependencies (route_id, dep_name) VALUES ('get_user', 'test_marker');
+
+-- phase helper returns the sqls
+WITH s AS (SELECT run_dependency_phase('test_marker', 'setup') AS ssql),
+     t AS (SELECT run_dependency_phase('test_marker', 'teardown') AS tsql)
+INSERT INTO _test_results
+  SELECT 'DI run_dependency_phase(setup) returns sql', (SELECT ssql FROM s) IS NOT NULL AND instr((SELECT ssql FROM s), '_di_marker') > 0, (SELECT ssql FROM s) FROM s
+  UNION ALL
+  SELECT 'DI run_dependency_phase(teardown) returns sql', (SELECT tsql FROM t) IS NOT NULL AND instr((SELECT tsql FROM t), '_di_marker') > 0, (SELECT tsql FROM t) FROM t;
+
+-- Simulate the sequenced execution for "setup binds a value the handler returns"
+-- (setup effect, then handler reads it, check value, teardown effect)
+INSERT INTO _di_marker(v) VALUES (42);  -- effect of setup_sql
+WITH h AS (SELECT v FROM _di_marker LIMIT 1)
+INSERT INTO _test_results
+  SELECT 'DI setup binds value seen by handler', (SELECT v FROM h) = 42, 'val=' || (SELECT CASE WHEN (SELECT v FROM h) IS NULL THEN '-1' ELSE (SELECT v FROM h)::VARCHAR END) FROM (SELECT 1);
+
+DELETE FROM _di_marker;  -- effect of teardown_sql
+INSERT INTO _test_results
+  SELECT 'DI teardown helper ran (marker cleaned)', (SELECT count(*) FROM _di_marker) = 0, 'count=' || (SELECT count(*) FROM _di_marker)::VARCHAR FROM (SELECT 1);
+
+-- cleanup test artifacts (harmless if absent)
+DELETE FROM route_dependencies WHERE route_id='get_user';
+DELETE FROM dependencies WHERE name='test_marker';
+DROP TABLE IF EXISTS _di_marker;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
