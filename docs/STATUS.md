@@ -86,7 +86,7 @@ rows below (except lifecycle, which is built-in-worktree-but-unmerged).
 |---|---|---|---|---|
 | 75 | #754 | First-class sessions | `CREATE SESSION` — server store IS a table; cookie issue/verify + CSRF | **not started in code** (0 markers); spec ready (`SESSION_CSRF_SPEC.md`), worktree `q-sessions` |
 | 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | **oracle built, UNMERGED** — on `fleet/lifecycle` (`5f250a1`), 0 markers in main; merge or fold in |
-| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **not started** (0 markers); needs outbound-POST verdict first |
+| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **WIP parked in stash** — `6088198` on `fleet/oauth-cpp` (+100 framework.sql, +45 tier-1); 0 markers in main; needs outbound-POST verdict + un-stash before continuing |
 | 37 | #1428 | Keycloak/OIDC | same OAuth2 machinery + discovery URL | **not started** (rides #335) |
 
 **Phase-0 auth gate: CLEARED** (was listed here as pending — it is not). `_constant_time_str_equals`
