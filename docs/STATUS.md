@@ -1,23 +1,32 @@
 # quackapi — STATUS (READ THIS FIRST)
 
-> **LIVING DOC — single source of current truth.** Last verified against code: **2026-07-08**.
+> **LIVING DOC — single source of current truth.** Last verified against code + `git log`: **2026-07-09**.
 > **Replaces `docs/FEATURE_GAP_MATRIX.md` (DELETED 2026-07-08).** That file was a *frozen 2026-07-02
 > snapshot* that graded post-R2/B7 work as "HARD." A fresh agent read it as current state and
 > hallucinated that shipped features (parallelism, concurrency, async access-log, keep-alive, DI,
 > field-projection) were still open. This doc exists so that never happens again.
+>
+> **2026-07-09 audit note (learn from this):** the previous cut of THIS doc (2026-07-08) committed the
+> SAME sin recursively — it listed **health #1907, DI #11143, and the Phase-0 auth gate as "building"
+> / "open"** while `git log` showed all three already merged to `main` *before* the doc was written.
+> Whoever wrote it transcribed the roadmap from the *specs*, not from the *code*. Corrected below.
 
 ## Rule for any agent reading this
 
 1. **Do NOT infer "gaps" from any dated snapshot.** A doc with a date in its header is a photograph,
    not a live feed. If it grades a feature "HARD"/"open", assume it may be months of work stale.
-2. **Truth lives in the code, then the debt list — this file is only the index.** Verification order:
+2. **Before you call anything "building"/"open", run `git log --oneline -20` and grep the code.** The
+   2026-07-08 staleness bug was exactly this: the doc claimed merged features were unbuilt. A
+   `feat(#NNNN)` commit + a marker in `framework.sql`/`quackapi_extension.cpp` beats any prose here.
+3. **Truth lives in the code, then the debt list — this file is only the index.** Verification order:
    1. `framework.sql` + `ext-cpp/src/quackapi_brain.cpp` + `ext-cpp/src/quackapi_extension.cpp` (the code).
-   2. `docs/BACKLOG.md` (the live debt/decision queue — kept current).
-   3. `ext-cpp/B*_RESULT.md` / `*_RESULT.md` (dated proof-of-work with re-runnable evidence).
-   4. This file (the map).
-3. **A green claim without a re-runnable command is not evidence.** Every "shipped" row below carries
+   2. `git log --oneline` (what actually merged).
+   3. `docs/BACKLOG.md` (the live debt/decision queue).
+   4. `ext-cpp/B*_RESULT.md` / `*_RESULT.md` (dated proof-of-work with re-runnable evidence).
+   5. This file (the map).
+4. **A green claim without a re-runnable command is not evidence.** Every "shipped" row below carries
    one. Grok/subagent "all green" has been wrong twice — certify personally before believing.
-4. **If this doc and the code disagree, the CODE wins — fix this doc.**
+5. **If this doc and the code disagree, the CODE wins — fix this doc.**
 
 ---
 
@@ -49,6 +58,10 @@ gated at **≥59k /search** (`BACKLOG.md` §4).
 | OpenAPI + Swagger UI | Parity, arguably better (generation is a `SELECT`) | boot `serve_brain`, curl `/openapi.json` `/docs` |
 | `CREATE ROUTE` live DDL registration | Strictly better (no restart; FastAPI needs one) | `quackapi_extension.cpp` ParserExtension |
 | Response field include/exclude (**FastAPI #1357**) | **Shipped** — `CREATE ROUTE … FIELDS(INCLUDE… \| EXCLUDE…)` | oracle 156/156; `_apply_field_projection` |
+| Health / readiness / liveness + `/metrics` (**#1907**) | **Shipped (oracle + C)** — merged `e520a0c`/`e2520f0` | `CREATE HEALTH CHECK`, `/livez` `/readyz` in `framework.sql`; C `HEALTH` sugar in `quackapi_extension.cpp` |
+| Request-scoped DI setup/teardown (**#11143 yield-DI**) | **Shipped (oracle + C)** — merged `962c1af`/`1435a6f` | `CREATE DEPENDENCY … SETUP … TEARDOWN …`; `dependencies`/`route_dependencies` + `run_dependency_phase`; C worker runs `setup; handler; teardown (always)` on `exec_con`; `test/di.test.sql` |
+| Phase-0 auth gate — constant-time compare + oracle auth wiring | **Shipped** — merged `ec7ade6`/`602450d` | `_constant_time_str_equals` (XOR-fold, replaced `=`); authenticate→authorize wired into oracle `handle_request` |
+| gzip response compression (= FastAPI `GZipMiddleware`) | **Shipped (main)** — source in `ext-cpp/src/quackapi_brain.cpp` (+`-lz`), built exit 0, live curl matrix certified | `Content-Encoding: gzip` + `Vary` on `/openapi.json`; <860B skipped; SSE untouched; regression 200s |
 | Auto-HEAD for every GET (**#1773**) | **Shipped** (R4) | parity 40/40, tier-1 112/112, live curl |
 | SSE / chunked streaming | Have, verified | curl `-N` on the stream route |
 | Multipart uploads (text-safe v1) | Have (R3); binary/base64 = v2 planned | `MULTIPART_SPEC.md` |
@@ -63,29 +76,22 @@ gated at **≥59k /search** (`BACKLOG.md` §4).
 
 ---
 
-## Built, pending certification (NOT merged to main)
-
-| Feature | Where | Evidence | Gate to merge |
-|---|---|---|---|
-| **gzip response compression** (= FastAPI `GZipMiddleware`) | worktree `q-gzip` (`ext-cpp/src/quackapi_brain.cpp` +124, `CMakeLists.txt` `-lz`) | grok curl matrix in `/tmp/grok_gzip.log`: `Content-Encoding: gzip` on `/openapi.json`, decode-to-valid-JSON, no-header→plaintext, tiny-body skipped (<860B), SSE untouched, `/health`/`/users`/`/search` regression 200 | **My** cert: oracle tier-1 + fresh-port boot + curl matrix, then merge serially |
-
----
-
 ## Building — the FastAPI "most-wanted, closed unresolved" hit list (Wave A)
 
-See `docs/FASTAPI_MOST_WANTED.md` (the pitch scoreboard) for the full upvote table.
+See `docs/FASTAPI_MOST_WANTED.md` (the pitch scoreboard) for the full upvote table. **Verified against
+`git log` + code markers 2026-07-09** — 0 matches in `framework.sql`/`quackapi_extension.cpp` for the
+rows below (except lifecycle, which is built-in-worktree-but-unmerged).
 
-| 👍 | Issue | Feature | Mechanism | Status |
+| 👍 | Issue | Feature | Mechanism | Status (code-verified) |
 |---|---|---|---|---|
-| 75 | #754 | First-class sessions | `CREATE SESSION` — server store IS a table; cookie issue/verify + CSRF | building (`SESSION_CSRF_SPEC.md`) |
-| 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | partial→building |
-| 62 | #1907 | readiness/liveness/health | `CREATE HEALTH CHECK` + `/livez` `/readyz` + `/metrics` as a `SELECT` | building |
-| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | building |
-| 37 | #1428 | Keycloak/OIDC | same OAuth2 machinery + discovery URL | building |
+| 75 | #754 | First-class sessions | `CREATE SESSION` — server store IS a table; cookie issue/verify + CSRF | **not started in code** (0 markers); spec ready (`SESSION_CSRF_SPEC.md`), worktree `q-sessions` |
+| 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | **oracle built, UNMERGED** — on `fleet/lifecycle` (`5f250a1`), 0 markers in main; merge or fold in |
+| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **not started** (0 markers); needs outbound-POST verdict first |
+| 37 | #1428 | Keycloak/OIDC | same OAuth2 machinery + discovery URL | **not started** (rides #335) |
 
-**Phase-0 gate before any "secure" auth claim** (`BACKLOG.md` §3.3/§3.9): (1) real XOR-fold
-constant-time compare replacing DuckDB `=`; (2) wire the authenticate→authorize stage into the
-oracle `handle_request` (currently only the C server enforces).
+**Phase-0 auth gate: CLEARED** (was listed here as pending — it is not). `_constant_time_str_equals`
+(XOR-fold) replaced DuckDB `=`, and authenticate→authorize is wired into the oracle `handle_request`
+(merged `ec7ade6`/`602450d`). `BACKLOG.md` §3.3/§3.9 residuals are now polish, not a gate.
 
 ---
 
@@ -95,7 +101,7 @@ oracle `handle_request` (currently only the C server enforces).
 |---|---|---|
 | **Direct in-process TLS termination** | **Mechanism-limited.** Verified 2026-07-08: the vendored `duckdb_mbedtls` is a *crypto-only* static lib (HMAC/hash) — no `ssl.h`, no SSL/X.509/RNG; `mbedtls_ssl_init` is undefined against it. | **Proxy termination (Caddy / tailscale-serve) is v1 — that is uvicorn's own production answer.** Direct v2 needs a deliberate build decision (vendor full mbedTLS SSL, or vcpkg). `TLS_SPEC.md`. |
 | **Async I/O fan-out inside one handler** | Event-loop model wins for many-slow-upstream-calls in a single request. GET fan-out is already parallel via `curl_httpfs`; POST fan-out mechanism is settling (`http_client.http_post` vs shellfs+curl `xargs -P`). | Conceded as *different, not equal* — documented, not contorted. Throughput concurrency (many clients) is separately **won** (B6/B7). |
-| **Request-scoped DI with setup/teardown** | The real architectural tear of a stateless one-shot SQL dispatch model (FastAPI #11143/#10719/#1474). | Named honest edge; `probes/6_di_setup_teardown.sql`. Not overclaimed. |
+| **Request-scoped DI — live-object lifetime** | **Setup/teardown IS shipped** (#11143 — `CREATE DEPENDENCY`, C worker runs `setup; handler; teardown (always)`). The *narrow* residual: a dependency that must hold a **live object across statements** (an open cursor, a streaming client) — the one-shot model guarantees teardown *runs*, not that the same object identity is threaded through, the way a Python generator frame holds it. | Setup/teardown-SQL sequencing: **done**. Object-identity-across-statements: honest residual, rarely needed, not overclaimed. `test/di.test.sql`. |
 | **WebSockets on the main HTTP port** | Transport prototyped; app-layer wiring pending. Design decision is **radio** (the DuckDB realtime ext) + `CREATE ROUTE … WS`. | Spec'd (`WS_SPEC.md`); a decided design, not a missing capability. |
 | **Multipart binary** | v1 text-safe shipped; binary via base64 vs streaming parser is the open call. | `MULTIPART_SPEC.md` §6/§7. |
 | **Horizontal scale + ecosystem/Stack-Overflow familiarity** | Single-process blast radius until Quack multi-writer; smaller SO corpus than FastAPI. | Conceded, countered by the whole DuckDB extension ecosystem being the "standard library" + a cleaner `INSTALL quackapi FROM community` story. |
@@ -115,8 +121,12 @@ sugar layer wired into `handle_request`. What FastAPI needs a pip **plus a runni
 (Redis, a broker, a search cluster, an S3 SDK), quackapi gets from `LOAD`.
 
 **Tier 1 — undercut whole products (mostly ext-backed):**
-- `CREATE SUBSCRIPTION` (Supabase Realtime) **+** WebSockets on the main port **+** Redis-style
-  pub/sub → **`radio` ext** (message bus + WS). One extension collapses all three.
+- `CREATE SUBSCRIPTION` — consume an upstream `ws://`/`wss://` feed or Redis channel (materialize
+  `INTO` a table or run a per-message `HANDLER`) → **`radio` ext**. Verified round-trip 2026-07-06;
+  spec complete, buildable now (`SUBSCRIPTION_SPEC.md`). **Nuance (verified): radio is a CLIENT only
+  — it dials outbound; it does NOT accept inbound browser WebSocket connections.**
+- WebSockets on the main port (browser → quackapi, `@app.websocket` equivalent) → **C-server work**
+  (per-connection threads, `WS_SPEC.md`), NOT radio. Redis-style pub/sub (outbound) → `radio`.
 - `CREATE API FOR TABLE` (PostgREST / Supabase auto-API) → SQL over the catalog (a real build);
   for a Postgres backend the **`postgres` ext** passthrough undercuts PostgREST directly.
 - `CREATE POLICY` (PostgREST RLS) → SQL predicate + **`crypto` ext** (`crypto_hmac`) for token verify.
@@ -139,7 +149,7 @@ OAuth2 #335 · OIDC/Keycloak #1428.
 | What people want | In FastAPI-land you reach for | quackapi mechanism | What it undercuts | Status |
 |---|---|---|---|---|
 | **Auto REST/CRUD from a table** | `fastapi-crudrouter` (unmaintained) → drop to PostgREST/Supabase | `CREATE API FOR TABLE` | **PostgREST, Supabase auto-API** | spec'd (`TABLE_API_SPEC.md`) |
-| **Row-level security / multi-tenant** | hand-rolled `Depends` or Postgres RLS | `CREATE POLICY` (PERMISSIVE/RESTRICTIVE stacking, owner-from-token presets) | **PostgREST RLS, custom authz layers** | C-enforce shipped; oracle wiring pending |
+| **Row-level security / multi-tenant** | hand-rolled `Depends` or Postgres RLS | `CREATE POLICY` (PERMISSIVE/RESTRICTIVE stacking, owner-from-token presets) | **PostgREST RLS, custom authz layers** | **shipped (oracle + C)** — Phase-0 wired oracle enforcement |
 | **Realtime change feed / subscriptions** | Supabase Realtime, `broadcaster`, hand-rolled | `CREATE SUBSCRIPTION` (change-feed over shipped SSE) | **Supabase Realtime** | spec'd (`SUBSCRIPTION_SPEC.md`) |
 | **Rate limiting** | `slowapi` (3rd-party) | `CREATE RATE LIMIT` (sliding window over the request-log table) | slowapi, nginx `limit_req` | named |
 | **Background jobs / scheduled tasks** | Celery + Redis + beat | `CREATE JOB QUEUE` / `CREATE CRON` (cronjob ext) | **Celery + Redis, APScheduler** | named |
@@ -147,7 +157,7 @@ OAuth2 #335 · OIDC/Keycloak #1428.
 | **Fuzzy / typo-tolerant search** | `rapidfuzz` glue | `rapidfuzz` ext, native | — | ext available |
 | **Response caching + ETag/304** | `fastapi-cache` | `CACHE` clause + ETag over a result table | fastapi-cache | named |
 | **Pagination** | `fastapi-pagination` | native `LIMIT/OFFSET` + `PAGINATE` clause | fastapi-pagination | near-trivial |
-| **gzip compression** | `GZipMiddleware` (built-in) | C write-path gzip | — | **built, pending cert** |
+| **gzip compression** | `GZipMiddleware` (built-in) | C write-path gzip | — | **shipped (main, certified)** |
 | **Metrics / Prometheus** | `prometheus-fastapi-instrumentator` | `/metrics` as a `SELECT` over log tables | instrumentator | named |
 | **Admin panel** | `sqladmin`, `fastapi-admin` | embedded single-file Admin UI | sqladmin | spec'd (`ADMIN_UI_SPEC.md`) |
 | **File storage (S3/local)** | `boto3` glue | `CREATE STORAGE` (httpfs native) | boto3 glue | named |
@@ -167,17 +177,21 @@ OAuth2 #335 · OIDC/Keycloak #1428.
 
 Weighted by leverage × cost, where **ext-backed = cheap** (`LOAD` + sugar, not reimplementation).
 
-0. **Certify + merge gzip** — built in worktree `q-gzip`, pending my cert. Boot + run the curl matrix
-   myself before merge; grok "all green" is not evidence. Fast, closes in-flight work.
-1. **Phase-0 auth gate** (`BACKLOG.md` §3.3/§3.9) — real XOR-fold constant-time compare + wire
-   authenticate→authorize into the oracle `handle_request` (only C enforces today). Small; unblocks
-   everything auth/session/policy. Uses the **`crypto` ext** already in play.
-2. **radio cluster** — `CREATE SUBSCRIPTION` (Supabase Realtime killer) + WebSockets on the main
-   port, both riding the **`radio` ext** (bus + WS). High leverage, low cost — mostly DDL sugar +
-   wiring since radio owns the transport. Verify radio's server-side WS surface before building.
-3. **`CREATE API FOR TABLE`** — the flagship auto-CRUD (PostgREST / Supabase killer). Rides #1/#2
-   policy for row security so auto-exposing a table isn't a footgun.
-4. **Wave-A most-wanted:** sessions #754 → health/readiness #1907 → lifecycle #617 → OAuth2 #335 / OIDC #1428.
+~~0. Certify + merge gzip~~ **DONE** — in main, built exit 0, curl matrix certified.
+~~1. Phase-0 auth gate~~ **DONE** — constant-time compare + oracle auth wiring merged.
+
+1. **`CREATE SUBSCRIPTION` (radio-backed)** — consume upstream `ws`/`redis` feeds; materialize
+   `INTO` a table or handler-dispatch per message. Spec complete + radio round-trip verified
+   (`SUBSCRIPTION_SPEC.md`). Ext-backed = cheap (registry + poller + DDL sugar). Open design calls
+   to make first: handler-injection mechanism, admin-only security, restart durability. **Inbound
+   browser WS is a SEPARATE C-server track (`WS_SPEC.md`) — radio is a client, it can't accept
+   inbound connections.** Avoid `radio_subscriptions()` (UINT64 crash); use the per-URL helpers.
+2. **Merge / fold `CREATE LIFECYCLE` #617** — oracle already built on `fleet/lifecycle` (`5f250a1`);
+   certify + merge (or graft into the next feature branch) so it stops looking unbuilt.
+3. **`CREATE API FOR TABLE`** — the flagship auto-CRUD (PostgREST / Supabase killer). Rides the
+   already-shipped `CREATE POLICY` for row security so auto-exposing a table isn't a footgun.
+4. **Remaining Wave-A most-wanted:** sessions #754 → OAuth2 #335 / OIDC #1428 (health #1907 + DI
+   #11143 already shipped).
 
 Each feature: SUGAR-FIRST DDL, oracle tier-1 + `parity_b2.sh` (oracle == C) + a live curl matrix on a
 fresh 1845x port, **certified by me before merge**.
