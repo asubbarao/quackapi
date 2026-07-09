@@ -78,19 +78,17 @@ gated at **≥59k /search** (`BACKLOG.md` §4).
 
 ## Building — the FastAPI "most-wanted, closed unresolved" hit list (Wave A)
 
-See `docs/FASTAPI_MOST_WANTED.md` (the pitch scoreboard) for the full upvote table. **Verified against
-`git log` + code markers 2026-07-09, then re-audited the same day after the worktree salvage sweep**:
-main has 0 markers for the rows below, but every row except OIDC has real built-but-unmerged work on a
-`fleet/*` branch. (The earlier "not started" reads were false negatives — `git status` in the worktrees
-died on the broken nested `duckdb` submodule before listing dirty files; use
-`git status --ignore-submodules=all` in `quackapi-wt/*`.)
+See `docs/FASTAPI_MOST_WANTED.md` (the pitch scoreboard) for the full upvote table. **2026-07-09
+merge-and-certify pass** (after the salvage sweep exposed built-but-unmerged work the broken worktree
+`git status` had hidden — use `git status --ignore-submodules=all` in `quackapi-wt/*`): lifecycle, CORS,
+and sessions are now IN MAIN; tier-1 grew 178 → 192, all green at every step.
 
 | 👍 | Issue | Feature | Mechanism | Status (code-verified) |
 |---|---|---|---|---|
-| 75 | #754 | First-class sessions | `CREATE SESSION` — server store IS a table; cookie issue/verify + CSRF | **built, failed cert once, UNMERGED** — 07-08 build + fix + cert-prep passes; salvaged 2026-07-09 as WIP `2ef3000` on `fleet/sessions` (+291 framework.sql, +57 tier-1) + `fleet/sessions-cpp` (C mirror in progress). Needs re-cert against main |
-| 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | **oracle built, UNMERGED** — on `fleet/lifecycle` (`5f250a1`), 0 markers in main; merge or fold in |
-| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **TWO WIP vintages, UNMERGED** — worktree state salvaged as `9ddcc51` on `fleet/oauth` (+176 framework.sql, +55 tier-1) + `fleet/oauth-cpp-salvage`; older stash `6088198` on `fleet/oauth-cpp` (+100/+45). Reconcile the two, then outbound-POST verdict |
-| — | — | CORS (`CREATE CORS`, Starlette `CORSMiddleware` parity) | single global row in `quackapi_cors`; oracle + C worker | **built, UNMERGED** — 07-08 grok build was never lost, just invisible to broken `git status`; salvaged 2026-07-09 as `8506937` on `fleet/cors` (+217 framework.sql + middleware + tests) + `fleet/cors-cpp` |
+| 75 | #754 | First-class sessions | `CREATE SESSION STORE` + `CREATE AUTH … AS SESSION` — server store IS a table; signed sid\|exp\|hmac cookies + synchronizer CSRF | **MERGED (oracle)** `407200f` — tier-1 192/192. C mirror parked on `fleet/sessions-cpp` (forked pre-health/DI/gzip/CORS, failed 07-08 cert; needs rebase + own cert pass) |
+| 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | **MERGED (oracle)** `a7e14c5` — tier-1 gained 4 checks. C-side boot-runner (serve_brain executing STARTUP hooks) still open |
+| — | — | CORS (`CREATE CORS`, Starlette `CORSMiddleware` parity) | single global row in `quackapi_cors`; oracle + C worker | **MERGED + CERTIFIED end-to-end** `a1a7607` / ext-cpp `650cf07` — the salvaged build needed 7 real fixes (boot never loaded g_cors; sugar wrote non-JSON lists + never parsed scalar keys; `mi<sizeof-1` list mangler; HARDCODED ACAH/Expose fixture values; patch after early returns; dynamic emit dropped resp_headers entirely — that last one also silently ate Set-Cookie on handler responses; reason phrases). Cert: make test 85/85 + 7-case live curl matrix |
+| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **PARKED on `fleet/oauth` (`9ddcc51`)** — supersedes stash `6088198` (42 vs 22 markers; stash is an earlier draft, ignore it). 192/192 standalone, but merging = a 5-region semantic weave through the Phase-0 auth pipeline (scheme CASE, verify CTE, decision joins) AND token exchange still needs the outbound-POST verdict — do it as one deliberate rebase+finish pass, not a hand-weave |
 | 37 | #1428 | Keycloak/OIDC | same OAuth2 machinery + discovery URL | **not started** (rides #335) |
 
 **TLS note:** the 2026-07-09 direct-mbedTLS build job died 89s in (14 tool calls, nothing written) —
