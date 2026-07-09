@@ -804,9 +804,6 @@ INSERT INTO _test_results
   SELECT 'H6 /readyz handler NULL (special cased) post create', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- SUMMARY — print all results, then a pass/fail aggregate
--- ─────────────────────────────────────────────────────────────────────────────
--- ─────────────────────────────────────────────────────────────────────────────
 -- #1357  Response field include / exclude projection (FastAPI response_model_*)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Unit: _apply_field_projection over the two body shapes handlers produce (object + array).
@@ -851,6 +848,7 @@ INSERT INTO _test_results
   SELECT 'FIELDS end-to-end: projected user body omits age',
          _apply_field_projection(body, NULL, ['age']) = '{"id":1,"name":"alice"}',
          coalesce(_apply_field_projection(body, NULL, ['age']), '<null>') FROM _raw;
+
 -- DI ASSERTIONS (setup binds value visible to handler; teardown helper; phase macro)
 -- These run inside the tier1 script (stateful); prove oracle macros + sequencing model.
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -885,6 +883,59 @@ INSERT INTO _test_results
 DELETE FROM route_dependencies WHERE route_id='get_user';
 DELETE FROM dependencies WHERE name='test_marker';
 DROP TABLE IF EXISTS _di_marker;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SESSION + CSRF (oracle/tier1) — per SESSION_CSRF_SPEC (light; core helpers + table + sign/verify/revoke/expiry/csrf const covered; policed auth in live/C)
+-- ─────────────────────────────────────────────────────────────────────────────
+LOAD crypto;
+INSERT INTO quackapi_session_stores SELECT * FROM register_session_store('sessions', '01234567890123456789012345678901', 'sid', '/', 'Lax', false, 3600);
+
+-- Valid future session row with correct sig
+WITH p AS (SELECT 'sess_ora1' AS sid, CAST(CAST(floor(epoch(now() + INTERVAL '1 hour')) AS BIGINT) AS VARCHAR) AS exs, '01234567890123456789012345678901' AS sec),
+     cv AS (SELECT sid||'|'||exs||'|'||lower(hex(crypto_hmac('sha2-256', sec, sid||'|'||exs))) AS cv FROM p)
+INSERT INTO quackapi_sessions (id, subject, claims, created_at, expires_at, revoked_at, csrf_token, flash)
+SELECT 'sess_ora1', 'u_ora', to_json({'sub':'u_ora'}), now(), now()+INTERVAL '1 hour', NULL, 'csrf_ora_123', NULL;
+
+-- CHECK S1: sign/verify roundtrip
+WITH p AS (SELECT 'sess_ora1' AS sid, CAST(CAST(floor(epoch(now() + INTERVAL '1 hour')) AS BIGINT) AS VARCHAR) AS exs, '01234567890123456789012345678901' AS sec),
+     cv AS (SELECT sid||'|'||exs||'|'||lower(hex(crypto_hmac('sha2-256', sec, sid||'|'||exs))) AS cv FROM p),
+     v AS (SELECT _parse_and_verify_session_cookie( (SELECT cv FROM cv), (SELECT sec FROM p) ) AS pv FROM (SELECT 1) )
+INSERT INTO _test_results
+  SELECT 'SESS sign/verify roundtrip ok', (SELECT pv FROM v) IS NOT NULL, '' FROM (SELECT 1);
+
+-- CHECK S2: tampered sig verify fails
+WITH v AS (SELECT _parse_and_verify_session_cookie('sess_ora1|9999999999|badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadb', '01234567890123456789012345678901') AS pv FROM (SELECT 1) )
+INSERT INTO _test_results SELECT 'SESS tampered sig verify null', (SELECT pv FROM v) IS NULL, '' FROM (SELECT 1);
+
+-- CHECK S3: expired verify null (cookie exp_unix in the past; signed with correct secret so parse reaches exp check)
+INSERT INTO quackapi_sessions (id, subject, claims, created_at, expires_at, revoked_at, csrf_token)
+SELECT 'sess_exp','u_e',to_json({'sub':'u_e'}), now()-INTERVAL '2 hours', now()-INTERVAL '1 hour', NULL, 'csrf_e';
+WITH p AS (SELECT 'sess_exp' AS sid, CAST(CAST(floor(epoch(now() - INTERVAL '2 hours')) AS BIGINT) AS VARCHAR) AS exs, '01234567890123456789012345678901' AS sec),
+     cv AS (SELECT sid||'|'||exs||'|'||lower(hex(crypto_hmac('sha2-256', sec, sid||'|'||exs))) AS cv FROM p),
+     v AS (SELECT _parse_and_verify_session_cookie( (SELECT cv FROM cv), (SELECT sec FROM p) ) AS pv FROM (SELECT 1) )
+INSERT INTO _test_results SELECT 'SESS expired verify null', (SELECT pv FROM v) IS NULL, '' FROM (SELECT 1);
+
+-- CHECK S4: revoked verify null
+UPDATE quackapi_sessions SET revoked_at=now() WHERE id='sess_ora1';
+WITH p AS (SELECT 'sess_ora1' AS sid, CAST(CAST(floor(epoch(now() + INTERVAL '1 hour')) AS BIGINT) AS VARCHAR) AS exs, '01234567890123456789012345678901' AS sec),
+     cv AS (SELECT sid||'|'||exs||'|'||lower(hex(crypto_hmac('sha2-256', sec, sid||'|'||exs))) AS cv FROM p),
+     v AS (SELECT _verify_session_cookie( (SELECT cv FROM cv), (SELECT sec FROM p) ) AS pv FROM (SELECT 1) )
+INSERT INTO _test_results SELECT 'SESS revoked verify null', (SELECT pv FROM v) IS NULL, '' FROM (SELECT 1);
+UPDATE quackapi_sessions SET revoked_at=NULL WHERE id='sess_ora1';
+
+-- CHECK S5: csrf const time match/mismatch
+WITH m AS (SELECT _constant_time_str_equals('csrf_ora_123','csrf_ora_123') AS o FROM (SELECT 1)),
+     n AS (SELECT NOT _constant_time_str_equals('csrf_ora_123','wrong') AS o FROM (SELECT 1))
+INSERT INTO _test_results SELECT 'SESS csrf const eq match', (SELECT o FROM m), '' FROM (SELECT 1)
+UNION ALL SELECT 'SESS csrf const eq mismatch', (SELECT o FROM n), '' FROM (SELECT 1);
+
+-- CHECK S6: table row present
+WITH n AS (SELECT count(*) AS c FROM quackapi_sessions WHERE id='sess_ora1')
+INSERT INTO _test_results SELECT 'SESS table has live row', (SELECT c FROM n)=1, '' FROM (SELECT 1);
+
+-- CHECK S7: existing cookie param surface unaffected
+WITH r AS (SELECT * FROM handle_request('GET','/profile','{"_cookies":{"session":"s1"}}',''))
+INSERT INTO _test_results SELECT 'R1 cookie profile still 200', r.status_code=200, 'got '||r.status_code FROM r;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
