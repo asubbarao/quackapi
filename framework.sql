@@ -1214,7 +1214,7 @@ vok AS (
           rec AS ( SELECT (SELECT sid FROM parts) AS sid, try_cast( (SELECT exp_str FROM parts) AS BIGINT ) AS exp, (SELECT sig FROM parts) AS provided FROM (SELECT 1) ),
           es AS ( SELECT lower(hex( crypto_hmac('sha2-256', COALESCE((SELECT secret FROM sch),''), (SELECT sid FROM rec) || '|' || CAST( (SELECT exp FROM rec) AS VARCHAR ) ) )) AS es FROM (SELECT 1) ),
           vokp AS ( SELECT (SELECT sid FROM rec) IS NOT NULL AND (SELECT exp FROM rec) IS NOT NULL AND _constant_time_str_equals( (SELECT provided FROM rec), (SELECT es FROM es) ) AND (SELECT exp FROM rec) >= CAST(epoch(now()) AS BIGINT) AS ok FROM (SELECT 1) ),
-          srow AS ( SELECT s.claims FROM quackapi_sessions s WHERE s.id = (SELECT sid FROM rec) AND s.revoked_at IS NULL LIMIT 1 )
+          srow AS ( SELECT s.claims FROM quackapi_sessions s WHERE s.id = (SELECT sid FROM rec) AND s.revoked_at IS NULL AND s.expires_at >= now() LIMIT 1 )
           SELECT (SELECT ok FROM vokp) AND (SELECT claims FROM srow) IS NOT NULL FROM (SELECT 1) )
       ELSE
         (SELECT tok FROM cred) IS NOT NULL AND (SELECT tok FROM cred)<>'' AND
@@ -1229,7 +1229,7 @@ vok AS (
           rec AS ( SELECT (SELECT sid FROM parts) AS sid, try_cast( (SELECT exp_str FROM parts) AS BIGINT ) AS exp, (SELECT sig FROM parts) AS provided FROM (SELECT 1) ),
           es AS ( SELECT lower(hex( crypto_hmac('sha2-256', COALESCE((SELECT secret FROM sch),''), (SELECT sid FROM rec) || '|' || CAST( (SELECT exp FROM rec) AS VARCHAR ) ) )) AS es FROM (SELECT 1) ),
           vokp AS ( SELECT (SELECT sid FROM rec) IS NOT NULL AND (SELECT exp FROM rec) IS NOT NULL AND _constant_time_str_equals( (SELECT provided FROM rec), (SELECT es FROM es) ) AND (SELECT exp FROM rec) >= CAST(epoch(now()) AS BIGINT) AS ok FROM (SELECT 1) ),
-          srow AS ( SELECT to_json(s.claims) AS cj FROM quackapi_sessions s WHERE s.id = (SELECT sid FROM rec) AND s.revoked_at IS NULL LIMIT 1 )
+          srow AS ( SELECT to_json(s.claims) AS cj FROM quackapi_sessions s WHERE s.id = (SELECT sid FROM rec) AND s.revoked_at IS NULL AND s.expires_at >= now() LIMIT 1 )
           SELECT (SELECT cj FROM srow) FROM (SELECT 1) )
       ELSE
         (SELECT to_json( _verify_jwt_hs256((SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0)) )::VARCHAR )
