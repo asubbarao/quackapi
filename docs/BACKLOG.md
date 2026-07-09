@@ -1,6 +1,8 @@
 # BACKLOG — everything outstanding that is not a roadmap wave
 
-**Date:** 2026-07-05 (evening; full-repo sweep). Companion to `ROADMAP_10M.md`: the roadmap owns
+**Date:** 2026-07-05 (evening; full-repo sweep) · **re-audited 2026-07-09** against git log per
+STATUS.md rule #2 (shipped items tombstoned in place — numbering kept stable because §3.4/§3.8
+are cross-referenced). Companion to `ROADMAP_10M.md`: the roadmap owns
 the feature waves (A–E); this doc owns everything else — engineering debt, deferred gates, doc
 merges, publish mechanics, and the queue of decisions waiting on Alok. Every item carries
 provenance. When an item ships, delete it here and let the result doc carry the history.
@@ -21,7 +23,7 @@ README/app.sql/docs/tests for raw registry INSERTs and convert (§3.8).
 | WebSockets on main port | `specs/WS_SPEC.md` | per-connection threads bypass the 16-worker pool; `CREATE ROUTE ... WS`; effort M |
 | TLS | `specs/TLS_SPEC.md` | v1 = documented proxy (caddy) — buildable now; v2 = in-process mbedTLS |
 | Multipart binary v2 | `specs/MULTIPART_SPEC.md` §6 | v1 text-safe shipped; v2 = base64 path vs streaming parser (decision open, §7) |
-| CREATE AUTH/POLICY C-mirror | `specs/CREATE_POLICY_AUTH_SPEC.md` | **C enforcement SHIPPED + live-verified 2026-07-06** (11/11 curl, tier-1 132/132, 124k req/s unpoliced — see `ext-cpp/A1_AUTH_RESULT.md`). REMAINING: oracle `handle_request` enforcement wiring (§3.9) — helpers correct, pipeline stage absent |
+| CREATE AUTH/POLICY C-mirror | `specs/CREATE_POLICY_AUTH_SPEC.md` | **SHIPPED end-to-end** — C enforcement live-verified 2026-07-06 (11/11 curl, tier-1 132/132, 124k req/s unpoliced — `ext-cpp/A1_AUTH_RESULT.md`); oracle `handle_request` wiring shipped Phase-0 2026-07-07 (`ec7ade6`/`602450d`, tier-1 147/147, both tracks re-verified). Row kept only as spec pointer |
 | CREATE API FOR TABLE | `specs/TABLE_API_SPEC.md` (written 2026-07-05) | pending Claude+Alok review, esp. the routes-materialization decision inside it |
 | Admin UI | `specs/ADMIN_UI_SPEC.md` (written 2026-07-05) | pending review, esp. asset-embedding mechanism |
 | Sessions + CSRF | `specs/SESSION_CSRF_SPEC.md` (written 2026-07-05) | pending review; constant-time compare flagged must-fix before "secure" claims |
@@ -30,7 +32,7 @@ README/app.sql/docs/tests for raw registry INSERTs and convert (§3.8).
 
 `CREATE SUBSCRIPTION` (change-feed over shipped SSE) · `CREATE STORAGE` (local/S3) · migrations
 auto-diff · backup one-liner + durability doc · typed JS/TS SDK glue + CI OpenAPI validation ·
-`CREATE HEALTH CHECK` · `/metrics` route · `CREATE CRON` · `CREATE JOB QUEUE` · `CREATE WEBHOOK` ·
+~~`CREATE HEALTH CHECK` · `/metrics` route~~ (SHIPPED — #1907, merged `e520a0c`/`e2520f0`) · `CREATE CRON` · `CREATE JOB QUEUE` · `CREATE WEBHOOK` ·
 `IDEMPOTENCY KEY` clause · `CREATE RATE LIMIT` · `CREATE TOKEN BLACKLIST` · response `CACHE`
 clause + ETag/304 · route versioning metadata · trace propagation · `CREATE TENANT` · `CREATE
 CONNECTION` · SMTP/templated emails · JS-escape-hatch decision · Quack-protocol multi-writer.
@@ -45,9 +47,8 @@ CONNECTION` · SMTP/templated emails · JS-escape-hatch decision · Quack-protoc
    coercion-policy calls awaiting a human ruling (float rounding, int ceiling, bool coercion);
    intentional diffs documented (trailing slash 404-vs-307, HEAD, Allow header contents,
    multipart error code). `edges.md:519–535`, `TEST_PLAN.md:73–82`.
-3. **Constant-time compare (P1 security)** — DuckDB `=` is length-then-bytes; a real
-   `crypto_constant_time_eq` (XOR-fold) must land before any public-internet auth claim.
-   `CREATE_POLICY_AUTH_SPEC.md`, `SESSION_CSRF_SPEC.md:147`.
+3. ~~Constant-time compare (P1 security)~~ **SHIPPED 2026-07-07** — `_constant_time_str_equals`
+   (XOR-fold) landed in Phase-0, mirrored in C, both tracks re-verified; see `docs/STATUS.md`.
 4. **Access-log serialization wall (P2)** — `access_log=true` collapses /health c64 108k → ~1.6k
    (~68×) per `CHRONICLE.md` §6 #12 — NOTE: the 2026-07-04 C-layer wave measured 136k WITH
    logging on; reconcile which doc is stale and re-bench before believing either.
@@ -59,11 +60,9 @@ CONNECTION` · SMTP/templated emails · JS-escape-hatch decision · Quack-protoc
    seeds → ~90 false failures. Warning lives in the test header; keep it.
 8. **SUGAR-FIRST audit (new)** — convert any raw registry INSERTs in README, app.sql, docs,
    result-doc examples, and test seeds to DDL sugar (§0).
-9. **Oracle auth enforcement wiring (P1 parity debt, from A1 verification 2026-07-06)** —
-   `handle_request` has NO authenticate→authorize stage (the framework.sql comment claiming
-   it's inlined is false); only the C server enforces. Wire the same pipeline into the oracle
-   macro (match policies → resolve scheme → `_verify_jwt_hs256`/api-key lookup → 401/403 →
-   claims-bound `_ctx` for the handler), then extend parity_b2 to auth cases.
+9. ~~Oracle auth enforcement wiring (P1 parity debt)~~ **SHIPPED 2026-07-07** — Phase-0 wired
+   authenticate→authorize→claims-bind into oracle `handle_request` (`ec7ade6`/`602450d`),
+   tier-1 147/147 incl. auth rows; see `docs/STATUS.md`.
 10. **Claims wrap only exists on policied routes** — a handler referencing `claims`/`_ctx`
     on an unpoliced route 500s. Decide semantics (always-wrap with empty claims vs error).
 11. **`{...}` handler literals vs `{param}` templating** — parse-time truncation FIXED
