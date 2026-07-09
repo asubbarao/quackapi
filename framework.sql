@@ -144,8 +144,8 @@ CREATE OR REPLACE MACRO run_dependency_phase(dep_name, phase) AS (
 
 CREATE OR REPLACE TABLE quackapi_auth (
   name VARCHAR PRIMARY KEY,
-  kind VARCHAR,         -- 'jwt_hs256' | 'api_key'
-  config_json VARCHAR   -- JSON: for jwt {secret_name, header, verify_exp, leeway}; for apikey {header, table, hash}
+  kind VARCHAR,         -- 'jwt_hs256' | 'api_key' | 'session'
+  config_json VARCHAR   -- JSON: for jwt {...}; for apikey {...}; for session {cookie,secret,store}
 );
 
 CREATE OR REPLACE TABLE policies (
@@ -348,6 +348,59 @@ CREATE OR REPLACE MACRO _b64url_decode(s) AS (
   )
 );
 
+-- ============================================================================
+-- SESSION + CSRF (first-class per SESSION_CSRF_SPEC #754)
+-- Server-side store (table), signed sid|exp|sig cookies, synchronizer CSRF,
+-- lazy expiry, claims shape identical to JWT so policies oblivious.
+-- DDL: CREATE SESSION STORE + CREATE AUTH ... AS SESSION
+-- ============================================================================
+
+-- Session stores config (populated by CREATE SESSION STORE sugar or register)
+CREATE OR REPLACE TABLE quackapi_session_stores (
+  name VARCHAR PRIMARY KEY,
+  secret VARCHAR,             -- signing secret value (inlined from DDL; never literal in user routes)
+  cookie_name VARCHAR,
+  cookie_path VARCHAR,
+  cookie_samesite VARCHAR,
+  cookie_secure BOOLEAN,
+  expires_seconds BIGINT
+);
+
+-- Backing session rows. claims stored as JSON, materialized to MAP at verify.
+-- subject denorm for convenience; csrf_token for synchronizer pattern.
+CREATE OR REPLACE TABLE quackapi_sessions (
+  id VARCHAR PRIMARY KEY,
+  subject VARCHAR,
+  claims JSON,
+  created_at TIMESTAMP,
+  expires_at TIMESTAMP,
+  revoked_at TIMESTAMP,
+  csrf_token VARCHAR,
+  flash JSON
+);
+
+-- register helper (oracle + tests)
+CREATE OR REPLACE MACRO register_session_store(
+  name,
+  secret,
+  cookie_name := 'sid',
+  cookie_path := '/',
+  cookie_samesite := 'Lax',
+  cookie_secure := false,
+  expires_seconds := 86400
+) AS TABLE (
+  SELECT name AS name, secret AS secret, cookie_name AS cookie_name,
+         cookie_path AS cookie_path, cookie_samesite AS cookie_samesite,
+         cookie_secure AS cookie_secure, expires_seconds AS expires_seconds
+);
+
+-- Sign sid|exp into cookie value using hmac (reuses crypto ext + constant time helper infra)
+-- Format per spec: sid|exp_unix|hexsig   (to_sign = sid|exp )
+CREATE OR REPLACE MACRO _sign_session_value(sid, exp_unix, secret) AS (
+  sid || '|' || CAST(CAST(floor(COALESCE(try_cast(exp_unix AS DOUBLE), 0)) AS BIGINT) AS VARCHAR) || '|' ||
+  lower(hex( crypto_hmac('sha2-256', secret, sid || '|' || CAST(CAST(floor(COALESCE(try_cast(exp_unix AS DOUBLE), 0)) AS BIGINT) AS VARCHAR) ) ))
+);
+
 -- Constant-time string equality. A naive `x = y` on strings is a byte memcmp with an
 -- early-out: the time-to-false grows with the shared prefix, a remote timing oracle an
 -- attacker walks byte-by-byte to forge an API key or HMAC signature. A true elementwise
@@ -366,6 +419,129 @@ CREATE OR REPLACE MACRO _constant_time_str_equals(x, y) AS (
   AND crypto_hmac('sha2-256', 'quackapi-ctcmp-domain-v1', x)
     = crypto_hmac('sha2-256', 'quackapi-ctcmp-domain-v1', y)
 );
+
+-- Parse cookie_val, verify sig with constant-time compare, check exp >= now (lazy).
+-- Returns MAP with 'sid','exp' on success else NULL. Avoids struct literal for binder safety.
+CREATE OR REPLACE MACRO _parse_and_verify_session_cookie(cookie_val, secret) AS (
+  WITH
+    parts AS ( SELECT
+      list_element(string_split(COALESCE(cookie_val, ''), '|'), 1) AS sid,
+      list_element(string_split(COALESCE(cookie_val, ''), '|'), 2) AS exp_str,
+      list_element(string_split(COALESCE(cookie_val, ''), '|'), 3) AS sig
+    ),
+    rec AS ( SELECT
+      (SELECT sid FROM parts) AS sid,
+      try_cast( (SELECT exp_str FROM parts) AS BIGINT ) AS exp,
+      (SELECT sig FROM parts) AS provided
+    FROM (SELECT 1) ),
+    expected_sig AS ( SELECT
+      lower(hex( crypto_hmac('sha2-256', secret,
+        (SELECT sid FROM rec) || '|' || CAST( (SELECT exp FROM rec) AS VARCHAR ) ) )) AS es
+    FROM (SELECT 1) ),
+    vok AS ( SELECT
+      (SELECT sid FROM rec) IS NOT NULL
+      AND (SELECT exp FROM rec) IS NOT NULL
+      AND _constant_time_str_equals( (SELECT provided FROM rec), (SELECT es FROM expected_sig) )
+      AND (SELECT exp FROM rec) >= CAST(epoch(now()) AS BIGINT)
+      AS ok,
+      (SELECT sid FROM rec) AS sid,
+      (SELECT exp FROM rec) AS exp
+    FROM (SELECT 1) )
+  SELECT CASE WHEN (SELECT ok FROM vok) THEN map_from_entries([struct_pack(key:='sid', value:=(SELECT sid FROM vok)::VARCHAR), struct_pack(key:='exp', value:=CAST((SELECT exp FROM vok) AS VARCHAR))]) ELSE NULL END
+);
+
+-- Verify a session cookie value against store secret; load row; return claims JSON string on success (for cj compat), else NULL.
+-- Inline parse logic to avoid nested macro resolution issues in handle_request body.
+CREATE OR REPLACE MACRO _verify_session_cookie(cookie_val, secret) AS (
+  WITH
+    parts AS ( SELECT
+      list_element(string_split(COALESCE(cookie_val, ''), '|'), 1) AS sid,
+      list_element(string_split(COALESCE(cookie_val, ''), '|'), 2) AS exp_str,
+      list_element(string_split(COALESCE(cookie_val, ''), '|'), 3) AS sig
+    ),
+    rec AS ( SELECT
+      (SELECT sid FROM parts) AS sid,
+      try_cast( (SELECT exp_str FROM parts) AS BIGINT ) AS exp,
+      (SELECT sig FROM parts) AS provided
+    FROM (SELECT 1) ),
+    expected_sig AS ( SELECT
+      lower(hex( crypto_hmac('sha2-256', secret,
+        (SELECT sid FROM rec) || '|' || CAST( (SELECT exp FROM rec) AS VARCHAR ) ) )) AS es
+    FROM (SELECT 1) ),
+    vok AS ( SELECT
+      (SELECT sid FROM rec) IS NOT NULL
+      AND (SELECT exp FROM rec) IS NOT NULL
+      AND _constant_time_str_equals( (SELECT provided FROM rec), (SELECT es FROM expected_sig) )
+      AND (SELECT exp FROM rec) >= CAST(epoch(now()) AS BIGINT)
+      AS ok,
+      (SELECT sid FROM rec) AS sid
+    FROM (SELECT 1) ),
+    srow AS (
+      SELECT s.id, s.subject, s.claims, s.csrf_token, s.expires_at, s.revoked_at
+      FROM quackapi_sessions s
+      WHERE s.id = (SELECT sid FROM vok)
+        AND s.revoked_at IS NULL
+      LIMIT 1
+    ),
+    live AS (
+      SELECT (SELECT ok FROM vok) IS NOT NULL AND (SELECT ok FROM vok)
+        AND (SELECT id FROM srow) IS NOT NULL
+        AND (SELECT revoked_at FROM srow) IS NULL
+        AND (SELECT expires_at FROM srow) >= now()
+        AS ok,
+      (SELECT claims FROM srow) AS cj
+    FROM (SELECT 1) )
+  SELECT CASE WHEN (SELECT ok FROM live) THEN (SELECT cj FROM live) ELSE NULL END
+);
+
+-- Extract csrf candidate from headers (X-CSRF-Token or x_csrf_token) or form body map (if present).
+CREATE OR REPLACE MACRO _extract_csrf_token(headers, form_body_map) AS (
+  COALESCE(
+    json_extract_string(headers, '$.x-csrf-token'),
+    json_extract_string(headers, '$.X-CSRF-Token'),
+    json_extract_string(headers, '$.x_csrf_token'),
+    CASE WHEN form_body_map IS NOT NULL THEN form_body_map['csrf_token'] ELSE NULL END,
+    CASE WHEN form_body_map IS NOT NULL THEN form_body_map['_csrf'] ELSE NULL END
+  )
+);
+
+-- Create a fresh session row (side-effect INSERT) and return the signed cookie value + csrf.
+-- Usage in a login handler (after primary auth): INSERT INTO route_headers ... with the cookie hdr; or client uses csrf from body.
+-- NOTE: for dynamic Set-Cookie on live responses, register the route with a pre-computed value or use body+client JS read for v1.
+CREATE OR REPLACE MACRO _create_session(claims, secret, subject := NULL, ttl_seconds := 86400) AS TABLE (
+  WITH
+    ts AS (SELECT now() AS t),
+    sid AS (SELECT 'sess_' || replace(uuid()::VARCHAR, '-', '') AS s FROM (SELECT 1)),
+    ex AS (SELECT CAST(floor( epoch( (SELECT t FROM ts) + (ttl_seconds * INTERVAL '1 second') ) ) AS BIGINT) AS e FROM (SELECT 1)),
+    ctok AS (SELECT replace(uuid()::VARCHAR, '-', '') AS c FROM (SELECT 1))
+  SELECT
+    (SELECT s FROM sid) AS sid,
+    (SELECT _sign_session_value( (SELECT s FROM sid), (SELECT e FROM ex), secret )) AS cookie_value,
+    (SELECT c FROM ctok) AS csrf_token
+  FROM (SELECT 1)
+);
+
+-- Build a full Set-Cookie header string for use with route_headers (value precomputed).
+CREATE OR REPLACE MACRO _build_set_cookie_header(signed_cookie_val, store := 'sessions') AS (
+  WITH st AS (SELECT * FROM quackapi_session_stores s WHERE s.name = store LIMIT 1)
+  SELECT
+    COALESCE((SELECT cookie_name FROM st), 'sid') || '=' || signed_cookie_val ||
+    '; HttpOnly; Path=' || COALESCE((SELECT cookie_path FROM st), '/') ||
+    '; SameSite=' || COALESCE((SELECT cookie_samesite FROM st), 'Lax') ||
+    CASE WHEN COALESCE((SELECT cookie_secure FROM st), false) THEN '; Secure' ELSE '' END ||
+    '; Max-Age=' || COALESCE((SELECT expires_seconds FROM st), 86400)::VARCHAR
+);
+
+-- ── crypto / b64url / JWT helpers (lean on DuckDB 'crypto' ext + json) ──────
+-- Load is caller responsibility for JWT paths (tests do LOAD crypto; server workers too when auth used).
+-- base64url decode: add padding, map -_ -> +/, from_base64 -> blob
+CREATE OR REPLACE MACRO _b64url_decode(s) AS (
+  from_base64(
+    replace(replace(s, '-', '+'), '_', '/')
+    || repeat('=', (4 - (length(s) % 4)) % 4)
+  )
+);
+
 
 -- Verify HS256 JWT. Returns claims MAP on success, NULL on any failure.
 CREATE OR REPLACE MACRO _verify_jwt_hs256(token, secret, verify_exp, leeway) AS (
@@ -584,11 +760,11 @@ query_map AS (
 -- + becomes space; %XX decoded. Resulting map feeds location='body' params exactly
 -- like JSON body path. Pure SQL, matches form semantics for try_cast + constraints.
 is_form_ct AS (
-  SELECT lower(COALESCE(
+  SELECT starts_with(lower(COALESCE(
     json_extract_string(headers, '$.content-type'),
     json_extract_string(headers, '$.Content-Type'),
     ''
-  )) LIKE 'application/x-www-form-urlencoded%' AS yes
+  )), 'application/x-www-form-urlencoded') AS yes
 ),
 form_map AS (
   SELECT
@@ -623,7 +799,7 @@ ct_raw AS (
 is_json_ct AS (
   SELECT
     ( (SELECT ct FROM ct_raw) = ''
-      OR lower((SELECT ct FROM ct_raw)) LIKE 'application/%json%'
+      OR ( starts_with(lower((SELECT ct FROM ct_raw)), 'application/') AND instr(lower((SELECT ct FROM ct_raw)), 'json') > 0 )
       OR instr(lower((SELECT ct FROM ct_raw)), '+json') > 0
     ) AS yes
 ),
@@ -991,44 +1167,78 @@ cred AS (
                 END,
                 trim(replace(COALESCE(json_extract_string(headers,'$.x-api-key'),json_extract_string(headers,'$.X-API-Key'),json_extract_string(headers,'$.x_api_key'),''), '"', ''))
               )
-    END AS tok
+    END AS tok,
+    -- Session cookie candidate: pull from _cookies (parsed by C layer). Default 'sid' for v1; real selection uses sch config later.
+    CASE WHEN json_extract(headers, '$._cookies') IS NULL THEN NULL
+         ELSE json_extract_string( json_extract(headers, '$._cookies'), '$.sid' )
+    END AS session_cand
 ),
 sch AS (
   SELECT name, kind, config_json,
     json_extract_string(config_json,'$.header') AS cfg_h,
     json_extract_string(config_json,'$.secret') AS secret,
     COALESCE(try_cast(json_extract_string(config_json,'$.verify_exp')AS BOOLEAN), true) AS verify_exp,
-    COALESCE(try_cast(json_extract_string(config_json,'$.leeway')AS INTEGER), 0) AS leeway
+    COALESCE(try_cast(json_extract_string(config_json,'$.leeway')AS INTEGER), 0) AS leeway,
+    -- Session extras (from CREATE AUTH ... AS SESSION or CREATE SESSION STORE)
+    COALESCE(json_extract_string(config_json,'$.cookie'), 'sid') AS sess_cookie,
+    COALESCE(json_extract_string(config_json,'$.store'), 'sessions') AS sess_store
   FROM quackapi_auth
   WHERE (SELECT n FROM nm)>0
   ORDER BY
     -- Prefer the scheme whose KIND matches the credential header actually present in
     -- this request (kind is the reliable discriminator, not a substring of the header
-    -- name). Exact equality on the known enum ('jwt_hs256' | 'api_key') — no LIKE.
+    -- name). Exact equality on the known enum ('jwt_hs256' | 'api_key' | 'session') — no LIKE.
     CASE
       WHEN (SELECT tok FROM cred) IS NOT NULL AND kind = 'api_key'   AND instr(lower(headers),'x-api-key')     > 0 THEN 0
       WHEN (SELECT tok FROM cred) IS NOT NULL AND kind = 'jwt_hs256' AND instr(lower(headers),'authorization') > 0 THEN 0
+      -- Session: prefer when a sid-like cookie is present (even if tok empty, session_cand carries it)
+      WHEN (SELECT session_cand FROM cred) IS NOT NULL AND kind = 'session' THEN 0
       ELSE 1
     END,
-    CASE WHEN kind = 'jwt_hs256' THEN 0 ELSE 1 END,
+    CASE WHEN kind = 'jwt_hs256' THEN 0 WHEN kind = 'session' THEN 0 ELSE 1 END,
     name
   LIMIT 1
 ),
 vok AS (
   SELECT
-    (SELECT n FROM nm)>0 AND (SELECT tok FROM cred) IS NOT NULL AND (SELECT tok FROM cred)<>'' AND (SELECT kind FROM sch) IS NOT NULL AND
+    (SELECT n FROM nm)>0 AND (SELECT kind FROM sch) IS NOT NULL AND
     CASE
       WHEN (SELECT kind FROM sch) = 'api_key' THEN
+        (SELECT tok FROM cred) IS NOT NULL AND (SELECT tok FROM cred)<>'' AND
         EXISTS(SELECT 1 FROM api_keys k WHERE _constant_time_str_equals((SELECT tok FROM cred), k.key))
+      WHEN (SELECT kind FROM sch) = 'session' THEN
+        -- For session, inline verify to avoid macro resolution edge in big handle WITH. 
+        (SELECT session_cand FROM cred) IS NOT NULL AND (SELECT session_cand FROM cred)<>'' AND
+        ( WITH cv AS (SELECT (SELECT session_cand FROM cred) AS cv FROM (SELECT 1)),
+          parts AS ( SELECT list_element(string_split(COALESCE((SELECT cv FROM cv), ''), '|'), 1) AS sid, list_element(string_split(COALESCE((SELECT cv FROM cv), ''), '|'), 2) AS exp_str, list_element(string_split(COALESCE((SELECT cv FROM cv), ''), '|'), 3) AS sig FROM (SELECT 1) ),
+          rec AS ( SELECT (SELECT sid FROM parts) AS sid, try_cast( (SELECT exp_str FROM parts) AS BIGINT ) AS exp, (SELECT sig FROM parts) AS provided FROM (SELECT 1) ),
+          es AS ( SELECT lower(hex( crypto_hmac('sha2-256', COALESCE((SELECT secret FROM sch),''), (SELECT sid FROM rec) || '|' || CAST( (SELECT exp FROM rec) AS VARCHAR ) ) )) AS es FROM (SELECT 1) ),
+          vokp AS ( SELECT (SELECT sid FROM rec) IS NOT NULL AND (SELECT exp FROM rec) IS NOT NULL AND _constant_time_str_equals( (SELECT provided FROM rec), (SELECT es FROM es) ) AND (SELECT exp FROM rec) >= CAST(epoch(now()) AS BIGINT) AS ok FROM (SELECT 1) ),
+          srow AS ( SELECT s.claims FROM quackapi_sessions s WHERE s.id = (SELECT sid FROM rec) AND s.revoked_at IS NULL LIMIT 1 )
+          SELECT (SELECT ok FROM vokp) AND (SELECT claims FROM srow) IS NOT NULL FROM (SELECT 1) )
       ELSE
+        (SELECT tok FROM cred) IS NOT NULL AND (SELECT tok FROM cred)<>'' AND
         _verify_jwt_hs256( (SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0) ) IS NOT NULL
     END AS ok,
     CASE
       WHEN (SELECT kind FROM sch) = 'api_key' THEN
         (SELECT to_json(map_from_entries([struct_pack(key:='sub',value:=COALESCE(k.subject,''))]))::VARCHAR FROM api_keys k WHERE _constant_time_str_equals((SELECT tok FROM cred),k.key) LIMIT 1)
+      WHEN (SELECT kind FROM sch) = 'session' THEN
+        ( WITH cv AS (SELECT (SELECT session_cand FROM cred) AS cv FROM (SELECT 1)),
+          parts AS ( SELECT list_element(string_split(COALESCE((SELECT cv FROM cv), ''), '|'), 1) AS sid, list_element(string_split(COALESCE((SELECT cv FROM cv), ''), '|'), 2) AS exp_str, list_element(string_split(COALESCE((SELECT cv FROM cv), ''), '|'), 3) AS sig FROM (SELECT 1) ),
+          rec AS ( SELECT (SELECT sid FROM parts) AS sid, try_cast( (SELECT exp_str FROM parts) AS BIGINT ) AS exp, (SELECT sig FROM parts) AS provided FROM (SELECT 1) ),
+          es AS ( SELECT lower(hex( crypto_hmac('sha2-256', COALESCE((SELECT secret FROM sch),''), (SELECT sid FROM rec) || '|' || CAST( (SELECT exp FROM rec) AS VARCHAR ) ) )) AS es FROM (SELECT 1) ),
+          vokp AS ( SELECT (SELECT sid FROM rec) IS NOT NULL AND (SELECT exp FROM rec) IS NOT NULL AND _constant_time_str_equals( (SELECT provided FROM rec), (SELECT es FROM es) ) AND (SELECT exp FROM rec) >= CAST(epoch(now()) AS BIGINT) AS ok FROM (SELECT 1) ),
+          srow AS ( SELECT to_json(s.claims) AS cj FROM quackapi_sessions s WHERE s.id = (SELECT sid FROM rec) AND s.revoked_at IS NULL LIMIT 1 )
+          SELECT (SELECT cj FROM srow) FROM (SELECT 1) )
       ELSE
         (SELECT to_json( _verify_jwt_hs256((SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0)) )::VARCHAR )
-    END AS cj
+    END AS cj,
+    -- For session schemes, also surface the csrf_token and whether this auth used a session cookie (for CSRF gate)
+    CASE WHEN (SELECT kind FROM sch) = 'session' THEN
+      (SELECT csrf_token FROM (SELECT s.csrf_token FROM quackapi_sessions s WHERE s.id = list_element(string_split(COALESCE((SELECT session_cand FROM cred),''), '|'), 1) AND s.revoked_at IS NULL LIMIT 1 ) t )
+    ELSE NULL END AS sess_csrf,
+    (SELECT kind FROM sch) = 'session' AS used_session_cookie
 ),
 -- Policy predicate eval — LITERALS ONLY on the oracle/pure-track, by architectural
 -- necessity: a SQL macro cannot EXECUTE a dynamic predicate expression over runtime
@@ -1060,6 +1270,8 @@ pol_a AS (
     bool_or(mode<>'RESTRICTIVE' AND pass) AS any_perm,
     (SELECT ok FROM vok) AS vok,
     (SELECT cj FROM vok) AS claims_j,
+    (SELECT sess_csrf FROM vok) AS sess_csrf,
+    (SELECT used_session_cookie FROM vok) AS used_session_cookie,
     (SELECT _build_request_json((SELECT m FROM effm), (SELECT clean_path FROM path_query), COALESCE((SELECT pmap FROM best),map()), (SELECT qmap FROM query_map), headers, body) FROM (SELECT 1)) AS req_j
   FROM pol_p
 ),
@@ -1068,6 +1280,8 @@ auth_dec AS (
     has_pol,
     vok,
     claims_j,
+    sess_csrf,
+    used_session_cookie,
     CASE WHEN has_pol AND NOT vok THEN 401
          WHEN has_pol AND vok THEN (CASE
            WHEN has_restr THEN (CASE WHEN all_restr AND (NOT has_perm OR any_perm) THEN 200 ELSE 403 END)
@@ -1080,6 +1294,53 @@ auth_dec AS (
          ELSE NULL
     END AS forced_body
   FROM pol_a
+),
+-- CSRF gate (synchronizer token): only for session-authenticated requests on unsafe methods.
+-- Bearer/API-key routes (no session cookie) are exempt. Safe methods (GET/HEAD/OPTIONS) never require.
+-- Token may arrive via X-CSRF-Token (any case) header or form field csrf_token / _csrf .
+-- Constant-time compare. Mismatch/missing on protected → 403 "CSRF token missing or invalid"
+csrf_vals AS (
+  SELECT
+    (SELECT sess_csrf FROM auth_dec) AS expected,
+    _extract_csrf_token( headers, (SELECT fmap FROM form_map) ) AS provided
+  FROM (SELECT 1)
+),
+csrf_gate AS (
+  SELECT
+    (SELECT used_session_cookie FROM auth_dec) AS uses_sess,
+    upper(COALESCE( (SELECT m FROM effm), '' )) AS meth,
+    (SELECT expected FROM csrf_vals) AS expected,
+    (SELECT provided FROM csrf_vals) AS provided,
+    CASE
+      WHEN COALESCE( (SELECT used_session_cookie FROM auth_dec), false ) = false THEN false  -- no session (incl. nm=0 case), exempt
+      WHEN upper(COALESCE( (SELECT m FROM effm), '' )) IN ('GET','HEAD','OPTIONS') THEN false  -- safe, exempt
+      ELSE (SELECT expected FROM csrf_vals) IS NULL
+           OR (SELECT provided FROM csrf_vals) IS NULL
+           OR NOT _constant_time_str_equals(
+                COALESCE( (SELECT provided FROM csrf_vals), '' ),
+                COALESCE( (SELECT expected FROM csrf_vals), '' )
+              )
+    END AS csrf_fail
+  FROM (SELECT 1)
+),
+-- If csrf_fail and not already forced, override to 403
+csrf_dec AS (
+  SELECT
+    (SELECT forced_status FROM auth_dec) AS prior_status,
+    (SELECT forced_body FROM auth_dec) AS prior_body,
+    (SELECT csrf_fail FROM csrf_gate) AS csrf_fail,
+    CASE
+      WHEN (SELECT csrf_fail FROM csrf_gate) THEN 403
+      ELSE (SELECT forced_status FROM auth_dec)
+    END AS forced_status,
+    CASE
+      WHEN (SELECT csrf_fail FROM csrf_gate) THEN '{"detail":"CSRF token missing or invalid"}'
+      ELSE (SELECT forced_body FROM auth_dec)
+    END AS forced_body,
+    (SELECT claims_j FROM auth_dec) AS claims_j,
+    (SELECT has_pol FROM auth_dec) AS has_pol,
+    (SELECT vok FROM auth_dec) AS vok
+  FROM (SELECT 1)
 ),
 -- Extract values for path/query/header/cookie/body params of the matched route.
 -- header: top-level key in headers_json (C provides lowercased names)
@@ -1377,7 +1638,7 @@ result AS (
   LEFT JOIN err_agg ea ON true
   LEFT JOIN rendered_static rs ON rs.route_id = b.route_id
   LEFT JOIN handler_rendered hr ON true
-  LEFT JOIN auth_dec ad ON true
+  LEFT JOIN csrf_dec ad ON true
 )
 SELECT
   -- Auth decisions override route/validation decisions (C does the same after quack_route)
