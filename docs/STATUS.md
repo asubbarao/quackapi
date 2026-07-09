@@ -79,15 +79,22 @@ gated at **≥59k /search** (`BACKLOG.md` §4).
 ## Building — the FastAPI "most-wanted, closed unresolved" hit list (Wave A)
 
 See `docs/FASTAPI_MOST_WANTED.md` (the pitch scoreboard) for the full upvote table. **Verified against
-`git log` + code markers 2026-07-09** — 0 matches in `framework.sql`/`quackapi_extension.cpp` for the
-rows below (except lifecycle, which is built-in-worktree-but-unmerged).
+`git log` + code markers 2026-07-09, then re-audited the same day after the worktree salvage sweep**:
+main has 0 markers for the rows below, but every row except OIDC has real built-but-unmerged work on a
+`fleet/*` branch. (The earlier "not started" reads were false negatives — `git status` in the worktrees
+died on the broken nested `duckdb` submodule before listing dirty files; use
+`git status --ignore-submodules=all` in `quackapi-wt/*`.)
 
 | 👍 | Issue | Feature | Mechanism | Status (code-verified) |
 |---|---|---|---|---|
-| 75 | #754 | First-class sessions | `CREATE SESSION` — server store IS a table; cookie issue/verify + CSRF | **not started in code** (0 markers); spec ready (`SESSION_CSRF_SPEC.md`), worktree `q-sessions` |
+| 75 | #754 | First-class sessions | `CREATE SESSION` — server store IS a table; cookie issue/verify + CSRF | **built, failed cert once, UNMERGED** — 07-08 build + fix + cert-prep passes; salvaged 2026-07-09 as WIP `2ef3000` on `fleet/sessions` (+291 framework.sql, +57 tier-1) + `fleet/sessions-cpp` (C mirror in progress). Needs re-cert against main |
 | 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | **oracle built, UNMERGED** — on `fleet/lifecycle` (`5f250a1`), 0 markers in main; merge or fold in |
-| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **WIP parked in stash** — `6088198` on `fleet/oauth-cpp` (+100 framework.sql, +45 tier-1); 0 markers in main; needs outbound-POST verdict + un-stash before continuing |
+| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **TWO WIP vintages, UNMERGED** — worktree state salvaged as `9ddcc51` on `fleet/oauth` (+176 framework.sql, +55 tier-1) + `fleet/oauth-cpp-salvage`; older stash `6088198` on `fleet/oauth-cpp` (+100/+45). Reconcile the two, then outbound-POST verdict |
+| — | — | CORS (`CREATE CORS`, Starlette `CORSMiddleware` parity) | single global row in `quackapi_cors`; oracle + C worker | **built, UNMERGED** — 07-08 grok build was never lost, just invisible to broken `git status`; salvaged 2026-07-09 as `8506937` on `fleet/cors` (+217 framework.sql + middleware + tests) + `fleet/cors-cpp` |
 | 37 | #1428 | Keycloak/OIDC | same OAuth2 machinery + discovery URL | **not started** (rides #335) |
+
+**TLS note:** the 2026-07-09 direct-mbedTLS build job died 89s in (14 tool calls, nothing written) —
+the "proxy termination is v1" stance below remains accurate; nothing new exists.
 
 **Phase-0 auth gate: CLEARED** (was listed here as pending — it is not). `_constant_time_str_equals`
 (XOR-fold) replaced DuckDB `=`, and authenticate→authorize is wired into the oracle `handle_request`
