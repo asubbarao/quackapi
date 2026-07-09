@@ -113,7 +113,11 @@ maintenance. Precedent: httpserver is in community, excludes only wasm.
   boundary) per report 05 §10
 - `CHRONICLE.md` — regen is manual (`docs/build_pdf.sh`); no CI freshness check
 - Stale-doc reconciliation: `TEST_PLAN.md:44` (shutdown "HARD" — actually shipped),
-  `FEATURE_GAP_MATRIX.md` (predates R2–R4 + B7), access-log perf contradiction (§3.4)
+  ~~`FEATURE_GAP_MATRIX.md` (predates R2–R4 + B7)~~ **DELETED 2026-07-08 → replaced by the living
+  `docs/STATUS.md`** (it was read as current and hallucinated shipped work as open). Frozen
+  line-anchored citations to it still exist in `learning/08`, `WS_SPEC.md`, `POLISH_OPS_SPEC.md`,
+  `ROADMAP_10M.md`, `TEST_PLAN.md` — those are historical study references to the pre-B7 snapshot,
+  not live pointers; leave until their parent docs are reviewed. Also: access-log perf contradiction (§3.4)
 
 ## 7. Decision queue (Alok)
 
