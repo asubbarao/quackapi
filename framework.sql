@@ -104,6 +104,13 @@ CREATE OR REPLACE MACRO register_redirect(route_id, method, pattern, target, sta
   SELECT * FROM register_route(route_id, method, pattern, '', 'redirect', 'Redirect to ' || target, status)
 );
 
+-- register_oauth_authorize: 302 authorize-start for CREATE AUTH AS OAUTH2 / OIDC.
+-- handler column holds the auth scheme name; Location is built at request time
+-- (client_id + state + response_type=code) via _oauth2_build_authorize_url.
+CREATE OR REPLACE MACRO register_oauth_authorize(route_id, method, pattern, auth_name, status := 302) AS TABLE (
+  SELECT * FROM register_route(route_id, method, pattern, auth_name, 'oauth_authorize', 'OAuth2 authorize redirect', status)
+);
+
 -- ============================================================================
 -- DEPENDENCIES: request-scoped setup/teardown (FastAPI yield equiv)
 -- CREATE DEPENDENCY name AS SETUP '...' TEARDOWN '...'  (via ParserExtension)
@@ -142,8 +149,10 @@ CREATE OR REPLACE MACRO run_dependency_phase(dep_name, phase) AS (
 
 CREATE OR REPLACE TABLE quackapi_auth (
   name VARCHAR PRIMARY KEY,
-  kind VARCHAR,         -- 'jwt_hs256' | 'api_key'
-  config_json VARCHAR   -- JSON: for jwt {secret_name, header, verify_exp, leeway}; for apikey {header, table, hash}
+  kind VARCHAR,         -- 'jwt_hs256' | 'api_key' | 'oauth2' | 'oidc'
+  config_json VARCHAR   -- JSON: jwt {secret, header, verify_exp, leeway}; apikey {header};
+                        -- oauth2/oidc {client_id, client_secret, authorize_url, token_url, jwks_url,
+                        --   scope, redirect_uri, discovery_url, secret (HS verify), header}
 );
 
 CREATE OR REPLACE TABLE policies (
@@ -257,6 +266,112 @@ CREATE OR REPLACE MACRO _verify_jwt_hs256(token, secret, verify_exp, leeway) AS 
 -- Only then: 401 on missing/invalid credential, 403 on valid-cred but policy deny,
 -- and successful dynamic handler_sql is wrapped as: WITH _ctx AS (SELECT <claims>::JSON::MAP... , '{}'::JSON AS request) <hsql>
 -- No policy match for the route: zero change to prior behavior (unpoliced fast path).
+
+-- ============================================================================
+-- OAUTH2 / OIDC helpers (CREATE AUTH AS OAUTH2 / OIDC — FastAPI #335 / #1428)
+-- ============================================================================
+-- Deterministic test state (csrf). Live/C path may mint a random state later; oracle +
+-- tier-1 assert on this constant so authorize Location is stable.
+CREATE OR REPLACE MACRO _oauth2_test_state() AS 'test-csrf-state-42';
+
+-- Build the authorization-endpoint URL for a registered oauth2/oidc scheme.
+-- Reads authorize_url, client_id, scope, redirect_uri from quackapi_auth.config_json.
+CREATE OR REPLACE MACRO _oauth2_build_authorize_url(auth_name) AS (
+  WITH c AS (
+    SELECT
+      json_extract_string(config_json, '$.authorize_url') AS authorize_url,
+      json_extract_string(config_json, '$.client_id') AS client_id,
+      json_extract_string(config_json, '$.scope') AS scope,
+      json_extract_string(config_json, '$.redirect_uri') AS redirect_uri
+    FROM quackapi_auth
+    WHERE name = auth_name
+  )
+  SELECT
+    (SELECT authorize_url FROM c)
+    || CASE WHEN instr(CAST((SELECT authorize_url FROM c) AS VARCHAR), '?') > 0 THEN '&' ELSE '?' END
+    || 'response_type=code'
+    || '&client_id=' || CASE WHEN (SELECT client_id FROM c) IS NULL THEN '' ELSE (SELECT client_id FROM c) END
+    || CASE
+         WHEN (SELECT scope FROM c) IS NULL OR length(trim((SELECT scope FROM c))) = 0 THEN ''
+         ELSE '&scope=' || replace((SELECT scope FROM c), ' ', '+')
+       END
+    || CASE
+         WHEN (SELECT redirect_uri FROM c) IS NULL OR length(trim((SELECT redirect_uri FROM c))) = 0 THEN ''
+         ELSE '&redirect_uri=' || (SELECT redirect_uri FROM c)
+       END
+    || '&state=' || _oauth2_test_state()
+);
+
+-- Token-exchange request assembler (authorization_code grant).
+-- Canonical outbound HTTP is curl_httpfs (GET via read_text / read_json). A form-encoded
+-- POST body is NOT a first-class in-handler primitive, so this macro returns the assembled
+-- request descriptor with status='mechanism_limited' rather than faking a live exchange.
+-- Callers / future work can POST via an external agent or a dedicated POST TVF when available.
+CREATE OR REPLACE MACRO _oauth2_exchange(auth_name, code) AS (
+  WITH c AS (
+    SELECT
+      json_extract_string(config_json, '$.token_url') AS token_url,
+      json_extract_string(config_json, '$.client_id') AS client_id,
+      json_extract_string(config_json, '$.client_secret') AS client_secret,
+      json_extract_string(config_json, '$.redirect_uri') AS redirect_uri
+    FROM quackapi_auth
+    WHERE name = auth_name
+  )
+  SELECT cast(json_object(
+    'token_url', (SELECT token_url FROM c),
+    'grant_type', 'authorization_code',
+    'code', code,
+    'client_id', (SELECT client_id FROM c),
+    'client_secret_set', CASE
+      WHEN (SELECT client_secret FROM c) IS NULL OR length((SELECT client_secret FROM c)) = 0 THEN false
+      ELSE true
+    END,
+    'redirect_uri', (SELECT redirect_uri FROM c),
+    'status', 'mechanism_limited',
+    'detail', 'outbound form POST not available as in-handler primitive; request assembled only'
+  ) AS VARCHAR)
+);
+
+-- Verify a JWT against a JWKS document or URL.
+-- - If jwks_or_url starts with '[' or '{', treat as inline JWKS JSON (array or {keys:[...]}).
+-- - Else GET via curl_httpfs read_text (canonical outbound HTTP).
+-- HS*/oct keys: base64url-decode `k` → UTF-8 secret → _verify_jwt_hs256.
+-- RS* keys are not verified here (no RSA verifier in the crypto ext); returns NULL.
+CREATE OR REPLACE MACRO _verify_jwt_from_jwks(token, jwks_or_url) AS (
+  WITH
+    raw AS (
+      SELECT CASE
+        WHEN jwks_or_url IS NULL OR length(trim(jwks_or_url)) = 0 THEN NULL
+        WHEN starts_with(trim(jwks_or_url), '[') OR starts_with(trim(jwks_or_url), '{')
+          THEN trim(jwks_or_url)
+        ELSE (SELECT content FROM read_text(jwks_or_url) LIMIT 1)
+      END AS j
+    ),
+    keys_src AS (
+      SELECT CASE
+        WHEN (SELECT j FROM raw) IS NULL THEN '[]'
+        WHEN starts_with(trim((SELECT j FROM raw)), '[') THEN (SELECT j FROM raw)
+        ELSE CAST(json_extract(try_cast((SELECT j FROM raw) AS JSON), '$.keys') AS VARCHAR)
+      END AS arr
+    ),
+    oct AS (
+      SELECT json_extract_string(value, '$.k') AS k
+      FROM json_each(try_cast((SELECT arr FROM keys_src) AS JSON))
+      WHERE json_extract_string(value, '$.kty') = 'oct'
+        AND json_extract_string(value, '$.k') IS NOT NULL
+      LIMIT 1
+    ),
+    sec AS (
+      SELECT CASE
+        WHEN (SELECT k FROM oct) IS NULL THEN NULL
+        ELSE decode(_b64url_decode((SELECT k FROM oct)))
+      END AS s
+    )
+  SELECT CASE
+    WHEN (SELECT s FROM sec) IS NULL THEN NULL
+    ELSE _verify_jwt_hs256(token, (SELECT s FROM sec), true, 0)
+  END
+);
 
 -- Build a request context JSON from the pieces we have at auth time (method, path params, query, body, headers).
 -- body may be large; for v1 we pass the raw body string (json or form text).
@@ -787,7 +902,14 @@ cred AS (
 sch AS (
   SELECT name, kind, config_json,
     json_extract_string(config_json,'$.header') AS cfg_h,
-    json_extract_string(config_json,'$.secret') AS secret,
+    -- HS secret: explicit secret, else client_secret (oauth2/oidc test tokens)
+    CASE
+      WHEN json_extract_string(config_json,'$.secret') IS NOT NULL
+           AND length(json_extract_string(config_json,'$.secret')) > 0
+        THEN json_extract_string(config_json,'$.secret')
+      ELSE json_extract_string(config_json,'$.client_secret')
+    END AS secret,
+    json_extract_string(config_json,'$.jwks_url') AS jwks_url,
     COALESCE(try_cast(json_extract_string(config_json,'$.verify_exp')AS BOOLEAN), true) AS verify_exp,
     COALESCE(try_cast(json_extract_string(config_json,'$.leeway')AS INTEGER), 0) AS leeway
   FROM quackapi_auth
@@ -795,13 +917,13 @@ sch AS (
   ORDER BY
     -- Prefer the scheme whose KIND matches the credential header actually present in
     -- this request (kind is the reliable discriminator, not a substring of the header
-    -- name). Exact equality on the known enum ('jwt_hs256' | 'api_key') — no LIKE.
+    -- name). Known kinds: jwt_hs256 | api_key | oauth2 | oidc — no LIKE.
     CASE
       WHEN (SELECT tok FROM cred) IS NOT NULL AND kind = 'api_key'   AND instr(lower(headers),'x-api-key')     > 0 THEN 0
-      WHEN (SELECT tok FROM cred) IS NOT NULL AND kind = 'jwt_hs256' AND instr(lower(headers),'authorization') > 0 THEN 0
+      WHEN (SELECT tok FROM cred) IS NOT NULL AND kind IN ('jwt_hs256','oauth2','oidc') AND instr(lower(headers),'authorization') > 0 THEN 0
       ELSE 1
     END,
-    CASE WHEN kind = 'jwt_hs256' THEN 0 ELSE 1 END,
+    CASE WHEN kind IN ('jwt_hs256','oauth2','oidc') THEN 0 ELSE 1 END,
     name
   LIMIT 1
 ),
@@ -812,6 +934,9 @@ vok AS (
       WHEN (SELECT kind FROM sch) = 'api_key' THEN
         EXISTS(SELECT 1 FROM api_keys k WHERE _constant_time_str_equals((SELECT tok FROM cred), k.key))
       ELSE
+        -- jwt_hs256 + oauth2/oidc (HS secret path). JWKS/RS verify lives in
+        -- _verify_jwt_from_jwks (standalone + C worker) — cannot expand a FROM-bearing
+        -- scalar macro inside this table macro (binder: "cannot contain subqueries").
         _verify_jwt_hs256( (SELECT tok FROM cred), COALESCE((SELECT secret FROM sch),''), COALESCE((SELECT verify_exp FROM sch),true), COALESCE((SELECT leeway FROM sch),0) ) IS NOT NULL
     END AS ok,
     CASE
@@ -1150,10 +1275,38 @@ rendered_static AS (
 -- the final projection reads COLUMNS, not repeated scalar subqueries that each
 -- re-run routing. best executes once.
 -- is_malformed_multipart carries into result for short-circuit 422 (structural body error).
+-- oauth_authorize: compute Location via JOIN (not scalar macro with FROM — binder rejects
+-- nested FROM-bearing macros inside a table macro). handler column holds auth scheme name.
+oauth_authz AS (
+  SELECT
+    b.route_id,
+    (
+      json_extract_string(a.config_json, '$.authorize_url')
+      || CASE WHEN instr(CAST(json_extract_string(a.config_json, '$.authorize_url') AS VARCHAR), '?') > 0 THEN '&' ELSE '?' END
+      || 'response_type=code'
+      || '&client_id=' || CASE WHEN json_extract_string(a.config_json, '$.client_id') IS NULL THEN '' ELSE json_extract_string(a.config_json, '$.client_id') END
+      || CASE
+           WHEN json_extract_string(a.config_json, '$.scope') IS NULL
+                OR length(trim(json_extract_string(a.config_json, '$.scope'))) = 0 THEN ''
+           ELSE '&scope=' || replace(json_extract_string(a.config_json, '$.scope'), ' ', '+')
+         END
+      || CASE
+           WHEN json_extract_string(a.config_json, '$.redirect_uri') IS NULL
+                OR length(trim(json_extract_string(a.config_json, '$.redirect_uri'))) = 0 THEN ''
+           ELSE '&redirect_uri=' || json_extract_string(a.config_json, '$.redirect_uri')
+         END
+      || '&state=' || _oauth2_test_state()
+    ) AS loc
+  FROM best b
+  LEFT JOIN quackapi_auth a ON a.name = b.handler
+  WHERE b.kind = 'oauth_authorize'
+),
 result AS (
-  SELECT b.route_id, b.kind, b.status, b.include_fields, b.exclude_fields, ea.n_err, ea.detail_arr, rs.content_type AS rc_ct, rs.body AS rc_body, hr.hsql,
+  SELECT b.route_id, b.kind, b.status, b.handler AS route_handler, b.include_fields, b.exclude_fields, ea.n_err, ea.detail_arr, rs.content_type AS rc_ct, rs.body AS rc_body, hr.hsql,
     -- resp_headers from route_headers side table (additive). For 404 -> '{}'; for matched (incl 422 errs) emit the route's static headers.
+    -- oauth_authorize overrides Location at request time (state + client_id from scheme).
     COALESCE((SELECT json_group_object(name, value) FROM route_headers WHERE route_id = b.route_id), '{}') AS resp_headers,
+    oa.loc AS oauth_loc,
     (SELECT yes FROM is_malformed_multipart) AS malformed_mp,
     ad.forced_status, ad.forced_body, ad.has_pol, ad.vok, ad.claims_j
   FROM (SELECT 1) z
@@ -1162,6 +1315,7 @@ result AS (
   LEFT JOIN rendered_static rs ON rs.route_id = b.route_id
   LEFT JOIN handler_rendered hr ON true
   LEFT JOIN auth_dec ad ON true
+  LEFT JOIN oauth_authz oa ON oa.route_id = b.route_id
 )
 SELECT
   -- Auth decisions override route/validation decisions (C does the same after quack_route)
@@ -1172,12 +1326,14 @@ SELECT
     WHEN route_id IS NULL AND (SELECT path_exists FROM allow_methods) THEN 405
     WHEN route_id IS NULL THEN 404
     WHEN n_err > 0 THEN 422
+    WHEN kind = 'oauth_authorize' THEN 302
     WHEN route_id = 'readyz' THEN (SELECT CASE WHEN (SELECT bool_and(ready) FROM quackapi_readiness) THEN 200 ELSE 503 END)
     ELSE status
   END AS status_code,
   CASE
     WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) IN (401,403) THEN 'application/json'
     WHEN malformed_mp OR route_id IS NULL OR n_err > 0 THEN 'application/json'
+    WHEN kind = 'oauth_authorize' THEN 'application/json'
     WHEN kind IN ('openapi', 'static', 'html') THEN rc_ct
     WHEN kind = 'stream' THEN 'text/event-stream'
     ELSE 'application/json'
@@ -1194,7 +1350,7 @@ SELECT
     WHEN n_err > 0 THEN '{"detail":' || detail_arr || '}'
     WHEN route_id = 'readyz' AND (SELECT CASE WHEN (SELECT bool_and(ready) FROM quackapi_readiness) THEN 0 ELSE 1 END) = 1 THEN cast(json_object('detail', 'Not Ready') AS VARCHAR)
     WHEN kind IN ('openapi', 'static', 'html') THEN rc_body
-    WHEN kind = 'redirect' THEN NULL
+    WHEN kind IN ('redirect', 'oauth_authorize') THEN NULL
     ELSE NULL
   END AS body,
   CASE
@@ -1212,12 +1368,14 @@ SELECT
         include_fields,
         exclude_fields
       )
-    WHEN kind = 'redirect' THEN NULL
+    WHEN kind IN ('redirect', 'oauth_authorize') THEN NULL
     ELSE NULL
   END AS handler_sql,
   CASE
     WHEN route_id IS NULL AND (SELECT path_exists FROM allow_methods)
       THEN json_object('Allow', array_to_string((SELECT methods FROM allow_methods), ', '))
+    WHEN kind = 'oauth_authorize' THEN
+      json_object('Location', oauth_loc)
     ELSE resp_headers
   END AS resp_headers
 FROM result

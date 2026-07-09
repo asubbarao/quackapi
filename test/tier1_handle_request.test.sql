@@ -887,6 +887,61 @@ DELETE FROM dependencies WHERE name='test_marker';
 DROP TABLE IF EXISTS _di_marker;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- OAUTH2 / OIDC (CREATE AUTH grammar + flow mechanics) tier-1 assertions
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Seed a test OAUTH2 config (placeholder secret only — never a real client secret)
+INSERT INTO quackapi_auth SELECT * FROM register_auth('testoauth2', 'oauth2', '{"client_id":"testclient","client_secret":"PLACEHOLDER_SECRET_NEVER_REAL","authorize_url":"https://example.com/o/authorize","token_url":"https://example.com/o/token","jwks_url":"https://example.com/o/jwks","scope":"openid profile","redirect_uri":"http://127.0.0.1:18450/cb","secret":"test-secret-for-oauth","header":"Authorization","verify_exp":true,"leeway":0}');
+
+-- OAUTH A1: authorize url builder contains required params + state (no LIKE)
+WITH u AS (SELECT _oauth2_build_authorize_url('testoauth2') AS u)
+INSERT INTO _test_results
+  SELECT 'OAUTH2 authorize url has client_id', instr((SELECT u FROM u), 'client_id=testclient')>0, (SELECT u FROM u) FROM u
+  UNION ALL
+  SELECT 'OAUTH2 authorize url has response_type=code', instr((SELECT u FROM u), 'response_type=code')>0, (SELECT u FROM u) FROM u
+  UNION ALL
+  SELECT 'OAUTH2 authorize url has state', instr((SELECT u FROM u), 'state=test-csrf-state-42')>0, (SELECT u FROM u) FROM u
+  UNION ALL
+  SELECT 'OAUTH2 authorize url has scope', instr((SELECT u FROM u), 'scope=openid')>0, (SELECT u FROM u) FROM u;
+
+-- OAUTH A2: oauth_authorize kind route produces 302 + Location in resp_headers (dynamic)
+INSERT INTO routes SELECT * FROM register_oauth_authorize('oa2_authz', 'GET', '/oauth2/authorize', 'testoauth2', 302);
+WITH r AS (SELECT * FROM handle_request('GET','/oauth2/authorize','{}',''))
+INSERT INTO _test_results
+  SELECT 'OAUTH2 /oauth2/authorize kind → 302', r.status_code=302, 'got '||r.status_code::VARCHAR FROM r
+  UNION ALL
+  SELECT 'OAUTH2 /oauth2/authorize has Location header', instr(CAST(r.resp_headers AS VARCHAR), 'Location')>0, CAST(r.resp_headers AS VARCHAR) FROM r
+  UNION ALL
+  SELECT 'OAUTH2 /oauth2/authorize Location has state', instr(CAST(r.resp_headers AS VARCHAR), 'test-csrf-state-42')>0, CAST(r.resp_headers AS VARCHAR) FROM r
+  UNION ALL
+  SELECT 'OAUTH2 /oauth2/authorize Location has client_id', instr(CAST(r.resp_headers AS VARCHAR), 'client_id=testclient')>0, CAST(r.resp_headers AS VARCHAR) FROM r;
+
+-- OAUTH A3: test JWKS verify (inline JWKS with oct k → secret; uses generated test key)
+WITH v AS (SELECT _verify_jwt_from_jwks('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0aGVzdWJqIiwiaWF0IjoxLCJleHAiOjk5OTk5OTk5OTl9.Kh4wX193ybT7c4TMvF_V1O0M57HJPRQ0-_hfrHljAaA', '[{"kty":"oct","k":"dGVzdC1zZWNyZXQtZm9yLW9hdXRo"}]') AS c)
+INSERT INTO _test_results
+  SELECT 'OAUTH2 JWKS verify (test oct key) returns claims', (SELECT c FROM v) IS NOT NULL, (SELECT c FROM v)::VARCHAR FROM v
+  UNION ALL
+  SELECT 'OAUTH2 JWKS verify sub present', (SELECT c FROM v)['sub'] = 'thesubj', (SELECT c FROM v)::VARCHAR FROM v;
+
+-- OAUTH A4: OIDC kind accepted; config stores discovery + derived fields
+INSERT INTO quackapi_auth SELECT * FROM register_auth('testoidc', 'oidc', '{"discovery_url":"https://example.com/.well-known/openid-configuration","client_id":"oidcclient","client_secret":"PLACEHOLDER_OIDC","authorize_url":"https://example.com/oidc/auth","token_url":"https://example.com/oidc/token","jwks_url":"https://example.com/oidc/jwks"}');
+WITH c AS (SELECT config_json FROM quackapi_auth WHERE name='testoidc')
+INSERT INTO _test_results
+  SELECT 'OIDC CREATE stores discovery_url', instr((SELECT config_json FROM c), 'discovery_url')>0, (SELECT config_json FROM c) FROM c
+  UNION ALL
+  SELECT 'OIDC kind stored', (SELECT kind FROM quackapi_auth WHERE name='testoidc') = 'oidc', (SELECT kind FROM quackapi_auth WHERE name='testoidc');
+
+-- OAUTH A5: token exchange helper is mechanism-limited (request assembled, no fake POST)
+WITH e AS (SELECT _oauth2_exchange('testoauth2', 'authcode-xyz') AS j)
+INSERT INTO _test_results
+  SELECT 'OAUTH2 exchange is mechanism_limited', instr((SELECT j FROM e), 'mechanism_limited')>0, (SELECT j FROM e) FROM e
+  UNION ALL
+  SELECT 'OAUTH2 exchange carries token_url', instr((SELECT j FROM e), 'token_url')>0, (SELECT j FROM e) FROM e;
+
+-- cleanup oauth test routes (auth rows can remain; harmless for later checks)
+DELETE FROM routes WHERE route_id = 'oa2_authz';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT check_name, pass, detail FROM _test_results ORDER BY pass ASC, check_name;
