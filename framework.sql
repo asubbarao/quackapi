@@ -121,12 +121,130 @@ CREATE OR REPLACE TABLE policies (
 -- Tests and app DDL may CREATE OR REPLACE / populate; empty by default (no keys → auth fail for apikey schemes).
 CREATE OR REPLACE TABLE api_keys (key VARCHAR, subject VARCHAR);
 
+-- quackapi_cors: single global CORS policy table for v1 (Starlette CORSMiddleware parity).
+-- Populated exclusively via CREATE CORS DDL (or direct INSERT in tests). No row or NULL allowed_origins = disabled (OPTIONS on existing path yields 405 + Allow as before).
+-- allowed_* stored as JSON array strings (e.g. '["*"]' or '["https://a.com","https://b.com"]').
+-- allow_credentials=true forbids combining with origin "*" (must echo requesting origin).
+CREATE OR REPLACE TABLE quackapi_cors (
+  allowed_origins VARCHAR,
+  allowed_methods VARCHAR,
+  allowed_headers VARCHAR,
+  allow_credentials BOOLEAN,
+  expose_headers VARCHAR,
+  max_age INTEGER
+);
+
+-- register_cors: pure-SQL writer (for CREATE CORS DDL and tests). Returns one row for INSERT ... SELECT.
+CREATE OR REPLACE MACRO register_cors(allowed_origins, allowed_methods, allowed_headers, allow_credentials, expose_headers, max_age) AS TABLE (
+  SELECT allowed_origins AS allowed_origins,
+         allowed_methods AS allowed_methods,
+         allowed_headers AS allowed_headers,
+         allow_credentials AS allow_credentials,
+         expose_headers AS expose_headers,
+         max_age AS max_age
+);
+
 -- register_auth / register_policy: pure-SQL writers (oracle path + tests)
 CREATE OR REPLACE MACRO register_auth(name, kind, config_json) AS TABLE (
   SELECT name AS name, kind AS kind, config_json AS config_json
 );
 CREATE OR REPLACE MACRO register_policy(policy_id, pattern, as_mode, using_pred, with_check_pred := NULL, auth_name := NULL) AS TABLE (
   SELECT policy_id, pattern, as_mode, using_pred, with_check_pred, auth_name
+);
+
+-- ── CORS helpers (Starlette parity; inside handle_request; obey: instr/starts_with/ends_with, no LIKE, no COALESCE(col,''), verbose) ──
+-- _cors_json_to_list: best-effort cast of json array string to VARCHAR[] (falls back empty on fail). Used only for membership.
+CREATE OR REPLACE MACRO _cors_json_to_list(j) AS (
+  CASE
+    WHEN j IS NULL THEN []::VARCHAR[]
+    WHEN try_cast( json_extract( j::JSON , '$' ) AS VARCHAR[] ) IS NOT NULL THEN try_cast( json_extract( j::JSON , '$' ) AS VARCHAR[] )
+    ELSE []::VARCHAR[]
+  END
+);
+
+-- _cors_origin_allowed: true if origin matches explicit list or if "*" present. Caller ensures origin non-null.
+CREATE OR REPLACE MACRO _cors_origin_allowed(origin, ao_json) AS (
+  origin IS NOT NULL
+  AND ao_json IS NOT NULL
+  AND (
+    instr( ao_json , '"*"' ) > 0
+    OR list_contains( _cors_json_to_list( ao_json ) , origin )
+  )
+);
+
+-- _cors_method_allowed: true if acrm (upper) in list or "*" present.
+CREATE OR REPLACE MACRO _cors_method_allowed(meth_upper, am_json) AS (
+  meth_upper IS NOT NULL
+  AND am_json IS NOT NULL
+  AND (
+    instr( am_json , '"*"' ) > 0
+    OR list_contains( _cors_json_to_list( am_json ) , meth_upper )
+  )
+);
+
+-- _cors_build_acao_value: for a given request origin and config, return the ACA-Origin value per *+creds rule.
+CREATE OR REPLACE MACRO _cors_build_acao_value(origin, ao_json, ac_bool) AS (
+  CASE
+    WHEN ao_json IS NULL THEN NULL
+    WHEN instr( ao_json , '"*"' ) > 0 AND (ac_bool IS NULL OR ac_bool = false) THEN '*'
+    ELSE origin
+  END
+);
+
+-- _cors_build_preflight_resp_headers: returns JSON object string of ACA* for a preflight response (200 or 400 case still emits some headers per source).
+CREATE OR REPLACE MACRO _cors_build_preflight_resp_headers(origin, ao_json, am_json, ah_json, ac_bool, ma_int) AS (
+  json_object(
+    'Access-Control-Allow-Origin', _cors_build_acao_value( origin, ao_json, ac_bool ),
+    'Access-Control-Allow-Methods', CASE
+      WHEN am_json IS NOT NULL THEN
+        CASE
+          WHEN json_array_length( CASE WHEN try_cast( json_extract( am_json::JSON , '$' ) AS JSON ) IS NULL THEN '[]'::JSON ELSE try_cast( json_extract( am_json::JSON , '$' ) AS JSON ) END ) > 0
+          THEN array_to_string( _cors_json_to_list( am_json ) , ', ' )
+          ELSE 'GET, POST, OPTIONS'
+        END
+      ELSE 'GET, POST, OPTIONS'
+    END,
+    'Access-Control-Allow-Headers', CASE
+      WHEN ah_json IS NOT NULL THEN
+        CASE
+          WHEN json_array_length( CASE WHEN try_cast( json_extract( ah_json::JSON , '$' ) AS JSON ) IS NULL THEN '[]'::JSON ELSE try_cast( json_extract( ah_json::JSON , '$' ) AS JSON ) END ) > 0
+          THEN array_to_string( _cors_json_to_list( ah_json ) , ', ' )
+          ELSE 'Content-Type'
+        END
+      ELSE 'Content-Type'
+    END,
+    'Access-Control-Max-Age', CASE WHEN ma_int IS NOT NULL THEN cast(ma_int AS VARCHAR) ELSE '600' END
+  )
+);
+
+-- _cors_build_simple_resp_headers: for non-preflight responses that carry ACAO + optional creds/expose.
+-- Build via json_merge_patch to avoid invalid json from string concat. Always valid object.
+CREATE OR REPLACE MACRO _cors_build_simple_resp_headers(origin, ao_json, ac_bool, eh_json) AS (
+  CASE
+    WHEN origin IS NULL OR ao_json IS NULL OR NOT _cors_origin_allowed( origin, ao_json ) THEN '{}'
+    ELSE
+      CASE
+        WHEN (ac_bool IS NOT NULL AND ac_bool = true) AND (eh_json IS NOT NULL AND instr(eh_json,'[')>0)
+        THEN cast( json_merge_patch(
+               json_merge_patch(
+                 json_object('Access-Control-Allow-Origin', _cors_build_acao_value( origin, ao_json, ac_bool ))::JSON ,
+                 json_object('Access-Control-Allow-Credentials', 'true')::JSON
+               ),
+               json_object('Access-Control-Expose-Headers', array_to_string( _cors_json_to_list( eh_json ) , ', ' ))::JSON
+             ) AS VARCHAR )
+        WHEN (ac_bool IS NOT NULL AND ac_bool = true)
+        THEN cast( json_merge_patch(
+               json_object('Access-Control-Allow-Origin', _cors_build_acao_value( origin, ao_json, ac_bool ))::JSON ,
+               json_object('Access-Control-Allow-Credentials', 'true')::JSON
+             ) AS VARCHAR )
+        WHEN (eh_json IS NOT NULL AND instr(eh_json,'[')>0)
+        THEN cast( json_merge_patch(
+               json_object('Access-Control-Allow-Origin', _cors_build_acao_value( origin, ao_json, ac_bool ))::JSON ,
+               json_object('Access-Control-Expose-Headers', array_to_string( _cors_json_to_list( eh_json ) , ', ' ))::JSON
+             ) AS VARCHAR )
+        ELSE json_object( 'Access-Control-Allow-Origin', _cors_build_acao_value( origin, ao_json, ac_bool ) )
+      END
+  END
 );
 
 -- ── crypto / b64url / JWT helpers (lean on DuckDB 'crypto' ext + json) ──────
@@ -522,6 +640,80 @@ is_malformed_multipart AS (
     AND (SELECT boundary FROM multipart_boundary) IS NOT NULL
     AND instr(COALESCE(body, ''), '--' || (SELECT boundary FROM multipart_boundary)) = 0
   AS yes
+),
+
+-- ── CORS preflight / post context (v1 single global; short-circuits OPTIONS preflights before 405/Allow path) ──
+-- Must be before route_idx so preflight for unknown paths still get ACA headers + 200 instead of 405.
+has_cors AS (
+  SELECT
+    CASE WHEN (SELECT count(*)::BIGINT FROM quackapi_cors) > 0 THEN 1 ELSE 0 END AS n,
+    (SELECT allowed_origins FROM quackapi_cors LIMIT 1) AS ao,
+    (SELECT allowed_methods FROM quackapi_cors LIMIT 1) AS am,
+    (SELECT allowed_headers FROM quackapi_cors LIMIT 1) AS ah,
+    (SELECT allow_credentials FROM quackapi_cors LIMIT 1) AS ac,
+    (SELECT expose_headers FROM quackapi_cors LIMIT 1) AS eh,
+    (SELECT max_age FROM quackapi_cors LIMIT 1) AS ma
+  FROM (SELECT 1)
+),
+cors_ctx AS (
+  SELECT
+    CASE
+      WHEN json_extract_string(headers, '$.origin') IS NOT NULL THEN json_extract_string(headers, '$.origin')
+      WHEN json_extract_string(headers, '$.Origin') IS NOT NULL THEN json_extract_string(headers, '$.Origin')
+      ELSE NULL
+    END AS origin,
+    upper(
+      CASE
+        WHEN json_extract_string(headers, '$.access-control-request-method') IS NOT NULL THEN json_extract_string(headers, '$.access-control-request-method')
+        WHEN json_extract_string(headers, '$.Access-Control-Request-Method') IS NOT NULL THEN json_extract_string(headers, '$.Access-Control-Request-Method')
+        ELSE ''
+      END
+    ) AS acrm,
+    CASE
+      WHEN json_extract_string(headers, '$.access-control-request-headers') IS NOT NULL THEN json_extract_string(headers, '$.access-control-request-headers')
+      WHEN json_extract_string(headers, '$.Access-Control-Request-Headers') IS NOT NULL THEN json_extract_string(headers, '$.Access-Control-Request-Headers')
+      ELSE NULL
+    END AS acrh
+  FROM (SELECT 1)
+),
+is_preflight AS (
+  SELECT
+    upper(method) = 'OPTIONS'
+    AND (SELECT origin FROM cors_ctx) IS NOT NULL
+    AND (SELECT acrm FROM cors_ctx) IS NOT NULL
+    AND (SELECT n FROM has_cors) > 0
+  AS yes
+  FROM (SELECT 1)
+),
+cors_dec AS (
+  SELECT
+    CASE
+      WHEN (SELECT yes FROM is_preflight) THEN
+        CASE
+          WHEN NOT _cors_origin_allowed( (SELECT origin FROM cors_ctx), (SELECT ao FROM has_cors) ) THEN 400
+          WHEN NOT _cors_method_allowed( (SELECT acrm FROM cors_ctx), (SELECT am FROM has_cors) ) THEN 400
+          ELSE 200
+        END
+      ELSE 0
+    END AS pre_status,
+    CASE
+      WHEN (SELECT yes FROM is_preflight) THEN
+        CASE
+          WHEN NOT _cors_origin_allowed( (SELECT origin FROM cors_ctx), (SELECT ao FROM has_cors) ) THEN '{}'
+          ELSE _cors_build_preflight_resp_headers( (SELECT origin FROM cors_ctx), (SELECT ao FROM has_cors), (SELECT am FROM has_cors), (SELECT ah FROM has_cors), (SELECT ac FROM has_cors), (SELECT ma FROM has_cors) )
+        END
+      ELSE '{}'
+    END AS pre_resp_headers,
+    CASE
+      WHEN (SELECT yes FROM is_preflight) THEN
+        CASE
+          WHEN NOT _cors_origin_allowed( (SELECT origin FROM cors_ctx), (SELECT ao FROM has_cors) ) THEN 'Disallowed CORS origin'
+          WHEN NOT _cors_method_allowed( (SELECT acrm FROM cors_ctx), (SELECT am FROM has_cors) ) THEN 'Disallowed CORS method'
+          ELSE 'OK'
+        END
+      ELSE NULL
+    END AS pre_body
+  FROM (SELECT 1)
 ),
 -- route_idx: split each registered pattern into segments INLINE (no route_index
 -- table). seg_count is an O(1) length prefilter; literal_count drives the
@@ -1007,7 +1199,14 @@ result AS (
     -- resp_headers from route_headers side table (additive). For 404 -> '{}'; for matched (incl 422 errs) emit the route's static headers.
     COALESCE((SELECT json_group_object(name, value) FROM route_headers WHERE route_id = b.route_id), '{}') AS resp_headers,
     (SELECT yes FROM is_malformed_multipart) AS malformed_mp,
-    ad.forced_status, ad.forced_body, ad.has_pol, ad.vok, ad.claims_j
+    ad.forced_status, ad.forced_body, ad.has_pol, ad.vok, ad.claims_j,
+    (SELECT pre_status FROM cors_dec) AS cors_pre_status,
+    (SELECT pre_resp_headers FROM cors_dec) AS cors_pre_resp_headers,
+    (SELECT pre_body FROM cors_dec) AS cors_pre_body,
+    (SELECT origin FROM cors_ctx) AS cors_req_origin,
+    (SELECT ao FROM has_cors) AS cors_ao,
+    (SELECT ac FROM has_cors) AS cors_ac,
+    (SELECT eh FROM has_cors) AS cors_eh
   FROM (SELECT 1) z
   LEFT JOIN best b ON true
   LEFT JOIN err_agg ea ON true
@@ -1017,7 +1216,9 @@ result AS (
 )
 SELECT
   -- Auth decisions override route/validation decisions (C does the same after quack_route)
+  -- CORS preflight (when active) overrides even 405 path-match (OPTIONS preflights never 405 when policy set).
   CASE
+    WHEN (SELECT cors_pre_status FROM result LIMIT 1) IN (200,400) THEN (SELECT cors_pre_status FROM result LIMIT 1)
     WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) = 401 THEN 401
     WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) = 403 THEN 403
     WHEN malformed_mp THEN 422
@@ -1027,6 +1228,7 @@ SELECT
     ELSE status
   END AS status_code,
   CASE
+    WHEN (SELECT cors_pre_status FROM result LIMIT 1) IN (200,400) THEN 'text/plain'
     WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) IN (401,403) THEN 'application/json'
     WHEN malformed_mp OR route_id IS NULL OR n_err > 0 THEN 'application/json'
     WHEN kind IN ('openapi', 'static', 'html') THEN rc_ct
@@ -1034,6 +1236,7 @@ SELECT
     ELSE 'application/json'
   END AS content_type,
   CASE
+    WHEN (SELECT cors_pre_status FROM result LIMIT 1) IN (200,400) THEN (SELECT cors_pre_body FROM result LIMIT 1)
     WHEN (SELECT forced_status FROM result WHERE forced_status=401 LIMIT 1) = 401 THEN (SELECT forced_body FROM result LIMIT 1)
     WHEN (SELECT forced_status FROM result WHERE forced_status=403 LIMIT 1) = 403 THEN (SELECT forced_body FROM result LIMIT 1)
     WHEN malformed_mp THEN cast(json_object('detail', json_array(
@@ -1048,6 +1251,7 @@ SELECT
     ELSE NULL
   END AS body,
   CASE
+    WHEN (SELECT cors_pre_status FROM result LIMIT 1) IN (200,400) THEN NULL
     WHEN (SELECT forced_status FROM result WHERE forced_status IN (401,403) LIMIT 1) IN (401,403) THEN NULL
     WHEN malformed_mp OR route_id IS NULL OR n_err > 0 THEN NULL
     WHEN kind IN ('dynamic', 'stream') THEN
@@ -1061,9 +1265,20 @@ SELECT
     ELSE NULL
   END AS handler_sql,
   CASE
+    WHEN (SELECT cors_pre_status FROM result LIMIT 1) IN (200,400) THEN (SELECT cors_pre_resp_headers FROM result LIMIT 1)
     WHEN route_id IS NULL AND (SELECT path_exists FROM allow_methods)
       THEN json_object('Allow', array_to_string((SELECT methods FROM allow_methods), ', '))
-    ELSE resp_headers
+    ELSE
+      -- non-preflight: if cors active and origin allowed, merge simple ACA headers (ACAO + creds + expose) into base resp_headers
+      CASE
+        WHEN (SELECT cors_req_origin FROM result LIMIT 1) IS NULL OR (SELECT cors_ao FROM result LIMIT 1) IS NULL THEN resp_headers
+        WHEN NOT _cors_origin_allowed( (SELECT cors_req_origin FROM result LIMIT 1), (SELECT cors_ao FROM result LIMIT 1) ) THEN resp_headers
+        ELSE
+          cast( json_merge_patch(
+            CASE WHEN resp_headers IS NULL OR resp_headers = '' THEN '{}' ELSE resp_headers END ::JSON ,
+            (SELECT _cors_build_simple_resp_headers( (SELECT cors_req_origin FROM result LIMIT 1), (SELECT cors_ao FROM result LIMIT 1), (SELECT cors_ac FROM result LIMIT 1), (SELECT cors_eh FROM result LIMIT 1) ) FROM (SELECT 1) )::JSON
+          ) AS VARCHAR )
+      END
   END AS resp_headers
 FROM result
 );

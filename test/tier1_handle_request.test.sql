@@ -469,6 +469,87 @@ INSERT INTO _test_results
   SELECT 'PO OPTIONS /health → 405', r.status_code = 405, 'got '||r.status_code::VARCHAR FROM r;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- CORS CHECKS (CREATE CORS + Starlette parity: preflight 200+ACA, disallowed no ACAO or 400, actual carries ACAO, * vs creds)
+-- Insert policy, assert, leave row (harmless to later checks).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Ensure clean start for cors tests (in case prior state)
+DELETE FROM quackapi_cors;
+
+-- CHECK CORS-1: CREATE CORS with * origins, explicit methods/headers, no creds
+INSERT INTO quackapi_cors SELECT * FROM register_cors(
+  '["*"]'::VARCHAR,
+  '["GET","POST","OPTIONS","PUT","DELETE"]'::VARCHAR,
+  '["*"]'::VARCHAR,
+  false,
+  '[]'::VARCHAR,
+  600
+);
+
+-- preflight allowed * : 200 (not 405), ACA headers present, ACAO=echo for this case? but * allowed without creds -> may be *, but our _build echoes? wait per impl for !creds * sets *
+WITH r AS (SELECT * FROM handle_request('OPTIONS','/health','{"origin":"http://x.example","access-control-request-method":"POST"}',''))
+INSERT INTO _test_results
+  SELECT 'CORS preflight allowed → 200', r.status_code = 200, 'got '||r.status_code::VARCHAR FROM r
+  UNION ALL
+  SELECT 'CORS preflight ACAO present', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') IS NOT NULL, coalesce(r.resp_headers,'<null>') FROM r
+  UNION ALL
+  SELECT 'CORS preflight has ACA-Methods', instr(coalesce(json_extract_string(r.resp_headers,'$.Access-Control-Allow-Methods'),''), 'POST') > 0, r.resp_headers FROM r
+  UNION ALL
+  SELECT 'CORS preflight has Max-Age', json_extract_string(r.resp_headers, '$.Access-Control-Max-Age') = '600', r.resp_headers FROM r;
+
+-- actual GET with Origin: carries ACAO ( '*' for *+!creds per starlette simple_headers )
+WITH r AS (SELECT * FROM handle_request('GET','/health','{"origin":"http://x.example"}',''))
+INSERT INTO _test_results
+  SELECT 'CORS actual GET carries ACAO', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') = '*', coalesce(json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin'),'<null>') FROM r;
+
+-- disallow origin: 400 + NO ACAO header
+DELETE FROM quackapi_cors;
+INSERT INTO quackapi_cors SELECT * FROM register_cors(
+  '["https://good.example"]'::VARCHAR,
+  '["GET","POST","OPTIONS"]'::VARCHAR,
+  '["Content-Type"]'::VARCHAR,
+  false,
+  '[]'::VARCHAR,
+  600
+);
+WITH r AS (SELECT * FROM handle_request('OPTIONS','/users/1','{"origin":"http://evil.example","access-control-request-method":"GET"}',''))
+INSERT INTO _test_results
+  SELECT 'CORS preflight disallowed → 400', r.status_code = 400, 'got '||r.status_code::VARCHAR FROM r
+  UNION ALL
+  SELECT 'CORS disallowed preflight has no ACAO', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') IS NULL, coalesce(r.resp_headers,'<null>') FROM r;
+
+-- actual with disallowed: no ACAO added
+WITH r AS (SELECT * FROM handle_request('GET','/health','{"origin":"http://evil.example"}',''))
+INSERT INTO _test_results
+  SELECT 'CORS actual disallowed origin no ACAO added', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') IS NULL, coalesce(json_extract_string(r.resp_headers,'$.Access-Control-Allow-Origin'),'<null>') FROM r;
+
+-- creds + * : must echo origin not *
+DELETE FROM quackapi_cors;
+INSERT INTO quackapi_cors SELECT * FROM register_cors(
+  '["*"]'::VARCHAR,
+  '["GET","POST","OPTIONS"]'::VARCHAR,
+  '["*"]'::VARCHAR,
+  true,
+  '["X-Custom"]'::VARCHAR,
+  300
+);
+WITH r AS (SELECT * FROM handle_request('GET','/health','{"origin":"https://cred.example"}',''))
+INSERT INTO _test_results
+  SELECT 'CORS *+creds echoes origin', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') = 'https://cred.example', coalesce(json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin'),'<null>') FROM r
+  UNION ALL
+  SELECT 'CORS creds has Allow-Credentials', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Credentials') = 'true', r.resp_headers FROM r
+  UNION ALL
+  SELECT 'CORS expose present', instr(coalesce(json_extract_string(r.resp_headers,'$.Access-Control-Expose-Headers'),''), 'X-Custom') > 0, r.resp_headers FROM r;
+
+-- preflight with creds * echoes
+WITH r AS (SELECT * FROM handle_request('OPTIONS','/health','{"origin":"https://cred.example","access-control-request-method":"POST"}',''))
+INSERT INTO _test_results
+  SELECT 'CORS preflight *+creds echoes', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') = 'https://cred.example', coalesce(json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin'),'<null>') FROM r;
+
+-- clean for any downstream (optional)
+DELETE FROM quackapi_cors;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- R2 MULTIPART/FORM-DATA CHECKS
 -- Register an upload route with type='file' param.
 -- These checks are additive and do not affect any prior route.

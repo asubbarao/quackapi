@@ -75,7 +75,7 @@ FROM json_each('[
 --   log_entry    VARCHAR
 --   resp_headers VARCHAR   — additive (R1); for cors preflight short-circuit contains ACA* headers
 --
--- CORS preflight (OPTIONS + Origin + ACR-Method) short-circuits to 204 + ACA* when
+-- CORS preflight (OPTIONS + Origin + ACR-Method) short-circuits to 200 + ACA* when
 -- a 'cors' middleware row exists with allowed_origins etc. Priority should be early (e.g. 5).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO apply_pre(method, path, headers, body) AS TABLE (
@@ -122,7 +122,7 @@ step_outcomes AS (
 
     CASE m.kind
       WHEN 'auth_gate' THEN 401
-      WHEN 'cors' THEN 204
+      WHEN 'cors' THEN 200
       ELSE 200
     END AS fail_status,
 

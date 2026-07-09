@@ -202,10 +202,10 @@ SELECT assert_true(
 -- Uses the seeded cors row (priority 5, allowed example.com)
 -- ---------------------------------------------------------------------------
 SELECT assert_true(
-  pass = false AND status_code = 204
+  pass = false AND status_code = 200
   AND json_extract_string(resp_headers, '$.Access-Control-Allow-Origin') = 'https://example.com'
   AND json_extract_string(resp_headers, '$.Access-Control-Allow-Methods') LIKE '%POST%',
-  'R1: cors preflight OPTIONS short-circuits 204 with ACA* headers'
+  'R1: cors preflight OPTIONS short-circuits 200 with ACA* headers'
 )
 FROM apply_pre(
   'OPTIONS',
