@@ -85,7 +85,7 @@ and sessions are now IN MAIN; tier-1 grew 178 → 192, all green at every step.
 
 | 👍 | Issue | Feature | Mechanism | Status (code-verified) |
 |---|---|---|---|---|
-| 75 | #754 | First-class sessions | `CREATE SESSION STORE` + `CREATE AUTH … AS SESSION` — server store IS a table; signed sid\|exp\|hmac cookies + synchronizer CSRF | **MERGED (oracle)** `407200f` — tier-1 192/192. C mirror parked on `fleet/sessions-cpp` (forked pre-health/DI/gzip/CORS, failed 07-08 cert; needs rebase + own cert pass) |
+| 75 | #754 | First-class sessions | `CREATE SESSION STORE` + `CREATE AUTH … AS SESSION` — server store IS a table; signed sid\|exp\|hmac cookies + synchronizer CSRF | **SHIPPED (oracle + C)** — C mirror rebuilt on ext-cpp main (`3485f13`, supersedes `fleet/sessions-cpp`); verification delegated to the oracle macro via prepared binds; live-certified 7/7 matrix. Audit: `docs/SECURITY.md` |
 | 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | **MERGED (oracle)** `a7e14c5` — tier-1 gained 4 checks. C-side boot-runner (serve_brain executing STARTUP hooks) still open |
 | — | — | CORS (`CREATE CORS`, Starlette `CORSMiddleware` parity) | single global row in `quackapi_cors`; oracle + C worker | **MERGED + CERTIFIED end-to-end** `a1a7607` / ext-cpp `650cf07` — the salvaged build needed 7 real fixes (boot never loaded g_cors; sugar wrote non-JSON lists + never parsed scalar keys; `mi<sizeof-1` list mangler; HARDCODED ACAH/Expose fixture values; patch after early returns; dynamic emit dropped resp_headers entirely — that last one also silently ate Set-Cookie on handler responses; reason phrases). Cert: make test 85/85 + 7-case live curl matrix |
 | 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **PARKED on `fleet/oauth` (`9ddcc51`)** — supersedes stash `6088198` (42 vs 22 markers; stash is an earlier draft, ignore it). 192/192 standalone, but merging = a 5-region semantic weave through the Phase-0 auth pipeline (scheme CASE, verify CTE, decision joins) AND token exchange still needs the outbound-POST verdict — do it as one deliberate rebase+finish pass, not a hand-weave |
@@ -126,10 +126,11 @@ sugar layer wired into `handle_request`. What FastAPI needs a pip **plus a runni
 (Redis, a broker, a search cluster, an S3 SDK), quackapi gets from `LOAD`.
 
 **Tier 1 — undercut whole products (mostly ext-backed):**
-- `CREATE SUBSCRIPTION` — consume an upstream `ws://`/`wss://` feed or Redis channel (materialize
-  `INTO` a table or run a per-message `HANDLER`) → **`radio` ext**. Verified round-trip 2026-07-06;
-  spec complete, buildable now (`SUBSCRIPTION_SPEC.md`). **Nuance (verified): radio is a CLIENT only
-  — it dials outbound; it does NOT accept inbound browser WebSocket connections.**
+- `CREATE SUBSCRIPTION` — **SHIPPED 2026-07-09 (oracle + C)**: `CREATE SUBSCRIPTION name ON '<url>'
+  AS '<handler sql>'` — handler sees a `msg` CTE, payloads dispatched via prepared binds, at-most-once
+  with per-row error ledger. Live-certified against local redis pub/sub (see `SUBSCRIPTION_SPEC.md` §6).
+  **Nuance (verified): radio is a CLIENT only — it dials outbound; it does NOT accept inbound browser
+  WebSocket connections.** Kafka deferred: tributary today only ships whole-topic batch scan.
 - WebSockets on the main port (browser → quackapi, `@app.websocket` equivalent) → **C-server work**
   (per-connection threads, `WS_SPEC.md`), NOT radio. Redis-style pub/sub (outbound) → `radio`.
 - `CREATE API FOR TABLE` (PostgREST / Supabase auto-API) → SQL over the catalog (a real build);
@@ -185,12 +186,12 @@ Weighted by leverage × cost, where **ext-backed = cheap** (`LOAD` + sugar, not 
 ~~0. Certify + merge gzip~~ **DONE** — in main, built exit 0, curl matrix certified.
 ~~1. Phase-0 auth gate~~ **DONE** — constant-time compare + oracle auth wiring merged.
 
-1. **`CREATE SUBSCRIPTION` (radio-backed)** — consume upstream `ws`/`redis` feeds; materialize
-   `INTO` a table or handler-dispatch per message. Spec complete + radio round-trip verified
-   (`SUBSCRIPTION_SPEC.md`). Ext-backed = cheap (registry + poller + DDL sugar). Open design calls
-   to make first: handler-injection mechanism, admin-only security, restart durability. **Inbound
-   browser WS is a SEPARATE C-server track (`WS_SPEC.md`) — radio is a client, it can't accept
-   inbound connections.** Avoid `radio_subscriptions()` (UINT64 crash); use the per-URL helpers.
+~~1. `CREATE SUBSCRIPTION` (radio-backed)~~ **DONE 2026-07-09** — registry + runner thread + DDL
+   sugar shipped full-stack; live-certified on redis pub/sub; tier-1 197/197. Design calls resolved:
+   handler-injection = oracle-composed `msg` CTE with prepared binds; restart durability = registry
+   persists, runner resubscribes at boot; `radio_subscriptions()` never called. Residual v2 items in
+   `SUBSCRIPTION_SPEC.md` §6 honest edges. **Inbound browser WS remains a SEPARATE C-server track
+   (`WS_SPEC.md`).**
 2. **Merge / fold `CREATE LIFECYCLE` #617** — oracle already built on `fleet/lifecycle` (`5f250a1`);
    certify + merge (or graft into the next feature branch) so it stops looking unbuilt.
 3. **`CREATE API FOR TABLE`** — the flagship auto-CRUD (PostgREST / Supabase killer). Rides the

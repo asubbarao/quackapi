@@ -382,4 +382,82 @@ spike status? radio viable client backbone; spec written; SPIKE-COMPLETE (radio 
 
 ---
 
+## 6. SHIPPED (2026-07-09) — final design as built
+
+The spike's proposal above was simplified for v1. What shipped:
+
+### Substrate verdict (the "does Kafka belong here?" question, answered honestly)
+
+- **radio (WS + Redis pub/sub) is the v1 substrate.** It has exactly the runner
+  primitives: per-subscription background receive thread, blocking `radio_listen`,
+  buffered messages with monotonic per-subscription `message_id`. Verified live.
+- **tributary (Kafka) is DEFERRED, not designed-in.** Its only shipped function
+  today is `tributary_scan_topic` — whole-topic batch scan. Continuous/offset-based
+  consumption is on Query.Farm's *roadmap* (verified against query.farm docs
+  2026-07-09). Polling scan_topic would re-read the entire topic per tick, so a
+  Kafka-backed subscription waits for tributary to ship a real consumer. Note batch
+  Kafka analytics needs zero framework support already: a route handler can
+  `SELECT * FROM tributary_scan_topic(...)` today.
+- **Is an event-hook surface in a web framework scope creep?** No — FastAPI users
+  routinely ask for background consumers and FastAPI's answer is "spawn your own in
+  lifespan". Ours is one DDL statement, and the handler is SQL over the same DB the
+  routes serve — the framework thesis applied to events.
+
+### Shipped surface
+
+```sql
+CREATE SUBSCRIPTION alerts ON 'redis-tcp://localhost:6379?channel=alerts'
+  AS 'INSERT INTO alert_log SELECT now(), message, channel FROM msg';
+DROP SUBSCRIPTION alerts;
+```
+
+- **Handler-only** (the spike's `INTO table` mode is just a handler; YAGNI).
+- Handler sees a `msg` CTE: `msg(message VARCHAR, channel VARCHAR, message_id
+  UBIGINT, subscription VARCHAR)`. Composition lives in ONE place — the oracle
+  macro `_compose_subscription_sql` (framework.sql); the C runner fetches composed
+  text via `run_subscriptions()` and only prepares/binds.
+- **Payloads are untrusted**: passed as prepared binds, never spliced (tier-1 has
+  an injection-proof check with a `'); DROP TABLE ...--` payload). `decode()` gives
+  raw text; invalid UTF-8 falls back to the escaped blob-cast form (lossless).
+- **Registry**: `quackapi_subscriptions(name, url, handler_sql, enabled,
+  last_error, last_error_at)` — written only by the sugar (or
+  `register_subscription` in tests).
+- **Runner** (`subscription_runner_main`, ext-cpp): one thread on the HOST
+  instance; loops ≤1s (radio_listen timeout doubles as the shutdown poll);
+  re-reads the registry each loop (DDL takes effect within ~1s, no reload
+  coordination); reconciles subscribe/unsubscribe; one radio subscription per
+  URL fanned out to every matching registry row; per-URL high-water mark
+  (message_id) dedupes dispatch; at-most-once — handler failure records
+  last_error/last_error_at on the row (first failure per row per drain, bounded
+  writes) plus ONE aggregate stderr line per drain, and the message is skipped.
+  `radio_subscriptions()` is never called (§2 crash bug).
+
+### Live certification (2026-07-09, local redis-server 8.6.2 on 18486)
+
+- CREATE SUBSCRIPTION ×2 (same URL: good handler + intentionally broken handler) →
+  `SUBSCRIPTION_CREATED`; `redis-cli PUBLISH` returned subscriber count **1**
+  (URL dedup correct — one transport subscription, two handlers).
+- 3 published JSON payloads (containing quotes and `); injection`) landed
+  byte-exact in the target table with message_ids 1000–1002, durable after
+  graceful shutdown (read-write reopen).
+- Broken handler: `last_error = "prepare: Catalog Error: Table with name
+  does_not_exist does not exist!..."` + timestamp; good handler's row stayed
+  clean; exactly one aggregate stderr line per drain.
+- Zero-subscription server: /health and /users 200, zero [subs] log noise.
+- Gates: tier-1 **197/197** (5 new SUB checks), sqllogictest **85/85**.
+
+### Honest edges (v1, documented not hidden)
+
+- **At-most-once, in-process buffer.** radio's queue is memory-only and
+  capacity-bounded (FIFO eviction). This is an event-hook surface, not a durable
+  queue — pair with an upstream durable log when delivery matters.
+- **Reconnect on transport drop is not handled** ('disconnection' rows are
+  ignored; radio's own behavior governs). Resubscribe-with-backoff is future work.
+- **Unsubscribe reconcile path** (DROP while serving) is code-reviewed but not
+  live-certified — runtime DDL against a serving process needs the in-session
+  path; subscribe/dispatch/error/durability paths are all live-certified.
+- **Binary payloads** arrive in escaped text form; a raw-BLOB fifth bind is the
+  v2 answer if needed.
+- Handler SQL is developer-trusted DDL input (same trust model as route handlers).
+
 **End of spec.**

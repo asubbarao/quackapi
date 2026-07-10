@@ -243,6 +243,55 @@ CREATE OR REPLACE MACRO register_lifecycle(name, phase, sql, ordering := 100) AS
   SELECT name AS name, phase AS phase, sql AS sql, ordering AS ordering
 );
 
+-- ── Subscriptions (CREATE SUBSCRIPTION sugar; runner thread lives in serve_brain) ──
+-- quackapi_subscriptions: event-bus subscriptions registered via CREATE SUBSCRIPTION
+-- sugar (or register_subscription in oracle/tests). The C subscription runner thread
+-- LOADs the radio community extension on the HOST instance, radio_subscribe()s every
+-- enabled row, and executes handler_sql once per received 'message' row, wrapped by
+-- _compose_subscription_sql so the handler sees a `msg` CTE:
+--   msg(message VARCHAR, channel VARCHAR, message_id UBIGINT, subscription VARCHAR)
+-- Message payloads are UNTRUSTED input: the runner passes them as prepared-statement
+-- binds, never spliced into SQL. Handler failures are recorded on the registry row
+-- (last_error / last_error_at) and the message is skipped — at-most-once dispatch.
+-- radio's receive buffer is in-process and capacity-bounded (FIFO eviction), so this
+-- is an event-hook surface, not a durable queue; pair with an upstream durable log
+-- (redis streams / Kafka) when delivery guarantees matter.
+CREATE OR REPLACE TABLE quackapi_subscriptions (
+  name VARCHAR,
+  url VARCHAR,
+  handler_sql VARCHAR,
+  enabled BOOLEAN,
+  last_error VARCHAR,
+  last_error_at TIMESTAMP
+);
+
+-- register_subscription: pure-SQL writer (sugar path is CREATE SUBSCRIPTION in C++ parser).
+CREATE OR REPLACE MACRO register_subscription(name, url, handler_sql, enabled := true) AS TABLE (
+  SELECT name AS name, url AS url, handler_sql AS handler_sql, enabled AS enabled,
+         CAST(NULL AS VARCHAR) AS last_error, CAST(NULL AS TIMESTAMP) AS last_error_at
+);
+
+-- _compose_subscription_sql: the ONE place message-context injection is defined —
+-- the C runner fetches the composed text via run_subscriptions() and only
+-- prepares/binds it (no second composition implementation to drift).
+-- Bind order: 1=message 2=channel 3=message_id 4=subscription name.
+-- A handler that itself starts with WITH gets its CTE list merged after msg.
+CREATE OR REPLACE MACRO _compose_subscription_sql(h) AS (
+  CASE
+    WHEN starts_with(upper(ltrim(h)), 'WITH ')
+      THEN 'WITH msg AS (SELECT ?::VARCHAR AS message, ?::VARCHAR AS channel, ?::UBIGINT AS message_id, ?::VARCHAR AS subscription), ' || substr(ltrim(h), 6)
+    ELSE 'WITH msg AS (SELECT ?::VARCHAR AS message, ?::VARCHAR AS channel, ?::UBIGINT AS message_id, ?::VARCHAR AS subscription) ' || h
+  END
+);
+
+-- run_subscriptions(): runner-facing reader — enabled rows with composed exec_sql.
+CREATE OR REPLACE MACRO run_subscriptions() AS TABLE (
+  SELECT name, url, _compose_subscription_sql(handler_sql) AS exec_sql
+  FROM quackapi_subscriptions
+  WHERE enabled
+  ORDER BY name
+);
+
 -- ── CORS helpers (Starlette parity; inside handle_request; obey: instr/starts_with/ends_with, no LIKE, no COALESCE(col,''), verbose) ──
 -- _cors_json_to_list: best-effort cast of json array string to VARCHAR[] (falls back empty on fail). Used only for membership.
 CREATE OR REPLACE MACRO _cors_json_to_list(j) AS (

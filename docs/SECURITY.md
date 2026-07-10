@@ -14,6 +14,9 @@ proven.
 - **The HTTP client is untrusted.** Everything arriving over the socket — method,
   path, headers, cookies, body, tokens — is hostile input. The invariants below
   are about that boundary.
+- **The event bus is untrusted.** CREATE SUBSCRIPTION message payloads (and
+  channel names) arrive from external WebSocket/Redis sources and are hostile
+  input; only the subscription URL and handler SQL are developer-trusted DDL.
 - **Crypto is delegated to DuckDB's `crypto` extension** (HMAC-SHA256). quackapi
   deliberately implements no cipher, hash, or comparison primitive of its own.
 
@@ -33,7 +36,11 @@ proven.
    C tracks both.
 3. **Untrusted values are bound, never spliced.** The session verify and CSRF
    queries in the C worker use prepared-statement binds for cookie value, secret,
-   CSRF token, and sid. (Residual: the older JWT path splices with `''`-escaping —
+   CSRF token, and sid; the subscription runner dispatches event payloads,
+   channels, and message ids to handlers exclusively via prepared binds (the
+   composed statement comes from the oracle's `_compose_subscription_sql` —
+   tier-1 includes an injection-proof check with a `'); DROP TABLE ...--`
+   payload). (Residual: the older JWT path splices with `''`-escaping —
    see Open items.)
 4. **Session cookies**: `sid|exp|hmac-sha256` signed value; sid is a server-minted
    random UUID (128-bit) — the client can never choose it, so session fixation has

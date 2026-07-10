@@ -1036,6 +1036,46 @@ WITH r AS (SELECT * FROM handle_request('GET','/profile','{"_cookies":{"session"
 INSERT INTO _test_results SELECT 'R1 cookie profile still 200', r.status_code=200, 'got '||r.status_code FROM r;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- SUBSCRIPTIONS — registry writer/reader + composition (the C runner consumes
+-- run_subscriptions().exec_sql verbatim, so these checks pin its exact shape)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- CHECK SUB1: register_subscription writer shape → registry row lands
+INSERT INTO quackapi_subscriptions SELECT * FROM register_subscription('sub_t1', 'redis-tcp://localhost:6379?channel=t1', 'INSERT INTO _sub_probe SELECT message, channel, message_id, subscription FROM msg');
+WITH n AS (SELECT count(*) AS c FROM quackapi_subscriptions WHERE name='sub_t1' AND enabled)
+INSERT INTO _test_results SELECT 'SUB register lands enabled row', (SELECT c FROM n)=1, '' FROM (SELECT 1);
+
+-- CHECK SUB2: composed exec_sql is EXACTLY the literal the dispatch simulation below
+-- prepares — guards drift between _compose_subscription_sql and the runner contract
+WITH r AS (SELECT exec_sql FROM run_subscriptions() WHERE name='sub_t1')
+INSERT INTO _test_results SELECT 'SUB compose matches runner literal',
+  (SELECT exec_sql FROM r) = 'WITH msg AS (SELECT ?::VARCHAR AS message, ?::VARCHAR AS channel, ?::UBIGINT AS message_id, ?::VARCHAR AS subscription) INSERT INTO _sub_probe SELECT message, channel, message_id, subscription FROM msg',
+  substr((SELECT exec_sql FROM r),1,60) FROM (SELECT 1);
+
+-- CHECK SUB3: dispatch simulation — prepared positional binds through the composed
+-- shape (message payload as bind #1: untrusted input never spliced)
+CREATE OR REPLACE TABLE _sub_probe(payload VARCHAR, chan VARCHAR, mid UBIGINT, sub VARCHAR);
+PREPARE _sub_exec AS WITH msg AS (SELECT ?::VARCHAR AS message, ?::VARCHAR AS channel, ?::UBIGINT AS message_id, ?::VARCHAR AS subscription) INSERT INTO _sub_probe SELECT message, channel, message_id, subscription FROM msg;
+EXECUTE _sub_exec('payload''); DROP TABLE _sub_probe;--', 't1', '1000', 'sub_t1');
+WITH r AS (SELECT * FROM _sub_probe)
+INSERT INTO _test_results SELECT 'SUB dispatch binds injection-proof',
+  (SELECT count(*) FROM r)=1 AND (SELECT payload FROM r)='payload''); DROP TABLE _sub_probe;--' AND (SELECT mid FROM r)=1000,
+  'rows='||(SELECT count(*) FROM r)::VARCHAR FROM (SELECT 1);
+
+-- CHECK SUB4: handler starting with WITH gets its CTE list merged after msg
+WITH r AS (SELECT _compose_subscription_sql('WITH j AS (SELECT message FROM msg) INSERT INTO t SELECT * FROM j') AS s FROM (SELECT 1))
+INSERT INTO _test_results SELECT 'SUB compose merges handler CTEs',
+  starts_with((SELECT s FROM r), 'WITH msg AS (SELECT ?::VARCHAR AS message') AND instr((SELECT s FROM r), '), j AS (SELECT message FROM msg)') > 0,
+  substr((SELECT s FROM r),1,80) FROM (SELECT 1);
+
+-- CHECK SUB5: disabled rows excluded from the runner surface
+UPDATE quackapi_subscriptions SET enabled=false WHERE name='sub_t1';
+WITH n AS (SELECT count(*) AS c FROM run_subscriptions() WHERE name='sub_t1')
+INSERT INTO _test_results SELECT 'SUB disabled row hidden from runner', (SELECT c FROM n)=0, '' FROM (SELECT 1);
+DELETE FROM quackapi_subscriptions WHERE name='sub_t1';
+DROP TABLE _sub_probe;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT check_name, pass, detail FROM _test_results ORDER BY pass ASC, check_name;
