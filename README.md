@@ -1,159 +1,181 @@
 # quackapi
 
-**A FastAPI-equivalent web framework written in pure DuckDB SQL.**
+**A FastAPI-class web framework that lives inside DuckDB.**
 
-Routing, Pydantic-style validation, JSON serialization, auto-generated OpenAPI +
-Swagger UI, Server-Sent Events, WebSockets, background tasks, middleware, and true
-concurrent writes — built from primitives on stock, publicly-installable DuckDB
-extensions. No application code in any other language. The HTTP server itself is C,
-JIT-compiled *inside* the DuckDB process at runtime.
+Routes, validation, auth, sessions, CORS, lifecycle hooks, health probes, and
+event subscriptions are all rows in tables, declared with SQL DDL. Your handler
+is SQL over the same database it serves. There is no ORM because there is
+nothing to map — **the data layer is the framework.**
 
-This is not a DuckDB binding for an existing framework. It is the framework,
-re-derived from scratch to answer one question precisely: **where can pure DuckDB +
-self-dispatch actually stand in for Python/FastAPI, and where does the abstraction
-genuinely tear?** That map is [`edges.md`](./edges.md) — the point of the project.
+```sql
+CREATE ROUTE get_user GET '/users/{id}' (id INT) AS
+  SELECT to_json(u) AS body FROM users u WHERE u.id = {id};
 
----
+CREATE SESSION STORE web SECRET 'change-me' COOKIE_SECURE true;
+CREATE AUTH site AS SESSION ( STORE 'web' );
 
-## The thesis
+CREATE SUBSCRIPTION alerts ON 'redis-tcp://localhost:6379?channel=alerts'
+  AS 'INSERT INTO alert_log SELECT now(), message, channel FROM msg';
 
-FastAPI is two things bolted together: **uvicorn** (gets a request off the wire and
-into Python as `(method, path, headers, body)`) and **the framework** (routing,
-validation, serialization, OpenAPI). The framework half is, structurally, a series of
-transforms over data — exactly what a database is for:
+SELECT serve_brain(8000, 'app.db');
+```
+
+```
+$ curl localhost:8000/users/1
+{"id":1,"name":"alice","age":30}
+$ curl localhost:8000/users/abc
+{"detail":[{"type":"int_parsing","loc":["path","id"], ...}]}   # 422, FastAPI-exact
+$ open localhost:8000/docs                                     # Swagger UI, generated
+```
+
+## Why this exists
+
+FastAPI is two things bolted together: **uvicorn** (gets `(method, path,
+headers, body)` off the wire) and **the framework** — routing, validation,
+serialization, OpenAPI. That second half is, structurally, a series of
+transforms over data. Transforms over data are what a database does natively:
 
 | FastAPI / Pydantic concept | quackapi implementation |
 |---|---|
-| `@app.get("/users/{id}")` decorator | a **row** in a `routes` table (`register_route(...)`) |
-| Path/query/body parsing | segment-array structural match — **no regex** |
-| `BaseModel` field types + validators | `TRY_CAST` + a `param_schema` constraint table |
-| `ValidationError` → 422 `detail[]` | aggregate every failure into FastAPI's exact JSON shape |
-| `response_model` serialization | `to_json()` / `json_group_array()` |
+| `@app.get("/users/{id}")` decorator | a **row** in the `routes` table (`CREATE ROUTE` sugar) |
+| Path/query/body parsing | segment-array structural match — no regex |
+| `BaseModel` types + validators | `TRY_CAST` + a `param_schema` constraint table |
+| `ValidationError` → 422 `detail[]` | every failure aggregated into FastAPI's exact JSON shape |
+| `response_model` include/exclude | `FIELDS(INCLUDE …)` clause — column projection |
 | `/openapi.json` from type hints | a **`SELECT`** over `routes` + `param_schema` |
-| `/docs` Swagger UI | a route whose body is the Swagger HTML |
-| `BackgroundTasks` | a detached C thread self-dispatching to a loopback |
-| concurrent request handling | a 16-thread C accept-loop, one DuckDB connection each |
+| Session middleware + CSRF | the session store **is a table**; signed cookies, synchronizer tokens |
+| `lifespan` startup/shutdown | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS '<sql>'` |
+| background event consumers | `CREATE SUBSCRIPTION` — SQL handler per message |
 
-The honest answer to "explain Pydantic" stops being a recitation and becomes *"I
-reimplemented it as `TRY_CAST` + a constraint table + error aggregation — here's what
-that taught me about what it actually does."*
+## The receipts
 
-## Two front doors, one SQL brain
+The sharpest proof of the thesis: **FastAPI's most-upvoted feature requests of
+all time — which FastAPI closed unresolved — are things quackapi ships as a few
+lines of DDL.** Full scoreboard with links, mechanisms, and verification:
+[`docs/FASTAPI_MOST_WANTED.md`](docs/FASTAPI_MOST_WANTED.md).
 
-Everything routes through a single table macro,
-`handle_request(method, path, headers, body) -> (status_code, content_type, body, handler_sql)`.
+| 👍 | FastAPI asked for | outcome there | here |
+|----|---|---|---|
+| 83 | Pydantic ↔ SQLAlchemy bridge ([#214](https://github.com/fastapi/fastapi/issues/214)) | closed unresolved | **dissolved** — no ORM layer exists to bridge |
+| 75 | first-class sessions ([#754](https://github.com/fastapi/fastapi/issues/754)) | closed unresolved | **shipped** — `CREATE SESSION STORE` |
+| 65 | richer startup/shutdown events ([#617](https://github.com/fastapi/fastapi/issues/617)) | closed | **shipped** — `CREATE LIFECYCLE` |
+| 62 | built-in health/readiness probes ([#1907](https://github.com/fastapi/fastapi/issues/1907)) | closed | **shipped** — `/livez` `/readyz` `/metrics` |
+| 50 | response include/exclude fields ([#1357](https://github.com/fastapi/fastapi/issues/1357)) | closed | **shipped** — `FIELDS(...)` |
+| 49 | auto-HEAD for GET routes ([#1773](https://github.com/fastapi/fastapi/issues/1773)) | closed | **shipped** |
+| 35 | HTTPBearer 403-instead-of-401 ([#10177](https://github.com/fastapi/fastapi/issues/10177)) | closed | **correct** — 401/403 discipline verified |
 
-- **Tier 1 — zero non-DuckDB code.** A SQL client calls `handle_request(...)`
-  directly. A real, working HTTP API surface with no server process at all. FastAPI
-  cannot claim this — it always needs uvicorn.
-- **Tier 2 — browser-native.** `serve_brain.sql` JIT-compiles a C TCP server *inside
-  DuckDB* (via the `ducktinycc` extension): a 16-worker accept loop that reads the
-  request, calls the *same* `handle_request`, and executes the SQL it returns. This is
-  the uvicorn-equivalent, and it holds zero framework logic.
+## Performance
 
-The only boundary that is genuinely non-SQL is copying "path on the wire" → "path as
-an argument." That boundary is edge #1 — and it's **defeated** by compiling `accept()`
-in C inside the process.
+Measured head-to-head with ApacheBench against FastAPI + uvicorn (uvloop,
+httptools) on the same machine, byte-identical response bodies, raw `ab` output
+preserved — [`bench/BENCH_HEADTOHEAD.md`](bench/BENCH_HEADTOHEAD.md):
 
-## Quick start
+- quackapi dynamic `/health`: **42.6k req/s** (c8), zero failures
+- FastAPI's best cell in the same matrix: 21.8k req/s — 16 workers, in-memory
+  dict, no database at all
+- quackapi `/search` querying a real database: 2.2× that FastAPI ceiling
+- keep-alive static path: **108k req/s** (c64)
+
+The server is a 16-worker thread pool with an instance-pool read path (one
+writer, per-worker read replicas rebuilt on write) — reads scale without giving
+up read-your-writes.
+
+## Architecture: one brain, two tracks
+
+Everything routes through a single table macro:
+`handle_request(method, path, headers, body) → (status, content_type, body, handler_sql)`.
+
+- **The oracle** — [`framework.sql`](framework.sql). The entire framework as
+  pure SQL: an executable specification. You can run a real API surface with no
+  server process at all: load it and call `handle_request(...)` from any DuckDB
+  client. The tier-1 suite (197 checks) asserts against this directly.
+- **The compiled extension** — [`ext-cpp`](https://github.com/asubbarao/quackapi-ext-cpp)
+  (submodule). A DuckDB extension providing `serve_brain(port, db)` — the
+  uvicorn-equivalent: accept loop, worker pool, keep-alive, gzip, graceful
+  drain, SSE. It holds **no framework logic of its own**: verification,
+  composition, and policy all execute the oracle's SQL. Where both tracks
+  implement a surface, parity tests pin them byte-identical.
+
+The DDL sugar (`CREATE ROUTE / AUTH / POLICY / SESSION STORE / LIFECYCLE /
+SUBSCRIPTION / CORS / HEALTH CHECK`) is a parser extension; every statement is
+also expressible as plain SQL against the registry tables.
+
+## Security
+
+The audit ledger — trust model, enforced invariants, what was found and fixed,
+and what remains open — is [`docs/SECURITY.md`](docs/SECURITY.md). The rules in
+one breath: untrusted input (HTTP client *and* event bus) reaches SQL only
+through prepared binds; every secret comparison is constant-time through one
+choke point; one verification implementation per credential type (the C server
+calls the oracle's macros — there is no second copy to drift); sessions are
+server-minted signed cookies with CSRF synchronizer tokens; missing credential
+is 401, failed policy is 403.
+
+## Built on the DuckDB ecosystem
+
+quackapi is a framework layer, not a rival server — it fills the gap *above*
+the excellent transport-level extensions:
+
+- [`crypto`](https://duckdb.org/community_extensions/extensions/crypto) — HMAC
+  for sessions and JWT; quackapi implements no crypto primitive of its own
+- [`radio`](https://duckdb.org/community_extensions/extensions/radio) — the
+  `CREATE SUBSCRIPTION` transport (WebSocket + Redis pub/sub receive threads)
+- [`shellfs`](https://duckdb.org/community_extensions/extensions/shellfs),
+  `json` — handler-side plumbing
+- [`tributary`](https://duckdb.org/community_extensions/extensions/tributary) —
+  Kafka: batch topic scans work in route handlers today; subscription support
+  lands when tributary ships continuous consumption
+
+## Quick start (from source)
+
+Pre-v0.1 — not yet published as a community extension, so build the extension
+locally (vendored DuckDB, ~one coffee first build):
 
 ```bash
-./run.sh                 # boots on http://127.0.0.1:18099  (DUCKDB=/path/to/duckdb ./run.sh to override)
+git clone --recurse-submodules https://github.com/asubbarao/quackapi
+cd quackapi/ext-cpp && GEN=ninja make release && cd ..
+
+# load the framework into a database, then serve it
+./ext-cpp/build/release/duckdb app.db -unsigned < framework.sql
+./ext-cpp/build/release/duckdb app.db -unsigned < app.sql        # demo routes
+./ext-cpp/build/release/duckdb app.db -unsigned \
+  -c "SELECT serve_brain(8000, 'app.db'); SELECT block_forever(0);"
 ```
+
+Tests:
 
 ```bash
-curl localhost:18099/users/1                 # {"id":1,"name":"alice","age":30}
-curl localhost:18099/users/abc               # 422  {"detail":[{"type":"int_parsing",...}]}
-curl localhost:18099/search?q=al&limit=2     # JSON list, limit validated (max 100)
-curl -X POST -d '{"name":"zoe","age":31}' localhost:18099/users   # 201  {"id":...,"name":"zoe","age":31}
-curl -N localhost:18099/events               # SSE: chunked  data: tick 1 … tick 5
-open localhost:18099/docs                     # Swagger UI — "Try it out" works
+# oracle suite (197 checks, no server needed)
+cat framework.sql test/tier1_handle_request.test.sql | ./ext-cpp/build/release/duckdb -unsigned
+# extension suite
+cd ext-cpp && make test
 ```
 
-Tier 1 (no server) — load the framework and call the brain directly:
+## Honest edges
 
-```bash
-( cat framework.sql app.sql; echo "SELECT * FROM handle_request('GET','/users/1','{}','');" ) | duckdb :memory:
-```
+The project keeps a ledger of where the abstraction genuinely tears instead of
+hiding it ([`edges.md`](edges.md), plus current status in
+[`docs/STATUS.md`](docs/STATUS.md)):
 
-## The pillars
+- **Inbound browser WebSockets** on the main port need further C-server work
+  (radio is an outbound client; SSE is shipped and covers most push cases).
+- **TLS is proxy-terminated** in v1 — same deployment answer as uvicorn's.
+- **Subscriptions are at-most-once** with an in-process buffer and a per-row
+  error ledger — an event-hook surface, not a durable queue.
+- **Single writer** bounds write throughput (reads scale via the replica pool).
+- Secrets at rest are plaintext pending `SECRET ENV` indirection
+  (tracked in [`docs/SECURITY.md`](docs/SECURITY.md) open items).
 
-- **Routing** — match `(method, path)` against `/users/{id}`-style patterns by splitting
-  both into segment arrays and comparing position-by-position; capture `{param}` slots;
-  tie-break by most-literal-segments. No regex anywhere.
-- **Validation** — join request params to `param_schema`, `TRY_CAST` to the declared
-  type, check `min`/`max`/`required`/`enum`, and **aggregate all failures** into
-  `{"detail":[{"loc":[...],"msg":...,"type":...}]}` — byte-for-byte FastAPI.
-- **OpenAPI + Swagger** — `/openapi.json` is a `SELECT` over `routes` + `param_schema`
-  (generation is a query, not type-hint introspection — strictly easier than FastAPI).
-  `/docs` serves Swagger UI pointed at it.
-- **Self-dispatch / concurrency** — see below.
+## Repo map
 
-## Self-dispatch — the concurrency engine
-
-A pure-SQL macro cannot `EXECUTE` a runtime-built string, and `json_serialize_sql`
-refuses to serialize anything but a `SELECT`. So the engine splits by statement kind
-([`dispatch.sql`](./dispatch.sql), [`docs/03-self-dispatch.md`](./docs/03-self-dispatch.md)):
-
-- **dynamic reads** run natively in-process via
-  `json_execute_serialized_sql(json_serialize_sql(sql))` — no loopback.
-- **dynamic writes** self-dispatch to a separate DuckDB connection over a loopback,
-  which buys MVCC + OCC concurrency for free.
-- **concurrent writes** fan out over N OS threads from a `ducktinycc` C client
-  (`http_post` over a list does *not* parallelize); ~7.9× at 16 threads, all committed.
-- **write–write conflicts** retry inside the C worker; 16/16 recover where 12/16 would
-  otherwise be lost.
-
-Every mechanism here was adopted only after a simpler/native alternative was **run and
-measured failing** — the evidence trail is in the doc.
-
-## The edge-ledger
-
-[`edges.md`](./edges.md) is the senior signal: each entry is **hypothesis → probe →
-verdict**, every verdict backed by a re-runnable experiment.
-
-| # | Edge | Verdict |
-|---|------|---------|
-| 1 | Path-on-wire boundary (the uvicorn line) | **DEFEATED** — C `accept()` compiled inside DuckDB |
-| 1b | Single-thread / one-request-per-statement | **DEFEATED** — pthread pool, 10 concurrent in 0.33s |
-| 1c | In-process routing × SQL × thread concurrency | **REAL** trilemma — pick 2; resolution shipped |
-| 2 | SSE / streaming responses | **DEFEATED** — chunked `data:` write-loop in the responder |
-| 3 | WebSockets | **DEFEATED** (transport) — RFC 6455 handshake + frames in C |
-| 4 | Background tasks | **DEFEATED** — detached C thread self-dispatches |
-| 5 | Open transaction across a request | **REAL** — one-shot dispatch has no shared txn |
-| 6 | Dependency injection w/ setup+teardown | **PARTIAL** — no guaranteed `finally` |
-| 7 | Multipart file upload streaming | **PARTIAL** — tears at the 64 KB single-read ceiling |
-| 8 | High write throughput / true async | **REAL (bounded)** — single writer; numbers included |
-
-Showing exactly where it tears is the depth signal — not "X replaces Y," but a precise
-map of where the abstraction holds and where it does not.
-
-## Repo layout
-
-| File | Role |
+| Path | Role |
 |---|---|
-| `framework.sql` | `routes`/`param_schema` tables + `register_route` + the `handle_request` pipeline |
-| `app.sql` | the demo application — routes registered **as data** (users, search, SSE, openapi, docs) |
-| `serve_brain.sql` | the C HTTP server: 16-worker accept loop, header/cookie parsing, SSE streaming |
-| `serve_ws.sql` | the C WebSocket server (handshake + frame codec) |
-| `dispatch.sql` | self-dispatch engine: native reads, threaded-C parallel writes, OCC retry, fire-and-forget |
-| `middleware.sql` · `di.sql` | request middleware (auth, logging, header injection) + dependency-injection model |
-| `launch_server.sql` · `run.sh` | boot the unified server |
-| `edges.md` | the edge-ledger |
-| `probes/` | re-runnable experiments backing the edge verdicts |
-| `test/` | Tier-1 (`handle_request` assertions) + Tier-2 (curl) test suites |
-
-## Built on (stock `INSTALL ... ; LOAD ...` only)
-
-`ducktinycc` (in-process C compilation), `harbor` (loopback HTTP-SQL for self-dispatch),
-`curl_httpfs` (the soldered HTTP client for handlers), `shellfs`, `httpfs_timeout_retry`.
-No custom-compiled C++ community extension — the whole point is that anyone can `LOAD`
-and run this.
-
-## Caveats (these are real)
-
-A C bug crashes the process (no sandbox — defensive C + supervision is the mitigation;
-Rust is the memory-safe alternative). The C socket layout is macOS/BSD-specific. The
-single DB writer bounds write throughput (edge #8). DI teardown has no guaranteed
-`finally` (edge #6). Multipart tears above ~64 KB (edge #7). None of these are hidden —
-they are the ledger.
+| `framework.sql` | the oracle: registries, `handle_request`, all framework macros |
+| `app.sql` | demo application (routes as data) |
+| `ext-cpp/` | the compiled DuckDB extension (server, worker pool, DDL sugar) — submodule |
+| `test/` | tier-1 oracle suite, parity harness, conformance matrix vs real FastAPI |
+| `docs/FASTAPI_MOST_WANTED.md` | the scoreboard |
+| `docs/SECURITY.md` | security model + audit ledger |
+| `docs/STATUS.md` · `docs/BACKLOG.md` | current state, honest gaps, roadmap |
+| `edges.md` | hypothesis → probe → verdict ledger of where the abstraction tears |
+| `bench/` | head-to-head methodology + raw ab output |
