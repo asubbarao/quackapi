@@ -40,8 +40,8 @@ proven.
    channels, and message ids to handlers exclusively via prepared binds (the
    composed statement comes from the oracle's `_compose_subscription_sql` —
    tier-1 includes an injection-proof check with a `'); DROP TABLE ...--`
-   payload). (Residual: the older JWT path splices with `''`-escaping —
-   see Open items.)
+   payload). The JWT path migrated from `''`-escaping to binds 2026-07-10
+   (live matrix re-verified: no-token/tampered/injection 401, valid 200).
 4. **Session cookies**: `sid|exp|hmac-sha256` signed value; sid is a server-minted
    random UUID (128-bit) — the client can never choose it, so session fixation has
    no vector. Verification checks signature (constant-time), signed exp, row
@@ -91,10 +91,6 @@ proven.
   file access owns the app — which is also true of a `.env` file, but unlike a
   `.env` the secret rides along with `COPY DATABASE`/backups. Planned: `SECRET
   ENV 'VAR_NAME'` indirection so the DB stores only the env-var name.
-- **JWT C path splices** `''`-escaped token/secret into the verify SQL instead of
-  binding (predates the bind-everything convention; escaping is correct for
-  DuckDB string literals, so this is hardening debt, not a known injection).
-  Migrate to prepared binds like the session path.
 - **CSRF token via form fields** (`csrf_token`/`_csrf`) is honored by the oracle
   but not yet by the C worker (header `X-CSRF-Token` only). SPA/fetch clients are
   unaffected; classic form posts against the compiled server need the header.
