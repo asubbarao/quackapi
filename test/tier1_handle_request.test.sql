@@ -356,7 +356,7 @@ INSERT INTO route_headers VALUES ('login_set','Set-Cookie','sess=1; Path=/');
 WITH r AS (SELECT * FROM handle_request('GET','/secure','{"x_api_key":"k-123"}',''))
 INSERT INTO _test_results SELECT 'R1 header happy → status 200', r.status_code=200, 'got '||r.status_code FROM r;
 WITH r AS (SELECT * FROM handle_request('GET','/secure','{"x_api_key":"k-123"}',''))
-INSERT INTO _test_results SELECT 'R1 header happy → resp_headers {} (no route hdr)', r.resp_headers='{}', r.resp_headers FROM r;
+INSERT INTO _test_results SELECT 'R1 header happy → resp_headers {} (no route hdr)', r.resp_headers='{}', r.resp_headers::VARCHAR FROM r;
 
 -- CHECK 18 header required missing -> 422 loc header
 WITH r AS (SELECT * FROM handle_request('GET','/secure','{}',''))
@@ -397,13 +397,13 @@ INSERT INTO _test_results SELECT 'R1 redirect → body NULL', r.body IS NULL, co
 WITH r AS (SELECT * FROM handle_request('GET','/old-home','{}',''))
 INSERT INTO _test_results SELECT 'R1 redirect → handler_sql NULL', r.handler_sql IS NULL, coalesce(r.handler_sql,'<null>') FROM r;
 WITH r AS (SELECT * FROM handle_request('GET','/old-home','{}',''))
-INSERT INTO _test_results SELECT 'R1 redirect → Location in resp_headers', json_extract_string(r.resp_headers,'$.Location')='/new', r.resp_headers FROM r;
+INSERT INTO _test_results SELECT 'R1 redirect → Location in resp_headers', json_extract_string(r.resp_headers,'$.Location')='/new', r.resp_headers::VARCHAR FROM r;
 
 -- CHECK 24 Set-Cookie emitted via route_headers
 WITH r AS (SELECT * FROM handle_request('POST','/login','{}',''))
 INSERT INTO _test_results SELECT 'R1 set-cookie → 200', r.status_code=200, 'got '||r.status_code FROM r;
 WITH r AS (SELECT * FROM handle_request('POST','/login','{}',''))
-INSERT INTO _test_results SELECT 'R1 set-cookie header present', json_extract_string(r.resp_headers,'$.Set-Cookie')='sess=1; Path=/', r.resp_headers FROM r;
+INSERT INTO _test_results SELECT 'R1 set-cookie header present', json_extract_string(r.resp_headers,'$.Set-Cookie')='sess=1; Path=/', r.resp_headers::VARCHAR FROM r;
 
 -- (cors preflight 204 + ACA* and post injection tested via middleware chain in middleware.test.sql)
 
@@ -491,11 +491,11 @@ WITH r AS (SELECT * FROM handle_request('OPTIONS','/health','{"origin":"http://x
 INSERT INTO _test_results
   SELECT 'CORS preflight allowed → 200', r.status_code = 200, 'got '||r.status_code::VARCHAR FROM r
   UNION ALL
-  SELECT 'CORS preflight ACAO present', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') IS NOT NULL, coalesce(r.resp_headers,'<null>') FROM r
+  SELECT 'CORS preflight ACAO present', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') IS NOT NULL, coalesce(r.resp_headers::VARCHAR,'<null>') FROM r
   UNION ALL
-  SELECT 'CORS preflight has ACA-Methods', instr(coalesce(json_extract_string(r.resp_headers,'$.Access-Control-Allow-Methods'),''), 'POST') > 0, r.resp_headers FROM r
+  SELECT 'CORS preflight has ACA-Methods', instr(coalesce(json_extract_string(r.resp_headers,'$.Access-Control-Allow-Methods'),''), 'POST') > 0, r.resp_headers::VARCHAR FROM r
   UNION ALL
-  SELECT 'CORS preflight has Max-Age', json_extract_string(r.resp_headers, '$.Access-Control-Max-Age') = '600', r.resp_headers FROM r;
+  SELECT 'CORS preflight has Max-Age', json_extract_string(r.resp_headers, '$.Access-Control-Max-Age') = '600', r.resp_headers::VARCHAR FROM r;
 
 -- actual GET with Origin: carries ACAO ( '*' for *+!creds per starlette simple_headers )
 WITH r AS (SELECT * FROM handle_request('GET','/health','{"origin":"http://x.example"}',''))
@@ -516,7 +516,7 @@ WITH r AS (SELECT * FROM handle_request('OPTIONS','/users/1','{"origin":"http://
 INSERT INTO _test_results
   SELECT 'CORS preflight disallowed → 400', r.status_code = 400, 'got '||r.status_code::VARCHAR FROM r
   UNION ALL
-  SELECT 'CORS disallowed preflight has no ACAO', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') IS NULL, coalesce(r.resp_headers,'<null>') FROM r;
+  SELECT 'CORS disallowed preflight has no ACAO', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') IS NULL, coalesce(r.resp_headers::VARCHAR,'<null>') FROM r;
 
 -- actual with disallowed: no ACAO added
 WITH r AS (SELECT * FROM handle_request('GET','/health','{"origin":"http://evil.example"}',''))
@@ -537,9 +537,9 @@ WITH r AS (SELECT * FROM handle_request('GET','/health','{"origin":"https://cred
 INSERT INTO _test_results
   SELECT 'CORS *+creds echoes origin', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin') = 'https://cred.example', coalesce(json_extract_string(r.resp_headers, '$.Access-Control-Allow-Origin'),'<null>') FROM r
   UNION ALL
-  SELECT 'CORS creds has Allow-Credentials', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Credentials') = 'true', r.resp_headers FROM r
+  SELECT 'CORS creds has Allow-Credentials', json_extract_string(r.resp_headers, '$.Access-Control-Allow-Credentials') = 'true', r.resp_headers::VARCHAR FROM r
   UNION ALL
-  SELECT 'CORS expose present', instr(coalesce(json_extract_string(r.resp_headers,'$.Access-Control-Expose-Headers'),''), 'X-Custom') > 0, r.resp_headers FROM r;
+  SELECT 'CORS expose present', instr(coalesce(json_extract_string(r.resp_headers,'$.Access-Control-Expose-Headers'),''), 'X-Custom') > 0, r.resp_headers::VARCHAR FROM r;
 
 -- preflight with creds * echoes
 WITH r AS (SELECT * FROM handle_request('OPTIONS','/health','{"origin":"https://cred.example","access-control-request-method":"POST"}',''))

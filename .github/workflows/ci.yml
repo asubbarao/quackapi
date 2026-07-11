@@ -40,7 +40,7 @@ jobs:
           # Ensure shellfs community extension can be installed (for middleware tests)
           duckdb :memory: -c "INSTALL shellfs FROM community; LOAD shellfs; SELECT 'shellfs ok';" || true
 
-      - name: Run tier-1 handle_request oracle (229 checks)
+      - name: Run tier-1 handle_request oracle (239 checks)
         run: |
           cat framework.sql test/tier1_handle_request.test.sql \
             | duckdb -unsigned /tmp/ci_tier1.db 2>&1

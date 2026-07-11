@@ -1917,7 +1917,9 @@ SELECT
         WHEN NOT _cors_origin_allowed( (SELECT cors_req_origin FROM result LIMIT 1), (SELECT cors_ao FROM result LIMIT 1) ) THEN resp_headers
         ELSE
           cast( json_merge_patch(
-            CASE WHEN resp_headers IS NULL OR resp_headers = '' THEN '{}' ELSE resp_headers END ::JSON ,
+            -- resp_headers is JSON-typed (json_group_object); compare via a VARCHAR
+            -- cast — a bare `= ''` coerces the literal to JSON and throws at runtime.
+            CASE WHEN resp_headers IS NULL OR resp_headers::VARCHAR = '' THEN '{}' ELSE resp_headers END ::JSON ,
             (SELECT _cors_build_simple_resp_headers( (SELECT cors_req_origin FROM result LIMIT 1), (SELECT cors_ao FROM result LIMIT 1), (SELECT cors_ac FROM result LIMIT 1), (SELECT cors_eh FROM result LIMIT 1) ) FROM (SELECT 1) )::JSON
           ) AS VARCHAR )
       END
