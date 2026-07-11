@@ -88,8 +88,8 @@ and sessions are now IN MAIN; tier-1 grew 178 → 192, all green at every step.
 | 75 | #754 | First-class sessions | `CREATE SESSION STORE` + `CREATE AUTH … AS SESSION` — server store IS a table; signed sid\|exp\|hmac cookies + synchronizer CSRF | **SHIPPED (oracle + C)** — C mirror rebuilt on ext-cpp main (`3485f13`, supersedes `fleet/sessions-cpp`); verification delegated to the oracle macro via prepared binds; live-certified 7/7 matrix. Audit: `docs/SECURITY.md` |
 | 65 | #617 | Startup/shutdown lifecycle | `CREATE LIFECYCLE ON STARTUP\|SHUTDOWN AS <sql>` (drain already shipped) | **MERGED (oracle)** `a7e14c5` — tier-1 gained 4 checks. C-side boot-runner (serve_brain executing STARTUP hooks) still open |
 | — | — | CORS (`CREATE CORS`, Starlette `CORSMiddleware` parity) | single global row in `quackapi_cors`; oracle + C worker | **MERGED + CERTIFIED end-to-end** `a1a7607` / ext-cpp `650cf07` — the salvaged build needed 7 real fixes (boot never loaded g_cors; sugar wrote non-JSON lists + never parsed scalar keys; `mi<sizeof-1` list mangler; HARDCODED ACAH/Expose fixture values; patch after early returns; dynamic emit dropped resp_headers entirely — that last one also silently ate Set-Cookie on handler responses; reason phrases). Cert: make test 85/85 + 7-case live curl matrix |
-| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` (redirect + token exchange + JWKS) | **PARKED on `fleet/oauth` (`9ddcc51`)** — supersedes stash `6088198` (42 vs 22 markers; stash is an earlier draft, ignore it). 192/192 standalone, but merging = a 5-region semantic weave through the Phase-0 auth pipeline (scheme CASE, verify CTE, decision joins) AND token exchange still needs the outbound-POST verdict — do it as one deliberate rebase+finish pass, not a hand-weave |
-| 37 | #1428 | Keycloak/OIDC | same OAuth2 machinery + discovery URL | **not started** (rides #335) |
+| 57 | #335 | OAuth2 Authorization-Code | `CREATE AUTH … AS OAUTH2` — auto-registers `/auth/<n>/login` + `/callback`; server-minted single-use state (10-min TTL), PKCE S256 (RFC 7636 vector pinned), open-redirect-guarded `?next=`, curl token exchange with untrusted bytes through 0600 files (client_secret never on a command line), session mint on the #754 store | **SHIPPED (oracle + C)** 2026-07-10 — oracle `4a336ad` (tier-1 239/239, 32 OAuth rows), C dispatch + sugar ext-cpp `1786b4f`. Fresh design SUPERSEDES the parked `fleet/oauth` `9ddcc51` (constant state, own JWKS verifier, stubbed exchange — do not resurrect). Live-certified vs SQL-scripted fake IdP: round-trip login→cookie→`/dash`; replay/tamper/bogus-state/provider-error/injection all 401. Spec: `docs/specs/OAUTH_SPEC.md` |
+| 37 | #1428 | Keycloak/OIDC | `CREATE AUTH … AS OIDC (DISCOVERY …)` — discovery fetched at DDL time (fail loud at declare); RS256/JWKS bearer verify delegated to `quack_oauth_check_token` (invariant: one verification impl per credential type) | **SHIPPED (rides #335)** — same commits; against-real-Keycloak smoke is manual post-merge, not CI-gated |
 
 **TLS note:** the 2026-07-09 direct-mbedTLS build job died 89s in (14 tool calls, nothing written) —
 the "proxy termination is v1" stance below remains accurate; nothing new exists.
@@ -196,7 +196,7 @@ Weighted by leverage × cost, where **ext-backed = cheap** (`LOAD` + sugar, not 
    certify + merge (or graft into the next feature branch) so it stops looking unbuilt.
 3. **`CREATE API FOR TABLE`** — the flagship auto-CRUD (PostgREST / Supabase killer). Rides the
    already-shipped `CREATE POLICY` for row security so auto-exposing a table isn't a footgun.
-4. **Remaining Wave-A most-wanted:** sessions #754 → OAuth2 #335 / OIDC #1428 (health #1907 + DI
+4. ~~Remaining Wave-A most-wanted~~ — ALL SHIPPED 2026-07-10: sessions #754, OAuth2 #335, OIDC #1428 (health #1907 + DI
    #11143 already shipped).
 
 Each feature: SUGAR-FIRST DDL, oracle tier-1 + `parity_b2.sh` (oracle == C) + a live curl matrix on a
