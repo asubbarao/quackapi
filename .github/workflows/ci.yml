@@ -27,7 +27,7 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.2.2/duckdb_cli-linux-amd64.zip \
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip \
             -o /tmp/duckdb.zip
           unzip /tmp/duckdb.zip -d /tmp/duckdb_bin
           sudo install -m 755 /tmp/duckdb_bin/duckdb /usr/local/bin/duckdb
@@ -40,18 +40,18 @@ jobs:
           # Ensure shellfs community extension can be installed (for middleware tests)
           duckdb :memory: -c "INSTALL shellfs FROM community; LOAD shellfs; SELECT 'shellfs ok';" || true
 
-      - name: Run tier-1 handle_request oracle (112 checks)
+      - name: Run tier-1 handle_request oracle (229 checks)
         run: |
-          printf '.read framework.sql\n.read test/tier1_handle_request.test.sql\n' \
+          cat framework.sql test/tier1_handle_request.test.sql \
             | duckdb -unsigned /tmp/ci_tier1.db 2>&1
           # Surface the summary row
-          printf '.read framework.sql\n.read test/tier1_handle_request.test.sql\n' \
+          cat framework.sql test/tier1_handle_request.test.sql \
             | duckdb -unsigned :memory: 2>&1 \
             | awk '/total_checks/{p=1} p && /[0-9]+/' | head -3
 
       - name: Check tier-1 for any failures
         run: |
-          OUT=$(printf '.read framework.sql\n.read test/tier1_handle_request.test.sql\n' \
+          OUT=$(cat framework.sql test/tier1_handle_request.test.sql \
             | duckdb -unsigned :memory: 2>&1)
           FAILED=$(printf '%s\n' "$OUT" | awk 'NF>=5 && !/int64/ && /[0-9]/{last=$0} END{print last}' \
             | tr -d '│' | awk '{print $3}' | tr -d ' ')
@@ -60,20 +60,20 @@ jobs:
 
       - name: Run DI oracle suite (8 checks)
         run: |
-          printf '.read framework.sql\n.read di.sql\n.read test/di.test.sql\n' \
+          cat framework.sql di.sql test/di.test.sql \
             | duckdb -unsigned :memory: 2>&1
           # If DuckDB exits non-zero the step fails
 
       - name: Run middleware oracle suite (12 checks)
         run: |
-          printf '.read framework.sql\n.read middleware.sql\n.read test/middleware.test.sql\n' \
+          cat framework.sql middleware.sql test/middleware.test.sql \
             | duckdb -unsigned :memory: 2>&1
           # The suite uses assert_true() which throws Error on failure → non-zero exit
 
       - name: Run fuzz/property oracle suite (100 checks — 3 known bugs allowed)
         continue-on-error: true   # 3 known documented bugs fail; don't break CI yet
         run: |
-          OUT=$(printf '.read framework.sql\n.read app.sql\n.read test/fuzz/oracle_fuzz.test.sql\n' \
+          OUT=$(cat framework.sql app.sql test/fuzz/oracle_fuzz.test.sql \
             | duckdb -unsigned :memory: 2>&1)
           printf '%s\n' "$OUT" | tail -20
           FAILED=$(printf '%s\n' "$OUT" | awk 'NF>=5 && !/int64/ && /[0-9]/{last=$0} END{print last}' \
@@ -97,7 +97,7 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.2.2/duckdb_cli-linux-amd64.zip \
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip \
             -o /tmp/duckdb.zip
           unzip /tmp/duckdb.zip -d /tmp/duckdb_bin
           sudo install -m 755 /tmp/duckdb_bin/duckdb /usr/local/bin/duckdb
