@@ -1076,6 +1076,127 @@ DELETE FROM quackapi_subscriptions WHERE name='sub_t1';
 DROP TABLE _sub_probe;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- OAUTH2 Authorization-Code + PKCE (FastAPI #335 · OIDC #1428) — OAUTH_SPEC §7
+-- Placeholder secrets only — never real credentials in the suite.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+INSERT INTO quackapi_session_stores SELECT * FROM register_session_store('oauth_test_store', 'PLACEHOLDER_STORE_SECRET_NEVER_REAL');
+INSERT INTO quackapi_auth SELECT * FROM register_oauth('testidp', '{"client_id":"client-abc","client_secret":"PLACEHOLDER_SECRET_NEVER_REAL","auth_url":"https://idp.example/authorize","token_url":"https://idp.example/token","userinfo_url":"https://idp.example/userinfo","redirect_uri":"http://127.0.0.1:18450/auth/testidp/callback","scopes":"openid email","store":"oauth_test_store"}');
+
+-- OAUTH 1: PKCE S256 pinned to the RFC 7636 official test vector (appendix B)
+INSERT INTO _test_results SELECT 'OAUTH pkce challenge = RFC 7636 vector',
+  _pkce_challenge('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk') = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM',
+  _pkce_challenge('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk');
+
+-- OAUTH 2: _urlencode edge bytes — reserved, unreserved passthrough, UTF-8 multibyte, NULL
+INSERT INTO _test_results
+  SELECT 'OAUTH urlencode reserved bytes', _urlencode('a b&c=d+e/f:g') = 'a%20b%26c%3Dd%2Be%2Ff%3Ag', _urlencode('a b&c=d+e/f:g')
+  UNION ALL
+  SELECT 'OAUTH urlencode unreserved passthrough', _urlencode('AZaz09-._~') = 'AZaz09-._~', _urlencode('AZaz09-._~')
+  UNION ALL
+  SELECT 'OAUTH urlencode UTF-8 multibyte', _urlencode('é') = '%C3%A9', _urlencode('é')
+  UNION ALL
+  SELECT 'OAUTH urlencode NULL-safe', _urlencode(NULL) = '', '<' || _urlencode(NULL) || '>';
+
+-- OAUTH 3: _oauth_begin — byte-exact authorize-URL prefix, PKCE binding, minted lengths
+CREATE OR REPLACE TABLE _oa_begin AS SELECT * FROM _oauth_begin('testidp', next := '/dash');
+WITH b AS (SELECT * FROM _oa_begin)
+INSERT INTO _test_results
+  SELECT 'OAUTH begin authorize-URL prefix byte-exact',
+    starts_with(b.location, 'https://idp.example/authorize?response_type=code&client_id=client-abc&redirect_uri=http%3A%2F%2F127.0.0.1%3A18450%2Fauth%2Ftestidp%2Fcallback&scope=openid%20email&state=' || b.state),
+    b.location FROM b
+  UNION ALL
+  SELECT 'OAUTH begin challenge binds verifier',
+    instr(b.location, '&code_challenge=' || _pkce_challenge(b.pkce_verifier) || '&code_challenge_method=S256') > 0,
+    b.location FROM b
+  UNION ALL
+  SELECT 'OAUTH begin state 32 hex chars', length(b.state) = 32, b.state FROM b
+  UNION ALL
+  SELECT 'OAUTH begin verifier 64 chars', length(b.pkce_verifier) = 64, b.pkce_verifier FROM b
+  UNION ALL
+  SELECT 'OAUTH begin preserves valid next', b.redirect_after = '/dash', b.redirect_after FROM b;
+
+-- OAUTH 4: open-redirect guard — scheme-relative and absolute URLs collapse to '/'
+INSERT INTO _test_results
+  SELECT 'OAUTH next guard blocks //evil.com', (SELECT redirect_after FROM _oauth_begin('testidp', next := '//evil.com')) = '/', (SELECT redirect_after FROM _oauth_begin('testidp', next := '//evil.com'))
+  UNION ALL
+  SELECT 'OAUTH next guard blocks https://evil.com', (SELECT redirect_after FROM _oauth_begin('testidp', next := 'https://evil.com')) = '/', (SELECT redirect_after FROM _oauth_begin('testidp', next := 'https://evil.com'))
+  UNION ALL
+  SELECT 'OAUTH next guard default NULL → /', (SELECT redirect_after FROM _oauth_begin('testidp')) = '/', (SELECT redirect_after FROM _oauth_begin('testidp'));
+
+-- OAUTH 5: unknown scheme → empty begin (no row, caller 404s)
+INSERT INTO _test_results SELECT 'OAUTH begin unknown scheme empty',
+  (SELECT count(*) FROM _oauth_begin('no_such_scheme')) = 0, '';
+
+-- OAUTH 6: flow redeem — single-use + 10-minute TTL (caller-inserts pattern)
+INSERT INTO quackapi_oauth_flows SELECT state, 'testidp', pkce_verifier, redirect_after, now(), NULL, NULL FROM _oa_begin;
+WITH r AS (SELECT f.* FROM _oa_begin b, LATERAL (SELECT * FROM _oauth_flow_redeem(b.state)) f)
+INSERT INTO _test_results
+  SELECT 'OAUTH redeem returns fresh flow', (SELECT count(*) FROM r) = 1, ''
+  UNION ALL
+  SELECT 'OAUTH redeem carries next', (SELECT redirect_after FROM r) = '/dash', (SELECT redirect_after FROM r);
+UPDATE quackapi_oauth_flows SET redeemed_at = now() WHERE state = (SELECT state FROM _oa_begin);
+INSERT INTO _test_results SELECT 'OAUTH redeem single-use (replay empty)',
+  (SELECT count(*) FROM _oa_begin b, LATERAL (SELECT * FROM _oauth_flow_redeem(b.state)) f) = 0, '';
+INSERT INTO quackapi_oauth_flows VALUES ('stale-flow-state-0000000000000000', 'testidp', repeat('a', 64), '/', now() - INTERVAL 11 MINUTE, NULL, NULL);
+INSERT INTO _test_results SELECT 'OAUTH redeem 11-min-old flow expired',
+  (SELECT count(*) FROM _oauth_flow_redeem('stale-flow-state-0000000000000000')) = 0, '';
+
+-- OAUTH 7: token-exchange form body — byte-exact, injection payload inert, secret in body
+INSERT INTO _test_results
+  SELECT 'OAUTH form body byte-exact',
+    _oauth_form_body('testidp', 'CODE-xyz', 'ver_123') = 'grant_type=authorization_code&code=CODE-xyz&code_verifier=ver_123&redirect_uri=http%3A%2F%2F127.0.0.1%3A18450%2Fauth%2Ftestidp%2Fcallback&client_id=client-abc&client_secret=PLACEHOLDER_SECRET_NEVER_REAL',
+    _oauth_form_body('testidp', 'CODE-xyz', 'ver_123')
+  UNION ALL
+  SELECT 'OAUTH form body injection payload encoded inert',
+    instr(_oauth_form_body('testidp', 'ac''&x=y', 'v'), 'code=ac%27%26x%3Dy') > 0,
+    _oauth_form_body('testidp', 'ac''&x=y', 'v');
+
+-- OAUTH 8: composed curl SQL — byte-exact (command line = server path + registry URL only)
+INSERT INTO _test_results
+  SELECT 'OAUTH exchange SQL byte-exact',
+    _oauth_exchange_sql('testidp', '/tmp/qa.form') = 'SELECT content AS token_json FROM read_text(''curl -sS -X POST -H "Content-Type: application/x-www-form-urlencoded" --data-binary @/tmp/qa.form https://idp.example/token |'')',
+    _oauth_exchange_sql('testidp', '/tmp/qa.form')
+  UNION ALL
+  SELECT 'OAUTH userinfo SQL byte-exact',
+    _oauth_userinfo_sql('testidp', '/tmp/qa.hdr') = 'SELECT content AS userinfo_json FROM read_text(''curl -sS -H @/tmp/qa.hdr https://idp.example/userinfo |'')',
+    _oauth_userinfo_sql('testidp', '/tmp/qa.hdr');
+
+-- OAUTH 9: token response validation — ok / provider error / junk / missing access_token
+INSERT INTO _test_results
+  SELECT 'OAUTH token_ok accepts valid response', _oauth_token_ok('{"access_token":"at-1","token_type":"Bearer"}') = true, ''
+  UNION ALL
+  SELECT 'OAUTH token_ok rejects provider error', _oauth_token_ok('{"error":"invalid_grant"}') = false, ''
+  UNION ALL
+  SELECT 'OAUTH token_ok rejects junk body', COALESCE(_oauth_token_ok('<html>gateway timeout</html>'), false) = false, ''
+  UNION ALL
+  SELECT 'OAUTH token_ok rejects missing access_token', _oauth_token_ok('{"scope":"openid"}') = false, '';
+
+-- OAUTH 10: session mint — sid/subject/cookie/location from claims + scheme store
+WITH m AS (SELECT * FROM _oauth_session_mint('testidp', '{"sub":"u-1","email":"a@b.c"}', '/dash'))
+INSERT INTO _test_results
+  SELECT 'OAUTH mint sid present', (SELECT sid FROM m) IS NOT NULL, ''
+  UNION ALL
+  SELECT 'OAUTH mint subject prefers sub', (SELECT subject FROM m) = 'u-1', (SELECT subject FROM m)
+  UNION ALL
+  SELECT 'OAUTH mint Set-Cookie HttpOnly', instr((SELECT set_cookie FROM m), 'HttpOnly') > 0, (SELECT set_cookie FROM m)
+  UNION ALL
+  SELECT 'OAUTH mint location = redirect_after', (SELECT location FROM m) = '/dash', (SELECT location FROM m);
+INSERT INTO _test_results
+  SELECT 'OAUTH mint subject falls back to email',
+    (SELECT subject FROM _oauth_session_mint('testidp', '{"email":"a@b.c"}', NULL)) = 'a@b.c',
+    (SELECT subject FROM _oauth_session_mint('testidp', '{"email":"a@b.c"}', NULL))
+  UNION ALL
+  SELECT 'OAUTH mint no subject → empty (caller 401s)',
+    (SELECT count(*) FROM _oauth_session_mint('testidp', '{"name":"anon"}', NULL)) = 0, '';
+
+-- cleanup oauth fixtures
+DELETE FROM quackapi_oauth_flows WHERE auth_name = 'testidp';
+DELETE FROM quackapi_auth WHERE name = 'testidp';
+DELETE FROM quackapi_session_stores WHERE name = 'oauth_test_store';
+DROP TABLE _oa_begin;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- SUMMARY — print all results, then a pass/fail aggregate
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT check_name, pass, detail FROM _test_results ORDER BY pass ASC, check_name;

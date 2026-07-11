@@ -122,7 +122,11 @@ maintenance. Precedent: httpserver is in community, excludes only wasm.
 
 1. **Wave-A spec reviews** — TABLE_API (routes materialization tension), ADMIN_UI (asset
    embedding), SESSION_CSRF (CSRF model, admin bootstrap)
-2. **Conformance coercion policy** — strict-vs-coerce rulings that close most of the ~17 BUGs
+2. **Conformance coercion policy** — RULED 2026-07-10: see `docs/specs/VALIDATION_DOCTRINE.md`
+   (canonical parse of the declared SQL type; BOOL = true/false/1/0; stricter-than-Pydantic is
+   deliberate divergence; NULL-trinity param grammar spec'd there). Remaining work is a
+   mechanical audit of the ~17 BUG cases against the doctrine table — escalate only true
+   ambiguities.
 3. **Windows**: exclude vs port
 4. **Repo layout** for community submission (root vs dedicated repo)
 5. **Name**: quackapi vs duckapi (currently quackapi, locked informally 2026-07-03)

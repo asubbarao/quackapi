@@ -144,8 +144,8 @@ CREATE OR REPLACE MACRO run_dependency_phase(dep_name, phase) AS (
 
 CREATE OR REPLACE TABLE quackapi_auth (
   name VARCHAR PRIMARY KEY,
-  kind VARCHAR,         -- 'jwt_hs256' | 'api_key' | 'session'
-  config_json VARCHAR   -- JSON: for jwt {...}; for apikey {...}; for session {cookie,secret,store}
+  kind VARCHAR,         -- 'jwt_hs256' | 'api_key' | 'session' | 'oauth2'
+  config_json VARCHAR   -- JSON: for jwt {...}; for apikey {...}; for session {cookie,secret,store}; for oauth2 {client_id,client_secret,auth_url,token_url,userinfo_url,redirect_uri,scopes,store[,issuer,jwks_uri]}
 );
 
 CREATE OR REPLACE TABLE policies (
@@ -628,6 +628,166 @@ CREATE OR REPLACE MACRO _build_request_json(method, clean_path, pmap, qmap, head
     'body', CASE WHEN body IS NULL OR trim(body)='' THEN NULL ELSE try_cast(body AS JSON) END,
     'headers', headers
   )
+);
+
+-- ============================================================================
+-- OAuth2 Authorization-Code + PKCE / OIDC (FastAPI #335 · #1428) — docs/specs/OAUTH_SPEC.md
+-- quackapi owns the BROWSER leg only (redirect, callback, state, session mint);
+-- M2M grants + RS256/JWKS verification belong to the quack_oauth community
+-- extension (delegate, never reimplement — SECURITY.md invariant 1).
+-- Untrusted inputs (code, state, next, token/userinfo bodies) are BOUND, never
+-- spliced; registry values (URLs, client_id) are developer-trusted DDL.
+-- Outbound POSTs ride curl via shellfs with untrusted bytes passed through a
+-- COPY-written form file — the command line carries only server-generated paths
+-- and registry URLs (no escaping needed because nothing hostile touches it).
+-- ============================================================================
+
+-- One row per in-flight login. state is SERVER-MINTED (client can never choose
+-- it — same fixation-proof property as session ids); single-use via redeemed_at;
+-- 10-minute TTL checked at redeem (lazy expiry like sessions).
+CREATE OR REPLACE TABLE quackapi_oauth_flows (
+  state VARCHAR PRIMARY KEY,
+  auth_name VARCHAR,
+  pkce_verifier VARCHAR,
+  redirect_after VARCHAR,
+  created_at TIMESTAMP,
+  redeemed_at TIMESTAMP,
+  last_error VARCHAR
+);
+
+-- register_oauth: pure writer (mirrors CREATE AUTH ... AS OAUTH2/OIDC sugar)
+CREATE OR REPLACE MACRO register_oauth(name, config_json) AS TABLE (
+  SELECT name AS name, 'oauth2' AS kind, config_json AS config_json
+);
+
+-- Percent-encode a query/form component per RFC 3986 (unreserved = ALPHA DIGIT
+-- - . _ ~). Operates on UTF-8 BYTES via encode(), so multibyte chars encode as
+-- %XX%XX... . Empty/NULL-safe (returns '').
+CREATE OR REPLACE MACRO _urlencode(s) AS (
+  (WITH b AS (SELECT encode(COALESCE(s, '')) AS bb)
+   SELECT COALESCE(string_agg(
+     CASE
+       WHEN (h >= '41' AND h <= '5A') OR (h >= '61' AND h <= '7A') OR (h >= '30' AND h <= '39')
+            OR h IN ('2D','2E','5F','7E')
+       THEN decode((SELECT bb FROM b)[i+1:i+1])
+       ELSE '%' || h
+     END, '' ORDER BY i), '')
+   FROM (SELECT range AS i, upper(hex((SELECT bb FROM b)[range+1:range+1])) AS h
+         FROM range(octet_length((SELECT bb FROM b)))) t)
+);
+
+-- PKCE S256 code challenge (RFC 7636): b64url(sha256(verifier)), no padding.
+-- Tier-1 pins this against the RFC's official test vector.
+CREATE OR REPLACE MACRO _pkce_challenge(verifier) AS (
+  replace(replace(rtrim(base64(crypto_hash('sha2-256', verifier)::BLOB), '='), '+', '-'), '/', '_')
+);
+
+-- Begin a login: mint state + PKCE verifier, build the provider authorize URL.
+-- Returns one row (state, pkce_verifier, redirect_after, location); the CALLER
+-- inserts the quackapi_oauth_flows row (caller-inserts pattern, like sessions)
+-- and emits 302 Location + Cache-Control: no-store.
+-- next (?next= deep link) is validated: must be a local absolute path ('/x'),
+-- and '//evil.com' (scheme-relative) is rejected — open-redirect guard.
+CREATE OR REPLACE MACRO _oauth_begin(auth_name, next := NULL) AS TABLE (
+  WITH
+    cfg AS (SELECT config_json::JSON AS c FROM quackapi_auth a WHERE a.name = auth_name AND a.kind = 'oauth2' LIMIT 1),
+    st AS (SELECT replace(uuid()::VARCHAR, '-', '') AS s FROM (SELECT 1)),
+    pv AS (SELECT replace(uuid()::VARCHAR, '-', '') || replace(uuid()::VARCHAR, '-', '') AS v FROM (SELECT 1)),
+    nx AS (SELECT CASE WHEN next IS NOT NULL AND starts_with(next, '/') AND NOT starts_with(next, '//') THEN next ELSE '/' END AS n)
+  SELECT
+    (SELECT s FROM st) AS state,
+    (SELECT v FROM pv) AS pkce_verifier,
+    (SELECT n FROM nx) AS redirect_after,
+    json_extract_string((SELECT c FROM cfg), '$.auth_url')
+      || '?response_type=code'
+      || '&client_id=' || _urlencode(json_extract_string((SELECT c FROM cfg), '$.client_id'))
+      || '&redirect_uri=' || _urlencode(json_extract_string((SELECT c FROM cfg), '$.redirect_uri'))
+      || '&scope=' || _urlencode(COALESCE(json_extract_string((SELECT c FROM cfg), '$.scopes'), 'openid'))
+      || '&state=' || (SELECT s FROM st)
+      || '&code_challenge=' || _pkce_challenge((SELECT v FROM pv))
+      || '&code_challenge_method=S256' AS location
+  FROM (SELECT 1)
+  WHERE (SELECT c FROM cfg) IS NOT NULL
+);
+
+-- Redeemable flow row for a callback: exists, unredeemed, unexpired. state is a
+-- BOUND untrusted value. Empty result = 401 at the caller. The caller marks
+-- redeemed_at in the same statement sequence (single-use).
+CREATE OR REPLACE MACRO _oauth_flow_redeem(state_val) AS TABLE (
+  SELECT f.state, f.auth_name, f.pkce_verifier, f.redirect_after
+  FROM quackapi_oauth_flows f
+  WHERE f.state = state_val
+    AND f.redeemed_at IS NULL
+    AND f.created_at >= now() - INTERVAL 10 MINUTE
+);
+
+-- Token-endpoint form body from BOUND code + verifier. client_secret rides the
+-- body file too — never a command line (ps would leak it).
+CREATE OR REPLACE MACRO _oauth_form_body(auth_name, code, verifier) AS (
+  (WITH cfg AS (SELECT config_json::JSON AS c FROM quackapi_auth a WHERE a.name = auth_name AND a.kind = 'oauth2' LIMIT 1)
+   SELECT 'grant_type=authorization_code'
+     || '&code=' || _urlencode(code)
+     || '&code_verifier=' || _urlencode(verifier)
+     || '&redirect_uri=' || _urlencode(json_extract_string((SELECT c FROM cfg), '$.redirect_uri'))
+     || '&client_id=' || _urlencode(json_extract_string((SELECT c FROM cfg), '$.client_id'))
+     || CASE WHEN json_extract_string((SELECT c FROM cfg), '$.client_secret') IS NOT NULL
+             THEN '&client_secret=' || _urlencode(json_extract_string((SELECT c FROM cfg), '$.client_secret'))
+             ELSE '' END)
+);
+
+-- Composed curl SQL for the exchange (SUB2-style: tier-1 asserts this text
+-- byte-exactly; the C worker executes it verbatim). form_path is a
+-- server-generated scratch path; token_url comes from the registry.
+CREATE OR REPLACE MACRO _oauth_exchange_sql(auth_name, form_path) AS (
+  (WITH cfg AS (SELECT config_json::JSON AS c FROM quackapi_auth a WHERE a.name = auth_name AND a.kind = 'oauth2' LIMIT 1)
+   SELECT 'SELECT content AS token_json FROM read_text(''curl -sS -X POST -H "Content-Type: application/x-www-form-urlencoded" --data-binary @' || form_path
+     || ' ' || json_extract_string((SELECT c FROM cfg), '$.token_url') || ' |'')')
+);
+
+-- Composed curl SQL for userinfo. The access token rides a COPY-written header
+-- file (curl -H @file, curl >= 7.55) — same no-splice recipe as the form body.
+CREATE OR REPLACE MACRO _oauth_userinfo_sql(auth_name, hdr_path) AS (
+  (WITH cfg AS (SELECT config_json::JSON AS c FROM quackapi_auth a WHERE a.name = auth_name AND a.kind = 'oauth2' LIMIT 1)
+   SELECT 'SELECT content AS userinfo_json FROM read_text(''curl -sS -H @' || hdr_path
+     || ' ' || json_extract_string((SELECT c FROM cfg), '$.userinfo_url') || ' |'')')
+);
+
+-- Validate a token-endpoint response (BOUND untrusted body): parses as JSON,
+-- no error member, access_token present.
+CREATE OR REPLACE MACRO _oauth_token_ok(token_json) AS (
+  try_cast(token_json AS JSON) IS NOT NULL
+  AND json_extract_string(try_cast(token_json AS JSON), '$.error') IS NULL
+  AND json_extract_string(try_cast(token_json AS JSON), '$.access_token') IS NOT NULL
+);
+
+-- Mint the post-login session from userinfo claims (BOUND) + the scheme's
+-- session store. Returns everything the caller needs: the session row values
+-- (caller INSERTs into quackapi_sessions — caller-inserts pattern) plus the
+-- Set-Cookie header value and the redirect Location.
+CREATE OR REPLACE MACRO _oauth_session_mint(auth_name, claims_json, redirect_after) AS TABLE (
+  WITH
+    cfg AS (SELECT config_json::JSON AS c FROM quackapi_auth a WHERE a.name = auth_name AND a.kind = 'oauth2' LIMIT 1),
+    store AS (SELECT s.* FROM quackapi_session_stores s
+              WHERE s.name = COALESCE(json_extract_string((SELECT c FROM cfg), '$.store'), 'sessions') LIMIT 1),
+    subj AS (SELECT COALESCE(
+               json_extract_string(try_cast(claims_json AS JSON), '$.sub'),
+               json_extract_string(try_cast(claims_json AS JSON), '$.email')) AS s),
+    mint AS (SELECT * FROM _create_session(
+               claims_json,
+               (SELECT secret FROM store),
+               subject := (SELECT s FROM subj),
+               ttl_seconds := COALESCE((SELECT expires_seconds FROM store), 86400)))
+  SELECT
+    (SELECT sid FROM mint) AS sid,
+    (SELECT s FROM subj) AS subject,
+    claims_json AS claims,
+    now() AS created_at,
+    now() + (COALESCE((SELECT expires_seconds FROM store), 86400) * INTERVAL '1 second') AS expires_at,
+    (SELECT csrf_token FROM mint) AS csrf_token,
+    (SELECT _build_set_cookie_header((SELECT cookie_value FROM mint), store := (SELECT name FROM store))) AS set_cookie,
+    COALESCE(redirect_after, '/') AS location
+  FROM (SELECT 1)
+  WHERE (SELECT s FROM subj) IS NOT NULL AND (SELECT secret FROM store) IS NOT NULL
 );
 
 -- Seed routes from JSON array literal (config-as-data)
