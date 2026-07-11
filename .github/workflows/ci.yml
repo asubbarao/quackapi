@@ -37,8 +37,12 @@ jobs:
         run: |
           # Override DUCKDB path for the runner
           echo "DUCKDB=/usr/local/bin/duckdb" >> "$GITHUB_ENV"
-          # Ensure shellfs community extension can be installed (for middleware tests)
-          duckdb :memory: -c "INSTALL shellfs FROM community; LOAD shellfs; SELECT 'shellfs ok';" || true
+          # Pre-install every extension the suites use, with the STOCK http client.
+          # framework.sql sets httpfs_client_implementation='curl' before its later
+          # INSTALLs, so on a cold runner those downloads ride curl_httpfs's
+          # multi-curl manager — which can abort (assertion multi_curl_manager.cpp:80,
+          # run 29138312748). Pre-installing makes every in-suite INSTALL a no-op.
+          duckdb :memory: -c "INSTALL json; INSTALL shellfs FROM community; INSTALL curl_httpfs FROM community; INSTALL httpfs_timeout_retry FROM community; INSTALL crypto FROM community; SELECT 'extensions preinstalled';"
 
       - name: Run tier-1 handle_request oracle (239 checks)
         run: |
@@ -101,6 +105,8 @@ jobs:
             -o /tmp/duckdb.zip
           unzip /tmp/duckdb.zip -d /tmp/duckdb_bin
           sudo install -m 755 /tmp/duckdb_bin/duckdb /usr/local/bin/duckdb
+          # Pre-install extensions with the stock http client (see sql-oracle job note)
+          duckdb :memory: -c "INSTALL json; INSTALL shellfs FROM community; INSTALL curl_httpfs FROM community; INSTALL httpfs_timeout_retry FROM community; INSTALL crypto FROM community; SELECT 'extensions preinstalled';"
 
       - name: Set up Python
         uses: actions/setup-python@v5
