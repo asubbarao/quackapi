@@ -111,44 +111,57 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	}
 	rest = Trim(rest.substr(pattern_end + 1));
 
+	// Token boundary: first run of non-whitespace (spaces/tabs/newlines all OK).
+	auto NextTokenEnd = [](const string &s) -> idx_t {
+		idx_t i = 0;
+		while (i < s.size() && !StringUtil::CharacterIsSpace(s[i])) {
+			i++;
+		}
+		return i;
+	};
+
 	// [STATUS <n>]
 	int status = 200;
 	auto rest_upper = StringUtil::Upper(rest);
-	if (StringUtil::StartsWith(rest_upper, "STATUS ")) {
-		rest = Trim(rest.substr(7));
-		auto space = rest.find(' ');
-		if (space == string::npos) {
+	if (StringUtil::StartsWith(rest_upper, "STATUS") &&
+	    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
+		rest = Trim(rest.substr(6));
+		auto token_end = NextTokenEnd(rest);
+		if (token_end == 0) {
 			return ParserExtensionParseResult("Expected AS <select> after STATUS <n>");
 		}
-		status = atoi(rest.substr(0, space).c_str());
+		status = atoi(rest.substr(0, token_end).c_str());
 		if (status < 100 || status > 599) {
 			return ParserExtensionParseResult("STATUS must be a valid HTTP status code");
 		}
-		rest = Trim(rest.substr(space));
+		rest = Trim(rest.substr(token_end));
 		rest_upper = StringUtil::Upper(rest);
 	}
 
 	// [REQUIRE <auth-name>]
 	string require_auth;
-	if (StringUtil::StartsWith(rest_upper, "REQUIRE ")) {
-		rest = Trim(rest.substr(8));
-		auto space = rest.find(' ');
-		if (space == string::npos) {
+	if (StringUtil::StartsWith(rest_upper, "REQUIRE") &&
+	    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+		rest = Trim(rest.substr(7));
+		auto token_end = NextTokenEnd(rest);
+		if (token_end == 0) {
 			return ParserExtensionParseResult("Expected AS <select> after REQUIRE <auth>");
 		}
-		require_auth = rest.substr(0, space);
+		require_auth = rest.substr(0, token_end);
 		if (require_auth.empty()) {
 			return ParserExtensionParseResult("REQUIRE expects an auth name");
 		}
-		rest = Trim(rest.substr(space));
+		rest = Trim(rest.substr(token_end));
 		rest_upper = StringUtil::Upper(rest);
 	}
 
-	// AS <select>
-	if (!StringUtil::StartsWith(rest_upper, "AS ")) {
+	// AS <select> — any whitespace (spaces/tabs/newlines) after AS is accepted.
+	// "AS SELECT …" and "AS\nSELECT …" are both valid; bare "AS" is not.
+	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
+	      StringUtil::CharacterIsSpace(rest[2]))) {
 		return ParserExtensionParseResult("Expected AS <select> in CREATE ROUTE");
 	}
-	auto handler = Trim(rest.substr(3));
+	auto handler = Trim(rest.substr(2));
 	if (handler.empty()) {
 		return ParserExtensionParseResult("Empty handler after AS");
 	}

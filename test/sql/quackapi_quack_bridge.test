@@ -1,0 +1,76 @@
+# name: test/sql/quackapi_quack_bridge.test
+# description: quack auth bridge scalars (verify_auth / authentication / authorization)
+# group: [quackapi]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# quackapi_verify_auth — policy engine exposed as SQL (EvaluateAuthQuery shape)
+# ---------------------------------------------------------------------------
+query I
+CREATE AUTH bridge_keys AS API_KEY;
+----
+Auth bridge_keys: API_KEY
+
+query I
+SELECT * FROM quackapi_add_api_key('bridge_keys', 'bridge-secret', 'carol');
+----
+carol
+
+# Good key → ok=true, status=200, claims_json carries sub
+query III
+SELECT (quackapi_verify_auth('bridge_keys', 'bridge-secret')).ok,
+       (quackapi_verify_auth('bridge_keys', 'bridge-secret')).status,
+       (quackapi_verify_auth('bridge_keys', 'bridge-secret')).claims_json;
+----
+true	200	{"sub":"carol"}
+
+query I
+SELECT (quackapi_verify_auth('bridge_keys', 'wrong')).ok;
+----
+false
+
+query I
+SELECT (quackapi_verify_auth('bridge_keys', 'wrong')).status;
+----
+401
+
+# Unknown scheme fails closed (500)
+query II
+SELECT (quackapi_verify_auth('nope', 'x')).ok, (quackapi_verify_auth('nope', 'x')).status;
+----
+false	500
+
+# ---------------------------------------------------------------------------
+# quackapi_authentication — quack_check_token-compatible signature
+# ---------------------------------------------------------------------------
+# Token equality path (same contract as quack_check_token)
+query I
+SELECT quackapi_authentication('sess', 'mytoken', 'mytoken');
+----
+true
+
+query I
+SELECT quackapi_authentication('sess', 'mytoken', 'other');
+----
+false
+
+# Scheme fall-through: auth_string is a registered API key
+query I
+SELECT quackapi_authentication('sess', 'bridge-secret', 'not-the-server-token');
+----
+true
+
+# ---------------------------------------------------------------------------
+# quackapi_authorization — pass-through like quack_nop_authorization
+# ---------------------------------------------------------------------------
+query I
+SELECT quackapi_authorization('sess', 'SELECT 1');
+----
+SELECT 1
+
+# Cleanup
+query I
+DROP AUTH bridge_keys;
+----
+Dropped auth bridge_keys

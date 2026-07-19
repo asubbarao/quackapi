@@ -12,6 +12,7 @@
 namespace duckdb {
 
 class DatabaseInstance;
+class ExtensionLoader;
 
 //===--------------------------------------------------------------------===//
 // Crypto helpers (bundled mbedtls — same lib as httpfs / duckdb_mbedtls)
@@ -46,7 +47,20 @@ struct QuackapiAuthResult {
 	unordered_map<string, string> claims;
 };
 
-//! Enforce route.require_auth against request headers.
+//! Policy engine for one CREATE AUTH scheme against a raw credential string
+//! (API key material or JWT). Used by the SQL surface and by REST handlers via
+//! EvaluateAuthQuery-style SQL (mirrors quack_server.cpp::EvaluateAuthQuery).
+QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_name,
+                                    const string &auth_string);
+
+//! Extract the credential string a scheme expects from HTTP headers
+//! (X-API-Key / custom header / Authorization: Bearer). Empty if missing.
+string ExtractAuthString(const QuackapiAuth &auth, const case_insensitive_map_t<string> &headers);
+
+//! Enforce route.require_auth against request headers by dispatching through
+//! the registered SQL auth surface (quackapi_verify_auth), not a private
+//! in-handler branch — same EvaluateAuthQuery pattern as quack's CONNECTION_REQUEST
+//! path (duckdb-quack src/quack_server.cpp).
 //! Public routes (empty require_auth) return ok=true with empty claims.
 //! Unknown auth name fails closed (ok=false).
 //! Never puts secrets or key hashes into body/claims.
@@ -66,10 +80,17 @@ public:
 TableFunction GetApplyAuthFunction();
 
 //===--------------------------------------------------------------------===//
-// Table functions registered from LoadInternal
+// Table / scalar functions registered from LoadInternal
 //===--------------------------------------------------------------------===//
 
 TableFunction GetQuackapiAuthsFunction();
 TableFunction GetQuackapiAddApiKeyFunction();
+
+//! Register quack-compatible auth scalars:
+//!   quackapi_authentication(session_id, auth_string, token) → BOOLEAN
+//!   quackapi_authorization(session_id, query) → VARCHAR
+//!   quackapi_verify_auth(scheme, auth_string) → STRUCT(...)
+//! so SET quack_authentication_function='quackapi_authentication' works.
+void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader);
 
 } // namespace duckdb

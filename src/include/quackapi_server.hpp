@@ -22,9 +22,17 @@ class DatabaseInstance;
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 
-//! HTTP server that dispatches requests to routes in QuackapiState.
-//! Transport is DuckDB's bundled httplib, following the same listener-thread +
-//! synchronous-bind discipline as the core quack extension's RPC server.
+//! REST sidecar that dispatches requests to routes in QuackapiState.
+//!
+//! Why a sidecar (architecture C): the core quack HttpQuackServer hardcodes
+//! only GET `/`, OPTIONS `/quack`, POST `/quack` (duckdb-quack
+//! src/quack_http_server.cpp) and exposes no path-registration hook. Plain
+//! curl REST therefore cannot ride quack's listener without an upstream change.
+//!
+//! Lifecycle, bind discipline, and stop semantics intentionally mirror
+//! HttpQuackServer / QuackServer (StopAccepting vs Close, synchronous
+//! bind_to_port, detached destroy) so this file would read as a natural
+//! chapter of duckdb-quack if a route hook were ever added.
 class QuackapiHttpServer {
 public:
 	//! static_dir: optional directory of files to serve for GET paths that match
@@ -33,9 +41,11 @@ public:
 	~QuackapiHttpServer();
 
 	//! Close the listener socket only; safe from a request-handler thread.
+	//! Mirrors QuackServer::StopAccepting (quack_server.hpp).
 	void StopAccepting();
 	//! Stop accepting AND join listener threads. Must not be called from a
 	//! worker thread (httplib's listen teardown joins all workers).
+	//! Mirrors QuackServer::Close.
 	void Close();
 
 	const string &Host() const {

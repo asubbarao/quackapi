@@ -325,6 +325,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
 	// Public routes (require_auth empty) pass through unchanged.
+	// Auth is evaluated through the SQL surface (quackapi_verify_auth), the
+	// same EvaluateAuthQuery shape quack uses for CONNECTION_REQUEST
+	// (duckdb-quack src/quack_server.cpp). CREATE AUTH DDL remains the policy
+	// definition layer; quack_authentication_function can point at
+	// quackapi_authentication so the RPC plane shares that policy.
 	auto headers = CollectHeaders(req);
 	auto auth_result = CheckAuth(*db, match.route, headers);
 	if (!auth_result.ok) {

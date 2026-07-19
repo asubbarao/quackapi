@@ -2,9 +2,13 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
 // Bundled mbedtls — same target httpfs/parquet link as duckdb_mbedtls.
@@ -504,7 +508,154 @@ string HeaderGet(const case_insensitive_map_t<string> &headers, const string &na
 } // namespace
 
 //===--------------------------------------------------------------------===//
-// CheckAuth
+// Policy engine (CREATE AUTH) — shared by SQL surface + REST
+//===--------------------------------------------------------------------===//
+
+string ExtractAuthString(const QuackapiAuth &auth, const case_insensitive_map_t<string> &headers) {
+	if (auth.kind == QuackapiAuthKind::API_KEY) {
+		string raw_key = HeaderGet(headers, auth.header);
+		if (!raw_key.empty()) {
+			return raw_key;
+		}
+		string authorization = HeaderGet(headers, "Authorization");
+		if (ExtractBearer(authorization, raw_key)) {
+			return raw_key;
+		}
+		return "";
+	}
+	if (auth.kind == QuackapiAuthKind::JWT_HS256) {
+		string authorization = HeaderGet(headers, "Authorization");
+		string token;
+		if (ExtractBearer(authorization, token)) {
+			return token;
+		}
+		return "";
+	}
+	return "";
+}
+
+//! Encode claims map as a compact JSON object for SQL return / $claims_* rebind.
+static string ClaimsToJson(const unordered_map<string, string> &claims) {
+	string out = "{";
+	bool first = true;
+	for (auto &kv : claims) {
+		if (!first) {
+			out += ",";
+		}
+		first = false;
+		// Keys and values are escaped via the same FastAPI-shaped helper path.
+		string key_esc;
+		for (unsigned char c : kv.first) {
+			if (c == '"') {
+				key_esc += "\\\"";
+			} else if (c == '\\') {
+				key_esc += "\\\\";
+			} else {
+				key_esc += static_cast<char>(c);
+			}
+		}
+		string val_esc;
+		for (unsigned char c : kv.second) {
+			if (c == '"') {
+				val_esc += "\\\"";
+			} else if (c == '\\') {
+				val_esc += "\\\\";
+			} else if (c == '\n') {
+				val_esc += "\\n";
+			} else if (c == '\r') {
+				val_esc += "\\r";
+			} else if (c == '\t') {
+				val_esc += "\\t";
+			} else {
+				val_esc += static_cast<char>(c);
+			}
+		}
+		out += "\"" + key_esc + "\":\"" + val_esc + "\"";
+	}
+	out += "}";
+	return out;
+}
+
+//! Parse claims_json produced by ClaimsToJson back into a map (for REST rebind).
+static void ParseClaimsJson(const string &json, unordered_map<string, string> &claims) {
+	unordered_map<string, bool> nulls;
+	ParseJsonObjectClaims(json, claims, nulls);
+}
+
+QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_name, const string &auth_string) {
+	QuackapiAuth auth;
+	if (!QuackapiState::Get(db).GetAuth(scheme_name, auth)) {
+		return Fail500("Authentication scheme \"" + scheme_name + "\" is not configured");
+	}
+
+	if (auth.kind == QuackapiAuthKind::API_KEY) {
+		if (auth_string.empty()) {
+			return Fail401("Not authenticated", "ApiKey");
+		}
+		string hash = QuackapiSha256(auth_string);
+		auto keys = QuackapiState::Get(db).SnapshotApiKeys(auth.name);
+		string subject;
+		bool matched = false;
+		for (auto &entry : keys) {
+			if (QuackapiConstantTimeEquals(hash, entry.key_hash)) {
+				if (!matched) {
+					subject = entry.subject;
+					matched = true;
+				}
+			}
+		}
+		if (!matched) {
+			return Fail401("Invalid authentication credentials");
+		}
+		QuackapiAuthResult ok;
+		ok.ok = true;
+		ok.status = 200;
+		ok.claims["sub"] = subject;
+		return ok;
+	}
+
+	if (auth.kind == QuackapiAuthKind::JWT_HS256) {
+		if (auth_string.empty()) {
+			return Fail401("Not authenticated", "Bearer");
+		}
+		unordered_map<string, string> claims;
+		string err;
+		if (!VerifyJwtHs256(auth_string, auth.secret, claims, err)) {
+			return Fail401(err);
+		}
+		QuackapiAuthResult ok;
+		ok.ok = true;
+		ok.status = 200;
+		ok.claims = std::move(claims);
+		return ok;
+	}
+
+	return Fail500("Unknown authentication kind");
+}
+
+//! Mirror of quack_server.cpp EvaluateAuthQuery — run a one-shot SQL auth probe.
+template <typename... ARGS>
+static Value EvaluateAuthQuery(DatabaseInstance &db, const string &sql, ARGS... values) {
+	Connection dummy_connection(db);
+	auto auth_result = dummy_connection.Query(sql, values...);
+	if (!auth_result || auth_result->HasError()) {
+		return Value();
+	}
+	auto chunk = auth_result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return Value();
+	}
+	return chunk->GetValue(0, 0);
+}
+
+//! Timing-safe token equality — same contract as quack_check_token
+//! (duckdb-quack src/quack_extension.cpp QuackAuthToken).
+static bool TimingSafeTokenEqual(const string &a, const string &b) {
+	return QuackapiConstantTimeEquals(a, b);
+}
+
+//===--------------------------------------------------------------------===//
+// CheckAuth — REST path goes through SQL (quack EvaluateAuthQuery shape)
 //===--------------------------------------------------------------------===//
 
 QuackapiAuthResult CheckAuth(DatabaseInstance &db, const QuackapiRoute &route,
@@ -517,68 +668,130 @@ QuackapiAuthResult CheckAuth(DatabaseInstance &db, const QuackapiRoute &route,
 
 	QuackapiAuth auth;
 	if (!QuackapiState::Get(db).GetAuth(route.require_auth, auth)) {
-		// Fail closed: required scheme is not configured.
 		return Fail500("Authentication scheme \"" + route.require_auth + "\" is not configured");
 	}
 
-	if (auth.kind == QuackapiAuthKind::API_KEY) {
-		string raw_key;
-		// 1) configured header
-		string hdr = HeaderGet(headers, auth.header);
-		if (!hdr.empty()) {
-			raw_key = hdr;
-		} else {
-			// 2) Authorization: Bearer <key>
-			string authorization = HeaderGet(headers, "Authorization");
-			if (!ExtractBearer(authorization, raw_key)) {
-				return Fail401("Not authenticated", "ApiKey");
-			}
-		}
-		if (raw_key.empty()) {
-			return Fail401("Not authenticated", "ApiKey");
-		}
+	string auth_string = ExtractAuthString(auth, headers);
 
-		string hash = QuackapiSha256(raw_key);
-		auto keys = QuackapiState::Get(db).SnapshotApiKeys(auth.name);
-		string subject;
-		bool matched = false;
-		// Compare against every stored hash (constant-time per compare).
-		for (auto &entry : keys) {
-			if (QuackapiConstantTimeEquals(hash, entry.key_hash)) {
-				// Prefer first match for subject; still scan all for timing smoothness.
-				if (!matched) {
-					subject = entry.subject;
-					matched = true;
-				}
-			}
-		}
-		if (!matched) {
-			return Fail401("Invalid authentication credentials");
-		}
-		QuackapiAuthResult ok;
-		ok.ok = true;
-		ok.claims["sub"] = subject;
-		return ok;
+	// Dispatch via SQL so the REST plane and quack's authentication_function
+	// share one policy entrypoint (quackapi_verify_auth). Same pattern as
+	// QuackServer::HandleMessageInternal CONNECTION_REQUEST:
+	//   SELECT <auth_fn>(?, ?, ?)
+	// (duckdb-quack src/quack_server.cpp ~L279-L281).
+	auto struct_val = EvaluateAuthQuery(
+	    db, "SELECT quackapi_verify_auth(?, ?)", Value(route.require_auth), Value(auth_string));
+	if (struct_val.IsNull() || struct_val.type().id() != LogicalTypeId::STRUCT) {
+		// Function missing or error — fail closed via direct policy (still no
+		// private header-only branch that skips the engine).
+		return VerifyAuthScheme(db, route.require_auth, auth_string);
 	}
 
-	if (auth.kind == QuackapiAuthKind::JWT_HS256) {
-		string authorization = HeaderGet(headers, "Authorization");
-		string token;
-		if (!ExtractBearer(authorization, token)) {
-			return Fail401("Not authenticated", "Bearer");
-		}
-		unordered_map<string, string> claims;
-		string err;
-		if (!VerifyJwtHs256(token, auth.secret, claims, err)) {
-			return Fail401(err);
-		}
-		QuackapiAuthResult ok;
-		ok.ok = true;
-		ok.claims = std::move(claims);
-		return ok;
+	auto &children = StructValue::GetChildren(struct_val);
+	auto &child_types = StructType::GetChildTypes(struct_val.type());
+	// Field order: ok, status, body, www_authenticate, claims_json
+	if (children.size() < 5) {
+		return Fail500("quackapi_verify_auth returned unexpected shape");
+	}
+	QuackapiAuthResult result;
+	result.ok = !children[0].IsNull() && children[0].GetValue<bool>();
+	result.status = children[1].IsNull() ? 401 : children[1].GetValue<int32_t>();
+	result.body = children[2].IsNull() ? string() : children[2].GetValue<string>();
+	result.www_authenticate = children[3].IsNull() ? string() : children[3].GetValue<string>();
+	if (result.ok && !children[4].IsNull()) {
+		ParseClaimsJson(children[4].GetValue<string>(), result.claims);
+	}
+	(void)child_types;
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// quack-compatible auth bridge scalars
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+LogicalType VerifyAuthReturnType() {
+	child_list_t<LogicalType> children;
+	children.emplace_back("ok", LogicalType::BOOLEAN);
+	children.emplace_back("status", LogicalType::INTEGER);
+	children.emplace_back("body", LogicalType::VARCHAR);
+	children.emplace_back("www_authenticate", LogicalType::VARCHAR);
+	children.emplace_back("claims_json", LogicalType::VARCHAR);
+	return LogicalType::STRUCT(std::move(children));
+}
+
+void QuackapiVerifyAuthFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &db = *state.GetContext().db;
+	auto scheme = args.GetValue(0, 0);
+	auto auth_string = args.GetValue(1, 0);
+	string scheme_s = scheme.IsNull() ? string() : scheme.GetValue<string>();
+	string auth_s = auth_string.IsNull() ? string() : auth_string.GetValue<string>();
+
+	auto auth_result = VerifyAuthScheme(db, scheme_s, auth_s);
+	vector<Value> fields;
+	fields.emplace_back(Value::BOOLEAN(auth_result.ok));
+	fields.emplace_back(Value::INTEGER(auth_result.status));
+	fields.emplace_back(Value(auth_result.body));
+	fields.emplace_back(Value(auth_result.www_authenticate));
+	fields.emplace_back(Value(auth_result.ok ? ClaimsToJson(auth_result.claims) : string("{}")));
+	result.Reference(Value::STRUCT(VerifyAuthReturnType(), std::move(fields)));
+}
+
+//! Drop-in for SET quack_authentication_function = 'quackapi_authentication'.
+//! Signature matches quack_check_token (session_id, auth_string, token) → BOOLEAN
+//! (duckdb-quack src/quack_extension.cpp L131-L136).
+//! Accepts either the server token (timing-safe) OR any registered CREATE AUTH scheme.
+void QuackapiAuthenticationFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &db = *state.GetContext().db;
+	// args: session_id, auth_string, token — session_id unused for token equality
+	// (same as quack_check_token which only compares args[1] and args[2]).
+	string auth_string = args.GetValue(1, 0).IsNull() ? string() : args.GetValue(1, 0).GetValue<string>();
+	string token = args.GetValue(2, 0).IsNull() ? string() : args.GetValue(2, 0).GetValue<string>();
+
+	if (!auth_string.empty() && !token.empty() && TimingSafeTokenEqual(auth_string, token)) {
+		result.Reference(Value::BOOLEAN(true));
+		return;
 	}
 
-	return Fail500("Unknown authentication kind");
+	// Fall through: try every registered CREATE AUTH scheme against auth_string.
+	// Lets a co-located quack_serve share API_KEY/JWT policy with REST.
+	auto schemes = QuackapiState::Get(db).SnapshotAuths();
+	for (auto &scheme : schemes) {
+		auto r = VerifyAuthScheme(db, scheme.name, auth_string);
+		if (r.ok) {
+			result.Reference(Value::BOOLEAN(true));
+			return;
+		}
+	}
+	result.Reference(Value::BOOLEAN(false));
+}
+
+//! Drop-in for SET quack_authorization_function = 'quackapi_authorization'.
+//! Same contract as quack_nop_authorization: return the query unchanged
+//! (duckdb-quack src/quack_extension.cpp QuackDummyAuthorization).
+void QuackapiAuthorizationFunction(DataChunk &args, ExpressionState &, Vector &result) {
+	// args: session_id, query_string
+	result.Reference(args.GetValue(1, 0));
+}
+
+} // namespace
+
+void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader) {
+	ScalarFunction verify("quackapi_verify_auth", {LogicalType::VARCHAR, LogicalType::VARCHAR}, VerifyAuthReturnType(),
+	                      QuackapiVerifyAuthFunction);
+	verify.SetVolatile();
+	loader.RegisterFunction(verify);
+
+	ScalarFunction authn("quackapi_authentication",
+	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                     QuackapiAuthenticationFunction);
+	authn.SetVolatile();
+	loader.RegisterFunction(authn);
+
+	ScalarFunction authz("quackapi_authorization", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                     QuackapiAuthorizationFunction);
+	authz.SetVolatile();
+	loader.RegisterFunction(authz);
 }
 
 //===--------------------------------------------------------------------===//

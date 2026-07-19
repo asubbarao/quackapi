@@ -10,6 +10,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/main/settings.hpp"
 
 #include "quackapi_auth.hpp"
 #include "quackapi_ddl.hpp"
@@ -53,11 +54,42 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &, TableFunctionBindInpu
 	return std::move(bind_data);
 }
 
+//! When the core quack extension is loaded, point its auth settings at
+//! quackapi's bridge functions so REST CREATE AUTH policy and quack RPC share
+//! one machinery (quack_server.cpp EvaluateAuthQuery + extension options
+//! quack_authentication_function / quack_authorization_function).
+static void ComposeQuackAuthSettings(ClientContext &context) {
+	auto &db = *context.db;
+	auto &config = DBConfig::GetConfig(db);
+	Value existing;
+	// Only set when the option exists (quack is loaded). Never invent settings.
+	if (config.TryGetCurrentSetting("quack_authentication_function", existing)) {
+		// Install our bridge if still at quack's default token checker, or
+		// already pointing at us (idempotent re-serve). Leave custom user
+		// callbacks alone.
+		auto current = existing.IsNull() ? string() : existing.GetValue<string>();
+		if (current.empty() || current == "quack_check_token" || current == "quackapi_authentication") {
+			config.SetOptionByName("quack_authentication_function", Value("quackapi_authentication"));
+		}
+	}
+	if (config.TryGetCurrentSetting("quack_authorization_function", existing)) {
+		auto current = existing.IsNull() ? string() : existing.GetValue<string>();
+		if (current.empty() || current == "quack_nop_authorization" || current == "quackapi_authorization") {
+			config.SetOptionByName("quack_authorization_function", Value("quackapi_authorization"));
+		}
+	}
+}
+
 static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->CastNoConst<ServeBindData>();
 	if (bind_data.finished) {
 		return;
 	}
+	// Compose with quack's auth settings when present (no-op if quack unloaded).
+	ComposeQuackAuthSettings(context);
+	// REST listener — justified by absence of a quack path-registration hook
+	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
+	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.
 	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, bind_data.static_dir);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
 	output.SetCardinality(1);
@@ -237,6 +269,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Auth inspection + API key management (secrets/hashes never exposed).
 	loader.RegisterFunction(GetQuackapiAuthsFunction());
 	loader.RegisterFunction(GetQuackapiAddApiKeyFunction());
+
+	// quack auth bridge: quackapi_authentication / quackapi_authorization /
+	// quackapi_verify_auth — same signatures as quack_check_token /
+	// quack_nop_authorization so they can be SET as quack_*_function.
+	RegisterQuackAuthBridgeFunctions(loader);
 
 	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.

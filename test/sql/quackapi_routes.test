@@ -83,6 +83,45 @@ DROP ROUTE hello;
 ----
 Dropped route hello
 
+# Multi-line handler body: any whitespace (newline/tab) after AS is accepted
+query I
+CREATE ROUTE multiline GET '/multi' AS
+SELECT
+  'ok' AS msg;
+----
+Route multiline: GET /multi
+
+# Handler is stored with internal newlines collapsed only by whitespace trim at
+# the edges — body still contains SELECT … AS msg (single cell; replace \n for assert)
+query I
+SELECT replace(handler, chr(10), ' ') FROM quackapi_routes() WHERE name = 'multiline';
+----
+SELECT   'ok' AS msg
+
+query I
+DROP ROUTE multiline;
+----
+Dropped route multiline
+
+# STATUS + REQUIRE also tolerate newlines before AS
+query I
+CREATE ROUTE spaced GET '/spaced' STATUS 201
+REQUIRE
+site_placeholder AS SELECT 1 AS n;
+----
+Route spaced: GET /spaced
+
+# REQUIRE with a non-existent scheme is allowed at CREATE (fail closed at request)
+query II
+SELECT require_auth, status FROM quackapi_routes() WHERE name = 'spaced';
+----
+site_placeholder	201
+
+query I
+DROP ROUTE spaced;
+----
+Dropped route spaced
+
 # Handler SQL is validated at CREATE time (not deferred to first request)
 statement error
 CREATE ROUTE bad GET '/x' AS SELECT * FROM no_such_table;

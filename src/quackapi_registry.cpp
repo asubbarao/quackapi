@@ -153,6 +153,9 @@ vector<QuackapiApiKeyEntry> QuackapiState::SnapshotApiKeys(const string &auth_na
 }
 
 void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port, const string &static_dir) {
+	// Mirrors QuackStorageExtensionInfo::CreateServer (duckdb-quack
+	// src/quack_storage.cpp): lock map → reject duplicate key → construct
+	// (bind happens in ctor so EADDRINUSE propagates) → emplace.
 	auto key = host + ":" + std::to_string(port);
 	std::lock_guard<std::mutex> lock(servers_mutex);
 	if (servers.find(key) != servers.end()) {
@@ -162,8 +165,10 @@ void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int po
 }
 
 bool QuackapiState::StopServer(int port) {
-	// Under the lock: only move the server out of the map. Never hold
-	// servers_mutex across httplib teardown (Close joins the worker pool).
+	// Mirrors QuackStorageExtensionInfo::StopServer (duckdb-quack
+	// src/quack_storage.cpp): under lock move out of map; StopAccepting
+	// (socket only); full destroy on a detached thread so httplib worker-pool
+	// join never runs under servers_mutex or on a request-handler thread.
 	unique_ptr<QuackapiHttpServer> to_destroy;
 	{
 		std::lock_guard<std::mutex> lock(servers_mutex);
@@ -178,12 +183,9 @@ bool QuackapiState::StopServer(int port) {
 	if (!to_destroy) {
 		return false;
 	}
-	// StopAccepting is socket-close only — safe from a request-handler worker.
 	to_destroy->StopAccepting();
-	// Full destruction (listener + worker-pool join) must run off any httplib
-	// worker thread, otherwise quackapi_stop() from inside a route self-joins.
-	// Brief delay so the calling worker can finish its response before ~Server
-	// joins the thread pool (race that previously deadlocked self-stop).
+	// Brief delay so a self-stop from inside a route can finish its response
+	// before ~Server joins the thread pool.
 	std::thread([srv = std::move(to_destroy)]() mutable {
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		srv.reset();
