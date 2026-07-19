@@ -245,9 +245,43 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 
 		auto path_params = PathParamNames(route.pattern);
 		auto oas_path = OasPath(route.pattern);
-		auto mode = ModeFor(col_names);
+		// Filter special response columns from response schema mode.
+		vector<string> data_col_names;
+		for (auto &n : col_names) {
+			auto lower = StringUtil::Lower(n);
+			if (lower == "location" || lower == "set_cookie" || lower == "set-cookie") {
+				continue;
+			}
+			data_col_names.push_back(n);
+		}
+		auto mode = ModeFor(data_col_names);
 
-		// parameters: path + query
+		// Build param-spec lookup for header/cookie sources.
+		auto FindSpec = [&](const string &n) -> const QuackapiParamSpec * {
+			for (auto &s : route.params) {
+				if (StringUtil::Lower(s.name) == StringUtil::Lower(n)) {
+					return &s;
+				}
+			}
+			return nullptr;
+		};
+		auto WireName = [&](const QuackapiParamSpec &s) -> string {
+			if (!s.external_name.empty()) {
+				return s.external_name;
+			}
+			if (s.source == QuackapiParamSource::HEADER) {
+				string out = s.name;
+				for (char &c : out) {
+					if (c == '_') {
+						c = '-';
+					}
+				}
+				return out;
+			}
+			return s.name;
+		};
+
+		// parameters: path + header + cookie + query
 		string params_json = "[";
 		bool first_param = true;
 		for (auto &n : path_params) {
@@ -276,12 +310,29 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			if (tit != expected_types.end()) {
 				ptype = tit->second;
 			}
-			params_json += "{\"name\":" + JsonString(n) + ",\"in\":\"query\",\"required\":true,\"schema\":" +
-			               ParamTypeToOas(ptype) + "}";
+			const QuackapiParamSpec *spec = FindSpec(n);
+			string in_loc = "query";
+			string oas_name = n;
+			bool required = true;
+			if (spec) {
+				if (spec->source == QuackapiParamSource::HEADER) {
+					in_loc = "header";
+					oas_name = WireName(*spec);
+				} else if (spec->source == QuackapiParamSource::COOKIE) {
+					in_loc = "cookie";
+					oas_name = WireName(*spec);
+				}
+				if (spec->has_default) {
+					required = false;
+				}
+			}
+			params_json += "{\"name\":" + JsonString(oas_name) + ",\"in\":" + JsonString(in_loc) +
+			               ",\"required\":" + (required ? "true" : "false") +
+			               ",\"schema\":" + ParamTypeToOas(ptype) + "}";
 		}
 		params_json += "]";
 
-		// response schema
+		// response schema (exclude location / set_cookie control columns)
 		string response_schema;
 		string content_type;
 		string response_desc;
@@ -295,14 +346,24 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			response_desc = "Plain text response";
 			response_schema =
 			    "{\"type\":\"string\",\"description\":\"Raw text body (single-column handler AS text)\"}";
+		} else if (data_col_names.empty()) {
+			content_type = "application/json";
+			response_desc = "Empty body (redirect / Set-Cookie control columns only)";
+			response_schema = "{\"type\":\"string\",\"maxLength\":0}";
 		} else {
 			content_type = "application/json";
 			response_desc = "Successful response (JSON array of row objects)";
 			string props = "{";
+			bool first_p = true;
 			for (idx_t i = 0; i < col_names.size(); i++) {
-				if (i > 0) {
+				auto lower = StringUtil::Lower(col_names[i]);
+				if (lower == "location" || lower == "set_cookie" || lower == "set-cookie") {
+					continue;
+				}
+				if (!first_p) {
 					props += ",";
 				}
+				first_p = false;
 				LogicalType t = i < col_types.size() ? col_types[i] : LogicalType::VARCHAR;
 				props += JsonString(col_names[i]) + ":" + DuckTypeToOas(t);
 			}

@@ -507,9 +507,28 @@ vector<string> SplitPath(const string &path) {
 	return segments;
 }
 
+//! Trailing-slash presence for paths other than "/".
+bool HasTrailingSlash(const string &path) {
+	return path.size() > 1 && path.back() == '/';
+}
+
+string StripTrailingSlash(const string &path) {
+	if (HasTrailingSlash(path)) {
+		return path.substr(0, path.size() - 1);
+	}
+	return path;
+}
+
 //! Match a request path against a route pattern. ':name' and '{name}' segments
 //! capture; all other segments must match exactly.
+//! Trailing-slash is significant (Starlette parity): `/users` ≠ `/users/`.
 bool MatchPattern(const string &pattern, const string &path, vector<std::pair<string, string>> &captures) {
+	// Exact trailing-slash policy: patterns without trailing slash do not match
+	// paths with one (and vice versa). SplitPath collapses empty segments, so
+	// enforce slash equality explicitly.
+	if (HasTrailingSlash(pattern) != HasTrailingSlash(path)) {
+		return false;
+	}
 	auto pattern_segments = SplitPath(pattern);
 	auto path_segments = SplitPath(path);
 	if (pattern_segments.size() != path_segments.size()) {
@@ -526,6 +545,103 @@ bool MatchPattern(const string &pattern, const string &path, vector<std::pair<st
 		}
 	}
 	return true;
+}
+
+//! Rebuild query string from httplib params (order not guaranteed; fine for redirects).
+string BuildQueryString(const duckdb_httplib::Request &req) {
+	if (req.params.empty()) {
+		return string();
+	}
+	string qs;
+	bool first = true;
+	for (auto &kv : req.params) {
+		if (!first) {
+			qs += "&";
+		}
+		first = false;
+		qs += duckdb_httplib::encode_query_component(kv.first);
+		qs += "=";
+		qs += duckdb_httplib::encode_query_component(kv.second);
+	}
+	return qs;
+}
+
+//! Wire name for a HEADER/COOKIE PARAM (FastAPI Header convert_underscores).
+string ParamWireName(const QuackapiParamSpec &spec) {
+	if (!spec.external_name.empty()) {
+		return spec.external_name;
+	}
+	if (spec.source == QuackapiParamSource::HEADER) {
+		// user_agent → user-agent (matched case-insensitively against User-Agent)
+		string out = spec.name;
+		for (char &c : out) {
+			if (c == '_') {
+				c = '-';
+			}
+		}
+		return out;
+	}
+	// COOKIE / QUERY: param name as-is
+	return spec.name;
+}
+
+//! Parse Cookie header into name → value (first wins; values unquoted).
+case_insensitive_map_t<string> ParseCookieHeader(const string &cookie_header) {
+	case_insensitive_map_t<string> out;
+	idx_t i = 0;
+	while (i < cookie_header.size()) {
+		// skip whitespace and separators
+		while (i < cookie_header.size() &&
+		       (cookie_header[i] == ' ' || cookie_header[i] == ';' || cookie_header[i] == '\t')) {
+			i++;
+		}
+		if (i >= cookie_header.size()) {
+			break;
+		}
+		idx_t start = i;
+		while (i < cookie_header.size() && cookie_header[i] != '=' && cookie_header[i] != ';') {
+			i++;
+		}
+		string name = cookie_header.substr(start, i - start);
+		StringUtil::Trim(name);
+		string val;
+		if (i < cookie_header.size() && cookie_header[i] == '=') {
+			i++;
+			idx_t vstart = i;
+			while (i < cookie_header.size() && cookie_header[i] != ';') {
+				i++;
+			}
+			val = cookie_header.substr(vstart, i - vstart);
+			StringUtil::Trim(val);
+			// Strip surrounding quotes if present
+			if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+				val = val.substr(1, val.size() - 2);
+			}
+		}
+		if (!name.empty() && out.find(name) == out.end()) {
+			out[name] = val;
+		}
+		if (i < cookie_header.size() && cookie_header[i] == ';') {
+			i++;
+		}
+	}
+	return out;
+}
+
+//! Case-insensitive header lookup by wire name.
+bool FindHeaderValue(const case_insensitive_map_t<string> &headers, const string &wire_name, string &out) {
+	auto it = headers.find(wire_name);
+	if (it != headers.end()) {
+		out = it->second;
+		return true;
+	}
+	return false;
+}
+
+//! True if column name is a special response control column (stripped from body).
+bool IsSpecialResponseColumn(const string &name) {
+	auto lower = StringUtil::Lower(name);
+	return lower == "location" || lower == "set_cookie" || lower == "set-cookie";
 }
 
 void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
@@ -829,6 +945,39 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 
 	if (!match.matched) {
+		// Starlette redirect_slashes: if the alternate trailing-slash form would
+		// match a registered route, 307 to that path (preserve query string).
+		// Built-in docs paths already accept both forms above.
+		if (!path_matched_other_method && methods_for_path.empty() && req.path != "/") {
+			string alt_path;
+			if (HasTrailingSlash(req.path)) {
+				alt_path = StripTrailingSlash(req.path);
+			} else {
+				alt_path = req.path + "/";
+			}
+			bool alt_matches = false;
+			for (auto &route : routes) {
+				vector<std::pair<string, string>> captures;
+				if (!MatchPattern(route.pattern, alt_path, captures)) {
+					continue;
+				}
+				// Any method registration is enough to redirect (Starlette).
+				alt_matches = true;
+				break;
+			}
+			if (alt_matches) {
+				string location = alt_path;
+				string qs = BuildQueryString(req);
+				if (!qs.empty()) {
+					location += "?" + qs;
+				}
+				res.status = 307;
+				res.set_header("Location", location);
+				res.body.clear();
+				finish();
+				return;
+			}
+		}
 		if (path_matched_other_method || !methods_for_path.empty()) {
 			// Ensure HEAD is advertised when GET is registered.
 			if (MethodListContains(methods_for_path, "GET") && !MethodListContains(methods_for_path, "HEAD")) {
@@ -891,6 +1040,41 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			provided[kv.first] = {"path", kv.second};
 		}
 
+		// ---- HEADER / COOKIE PARAMS (FastAPI Header / Cookie) ----
+		// Declared via PARAM <name> HEADER [wire] | COOKIE [wire]. Wire defaults:
+		// HEADER: underscore→hyphen (x_token → x-token); COOKIE: param name.
+		case_insensitive_map_t<string> cookies;
+		bool cookies_parsed = false;
+		for (auto &pspec : match.route.params) {
+			if (pspec.source == QuackapiParamSource::HEADER) {
+				string wire = ParamWireName(pspec);
+				string val;
+				if (FindHeaderValue(headers, wire, val)) {
+					// Header fills only if not already path-bound (path still wins).
+					if (provided.find(pspec.name) == provided.end() ||
+					    provided[pspec.name].first != "path") {
+						provided[pspec.name] = {"header", val};
+					}
+				}
+			} else if (pspec.source == QuackapiParamSource::COOKIE) {
+				if (!cookies_parsed) {
+					string cookie_hdr;
+					if (FindHeaderValue(headers, "Cookie", cookie_hdr)) {
+						cookies = ParseCookieHeader(cookie_hdr);
+					}
+					cookies_parsed = true;
+				}
+				string wire = ParamWireName(pspec);
+				auto cit = cookies.find(wire);
+				if (cit != cookies.end()) {
+					if (provided.find(pspec.name) == provided.end() ||
+					    provided[pspec.name].first != "path") {
+						provided[pspec.name] = {"cookie", cit->second};
+					}
+				}
+			}
+		}
+
 		// ---- REQUEST BODY BINDING (POST/PUT/PATCH) ----
 		// FastAPI parity: JSON body fields, form-urlencoded, multipart files,
 		// malformed JSON → 422 json_invalid, wrong CT → 422 model_attributes_type.
@@ -915,6 +1099,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				}
 				const QuackapiParamSpec *ps = FindParamSpec(match.route.params, entry.first);
 				if (ps && ps->has_default) {
+					continue;
+				}
+				// Header/Cookie params are not body-derived.
+				if (ps && (ps->source == QuackapiParamSource::HEADER ||
+				           ps->source == QuackapiParamSource::COOKIE)) {
 					continue;
 				}
 				// File filename helpers are body-derived.
@@ -1065,7 +1254,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 
 			auto it = provided.find(param_name);
-			string loc_kind = IsPathParam(match.route.pattern, param_name) ? "path" : "query";
+			// Default loc for missing errors: path / header / cookie / query.
+			string loc_kind = "query";
+			if (IsPathParam(match.route.pattern, param_name)) {
+				loc_kind = "path";
+			} else if (spec && spec->source == QuackapiParamSource::HEADER) {
+				loc_kind = "header";
+			} else if (spec && spec->source == QuackapiParamSource::COOKIE) {
+				loc_kind = "cookie";
+			}
 			string raw;
 			bool from_default = false;
 
@@ -1078,8 +1275,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						continue;
 					}
 					raw = spec->default_raw;
-					// Defaults bind as query location for error loc shape.
-					loc_kind = "query";
+					// Defaults keep the declared source loc for error shape.
 				} else {
 					SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, "Field required", "missing"));
 					finish();
@@ -1244,23 +1440,90 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		auto &names = result->names;
-		auto mode = ResponseModeFor(names);
+		// Identify special response columns (FastAPI RedirectResponse / response cookies).
+		// `location` → Location header; `set_cookie` / `set-cookie` → Set-Cookie.
+		// These are stripped from the JSON/HTML/TEXT body.
+		vector<bool> is_special(names.size(), false);
+		vector<idx_t> data_cols;
+		idx_t location_col = names.size(); // invalid sentinel
+		idx_t set_cookie_col = names.size();
+		for (idx_t c = 0; c < names.size(); c++) {
+			auto lower = StringUtil::Lower(names[c]);
+			if (lower == "location") {
+				is_special[c] = true;
+				location_col = c;
+			} else if (lower == "set_cookie" || lower == "set-cookie") {
+				is_special[c] = true;
+				set_cookie_col = c;
+			} else {
+				data_cols.push_back(c);
+			}
+		}
 
-		// HTML/TEXT mode: a single column named `html`/`text` serves its raw
+		// Materialize rows once so we can apply headers then serialize body.
+		struct RowVals {
+			vector<Value> cols;
+		};
+		vector<RowVals> rows;
+		while (true) {
+			auto chunk = result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				RowVals rv;
+				rv.cols.resize(chunk->ColumnCount());
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					rv.cols[col] = chunk->GetValue(col, row);
+				}
+				rows.push_back(std::move(rv));
+			}
+		}
+
+		// Apply Location / Set-Cookie from first (or each) row.
+		string location_value;
+		vector<string> set_cookie_values;
+		for (auto &rv : rows) {
+			if (location_col < rv.cols.size() && !rv.cols[location_col].IsNull() && location_value.empty()) {
+				location_value = rv.cols[location_col].ToString();
+			}
+			if (set_cookie_col < rv.cols.size() && !rv.cols[set_cookie_col].IsNull()) {
+				set_cookie_values.push_back(rv.cols[set_cookie_col].ToString());
+			}
+		}
+		if (!location_value.empty()) {
+			res.set_header("Location", location_value);
+		}
+		for (auto &cv : set_cookie_values) {
+			// httplib Headers is multimap — set_header appends.
+			res.set_header("Set-Cookie", cv);
+		}
+
+		// HTML/TEXT mode uses the single remaining data column name.
+		vector<string> data_names;
+		for (auto c : data_cols) {
+			data_names.push_back(names[c]);
+		}
+		auto mode = ResponseModeFor(data_names);
+
+		// No data columns: empty body (redirect / cookie-only responses).
+		if (data_cols.empty()) {
+			res.status = match.route.status;
+			res.body.clear();
+			// Drop Content-Type when there is no body.
+			finish();
+			return;
+		}
+
+		// HTML/TEXT mode: a single data column named `html`/`text` serves its raw
 		// string value (e.g. SELECT tera_render(...) AS html). Multiple rows are
 		// concatenated in order, so a query returning fragments streams a page.
 		if (mode != ResponseMode::JSON) {
 			string body;
-			while (true) {
-				auto chunk = result->Fetch();
-				if (!chunk || chunk->size() == 0) {
-					break;
-				}
-				for (idx_t row = 0; row < chunk->size(); row++) {
-					auto value = chunk->GetValue(0, row);
-					if (!value.IsNull()) {
-						body += value.ToString();
-					}
+			idx_t col = data_cols[0];
+			for (auto &rv : rows) {
+				if (col < rv.cols.size() && !rv.cols[col].IsNull()) {
+					body += rv.cols[col].ToString();
 				}
 			}
 			res.status = match.route.status;
@@ -1271,28 +1534,24 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		// Serialize: JSON array of row objects, typed by the query's columns.
+		// Serialize: JSON array of row objects, typed by the query's data columns.
 		string body = "[";
 		bool first_row = true;
-		while (true) {
-			auto chunk = result->Fetch();
-			if (!chunk || chunk->size() == 0) {
-				break;
+		for (auto &rv : rows) {
+			if (!first_row) {
+				body += ",";
 			}
-			for (idx_t row = 0; row < chunk->size(); row++) {
-				if (!first_row) {
+			first_row = false;
+			body += "{";
+			bool first_col = true;
+			for (auto col : data_cols) {
+				if (!first_col) {
 					body += ",";
 				}
-				first_row = false;
-				body += "{";
-				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-					if (col > 0) {
-						body += ",";
-					}
-					body += "\"" + JsonEscape(names[col]) + "\":" + ValueToJson(chunk->GetValue(col, row));
-				}
-				body += "}";
+				first_col = false;
+				body += "\"" + JsonEscape(names[col]) + "\":" + ValueToJson(rv.cols[col]);
 			}
+			body += "}";
 		}
 		body += "]";
 		SetJson(res, match.route.status, body);

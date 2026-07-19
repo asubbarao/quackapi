@@ -38,12 +38,23 @@ struct QuackapiApiKeyEntry {
 	string subject;
 };
 
-//! Optional/constraint metadata for a route parameter (FastAPI Query(...) parity).
-//! Declared via CREATE ROUTE … PARAM <name> [TYPE] [DEFAULT …] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH …]
+//! Where a route param is bound from (FastAPI Query / Header / Cookie).
+enum class QuackapiParamSource : uint8_t {
+	QUERY = 0,  // default: query string (+ path captures still win by pattern)
+	HEADER = 1, // request header (name: external_name or underscore→hyphen of name)
+	COOKIE = 2, // Cookie header field (name: external_name or param name)
+};
+
+//! Optional/constraint metadata for a route parameter (FastAPI Query/Header/Cookie parity).
+//! Declared via CREATE ROUTE … PARAM <name> [TYPE] [HEADER|COOKIE [name]] [DEFAULT …] [GE/…]
 struct QuackapiParamSpec {
 	string name;
 	//! Optional type hint (INTEGER, BIGINT, VARCHAR, …). Empty = infer from SQL.
 	string type_name;
+	QuackapiParamSource source = QuackapiParamSource::QUERY;
+	//! Wire name for HEADER/COOKIE when different from param name. Empty = derive:
+	//! HEADER → name with '_' → '-'; COOKIE → param name as-is.
+	string external_name;
 	bool has_default = false;
 	bool default_is_null = false;
 	//! Raw default literal (digits / true / false / unquoted text). Empty when default_is_null.

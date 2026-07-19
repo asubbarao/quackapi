@@ -58,8 +58,9 @@ bool IsParamTypeName(const string &tok) {
 }
 
 //! Serialize param specs for the apply_route table function (plan → exec).
-//! Format: name|type|has_def|def_null|def_raw|has_ge|ge|has_gt|gt|has_le|le|has_lt|lt|has_min|min|has_max|max
-//! Multiple specs separated by RS (\x1e). Fields use FS (\x1f). def_raw is percent-encoded for | and RS.
+//! Format fields (FS=\x1f): name, type, has_def, def_null, def_raw, has_ge, ge, has_gt, gt,
+//! has_le, le, has_lt, lt, has_min, min, has_max, max, source, external_name
+//! Multiple specs separated by RS (\x1e). Text fields percent-encoded for RS/FS/%.
 string EncodeField(const string &s) {
 	string out;
 	out.reserve(s.size());
@@ -90,6 +91,29 @@ string DecodeField(const string &s) {
 		out += s[i];
 	}
 	return out;
+}
+
+string ParamSourceToString(QuackapiParamSource src) {
+	switch (src) {
+	case QuackapiParamSource::HEADER:
+		return "header";
+	case QuackapiParamSource::COOKIE:
+		return "cookie";
+	case QuackapiParamSource::QUERY:
+	default:
+		return "query";
+	}
+}
+
+QuackapiParamSource ParamSourceFromString(const string &s) {
+	auto u = StringUtil::Lower(s);
+	if (u == "header") {
+		return QuackapiParamSource::HEADER;
+	}
+	if (u == "cookie") {
+		return QuackapiParamSource::COOKIE;
+	}
+	return QuackapiParamSource::QUERY;
 }
 
 string SerializeParamSpecs(const vector<QuackapiParamSpec> &specs) {
@@ -132,6 +156,10 @@ string SerializeParamSpecs(const vector<QuackapiParamSpec> &specs) {
 		result += s.has_max_length ? "1" : "0";
 		result += '\x1f';
 		result += std::to_string(s.max_length);
+		result += '\x1f';
+		result += ParamSourceToString(s.source);
+		result += '\x1f';
+		result += EncodeField(s.external_name);
 	}
 	return result;
 }
@@ -148,8 +176,8 @@ vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
 			continue;
 		}
 		auto fields = StringUtil::Split(entry, '\x1f');
-		// Pad so we never index OOB on partial data.
-		while (fields.size() < 17) {
+		// Pad so we never index OOB on partial data (17 legacy + source + external).
+		while (fields.size() < 19) {
 			fields.push_back("");
 		}
 		QuackapiParamSpec s;
@@ -170,6 +198,8 @@ vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
 		s.min_length = (idx_t)atoll(fields[14].c_str());
 		s.has_max_length = fields[15] == "1";
 		s.max_length = (idx_t)atoll(fields[16].c_str());
+		s.source = ParamSourceFromString(fields[17]);
+		s.external_name = DecodeField(fields[18]);
 		if (!s.name.empty()) {
 			specs.push_back(std::move(s));
 		}
@@ -181,9 +211,15 @@ vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
 //!     [STATUS <n>] [REQUIRE <auth>]
 //!     [BODY SCHEMA '<json-schema>']
-//!     [PARAM <name> [<type>] [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
+//!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
+//!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
 //!     AS <select>
 //!   DROP ROUTE <name>
+//!
+//! HEADER binds from a request header (FastAPI Header). Default wire name is
+//! the param name with underscores converted to hyphens (x_token → x-token).
+//! COOKIE binds from the Cookie header (FastAPI Cookie); default wire name is
+//! the param name as-is.
 ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &query) {
 	auto q = Trim(query);
 	auto upper = StringUtil::Upper(q);
@@ -387,7 +423,53 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			}
 		}
 
-		// DEFAULT / GE / GT / LE / LT / MIN_LENGTH / MAX_LENGTH
+		// optional source: HEADER [wire-name] | COOKIE [wire-name]
+		// May also appear after type or later among options.
+		auto TryConsumeSource = [&]() -> bool {
+			if (rest.empty()) {
+				return false;
+			}
+			rest_upper = StringUtil::Upper(rest);
+			te = NextTokenEnd(rest);
+			auto key = StringUtil::Upper(rest.substr(0, te));
+			if (key != "HEADER" && key != "COOKIE" && key != "QUERY") {
+				return false;
+			}
+			if (key == "HEADER") {
+				spec.source = QuackapiParamSource::HEADER;
+			} else if (key == "COOKIE") {
+				spec.source = QuackapiParamSource::COOKIE;
+			} else {
+				spec.source = QuackapiParamSource::QUERY;
+			}
+			rest = Trim(rest.substr(te));
+			// Optional quoted or bare wire name (not a known option keyword).
+			if (!rest.empty()) {
+				if (rest[0] == '\'') {
+					auto endq = rest.find('\'', 1);
+					if (endq == string::npos) {
+						return true; // leave rest; outer will error later if needed
+					}
+					spec.external_name = rest.substr(1, endq - 1);
+					rest = Trim(rest.substr(endq + 1));
+				} else {
+					te = NextTokenEnd(rest);
+					auto maybe = rest.substr(0, te);
+					auto mu = StringUtil::Upper(maybe);
+					if (mu != "DEFAULT" && mu != "GE" && mu != "GT" && mu != "LE" && mu != "LT" &&
+					    mu != "MIN_LENGTH" && mu != "MAX_LENGTH" && mu != "PARAM" && mu != "BODY" &&
+					    mu != "AS" && mu != "HEADER" && mu != "COOKIE" && mu != "QUERY" &&
+					    !IsParamTypeName(maybe)) {
+						spec.external_name = maybe;
+						rest = Trim(rest.substr(te));
+					}
+				}
+			}
+			return true;
+		};
+		TryConsumeSource();
+
+		// DEFAULT / GE / GT / LE / LT / MIN_LENGTH / MAX_LENGTH / HEADER / COOKIE
 		while (!rest.empty()) {
 			rest_upper = StringUtil::Upper(rest);
 			if (StringUtil::StartsWith(rest_upper, "PARAM") &&
@@ -401,6 +483,10 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
 			    StringUtil::CharacterIsSpace(rest[2])) {
 				break;
+			}
+			// HEADER / COOKIE may appear after DEFAULT/constraints too.
+			if (TryConsumeSource()) {
+				continue;
 			}
 			te = NextTokenEnd(rest);
 			auto key = StringUtil::Upper(rest.substr(0, te));
@@ -462,8 +548,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				}
 				continue;
 			}
-			return ParserExtensionParseResult("Unknown PARAM option \"" + key +
-			                                  "\" — expected DEFAULT, GE, GT, LE, LT, MIN_LENGTH, MAX_LENGTH");
+			return ParserExtensionParseResult(
+			    "Unknown PARAM option \"" + key +
+			    "\" — expected HEADER, COOKIE, DEFAULT, GE, GT, LE, LT, MIN_LENGTH, MAX_LENGTH");
 		}
 
 		params.push_back(std::move(spec));
