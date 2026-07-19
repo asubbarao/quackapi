@@ -167,3 +167,41 @@ query I
 SELECT count(*) FROM quackapi_routes();
 ----
 2100
+
+# BODY SCHEMA clause parses and is accepted on CREATE ROUTE
+query I
+CREATE ROUTE with_schema POST '/with-schema'
+  BODY SCHEMA '{"type":"object","properties":{"n":{"type":"integer"}}}'
+  AS SELECT $n::INTEGER AS n;
+----
+Route with_schema: POST /with-schema
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name = 'with_schema';
+----
+1
+
+query I
+DROP ROUTE with_schema;
+----
+Dropped route with_schema
+
+# BODY SCHEMA after PARAM also parses
+query I
+CREATE ROUTE with_schema2 POST '/with-schema2'
+  PARAM n INTEGER DEFAULT 0
+  BODY SCHEMA '{"type":"object"}'
+  AS SELECT $n::INTEGER AS n;
+----
+Route with_schema2: POST /with-schema2
+
+query I
+DROP ROUTE with_schema2;
+----
+Dropped route with_schema2
+
+# Unterminated BODY SCHEMA errors
+statement error
+CREATE ROUTE bad_schema POST '/x' BODY SCHEMA '{"type":"object" AS SELECT 1;
+----
+Unterminated BODY SCHEMA
