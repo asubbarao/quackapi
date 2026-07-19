@@ -16,6 +16,7 @@
 #include "quackapi_http_fetch.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
+#include "quackapi_table_api.hpp"
 
 namespace duckdb {
 
@@ -245,6 +246,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
+	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

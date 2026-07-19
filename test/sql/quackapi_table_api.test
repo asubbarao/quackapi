@@ -1,0 +1,48 @@
+# name: test/sql/quackapi_table_api.test
+# description: CREATE API FOR TABLE generates read routes into the registry
+# group: [quackapi]
+
+require quackapi
+
+statement ok
+CREATE TABLE cases AS SELECT 1 AS id, '24-000117' AS case_no;
+
+# Generates a list route and a by-key route at the default base '/<table>'.
+statement ok
+CREATE API FOR TABLE cases;
+
+query TTT
+SELECT name, method, pattern FROM quackapi_routes() ORDER BY name;
+----
+cases_get	GET	/cases/:id
+cases_list	GET	/cases
+
+# Custom base path and key column.
+statement ok
+CREATE TABLE documents AS SELECT 1 AS doc_id, 'report.pdf' AS filename;
+
+statement ok
+CREATE API FOR TABLE documents AT '/api/documents' KEY 'doc_id';
+
+query TTT
+SELECT method, pattern, handler FROM quackapi_routes() WHERE name = 'documents_get';
+----
+GET	/api/documents/:doc_id	SELECT * FROM "documents" WHERE "doc_id" = $doc_id
+
+# The generated routes are ordinary registry rows: DROP ROUTE removes them.
+statement ok
+DROP ROUTE cases_list;
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name = 'cases_list';
+----
+0
+
+# OR REPLACE re-generates without a duplicate error.
+statement ok
+CREATE OR REPLACE API FOR TABLE documents AT '/api/documents' KEY 'doc_id';
+
+# Bad grammar: AT requires a leading-slash quoted path.
+statement error
+CREATE API FOR TABLE cases AT 'nope';
+----
