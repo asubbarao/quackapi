@@ -41,6 +41,59 @@ bool ParseQuoted(string &rest, string &out) {
 	return true;
 }
 
+//! Parse a SQL identifier: bare token OR double-quoted with "" escapes.
+//! Bare tokens must not contain '"' (those need proper "quoting") so the
+//! statement splitter / shell never sees an unbalanced double-quote.
+bool ParseIdent(string &rest, string &out) {
+	rest = Trim(rest);
+	if (rest.empty()) {
+		return false;
+	}
+	if (rest[0] == '"') {
+		string result;
+		idx_t i = 1;
+		while (i < rest.size()) {
+			if (rest[i] == '"') {
+				if (i + 1 < rest.size() && rest[i + 1] == '"') {
+					result += '"';
+					i += 2;
+					continue;
+				}
+				out = result;
+				rest = Trim(rest.substr(i + 1));
+				return !out.empty();
+			}
+			result += rest[i];
+			i++;
+		}
+		return false; // unterminated
+	}
+	// Bare identifier: up to whitespace. Reject embedded double-quotes so callers
+	// use standard "quoted""idents" (balanced for the shell / statement splitter).
+	auto space = rest.find(' ');
+	string tok = space == string::npos ? rest : rest.substr(0, space);
+	if (tok.empty() || tok.find('"') != string::npos) {
+		return false;
+	}
+	out = tok;
+	rest = space == string::npos ? string() : Trim(rest.substr(space));
+	return true;
+}
+
+//! Path/query param names must be safe bare identifiers ($name).
+bool IsSafeParamName(const string &name) {
+	if (name.empty()) {
+		return false;
+	}
+	for (char c : name) {
+		if (!(StringUtil::CharacterIsAlpha(c) || StringUtil::CharacterIsDigit(c) || c == '_')) {
+			return false;
+		}
+	}
+	// leading digit is fine for path captures; DuckDB named params accept it
+	return true;
+}
+
 //! Parsed CREATE API FOR TABLE, carried from parse to plan.
 struct TableApiParseData : public ParserExtensionParseData {
 	bool or_replace = false;
@@ -84,18 +137,16 @@ ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult("CREATE API FOR TABLE expects a table name");
 	}
 
-	// <table> is the first whitespace-delimited token.
-	auto space = rest.find(' ');
+	// <table>: bare ident OR "quoted""ident" (SQL standard). Quoted form is
+	// required when the name embeds double-quotes so the statement splitter
+	// sees balanced quotes.
 	auto data = make_uniq<TableApiParseData>();
 	data->or_replace = or_replace;
-	if (space == string::npos) {
-		data->table = rest;
-		rest.clear();
-	} else {
-		data->table = rest.substr(0, space);
-		rest = Trim(rest.substr(space));
+	if (!ParseIdent(rest, data->table)) {
+		return ParserExtensionParseResult(
+		    "CREATE API FOR TABLE: invalid table name — use a bare identifier or \"quoted\"\"ident\"");
 	}
-	if (data->table.empty() || data->table.find('\'') != string::npos) {
+	if (data->table.find('\'') != string::npos) {
 		return ParserExtensionParseResult("CREATE API FOR TABLE: invalid table name");
 	}
 
@@ -115,6 +166,12 @@ ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &qu
 		} else {
 			return ParserExtensionParseResult("CREATE API FOR TABLE: unexpected clause \"" + rest + "\"");
 		}
+	}
+
+	// KEY is also the path-param / $name — must be a safe bare identifier.
+	if (!IsSafeParamName(data->key)) {
+		return ParserExtensionParseResult(
+		    "CREATE API FOR TABLE: KEY must be a bare identifier (letters, digits, underscore)");
 	}
 
 	return ParserExtensionParseResult(std::move(data));

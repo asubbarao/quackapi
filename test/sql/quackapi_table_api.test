@@ -46,3 +46,33 @@ CREATE OR REPLACE API FOR TABLE documents AT '/api/documents' KEY 'doc_id';
 statement error
 CREATE API FOR TABLE cases AT 'nope';
 ----
+
+# Quoted table identifier with embedded double-quote — QuoteIdent must not break out.
+# SQL: CREATE TABLE "weird""name" (...); CREATE API FOR TABLE "weird""name" KEY 'id';
+statement ok
+CREATE TABLE "weird""name" AS SELECT 1 AS id, 'v' AS v;
+
+statement ok
+CREATE API FOR TABLE "weird""name" KEY 'id';
+
+query TTT
+SELECT name, pattern, handler FROM quackapi_routes() WHERE name = 'weird"name_list';
+----
+weird"name_list	/weird"name	SELECT * FROM "weird""name"
+
+query TTT
+SELECT name, pattern, handler FROM quackapi_routes() WHERE name = 'weird"name_get';
+----
+weird"name_get	/weird"name/:id	SELECT * FROM "weird""name" WHERE "id" = $id
+
+# Bare table token with an embedded " is rejected (use "quoted""ident" form).
+statement error
+CREATE API FOR TABLE bare"quote;
+----
+invalid table name
+
+# KEY must be a safe path-param identifier.
+statement error
+CREATE API FOR TABLE cases KEY 'id"x';
+----
+KEY must be a bare identifier

@@ -1,6 +1,7 @@
 #include "quackapi_state.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <thread>
 
 #include "duckdb/common/exception.hpp"
@@ -181,7 +182,12 @@ bool QuackapiState::StopServer(int port) {
 	to_destroy->StopAccepting();
 	// Full destruction (listener + worker-pool join) must run off any httplib
 	// worker thread, otherwise quackapi_stop() from inside a route self-joins.
-	std::thread([srv = std::move(to_destroy)]() mutable { srv.reset(); }).detach();
+	// Brief delay so the calling worker can finish its response before ~Server
+	// joins the thread pool (race that previously deadlocked self-stop).
+	std::thread([srv = std::move(to_destroy)]() mutable {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		srv.reset();
+	}).detach();
 	return true;
 }
 
@@ -200,7 +206,10 @@ void QuackapiState::StopAllServers() {
 		}
 	}
 	for (auto &srv : to_destroy) {
-		std::thread([s = std::move(srv)]() mutable { s.reset(); }).detach();
+		std::thread([s = std::move(srv)]() mutable {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			s.reset();
+		}).detach();
 	}
 }
 

@@ -403,13 +403,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		auto result = prepared->Execute(named_values, false);
 		if (result->HasError()) {
-			auto &error = result->GetErrorObject();
-			if (error.Type() == ExceptionType::CONVERSION || error.Type() == ExceptionType::INVALID_INPUT) {
-				// Keep detailed FastAPI-shaped 422 for request-validation errors only.
-				SetJson(res, 422, ValidationErrorJson("query", "", error.RawMessage(), "type_error"));
-			} else {
-				SetInternalError(res, result->GetError());
-			}
+			// Request-parameter validation (missing / type cast) already returned
+			// FastAPI-shaped 422 above. Any failure during Execute is a handler-side
+			// error — sanitize to 500 so SQL text, error(), and internal messages
+			// never reach clients (INVALID_INPUT would otherwise leak via 422).
+			SetInternalError(res, result->GetError());
 			return;
 		}
 
