@@ -180,6 +180,7 @@ vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
 //!     [STATUS <n>] [REQUIRE <auth>]
+//!     [BODY SCHEMA '<json-schema>']
 //!     [PARAM <name> [<type>] [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
 //!     AS <select>
 //!   DROP ROUTE <name>
@@ -286,6 +287,74 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		rest_upper = StringUtil::Upper(rest);
 	}
 
+	// [BODY SCHEMA '<json-schema>'] — may appear before PARAM or after PARAM blocks.
+	// Returns false and sets err on syntax error; true when clause absent or consumed.
+	auto TryConsumeBodySchema = [&](string &err_out) -> bool {
+		if (!(StringUtil::StartsWith(rest_upper, "BODY") && rest.size() > 4 &&
+		      StringUtil::CharacterIsSpace(rest[4]))) {
+			return true; // not present
+		}
+		string after_body = Trim(rest.substr(4));
+		auto after_upper = StringUtil::Upper(after_body);
+		if (!StringUtil::StartsWith(after_upper, "SCHEMA")) {
+			err_out = "Expected BODY SCHEMA '<json-schema>'";
+			return false;
+		}
+		if (after_body.size() == 6) {
+			err_out = "BODY SCHEMA expects a quoted JSON schema string";
+			return false;
+		}
+		string after_schema;
+		if (StringUtil::CharacterIsSpace(after_body[6])) {
+			after_schema = Trim(after_body.substr(6));
+		} else if (after_body[6] == '\'') {
+			after_schema = after_body.substr(6);
+		} else {
+			err_out = "Expected BODY SCHEMA '<json-schema>'";
+			return false;
+		}
+		if (after_schema.empty() || after_schema[0] != '\'') {
+			err_out = "BODY SCHEMA expects a quoted JSON schema string";
+			return false;
+		}
+		// Quoted string with SQL '' escape.
+		string schema;
+		idx_t i = 1;
+		while (i < after_schema.size()) {
+			if (after_schema[i] == '\'') {
+				if (i + 1 < after_schema.size() && after_schema[i + 1] == '\'') {
+					schema += '\'';
+					i += 2;
+					continue;
+				}
+				break;
+			}
+			schema += after_schema[i];
+			i++;
+		}
+		if (i >= after_schema.size() || after_schema[i] != '\'') {
+			err_out = "Unterminated BODY SCHEMA string";
+			return false;
+		}
+		// Assign via outer body_schema — declared below before this lambda is called.
+		// (We reassign rest/rest_upper here; body_schema set by caller using schema.)
+		rest = Trim(after_schema.substr(i + 1));
+		rest_upper = StringUtil::Upper(rest);
+		err_out = string("\x01") + schema; // success marker + payload
+		return true;
+	};
+
+	string body_schema;
+	{
+		string bs_err;
+		if (!TryConsumeBodySchema(bs_err)) {
+			return ParserExtensionParseResult(bs_err);
+		}
+		if (!bs_err.empty() && bs_err[0] == '\x01') {
+			body_schema = bs_err.substr(1);
+		}
+	}
+
 	// Zero or more PARAM clauses (optional defaults + constraints).
 	vector<QuackapiParamSpec> params;
 	while (StringUtil::StartsWith(rest_upper, "PARAM") &&
@@ -323,6 +392,10 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			rest_upper = StringUtil::Upper(rest);
 			if (StringUtil::StartsWith(rest_upper, "PARAM") &&
 			    (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
+				break;
+			}
+			if (StringUtil::StartsWith(rest_upper, "BODY") && rest.size() > 4 &&
+			    StringUtil::CharacterIsSpace(rest[4])) {
 				break;
 			}
 			if (StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
@@ -397,6 +470,17 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		rest_upper = StringUtil::Upper(rest);
 	}
 
+	// BODY SCHEMA after PARAM blocks (if not already set)
+	if (body_schema.empty()) {
+		string bs_err;
+		if (!TryConsumeBodySchema(bs_err)) {
+			return ParserExtensionParseResult(bs_err);
+		}
+		if (!bs_err.empty() && bs_err[0] == '\x01') {
+			body_schema = bs_err.substr(1);
+		}
+	}
+
 	// AS <select> — any whitespace (spaces/tabs/newlines) after AS is accepted.
 	// "AS SELECT …" and "AS\nSELECT …" are both valid; bare "AS" is not.
 	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
@@ -418,6 +502,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.status = status;
 	data->route.require_auth = require_auth;
 	data->route.params = std::move(params);
+	data->route.body_schema = std::move(body_schema);
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -444,6 +529,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	bind_data->route.require_auth = input.inputs[7].GetValue<string>();
 	if (input.inputs.size() > 8 && !input.inputs[8].IsNull()) {
 		bind_data->route.params = DeserializeParamSpecs(input.inputs[8].GetValue<string>());
+	}
+	if (input.inputs.size() > 9 && !input.inputs[9].IsNull()) {
+		bind_data->route.body_schema = input.inputs[9].GetValue<string>();
 	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
@@ -488,7 +576,7 @@ TableFunction MakeApplyRouteFunction() {
 	TableFunction function("quackapi_apply_route",
 	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR},
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       ApplyRouteExec, ApplyRouteBind);
 	return function;
 }
@@ -507,6 +595,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::INTEGER(data.route.status));
 	result.parameters.push_back(Value(data.route.require_auth));
 	result.parameters.push_back(Value(SerializeParamSpecs(data.route.params)));
+	result.parameters.push_back(Value(data.route.body_schema));
 	result.requires_valid_transaction = false;
 	result.return_type = StatementReturnType::QUERY_RESULT;
 	return result;

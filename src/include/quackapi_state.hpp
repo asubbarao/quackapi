@@ -74,6 +74,9 @@ struct QuackapiRoute {
 	string require_auth;
 	//! PARAM specs: optional defaults + FastAPI-style numeric/string constraints.
 	vector<QuackapiParamSpec> params;
+	//! Optional JSON Schema (draft) for the request body. Empty = no schema check.
+	//! Validated via the community `json_schema` extension at request time.
+	string body_schema;
 };
 
 //! Per-database quackapi state: the route registry, auth registry, and running servers.

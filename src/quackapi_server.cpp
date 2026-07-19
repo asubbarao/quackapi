@@ -122,10 +122,197 @@ string ValueToJson(const Value &value) {
 	}
 }
 
-//! FastAPI-shaped validation error body.
+//! FastAPI-shaped validation error body (loc = [kind, name]).
 string ValidationErrorJson(const string &loc_kind, const string &param_name, const string &msg, const string &type) {
 	return "{\"detail\":[{\"loc\":[\"" + JsonEscape(loc_kind) + "\",\"" + JsonEscape(param_name) + "\"],\"msg\":\"" +
 	       JsonEscape(msg) + "\",\"type\":\"" + JsonEscape(type) + "\"}]}";
+}
+
+//! FastAPI-shaped body-only validation error (loc = ["body"]).
+string ValidationErrorJsonBody(const string &msg, const string &type) {
+	return "{\"detail\":[{\"loc\":[\"body\"],\"msg\":\"" + JsonEscape(msg) + "\",\"type\":\"" + JsonEscape(type) +
+	       "\"}]}";
+}
+
+//! Media type from Content-Type (strip parameters; lowercased).
+string ContentTypeMedia(const case_insensitive_map_t<string> &headers) {
+	auto it = headers.find("Content-Type");
+	if (it == headers.end()) {
+		return string();
+	}
+	string ct = it->second;
+	auto sc = ct.find(';');
+	if (sc != string::npos) {
+		ct = ct.substr(0, sc);
+	}
+	StringUtil::Trim(ct);
+	return StringUtil::Lower(ct);
+}
+
+bool IsJsonMediaType(const string &media) {
+	return media == "application/json" || StringUtil::EndsWith(media, "+json");
+}
+
+bool IsFormUrlEncodedMediaType(const string &media) {
+	return media == "application/x-www-form-urlencoded";
+}
+
+bool IsMultipartMediaType(const string &media) {
+	return StringUtil::StartsWith(media, "multipart/form-data");
+}
+
+bool IsBodyMethod(const string &method) {
+	return method == "POST" || method == "PUT" || method == "PATCH";
+}
+
+//! application/x-www-form-urlencoded → key/value map (last wins).
+void ParseFormUrlEncoded(const string &body, case_insensitive_map_t<string> &out) {
+	idx_t i = 0;
+	while (i < body.size()) {
+		idx_t amp = body.find('&', i);
+		if (amp == string::npos) {
+			amp = body.size();
+		}
+		string pair = body.substr(i, amp - i);
+		if (!pair.empty()) {
+			auto eq = pair.find('=');
+			string key, val;
+			if (eq == string::npos) {
+				key = duckdb_httplib::decode_query_component(pair, true);
+			} else {
+				key = duckdb_httplib::decode_query_component(pair.substr(0, eq), true);
+				val = duckdb_httplib::decode_query_component(pair.substr(eq + 1), true);
+			}
+			if (!key.empty()) {
+				out[key] = val;
+			}
+		}
+		i = amp + 1;
+	}
+}
+
+//! Extract top-level JSON object fields as string values for binding.
+//! On invalid JSON sets err_json and returns false. Arrays/non-objects → model_attributes_type.
+bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensitive_map_t<string> &fields,
+                           string &err_json) {
+	if (raw_body.empty()) {
+		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
+		return false;
+	}
+	// Validate JSON parse first (TRY_CAST → NULL on failure).
+	auto check = con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(raw_body));
+	if (check->HasError()) {
+		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
+		return false;
+	}
+	auto check_chunk = check->Fetch();
+	if (!check_chunk || check_chunk->size() == 0 || !check_chunk->GetValue(0, 0).GetValue<bool>()) {
+		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
+		return false;
+	}
+	// Must be an object to extract named fields (FastAPI body model).
+	auto type_res = con.Query("SELECT json_type(?::JSON)", Value(raw_body));
+	if (type_res->HasError()) {
+		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
+		return false;
+	}
+	auto type_chunk = type_res->Fetch();
+	string jtype = type_chunk && type_chunk->size() > 0 && !type_chunk->GetValue(0, 0).IsNull()
+	                   ? type_chunk->GetValue(0, 0).GetValue<string>()
+	                   : string();
+	if (jtype != "OBJECT") {
+		err_json = ValidationErrorJsonBody(
+		    "Input should be a valid dictionary or object to extract fields from", "model_attributes_type");
+		return false;
+	}
+	// Flatten top-level scalars: key → string form for BindParamValue.
+	auto fields_res = con.Query(
+	    "SELECT k AS key, "
+	    "  CASE json_type(json_extract(doc, '$.' || k)) "
+	    "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
+	    "    WHEN 'NULL' THEN NULL "
+	    "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
+	    "  END AS val "
+	    "FROM (SELECT ?::JSON AS doc) t, "
+	    "     UNNEST(json_keys(doc)) AS u(k)",
+	    Value(raw_body));
+	if (fields_res->HasError()) {
+		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
+		return false;
+	}
+	while (true) {
+		auto chunk = fields_res->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto key_v = chunk->GetValue(0, row);
+			if (key_v.IsNull()) {
+				continue;
+			}
+			string key = key_v.GetValue<string>();
+			auto val_v = chunk->GetValue(1, row);
+			if (val_v.IsNull()) {
+				// Explicit JSON null: bind as empty string marker? Prefer skip so
+				// missing-style required still 422, or bind "" and let cast fail.
+				// FastAPI null for int → type error. Store special raw "null" text
+				// only if we want that; store empty and rely on type check is weak.
+				// Use the literal word that fails integer cast for ints: "null"
+				fields[key] = "null";
+				continue;
+			}
+			fields[key] = val_v.GetValue<string>();
+		}
+	}
+	return true;
+}
+
+//! Validate body against BODY SCHEMA using community json_schema extension.
+//! json_schema_validate returns true on pass and THROWS on fail — wrap with try().
+bool ValidateBodySchema(Connection &con, const string &schema, const string &raw_body, string &err_json) {
+	// LOAD is idempotent; INSTALL FROM community on first failure (network).
+	auto load = con.Query("LOAD json_schema");
+	if (load->HasError()) {
+		auto inst = con.Query("INSTALL json_schema FROM community");
+		if (!inst->HasError()) {
+			load = con.Query("LOAD json_schema");
+		}
+		if (load->HasError()) {
+			fprintf(stderr, "quackapi: json_schema unavailable: %s\n", load->GetError().c_str());
+			err_json = ValidationErrorJsonBody("json_schema extension unavailable", "value_error");
+			return false;
+		}
+	}
+	// try() → true on pass, NULL when the function throws (never returns false).
+	auto res = con.Query("SELECT try(json_schema_validate(?::JSON, ?::JSON))", Value(schema), Value(raw_body));
+	if (res->HasError()) {
+		fprintf(stderr, "quackapi: body schema check error: %s\n", res->GetError().c_str());
+		err_json = ValidationErrorJsonBody("Body schema validation failed", "value_error");
+		return false;
+	}
+	auto chunk = res->Fetch();
+	bool ok = chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull() && chunk->GetValue(0, 0).GetValue<bool>();
+	if (ok) {
+		return true;
+	}
+	// Recover a client-facing message from the bare throw.
+	string msg = "Body schema validation failed";
+	auto strict = con.Query("SELECT json_schema_validate(?::JSON, ?::JSON)", Value(schema), Value(raw_body));
+	if (strict->HasError()) {
+		msg = strict->GetError();
+		const string prefixes[] = {"Invalid Input Error: ", "Invalid Error: ", "Binder Error: "};
+		for (auto &p : prefixes) {
+			if (StringUtil::StartsWith(msg, p)) {
+				msg = msg.substr(p.size());
+				break;
+			}
+		}
+		if (msg.size() > 200) {
+			msg = msg.substr(0, 200);
+		}
+	}
+	err_json = ValidationErrorJson("body", "_schema", msg, "value_error");
+	return false;
 }
 
 //! True if type is a signed/unsigned integral type (not float/decimal).
@@ -688,12 +875,135 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		// Request params: path captures shadow query params of the same name.
+		// Body fields (JSON / form / multipart) fill remaining names with loc=body.
 		case_insensitive_map_t<std::pair<string, string>> provided; // name -> (loc, raw)
+		string media = ContentTypeMedia(headers);
+		bool form_ct = IsFormUrlEncodedMediaType(media);
+		bool multipart_ct = IsMultipartMediaType(media) || req.is_multipart_form_data();
+
+		// Query string params. When CT is form-urlencoded, httplib merges the body
+		// into req.params — re-parse body as body loc and only treat non-body keys
+		// from params as query (best-effort: form fields overwrite with body loc).
 		for (auto &kv : req.params) {
 			provided[kv.first] = {"query", kv.second};
 		}
 		for (auto &kv : match.path_params) {
 			provided[kv.first] = {"path", kv.second};
+		}
+
+		// ---- REQUEST BODY BINDING (POST/PUT/PATCH) ----
+		// FastAPI parity: JSON body fields, form-urlencoded, multipart files,
+		// malformed JSON → 422 json_invalid, wrong CT → 422 model_attributes_type.
+		bool body_method = IsBodyMethod(req.method);
+		bool has_body_named = prepared->named_param_map.find("body") != prepared->named_param_map.end();
+		// Does the handler still need any non-path/non-claims param not yet provided?
+		bool needs_body_fields = has_body_named || !match.route.body_schema.empty();
+		if (!needs_body_fields) {
+			for (auto &entry : prepared->named_param_map) {
+				string ck;
+				if (IsClaimsParam(entry.first, ck)) {
+					continue;
+				}
+				if (entry.first == "body") {
+					continue;
+				}
+				if (provided.find(entry.first) != provided.end()) {
+					continue;
+				}
+				if (IsPathParam(match.route.pattern, entry.first)) {
+					continue;
+				}
+				const QuackapiParamSpec *ps = FindParamSpec(match.route.params, entry.first);
+				if (ps && ps->has_default) {
+					continue;
+				}
+				// File filename helpers are body-derived.
+				needs_body_fields = true;
+				break;
+			}
+		}
+
+		if (body_method) {
+			if (IsJsonMediaType(media) || (media.empty() && !req.body.empty() &&
+			                               (req.body[0] == '{' || req.body[0] == '['))) {
+				// JSON body path.
+				if (req.body.empty() && !needs_body_fields && match.route.body_schema.empty()) {
+					// Empty JSON body with fully-bound query/path params — ignore.
+				} else {
+					case_insensitive_map_t<string> body_fields;
+					string err_json;
+					if (!ExtractJsonBodyFields(con, req.body, body_fields, err_json)) {
+						// Empty body with application/json and missing fields: if body
+						// is empty, Extract returns json_invalid — correct for body models.
+						// If CT is application/json and body empty but only query params
+						// needed, we already skipped above.
+						SetJson(res, 422, err_json);
+						finish();
+						return;
+					}
+					if (!match.route.body_schema.empty()) {
+						if (!ValidateBodySchema(con, match.route.body_schema, req.body, err_json)) {
+							SetJson(res, 422, err_json);
+							finish();
+							return;
+						}
+					}
+					// Body fields fill missing names only (path/query win).
+					for (auto &kv : body_fields) {
+						if (provided.find(kv.first) == provided.end()) {
+							provided[kv.first] = {"body", kv.second};
+						}
+					}
+					// $body binds the raw JSON payload.
+					if (has_body_named && provided.find("body") == provided.end()) {
+						provided["body"] = {"body", req.body};
+					}
+				}
+			} else if (form_ct) {
+				case_insensitive_map_t<string> form_fields;
+				ParseFormUrlEncoded(req.body, form_fields);
+				for (auto &kv : form_fields) {
+					// Form fields are body-located (FastAPI Form(...)).
+					provided[kv.first] = {"body", kv.second};
+				}
+				if (has_body_named && provided.find("body") == provided.end()) {
+					provided["body"] = {"body", req.body};
+				}
+			} else if (multipart_ct) {
+				// Text fields
+				for (auto &kv : req.form.fields) {
+					provided[kv.first] = {"body", kv.second.content};
+				}
+				// Files: $name = content bytes, $name_filename = original filename
+				for (auto &kv : req.form.files) {
+					provided[kv.first] = {"body", kv.second.content};
+					string fname_key = kv.first + "_filename";
+					provided[fname_key] = {"body", kv.second.filename};
+					// Convenience: single-file routes may bind $filename
+					if (provided.find("filename") == provided.end()) {
+						provided["filename"] = {"body", kv.second.filename};
+					}
+				}
+				if (has_body_named && provided.find("body") == provided.end()) {
+					provided["body"] = {"body", req.body};
+				}
+			} else if (!media.empty() && !req.body.empty() && needs_body_fields) {
+				// Wrong Content-Type for a body-expecting route (FastAPI model_attributes_type).
+				SetJson(res, 422,
+				        ValidationErrorJsonBody(
+				            "Input should be a valid dictionary or object to extract fields from",
+				            "model_attributes_type"));
+				finish();
+				return;
+			} else if (!match.route.body_schema.empty()) {
+				// BODY SCHEMA requires JSON.
+				SetJson(res, 422,
+				        ValidationErrorJsonBody(
+				            "Input should be a valid dictionary or object to extract fields from",
+				            "model_attributes_type"));
+				finish();
+				return;
+			}
 		}
 
 		// The database types the columns: cast each provided param to the type
