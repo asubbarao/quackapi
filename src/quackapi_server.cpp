@@ -872,12 +872,19 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 	}
 
-	// Built-in OPTIONS preflight for docs paths when CORS is on.
+	// Built-in OPTIONS for docs paths: 204 preflight only when CORS is on;
+	// otherwise 405 like FastAPI without CORSMiddleware.
 	if (req.method == "OPTIONS" &&
 	    (req.path == "/openapi.json" || req.path == "/docs" || req.path == "/docs/" || req.path == "/redoc" ||
 	     req.path == "/redoc/")) {
-		res.status = 204;
-		res.set_header("Allow", "GET, HEAD, OPTIONS");
+		if (cors_origins.empty()) {
+			res.set_header("Allow", "GET, HEAD");
+			SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
+		} else {
+			res.status = 204;
+			res.set_header("Allow", "GET, HEAD, OPTIONS");
+			res.body.clear();
+		}
 		finish();
 		return;
 	}
@@ -921,15 +928,23 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 	}
 
-	// OPTIONS preflight / discovery for any registered path.
+	// OPTIONS: FastAPI without CORSMiddleware returns 405 for unregistered
+	// OPTIONS on an otherwise-valid path. With CORS configured we answer
+	// preflight with 204 + Allow (+ Access-Control-* via finish()).
 	if (req.method == "OPTIONS") {
 		if (!methods_for_path.empty() || path_matched_other_method) {
-			// Ensure OPTIONS itself is listed; add HEAD when GET is present.
-			if (!MethodListContains(methods_for_path, "OPTIONS")) {
-				methods_for_path.push_back("OPTIONS");
-			}
 			if (MethodListContains(methods_for_path, "GET") && !MethodListContains(methods_for_path, "HEAD")) {
 				methods_for_path.push_back("HEAD");
+			}
+			if (cors_origins.empty()) {
+				// Match Starlette/FastAPI default: OPTIONS is not allowed.
+				res.set_header("Allow", StringUtil::Join(methods_for_path, ", "));
+				SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
+				finish();
+				return;
+			}
+			if (!MethodListContains(methods_for_path, "OPTIONS")) {
+				methods_for_path.push_back("OPTIONS");
 			}
 			string allow = StringUtil::Join(methods_for_path, ", ");
 			res.status = 204;
@@ -983,7 +998,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			if (MethodListContains(methods_for_path, "GET") && !MethodListContains(methods_for_path, "HEAD")) {
 				methods_for_path.push_back("HEAD");
 			}
-			if (!MethodListContains(methods_for_path, "OPTIONS")) {
+			// Only advertise OPTIONS when CORS is on (preflight is accepted).
+			if (!cors_origins.empty() && !MethodListContains(methods_for_path, "OPTIONS")) {
 				methods_for_path.push_back("OPTIONS");
 			}
 			res.set_header("Allow", StringUtil::Join(methods_for_path, ", "));
