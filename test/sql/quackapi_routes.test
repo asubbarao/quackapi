@@ -1,0 +1,84 @@
+# name: test/sql/quackapi_routes.test
+# description: CREATE ROUTE / DROP ROUTE DDL and the route registry
+# group: [quackapi]
+
+require quackapi
+
+# Registry starts empty
+query I
+SELECT count(*) FROM quackapi_routes();
+----
+0
+
+# CREATE ROUTE registers a route
+query I
+CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
+----
+Route hello: GET /hello
+
+query IIII
+SELECT name, method, pattern, status FROM quackapi_routes();
+----
+hello	GET	/hello	200
+
+# Duplicate name without OR REPLACE errors
+statement error
+CREATE ROUTE hello GET '/other' AS SELECT 1;
+----
+already exists
+
+# CREATE OR REPLACE overwrites
+query I
+CREATE OR REPLACE ROUTE hello GET '/hello2' AS SELECT 'world2' AS msg;
+----
+Route hello: GET /hello2
+
+query I
+SELECT pattern FROM quackapi_routes() WHERE name = 'hello';
+----
+/hello2
+
+# Path params and STATUS clause parse
+query I
+CREATE ROUTE item GET '/items/:id' STATUS 201 AS SELECT $id::INT AS id;
+----
+Route item: GET /items/:id
+
+query II
+SELECT pattern, status FROM quackapi_routes() WHERE name = 'item';
+----
+/items/:id	201
+
+# Method must be a known HTTP verb
+statement error
+CREATE ROUTE bad TELEPORT '/x' AS SELECT 1;
+----
+Unknown HTTP method
+
+# Pattern must start with /
+statement error
+CREATE ROUTE bad GET 'x' AS SELECT 1;
+----
+must start with '/'
+
+# DROP ROUTE removes it
+query I
+DROP ROUTE item;
+----
+Dropped route item
+
+query I
+SELECT count(*) FROM quackapi_routes();
+----
+1
+
+# DROP of a missing route errors
+statement error
+DROP ROUTE nope;
+----
+does not exist
+
+query I
+DROP ROUTE hello;
+----
+Dropped route hello
