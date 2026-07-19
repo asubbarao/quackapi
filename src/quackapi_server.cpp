@@ -14,6 +14,7 @@
 #include "duckdb/main/query_result.hpp"
 
 #include "quackapi_auth.hpp"
+#include "quackapi_openapi.hpp"
 #include "quackapi_state.hpp"
 
 #include "httplib.hpp"
@@ -296,6 +297,42 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	if (!db) {
 		SetJson(res, 503, "{\"detail\":\"database shutting down\"}");
 		return;
+	}
+
+	// Built-in docs routes (always present while serving; not in quackapi_routes()).
+	// FastAPI parity: GET /openapi.json + GET /docs (+ optional /redoc).
+	if (req.method == "GET" || req.method == "HEAD") {
+		if (req.path == "/openapi.json") {
+			string server_url = StringUtil::Format("http://%s:%d", host, port);
+			try {
+				auto doc = BuildOpenApiDocument(*db, server_url);
+				SetJson(res, 200, doc);
+			} catch (std::exception &ex) {
+				SetInternalError(res, ex.what());
+			} catch (...) {
+				SetInternalError(res, "openapi generation failed");
+			}
+			if (req.method == "HEAD") {
+				res.body.clear();
+			}
+			return;
+		}
+		if (req.path == "/docs" || req.path == "/docs/") {
+			res.status = 200;
+			res.set_content(OpenApiDocsHtml(), "text/html; charset=utf-8");
+			if (req.method == "HEAD") {
+				res.body.clear();
+			}
+			return;
+		}
+		if (req.path == "/redoc" || req.path == "/redoc/") {
+			res.status = 200;
+			res.set_content(OpenApiRedocHtml(), "text/html; charset=utf-8");
+			if (req.method == "HEAD") {
+				res.body.clear();
+			}
+			return;
+		}
 	}
 
 	// Find a route: method + pattern

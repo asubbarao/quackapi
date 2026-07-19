@@ -1,0 +1,125 @@
+# name: test/sql/quackapi_openapi.test
+# description: OpenAPI registry surface — built-ins stay out of quackapi_routes(); sample routes prepare cleanly
+# group: [quackapi]
+
+require quackapi
+
+require json
+
+# Built-in /openapi.json and /docs are HTTP-only; they must NOT appear as user
+# rows in the registry (documented design choice).
+query I
+SELECT count(*) FROM quackapi_routes() WHERE pattern IN ('/openapi.json', '/docs', '/docs/', '/redoc', '/redoc/');
+----
+0
+
+# Sample registry matching the OpenAPI design coverage
+query I
+CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
+----
+Route hello: GET /hello
+
+query I
+CREATE ROUTE get_item GET '/items/:id' AS SELECT $id::BIGINT AS id, 'widget'::VARCHAR AS name;
+----
+Route get_item: GET /items/:id
+
+query I
+CREATE ROUTE search_items GET '/search' AS SELECT $q::VARCHAR AS q, 0::BIGINT AS hits;
+----
+Route search_items: GET /search
+
+query I
+CREATE ROUTE home_page GET '/page' AS SELECT '<h1>quackapi</h1>' AS html;
+----
+Route home_page: GET /page
+
+query I
+CREATE ROUTE healthz GET '/health' AS SELECT 'ok' AS text;
+----
+Route healthz: GET /health
+
+query I
+CREATE AUTH site AS API_KEY;
+----
+Auth site: API_KEY
+
+query I
+CREATE ROUTE me GET '/me' REQUIRE site AS SELECT 'alice'::VARCHAR AS user;
+----
+Route me: GET /me
+
+# Registry snapshot the OpenAPI generator consumes
+query III
+SELECT name, method, pattern FROM quackapi_routes() ORDER BY name;
+----
+get_item	GET	/items/:id
+healthz	GET	/health
+hello	GET	/hello
+home_page	GET	/page
+me	GET	/me
+search_items	GET	/search
+
+query II
+SELECT name, require_auth FROM quackapi_routes() WHERE require_auth <> '' ORDER BY name;
+----
+me	site
+
+# Path param form used by OasPath (:id → {id} at generation time)
+query I
+SELECT pattern FROM quackapi_routes() WHERE name = 'get_item';
+----
+/items/:id
+
+# Auth schemes feed components.securitySchemes
+query II
+SELECT name, kind FROM quackapi_auths() WHERE name = 'site';
+----
+site	API_KEY
+
+# Still no built-in rows after user routes exist
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name IN ('openapi', 'docs', 'redoc') OR pattern LIKE '/openapi%' OR pattern LIKE '/docs%';
+----
+0
+
+# Cleanup
+query I
+DROP ROUTE hello;
+----
+Dropped route hello
+
+query I
+DROP ROUTE get_item;
+----
+Dropped route get_item
+
+query I
+DROP ROUTE search_items;
+----
+Dropped route search_items
+
+query I
+DROP ROUTE home_page;
+----
+Dropped route home_page
+
+query I
+DROP ROUTE healthz;
+----
+Dropped route healthz
+
+query I
+DROP ROUTE me;
+----
+Dropped route me
+
+query I
+DROP AUTH site;
+----
+Dropped auth site
+
+query I
+SELECT count(*) FROM quackapi_routes();
+----
+0
