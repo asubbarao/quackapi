@@ -8,10 +8,11 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
+#include "quackapi_server.hpp"
+
 namespace duckdb {
 
 class DatabaseInstance;
-class QuackapiHttpServer;
 
 //! Auth scheme kind registered via CREATE AUTH.
 enum class QuackapiAuthKind : uint8_t {
@@ -93,8 +94,7 @@ public:
 	vector<QuackapiApiKeyEntry> SnapshotApiKeys(const string &auth_name);
 
 	//! Start serving on host:port. Throws if a server already listens there.
-	//! static_dir: optional file directory served for unrouted GETs.
-	void StartServer(DatabaseInstance &db, const string &host, int port, const string &static_dir);
+	void StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
 	//! Stop the server on port (any host). Returns false if none.
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).

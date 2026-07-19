@@ -30,10 +30,12 @@ struct ServeBindData : public TableFunctionData {
 	string host = "127.0.0.1";
 	int32_t port = 8000;
 	string static_dir;
+	//! Empty (default) = CORS off. Pass '*' or a comma-separated origin list.
+	string cors_origins;
 	bool finished = false;
 };
 
-static unique_ptr<FunctionData> ServeBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<ServeBindData>();
 	if (!input.inputs.empty()) {
@@ -49,6 +51,16 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &, TableFunctionBindInpu
 	auto static_entry = input.named_parameters.find("static_dir");
 	if (static_entry != input.named_parameters.end()) {
 		bind_data->static_dir = static_entry->second.GetValue<string>();
+	}
+	// cors_origins named param wins; else fall back to SET quackapi_cors_origins.
+	auto cors_entry = input.named_parameters.find("cors_origins");
+	if (cors_entry != input.named_parameters.end()) {
+		bind_data->cors_origins = cors_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_cors_origins", setting) && !setting.IsNull()) {
+			bind_data->cors_origins = setting.GetValue<string>();
+		}
 	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
@@ -111,7 +123,10 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	// REST listener — justified by absence of a quack path-registration hook
 	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
 	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.
-	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, bind_data.static_dir);
+	QuackapiServeOptions opts;
+	opts.static_dir = bind_data.static_dir;
+	opts.cors_origins = bind_data.cors_origins;
+	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, opts);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
 	output.SetCardinality(1);
 	bind_data.finished = true;
@@ -266,11 +281,21 @@ static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &re
 //===--------------------------------------------------------------------===//
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// quackapi_serve() / quackapi_serve(port) with optional host + static_dir named params
+	// SET quackapi_cors_origins = '*' | 'https://app.example,https://admin.example'
+	// Default empty = CORS off. Serve-time cors_origins := '…' overrides this SET.
+	auto &db = loader.GetDatabaseInstance();
+	auto &config = DBConfig::GetConfig(db);
+	config.AddExtensionOption("quackapi_cors_origins",
+	                          "CORS allowed origins for quackapi_serve (* or comma-separated list). "
+	                          "Empty (default) disables CORS. Overridden by cors_origins named parameter.",
+	                          LogicalType::VARCHAR, Value(""));
+
+	// quackapi_serve() / quackapi_serve(port) with optional host + static_dir + cors_origins
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
 	serve.named_parameters["static_dir"] = LogicalType::VARCHAR;
+	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);
@@ -301,7 +326,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
 
 	// CREATE ROUTE / DROP ROUTE and CREATE AUTH / DROP AUTH syntax
-	auto &db = loader.GetDatabaseInstance();
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());

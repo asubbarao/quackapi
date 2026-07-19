@@ -246,17 +246,26 @@ bool IsPathParam(const string &pattern, const string &param_name) {
 	return false;
 }
 
+bool MethodListContains(const vector<string> &list, const string &method) {
+	for (auto &s : list) {
+		if (s == method) {
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
-                                       const string &static_dir)
-    : db_ptr(db.shared_from_this()), host(host_p), port(port_p) {
+                                       const QuackapiServeOptions &opts)
+    : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins) {
 	server = make_uniq<duckdb_httplib::Server>();
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
 	// requests before route handlers, so API routes always win over files.
-	if (!static_dir.empty() && !server->set_mount_point("/", static_dir)) {
-		throw IOException("quackapi: static_dir \"%s\" is not a directory", static_dir);
+	if (!opts.static_dir.empty() && !server->set_mount_point("/", opts.static_dir)) {
+		throw IOException("quackapi: static_dir \"%s\" is not a directory", opts.static_dir);
 	}
 
 	server->new_task_queue = [] {
@@ -278,6 +287,10 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	server->Put(".*", handler);
 	server->Delete(".*", handler);
 	server->Patch(".*", handler);
+	// HEAD is dispatched to get_handlers_ by httplib (no separate Head API).
+	// Automatic HEAD-for-GET is handled inside HandleRequest.
+	// OPTIONS: CORS preflight + Allow listing for registered paths.
+	server->Options(".*", handler);
 
 	if (!server->is_valid()) {
 		throw IOException("quackapi: failed to instantiate HTTP server for %s:%d", host, port);
@@ -292,10 +305,70 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	listen_threads.emplace_back(ListenThread, this);
 }
 
+void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+	if (cors_origins.empty()) {
+		return;
+	}
+	string origin;
+	auto origin_it = req.headers.find("Origin");
+	if (origin_it != req.headers.end()) {
+		origin = origin_it->second;
+	}
+
+	string allow_origin;
+	if (cors_origins == "*") {
+		// When credentials are not used, * is fine; if a specific Origin was
+		// sent, echo it so browser clients with credentials still work.
+		allow_origin = origin.empty() ? "*" : origin;
+	} else {
+		// Comma-separated allow-list (trim whitespace per entry).
+		auto parts = StringUtil::Split(cors_origins, ',');
+		for (auto &part : parts) {
+			string trimmed = part;
+			StringUtil::Trim(trimmed);
+			if (!trimmed.empty() && trimmed == origin) {
+				allow_origin = origin;
+				break;
+			}
+		}
+		if (allow_origin.empty()) {
+			// Origin not allowed — do not set CORS headers.
+			return;
+		}
+	}
+
+	res.set_header("Access-Control-Allow-Origin", allow_origin);
+	res.set_header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS");
+	// Echo requested headers when present; otherwise a sensible default set.
+	string req_headers;
+	auto acrh = req.headers.find("Access-Control-Request-Headers");
+	if (acrh != req.headers.end() && !acrh->second.empty()) {
+		req_headers = acrh->second;
+	} else {
+		req_headers = "Authorization, Content-Type, X-API-Key";
+	}
+	res.set_header("Access-Control-Allow-Headers", req_headers);
+	res.set_header("Access-Control-Max-Age", "600");
+	// When we echo a specific origin, advertise that the response may vary.
+	if (allow_origin != "*") {
+		res.set_header("Vary", "Origin");
+	}
+}
+
 void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+	// Always attach CORS headers when configured (including error responses).
+	// Applied once at the end via a small RAII-ish pattern: call ApplyCors on
+	// every exit path is error-prone, so we apply after handling via a lambda
+	// wrapper pattern below. For simplicity apply at each return is avoided —
+	// we set a flag and apply once before returning from the outer path.
+	auto finish = [&]() {
+		ApplyCorsHeaders(req, res);
+	};
+
 	auto db = db_ptr.lock();
 	if (!db) {
 		SetJson(res, 503, "{\"detail\":\"database shutting down\"}");
+		finish();
 		return;
 	}
 
@@ -312,51 +385,111 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			} catch (...) {
 				SetInternalError(res, "openapi generation failed");
 			}
-			if (req.method == "HEAD") {
-				res.body.clear();
-			}
+			// httplib skips writing the body for HEAD while preserving Content-Length.
+			finish();
 			return;
 		}
 		if (req.path == "/docs" || req.path == "/docs/") {
 			res.status = 200;
 			res.set_content(OpenApiDocsHtml(), "text/html; charset=utf-8");
-			if (req.method == "HEAD") {
-				res.body.clear();
-			}
+			finish();
 			return;
 		}
 		if (req.path == "/redoc" || req.path == "/redoc/") {
 			res.status = 200;
 			res.set_content(OpenApiRedocHtml(), "text/html; charset=utf-8");
-			if (req.method == "HEAD") {
-				res.body.clear();
-			}
+			finish();
 			return;
 		}
 	}
 
-	// Find a route: method + pattern
+	// Built-in OPTIONS preflight for docs paths when CORS is on.
+	if (req.method == "OPTIONS" &&
+	    (req.path == "/openapi.json" || req.path == "/docs" || req.path == "/docs/" || req.path == "/redoc" ||
+	     req.path == "/redoc/")) {
+		res.status = 204;
+		res.set_header("Allow", "GET, HEAD, OPTIONS");
+		finish();
+		return;
+	}
+
+	// Find a route: method + pattern. Collect methods for Allow on 405.
+	// HEAD automatically matches GET when no explicit HEAD route exists.
 	RouteMatch match;
 	bool path_matched_other_method = false;
+	vector<string> methods_for_path;
 	auto routes = QuackapiState::Get(*db).SnapshotRoutes();
 	for (auto &route : routes) {
 		vector<std::pair<string, string>> captures;
 		if (MatchPattern(route.pattern, req.path, captures)) {
+			if (!MethodListContains(methods_for_path, route.method)) {
+				// Collect unique methods (order: first seen).
+				methods_for_path.push_back(route.method);
+			}
 			if (route.method == req.method) {
 				match.matched = true;
 				match.route = route;
 				match.path_params = std::move(captures);
-				break;
+				// Prefer exact method match; keep scanning only for Allow list.
+			} else if (!match.matched) {
+				path_matched_other_method = true;
 			}
-			path_matched_other_method = true;
 		}
 	}
+	// Auto-HEAD: if HEAD and no explicit HEAD route, reuse the GET handler.
+	if (!match.matched && req.method == "HEAD") {
+		for (auto &route : routes) {
+			vector<std::pair<string, string>> captures;
+			if (MatchPattern(route.pattern, req.path, captures) && route.method == "GET") {
+				match.matched = true;
+				match.route = route;
+				match.path_params = std::move(captures);
+				if (!MethodListContains(methods_for_path, "HEAD")) {
+					methods_for_path.push_back("HEAD");
+				}
+				break;
+			}
+		}
+	}
+
+	// OPTIONS preflight / discovery for any registered path.
+	if (req.method == "OPTIONS") {
+		if (!methods_for_path.empty() || path_matched_other_method) {
+			// Ensure OPTIONS itself is listed; add HEAD when GET is present.
+			if (!MethodListContains(methods_for_path, "OPTIONS")) {
+				methods_for_path.push_back("OPTIONS");
+			}
+			if (MethodListContains(methods_for_path, "GET") && !MethodListContains(methods_for_path, "HEAD")) {
+				methods_for_path.push_back("HEAD");
+			}
+			string allow = StringUtil::Join(methods_for_path, ", ");
+			res.status = 204;
+			res.set_header("Allow", allow);
+			res.body.clear();
+			finish();
+			return;
+		}
+		// Unknown path: 404 (no route to preflight).
+		SetJson(res, 404, "{\"detail\":\"Not Found\"}");
+		finish();
+		return;
+	}
+
 	if (!match.matched) {
-		if (path_matched_other_method) {
+		if (path_matched_other_method || !methods_for_path.empty()) {
+			// Ensure HEAD is advertised when GET is registered.
+			if (MethodListContains(methods_for_path, "GET") && !MethodListContains(methods_for_path, "HEAD")) {
+				methods_for_path.push_back("HEAD");
+			}
+			if (!MethodListContains(methods_for_path, "OPTIONS")) {
+				methods_for_path.push_back("OPTIONS");
+			}
+			res.set_header("Allow", StringUtil::Join(methods_for_path, ", "));
 			SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
 		} else {
 			SetJson(res, 404, "{\"detail\":\"Not Found\"}");
 		}
+		finish();
 		return;
 	}
 
@@ -374,6 +507,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			res.set_header("WWW-Authenticate", auth_result.www_authenticate);
 		}
 		SetJson(res, auth_result.status, auth_result.body);
+		finish();
 		return;
 	}
 	// auth_result.claims is ready for $claims_<k> binding below.
@@ -383,6 +517,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		auto prepared = con.Prepare(match.route.handler_sql);
 		if (prepared->HasError()) {
 			SetInternalError(res, prepared->GetError());
+			finish();
 			return;
 		}
 
@@ -422,6 +557,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				const char *loc_kind =
 				    IsPathParam(match.route.pattern, param_name) ? "path" : "query";
 				SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, "Field required", "missing"));
+				finish();
 				return;
 			}
 			Value raw_value(it->second.second);
@@ -435,6 +571,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					        ValidationErrorJson(it->second.first, param_name,
 					                            "Input should be a valid " + type_it->second.ToString(),
 					                            "type_error"));
+					finish();
 					return;
 				}
 				named_values[param_name] = BoundParameterData(casted);
@@ -463,6 +600,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			} else {
 				SetInternalError(res, err);
 			}
+			finish();
 			return;
 		}
 
@@ -489,6 +627,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			res.status = match.route.status;
 			res.set_content(body, mode == ResponseMode::HTML ? "text/html; charset=utf-8"
 			                                                  : "text/plain; charset=utf-8");
+			// Keep body so Content-Length is correct; httplib omits the body for HEAD.
+			finish();
 			return;
 		}
 
@@ -517,11 +657,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		body += "]";
 		SetJson(res, match.route.status, body);
+		// Keep body so Content-Length is correct; httplib omits the body for HEAD.
 	} catch (std::exception &ex) {
 		SetInternalError(res, ex.what());
 	} catch (...) {
 		SetInternalError(res, "unknown exception");
 	}
+	finish();
 }
 
 void QuackapiHttpServer::ListenThread(QuackapiHttpServer *server) {

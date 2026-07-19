@@ -152,7 +152,7 @@ vector<QuackapiApiKeyEntry> QuackapiState::SnapshotApiKeys(const string &auth_na
 	return result;
 }
 
-void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port, const string &static_dir) {
+void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts) {
 	// Mirrors QuackStorageExtensionInfo::CreateServer (duckdb-quack
 	// src/quack_storage.cpp): lock map → reject duplicate key → construct
 	// (bind happens in ctor so EADDRINUSE propagates) → emplace.
@@ -161,7 +161,7 @@ void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int po
 	if (servers.find(key) != servers.end()) {
 		throw InvalidInputException("quackapi already serving on %s", key);
 	}
-	servers.emplace(key, make_uniq<QuackapiHttpServer>(db, host, port, static_dir));
+	servers.emplace(key, make_uniq<QuackapiHttpServer>(db, host, port, opts));
 }
 
 bool QuackapiState::StopServer(int port) {

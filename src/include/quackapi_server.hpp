@@ -22,6 +22,15 @@ class DatabaseInstance;
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 
+//! Serve options (static files, CORS). Defaults keep CORS off (browser
+//! cross-origin blocked) until the operator opts in with cors_origins.
+struct QuackapiServeOptions {
+	string static_dir;
+	//! Empty = CORS disabled. "*" = reflect any Origin (or * when no Origin).
+	//! Otherwise a comma-separated allow-list of origins.
+	string cors_origins;
+};
+
 //! REST sidecar that dispatches requests to routes in QuackapiState.
 //!
 //! Why a sidecar (architecture C): the core quack HttpQuackServer hardcodes
@@ -35,9 +44,10 @@ static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 //! chapter of duckdb-quack if a route hook were ever added.
 class QuackapiHttpServer {
 public:
-	//! static_dir: optional directory of files to serve for GET paths that match
-	//! no registered route (FastAPI's StaticFiles equivalent). Empty = API only.
-	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port, const string &static_dir);
+	//! opts.static_dir: optional directory of files for unrouted GETs.
+	//! opts.cors_origins: empty (default) = CORS off; "*" or list enables CORS
+	//! headers on responses and automatic OPTIONS preflight.
+	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
 	~QuackapiHttpServer();
 
 	//! Close the listener socket only; safe from a request-handler thread.
@@ -54,14 +64,19 @@ public:
 	int Port() const {
 		return port;
 	}
+	const string &CorsOrigins() const {
+		return cors_origins;
+	}
 
 private:
 	static void ListenThread(QuackapiHttpServer *server);
 	void HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
+	void ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
 	weak_ptr<DatabaseInstance> db_ptr;
 	string host;
 	int port;
+	string cors_origins;
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};

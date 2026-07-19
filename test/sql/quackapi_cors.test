@@ -1,0 +1,43 @@
+# name: test/sql/quackapi_cors.test
+# description: CORS config surface (SET quackapi_cors_origins + serve named param)
+# group: [quackapi]
+
+require quackapi
+
+# Default: empty string (CORS off)
+query I
+SELECT current_setting('quackapi_cors_origins');
+----
+(empty)
+
+# SET surface (mirrors other extension options)
+statement ok
+SET quackapi_cors_origins = '*';
+
+query I
+SELECT current_setting('quackapi_cors_origins');
+----
+*
+
+statement ok
+SET quackapi_cors_origins = 'https://app.example,https://admin.example';
+
+query I
+SELECT current_setting('quackapi_cors_origins');
+----
+https://app.example,https://admin.example
+
+# Reset to off
+statement ok
+SET quackapi_cors_origins = '';
+
+query I
+SELECT current_setting('quackapi_cors_origins');
+----
+(empty)
+
+# Setting is listed among duckdb_settings
+query I
+SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_cors_origins';
+----
+true
