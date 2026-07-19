@@ -128,6 +128,172 @@ string ValidationErrorJson(const string &loc_kind, const string &param_name, con
 	       JsonEscape(msg) + "\",\"type\":\"" + JsonEscape(type) + "\"}]}";
 }
 
+//! True if type is a signed/unsigned integral type (not float/decimal).
+bool IsIntegralType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool IsUnsignedIntegralType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+//! FastAPI/Pydantic strict int: only optional leading '-' and digits — no
+//! floats ("1.5"), scientific ("1e2"), hex ("0x10"), or surrounding spaces.
+bool IsStrictIntegerString(const string &s, bool allow_negative) {
+	if (s.empty()) {
+		return false;
+	}
+	idx_t i = 0;
+	if (s[0] == '-') {
+		if (!allow_negative || s.size() == 1) {
+			return false;
+		}
+		i = 1;
+	}
+	for (; i < s.size(); i++) {
+		if (s[i] < '0' || s[i] > '9') {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool IsNumericType(const LogicalType &type) {
+	return IsIntegralType(type) || type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE ||
+	       type.id() == LogicalTypeId::DECIMAL;
+}
+
+//! Look up a PARAM spec by name (case-insensitive).
+const QuackapiParamSpec *FindParamSpec(const vector<QuackapiParamSpec> &specs, const string &name) {
+	for (auto &s : specs) {
+		if (StringUtil::Lower(s.name) == StringUtil::Lower(name)) {
+			return &s;
+		}
+	}
+	return nullptr;
+}
+
+//! Apply FastAPI-style numeric/string constraints. Returns false and fills
+//! msg/type when violated.
+bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, const Value &bound, string &msg,
+                           string &err_type) {
+	// String length constraints use the raw request string (FastAPI min_length/max_length).
+	if (spec.has_min_length && raw.size() < spec.min_length) {
+		msg = StringUtil::Format("String should have at least %llu characters",
+		                         (unsigned long long)spec.min_length);
+		err_type = "string_too_short";
+		return false;
+	}
+	if (spec.has_max_length && raw.size() > spec.max_length) {
+		msg = StringUtil::Format("String should have at most %llu characters",
+		                         (unsigned long long)spec.max_length);
+		err_type = "string_too_long";
+		return false;
+	}
+	if (!spec.has_ge && !spec.has_gt && !spec.has_le && !spec.has_lt) {
+		return true;
+	}
+	if (bound.IsNull()) {
+		return true;
+	}
+	// Numeric constraints need a number.
+	double num = 0;
+	if (IsNumericType(bound.type()) || bound.type().id() == LogicalTypeId::BOOLEAN) {
+		Value dbl;
+		string cerr;
+		if (!bound.DefaultTryCastAs(LogicalType::DOUBLE, dbl, &cerr) || dbl.IsNull()) {
+			return true; // non-numeric bound — skip numeric constraints
+		}
+		num = dbl.GetValue<double>();
+	} else {
+		// Try parse raw as double for VARCHAR-bound numbers
+		try {
+			num = std::stod(raw);
+		} catch (...) {
+			return true;
+		}
+	}
+	if (spec.has_ge && !(num >= spec.ge)) {
+		msg = StringUtil::Format("Input should be greater than or equal to %g", spec.ge);
+		err_type = "greater_than_equal";
+		return false;
+	}
+	if (spec.has_gt && !(num > spec.gt)) {
+		msg = StringUtil::Format("Input should be greater than %g", spec.gt);
+		err_type = "greater_than";
+		return false;
+	}
+	if (spec.has_le && !(num <= spec.le)) {
+		msg = StringUtil::Format("Input should be less than or equal to %g", spec.le);
+		err_type = "less_than_equal";
+		return false;
+	}
+	if (spec.has_lt && !(num < spec.lt)) {
+		msg = StringUtil::Format("Input should be less than %g", spec.lt);
+		err_type = "less_than";
+		return false;
+	}
+	return true;
+}
+
+//! Bind a raw string (or default) into a BoundParameterData, applying strict
+//! integer rules. On failure sets 422 body pieces via out params.
+bool BindParamValue(const string &raw, const LogicalType &expected, const string &loc_kind, const string &param_name,
+                    BoundParameterData &out, string &err_json) {
+	// Strict integers: reject non-digit forms before DuckDB TryCast rounds them.
+	if (IsIntegralType(expected)) {
+		if (!IsStrictIntegerString(raw, !IsUnsignedIntegralType(expected))) {
+			err_json = ValidationErrorJson(loc_kind, param_name, "Input should be a valid integer", "type_error");
+			return false;
+		}
+	}
+	Value raw_value(raw);
+	if (expected.id() != LogicalTypeId::VARCHAR && expected.id() != LogicalTypeId::UNKNOWN) {
+		Value casted;
+		string cast_error;
+		if (!raw_value.DefaultTryCastAs(expected, casted, &cast_error)) {
+			err_json = ValidationErrorJson(loc_kind, param_name, "Input should be a valid " + expected.ToString(),
+			                               "type_error");
+			return false;
+		}
+		out = BoundParameterData(casted);
+	} else {
+		// No concrete type from the planner — still reject non-strict ints when
+		// the raw string looks like a broken integer (contains '.' or 'e'/'E' or
+		// spaces) only if it is otherwise "almost" an int? Leave as VARCHAR;
+		// execute-time cast will convert. But for mixed $limit::INTEGER where
+		// type is UNKNOWN, we still want strict rejection of "1.5"/"1e2".
+		// Heuristic: if the string is non-empty and not a strict integer AND
+		// contains only number-like chars (digits, ., e, E, +, -), try strict
+		// int fail when it fails IsStrictIntegerString but would TryCast to int.
+		// Safer approach used below in HandleRequest for UNKNOWN types with
+		// PARAM type_name INTEGER, and a pre-check for number-like non-integers.
+		out = BoundParameterData(raw_value);
+	}
+	return true;
+}
+
 struct RouteMatch {
 	bool matched = false;
 	QuackapiRoute route;
@@ -534,8 +700,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// the prepared statement expects. Cast failure -> 422, FastAPI-shaped.
 		// $claims_* params are server-verified: bind from claims or SQL NULL
 		// (never 422 for a missing claim).
+		// PARAM … DEFAULT makes a query/path param optional (bind default/NULL).
 		auto expected_types = prepared->GetExpectedParameterTypes();
 		case_insensitive_map_t<BoundParameterData> named_values;
+		// Track raw strings for execute-time conversion error → param name recovery.
+		case_insensitive_map_t<std::pair<string, string>> bound_raw; // name -> (loc, raw)
+
 		for (auto &entry : prepared->named_param_map) {
 			auto &param_name = entry.first;
 
@@ -552,51 +722,210 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				continue;
 			}
 
-			auto it = provided.find(param_name);
-			if (it == provided.end()) {
-				const char *loc_kind =
-				    IsPathParam(match.route.pattern, param_name) ? "path" : "query";
-				SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, "Field required", "missing"));
-				finish();
-				return;
-			}
-			Value raw_value(it->second.second);
+			const QuackapiParamSpec *spec = FindParamSpec(match.route.params, param_name);
 			auto type_it = expected_types.find(param_name);
-			if (type_it != expected_types.end() && type_it->second.id() != LogicalTypeId::VARCHAR &&
-			    type_it->second.id() != LogicalTypeId::UNKNOWN) {
-				Value casted;
-				string cast_error;
-				if (!raw_value.DefaultTryCastAs(type_it->second, casted, &cast_error)) {
+			LogicalType expected = LogicalType::UNKNOWN;
+			if (type_it != expected_types.end()) {
+				expected = type_it->second;
+			}
+			// PARAM type_name can refine UNKNOWN/VARCHAR when the planner did not
+			// surface a concrete type (e.g. LIMIT $limit::INTEGER sometimes).
+			if ((expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR) && spec &&
+			    !spec->type_name.empty()) {
+				auto tn = StringUtil::Upper(spec->type_name);
+				if (tn == "INTEGER" || tn == "INT") {
+					expected = LogicalType::INTEGER;
+				} else if (tn == "BIGINT") {
+					expected = LogicalType::BIGINT;
+				} else if (tn == "SMALLINT") {
+					expected = LogicalType::SMALLINT;
+				} else if (tn == "TINYINT") {
+					expected = LogicalType::TINYINT;
+				} else if (tn == "HUGEINT") {
+					expected = LogicalType::HUGEINT;
+				} else if (tn == "DOUBLE") {
+					expected = LogicalType::DOUBLE;
+				} else if (tn == "FLOAT" || tn == "REAL") {
+					expected = LogicalType::FLOAT;
+				} else if (tn == "BOOLEAN" || tn == "BOOL") {
+					expected = LogicalType::BOOLEAN;
+				} else if (tn == "VARCHAR" || tn == "TEXT" || tn == "STRING") {
+					expected = LogicalType::VARCHAR;
+				}
+			}
+
+			auto it = provided.find(param_name);
+			string loc_kind = IsPathParam(match.route.pattern, param_name) ? "path" : "query";
+			string raw;
+			bool from_default = false;
+
+			if (it == provided.end()) {
+				if (spec && spec->has_default) {
+					from_default = true;
+					if (spec->default_is_null) {
+						named_values[param_name] = BoundParameterData(Value());
+						// Constraints on absent optional NULL: skip (FastAPI).
+						continue;
+					}
+					raw = spec->default_raw;
+					// Defaults bind as query location for error loc shape.
+					loc_kind = "query";
+				} else {
+					SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, "Field required", "missing"));
+					finish();
+					return;
+				}
+			} else {
+				raw = it->second.second;
+				loc_kind = it->second.first;
+			}
+
+			// Strict integral check even when type is UNKNOWN: if the raw value
+			// is number-like but not a strict integer, and a cast-to-int would
+			// succeed via DuckDB rounding (1.5→2, 1e2→100), reject now.
+			// When expected is integral we always require ^-?[0-9]+$.
+			// When expected is UNKNOWN, apply the same if raw fails strict int
+			// but DefaultTryCastAs to INTEGER succeeds (the FastAPI gap).
+			if (IsIntegralType(expected)) {
+				if (!IsStrictIntegerString(raw, !IsUnsignedIntegralType(expected))) {
 					SetJson(res, 422,
-					        ValidationErrorJson(it->second.first, param_name,
-					                            "Input should be a valid " + type_it->second.ToString(),
+					        ValidationErrorJson(loc_kind, param_name, "Input should be a valid integer",
 					                            "type_error"));
 					finish();
 					return;
 				}
-				named_values[param_name] = BoundParameterData(casted);
-			} else {
-				named_values[param_name] = BoundParameterData(raw_value);
+			} else if (expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR) {
+				// If raw is not a strict integer but DuckDB would accept it as
+				// INTEGER (float/scientific/hex-ish), reject so execute-time
+				// `$param::INTEGER` cannot round. Plain non-numeric strings
+				// ("abc") still reach execute and become 422 with the real name.
+				if (!raw.empty() && !IsStrictIntegerString(raw, true)) {
+					Value probe(raw);
+					Value as_int;
+					string cerr;
+					if (probe.DefaultTryCastAs(LogicalType::INTEGER, as_int, &cerr)) {
+						// Would cast — only reject number-like non-integers
+						// (contain digit and non-digit). Pure text like "abc"
+						// fails TryCast and is left for later.
+						bool has_digit = false;
+						bool has_non_digit = false;
+						for (unsigned char c : raw) {
+							if (c >= '0' && c <= '9') {
+								has_digit = true;
+							} else if (c != '-' && c != '+') {
+								has_non_digit = true;
+							}
+						}
+						if (has_digit && has_non_digit) {
+							SetJson(res, 422,
+							        ValidationErrorJson(loc_kind, param_name, "Input should be a valid integer",
+							                            "type_error"));
+							finish();
+							return;
+						}
+					}
+				}
 			}
+
+			BoundParameterData bound;
+			string err_json;
+			if (!BindParamValue(raw, expected, loc_kind, param_name, bound, err_json)) {
+				SetJson(res, 422, err_json);
+				finish();
+				return;
+			}
+
+			// Constraint checks (LE/GE/…/min_length) — FastAPI Query(le=…) shape.
+			if (spec && !from_default) {
+				// For defaults we still apply constraints (default must be valid);
+				// for request values always apply.
+			}
+			if (spec) {
+				string cmsg, ctype;
+				// bound.value may be accessed via BoundParameterData — use the Value we stored.
+				// BoundParameterData holds Value in .value in DuckDB — check API.
+				// We re-cast from raw for constraint checking to avoid depending on
+				// BoundParameterData layout:
+				Value constraint_val;
+				if (expected.id() != LogicalTypeId::UNKNOWN && expected.id() != LogicalTypeId::VARCHAR) {
+					string cerr;
+					Value(raw).DefaultTryCastAs(expected, constraint_val, &cerr);
+				} else {
+					constraint_val = Value(raw);
+				}
+				if (!CheckParamConstraints(*spec, raw, constraint_val, cmsg, ctype)) {
+					SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, cmsg, ctype));
+					finish();
+					return;
+				}
+			}
+
+			named_values[param_name] = bound;
+			bound_raw[param_name] = {loc_kind, raw};
+			(void)from_default;
 		}
 
 		auto result = prepared->Execute(named_values, false);
 		if (result->HasError()) {
-			// Request-parameter validation (missing / type cast) already returned
-			// FastAPI-shaped 422 above. Any failure during Execute is a handler-side
-			// error — sanitize to 500 so SQL text, error(), and internal messages
-			// never reach clients (INVALID_INPUT would otherwise leak via 422).
-			// Exception: Conversion Errors often mean a param was bound as VARCHAR
-			// because DuckDB did not surface a concrete type (mixed $q + $n::INT).
-			// Map those to 422 without leaking SQL / cast details (valsafe P1-1).
+			// Client-input failures must never surface as 500.
+			// - Conversion errors → 422 with recovered param name (not "_")
+			// - LIMIT/OFFSET negative → empty 200 [] (FastAPI unconstrained int)
+			// - Other binder/invalid-input from values → 422
+			// - True handler bugs → 500 sanitized
 			auto err = result->GetError();
 			auto err_lower = StringUtil::Lower(err);
 			bool conversion = StringUtil::Contains(err_lower, "conversion error") ||
 			                  StringUtil::Contains(err_lower, "could not convert string");
-			if (conversion) {
+			bool limit_neg = StringUtil::Contains(err_lower, "limit/offset cannot be negative") ||
+			                 StringUtil::Contains(err_lower, "limit cannot be negative") ||
+			                 StringUtil::Contains(err_lower, "offset cannot be negative");
+
+			if (limit_neg) {
+				// FastAPI returns [] for limit=-1 without ge constraint; never 500.
+				fprintf(stderr, "quackapi: client limit/offset negative → []: %s\n", err.c_str());
+				SetJson(res, 200, "[]");
+			} else if (conversion) {
 				fprintf(stderr, "quackapi: param conversion at execute: %s\n", err.c_str());
+				string loc_kind = "query";
+				string pname = "_";
+				// Recover param name: match raw bound value against the error text.
+				idx_t best_len = 0;
+				for (auto &kv : bound_raw) {
+					auto &raw = kv.second.second;
+					if (raw.empty()) {
+						continue;
+					}
+					if (StringUtil::Contains(err, raw) && raw.size() >= best_len) {
+						best_len = raw.size();
+						pname = kv.first;
+						loc_kind = kv.second.first;
+					}
+				}
+				// Fallback: single non-claims bound param.
+				if (pname == "_" && bound_raw.size() == 1) {
+					pname = bound_raw.begin()->first;
+					loc_kind = bound_raw.begin()->second.first;
+				}
 				SetJson(res, 422,
-				        ValidationErrorJson("query", "_", "Invalid input for parameter type", "type_error"));
+				        ValidationErrorJson(loc_kind, pname, "Invalid input for parameter type", "type_error"));
+			} else if (StringUtil::Contains(err_lower, "invalid input") ||
+			           StringUtil::Contains(err_lower, "binder error") ||
+			           StringUtil::Contains(err_lower, "out of range")) {
+				// Likely client-driven; prefer 422 over Internal Server Error.
+				fprintf(stderr, "quackapi: client-input execute error → 422: %s\n", err.c_str());
+				string loc_kind = "query";
+				string pname = "_";
+				idx_t best_len = 0;
+				for (auto &kv : bound_raw) {
+					auto &raw = kv.second.second;
+					if (!raw.empty() && StringUtil::Contains(err, raw) && raw.size() >= best_len) {
+						best_len = raw.size();
+						pname = kv.first;
+						loc_kind = kv.second.first;
+					}
+				}
+				SetJson(res, 422,
+				        ValidationErrorJson(loc_kind, pname, "Invalid input for parameter", "value_error"));
 			} else {
 				SetInternalError(res, err);
 			}
