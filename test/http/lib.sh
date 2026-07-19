@@ -52,17 +52,29 @@ curl_json() {
   local hdr
   hdr="$(mktemp)"
   set +e
-  _QA_LAST_BODY="$(curl -sS -D "$hdr" -o "$tmp" -X "$method" "$@" "$url" 2>&1)"
+  # HEAD: servers often advertise Content-Length of the would-be body while
+  # sending no entity. Plain curl -X HEAD then fails with (18). Use --head
+  # + --ignore-content-length; entity body is always empty for HEAD.
+  local err
+  if [[ "$method" == "HEAD" ]]; then
+    err="$(curl -sS --head --ignore-content-length -D "$hdr" -o /dev/null "$@" "$url" 2>&1)"
+  else
+    err="$(curl -sS -D "$hdr" -o "$tmp" -X "$method" "$@" "$url" 2>&1)"
+  fi
   local rc=$?
   set -e
   if [[ $rc -ne 0 ]]; then
     _QA_LAST_STATUS="0"
     _QA_LAST_HEADERS=""
-    _QA_LAST_BODY="curl failed rc=$rc: ${_QA_LAST_BODY}"
+    _QA_LAST_BODY="curl failed rc=$rc: ${err}"
     rm -f "$tmp" "$hdr"
     return 0
   fi
-  _QA_LAST_BODY="$(cat "$tmp")"
+  if [[ "$method" == "HEAD" ]]; then
+    _QA_LAST_BODY=""
+  else
+    _QA_LAST_BODY="$(cat "$tmp")"
+  fi
   _QA_LAST_HEADERS="$(cat "$hdr")"
   _QA_LAST_STATUS="$(awk 'NR==1 {print $2}' "$hdr")"
   rm -f "$tmp" "$hdr"
