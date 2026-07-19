@@ -182,7 +182,7 @@ void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p)
     : db_ptr(db.shared_from_this()), host(host_p), port(port_p) {
-	server = std::make_unique<duckdb_httplib::Server>();
+	server = make_uniq<duckdb_httplib::Server>();
 
 	server->new_task_queue = [] {
 		return new duckdb_httplib::ThreadPool(32);

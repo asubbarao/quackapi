@@ -206,7 +206,7 @@ TableFunction MakeApplyRouteFunction() {
 
 ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
                                        unique_ptr<ParserExtensionParseData> parse_data) {
-	auto &data = parse_data->Cast<RouteDdlParseData>();
+	auto &data = static_cast<RouteDdlParseData &>(*parse_data);
 	ParserExtensionPlanResult result;
 	result.function = MakeApplyRouteFunction();
 	result.parameters.push_back(Value(data.action));

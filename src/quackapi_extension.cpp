@@ -9,6 +9,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 
 #include "quackapi_ddl.hpp"
 #include "quackapi_server.hpp"
@@ -197,12 +198,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind));
 	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind));
-	// The DDL rewrite target must be resolvable by name at plan time
-	loader.RegisterFunction(GetApplyRouteFunction());
 
 	// CREATE ROUTE / DROP ROUTE syntax
 	auto &db = loader.GetDatabaseInstance();
-	db.config.parser_extensions.push_back(RouteDdlParserExtension());
+	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

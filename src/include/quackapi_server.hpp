@@ -1,11 +1,12 @@
 #pragma once
 
-#include <memory>
 #include <thread>
 #include <vector>
 
+#include "duckdb/common/helper.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 
 namespace duckdb_httplib {
 class Server;
@@ -45,7 +46,7 @@ private:
 	weak_ptr<DatabaseInstance> db_ptr;
 	string host;
 	int port;
-	std::unique_ptr<duckdb_httplib::Server> server;
+	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	bool is_running = false;
 };

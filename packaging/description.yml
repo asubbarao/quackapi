@@ -1,0 +1,81 @@
+# Community-extensions submission descriptor for the `quackapi` extension.
+#
+# To submit this extension to the DuckDB community-extensions registry:
+#   1. Fork https://github.com/duckdb/community-extensions
+#   2. Copy this file to extensions/quackapi/description.yml in your fork
+#   3. Set repo.ref below to the exact git SHA of the release commit
+#   4. Open a pull request against duckdb/community-extensions
+
+extension:
+  name: quackapi
+  description: Build and serve HTTP JSON APIs from SQL — CREATE ROUTE turns a SELECT into an endpoint, typed and validated by DuckDB itself.
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: MIT
+  maintainers:
+    - asubbarao
+  # The HTTP server (DuckDB's bundled httplib) does not target wasm; the
+  # mingw/rtools and windows_arm64 legs are untested.
+  excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
+
+repo:
+  github: asubbarao/quackapi
+  ref: <COMMIT_SHA>
+
+docs:
+  hello_world: |
+    LOAD quackapi;
+
+    -- A SELECT becomes an endpoint
+    CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
+
+    -- Path params bind as named parameters, typed by the query:
+    -- /items/abc -> 422 with a FastAPI-shaped validation error
+    CREATE ROUTE item GET '/items/:id' AS SELECT $id::INT AS id;
+
+    -- Serve (background threads; the shell stays usable)
+    SELECT * FROM quackapi_serve(8000);
+
+    -- curl http://127.0.0.1:8000/hello        -> [{"msg":"world"}]
+    -- curl http://127.0.0.1:8000/items/42     -> [{"id":42}]
+
+    -- Inspect and manage
+    SELECT * FROM quackapi_routes();
+    SELECT * FROM quackapi_stop(8000);
+
+  extended_description: |
+    `quackapi` is an API framework inside DuckDB: routes are DDL, handlers are
+    SQL, and request validation comes from the database's own type system.
+
+    **Routes**
+
+    - `CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>' [STATUS <n>] AS <select>`
+      — `<pattern>` supports `:param` (or `{param}`) path segments; the handler
+      is any SELECT, and request parameters bind to its named parameters
+      (`$id`). `STATUS` sets the success status code.
+    - `DROP ROUTE <name>` removes a route. Routes update live — a route created
+      after `quackapi_serve()` is served immediately.
+
+    **Validation, typed by the database**
+
+    Parameters are cast to the types the prepared handler expects. A failed
+    cast returns `422` with a FastAPI-shaped error body
+    (`{"detail":[{"loc":[...],"msg":...,"type":...}]}`); a missing required
+    parameter does the same. Responses are JSON arrays of row objects, with
+    JSON types derived from the query's column types (integers stay numbers,
+    booleans stay booleans, structs and lists nest).
+
+    **Serving**
+
+    `quackapi_serve([port], host := ...)` starts an HTTP server on background
+    threads (default `127.0.0.1:8000`) using DuckDB's bundled httplib —
+    the same transport as the core `quack` RPC extension. `quackapi_stop()`,
+    `quackapi_servers()` and `quackapi_routes()` manage and inspect state.
+    Nothing is written to the database catalog: the route registry lives with
+    the database instance and dies with it.
+
+    **Platform support**
+
+    Linux (x86_64, arm64), macOS (x86_64, arm64) and Windows (x64, MSVC).
+    WebAssembly is excluded (no server sockets).
