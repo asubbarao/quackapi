@@ -9,3 +9,7 @@ test/python/__pycache__/
 .cache/
 *.log
 vcpkg_installed/
+
+# Generated conformance output
+test/conformance/results/
+
