@@ -49,8 +49,139 @@ bool IsHttpMethod(const string &method) {
 	       method == "HEAD";
 }
 
+bool IsParamTypeName(const string &tok) {
+	auto u = StringUtil::Upper(tok);
+	return u == "INTEGER" || u == "INT" || u == "BIGINT" || u == "SMALLINT" || u == "TINYINT" || u == "HUGEINT" ||
+	       u == "UBIGINT" || u == "UINTEGER" || u == "USMALLINT" || u == "UTINYINT" || u == "DOUBLE" || u == "FLOAT" ||
+	       u == "REAL" || u == "DECIMAL" || u == "NUMERIC" || u == "VARCHAR" || u == "TEXT" || u == "STRING" ||
+	       u == "BOOLEAN" || u == "BOOL";
+}
+
+//! Serialize param specs for the apply_route table function (plan → exec).
+//! Format: name|type|has_def|def_null|def_raw|has_ge|ge|has_gt|gt|has_le|le|has_lt|lt|has_min|min|has_max|max
+//! Multiple specs separated by RS (\x1e). Fields use FS (\x1f). def_raw is percent-encoded for | and RS.
+string EncodeField(const string &s) {
+	string out;
+	out.reserve(s.size());
+	for (unsigned char c : s) {
+		if (c == '%' || c == '\x1e' || c == '\x1f') {
+			char buf[4];
+			snprintf(buf, sizeof(buf), "%%%02X", c);
+			out += buf;
+		} else {
+			out += static_cast<char>(c);
+		}
+	}
+	return out;
+}
+
+string DecodeField(const string &s) {
+	string out;
+	out.reserve(s.size());
+	for (idx_t i = 0; i < s.size(); i++) {
+		if (s[i] == '%' && i + 2 < s.size()) {
+			unsigned int v = 0;
+			if (sscanf(s.c_str() + i + 1, "%02x", &v) == 1 || sscanf(s.c_str() + i + 1, "%02X", &v) == 1) {
+				out += static_cast<char>(v);
+				i += 2;
+				continue;
+			}
+		}
+		out += s[i];
+	}
+	return out;
+}
+
+string SerializeParamSpecs(const vector<QuackapiParamSpec> &specs) {
+	string result;
+	for (idx_t i = 0; i < specs.size(); i++) {
+		if (i > 0) {
+			result += '\x1e';
+		}
+		auto &s = specs[i];
+		result += EncodeField(s.name);
+		result += '\x1f';
+		result += EncodeField(s.type_name);
+		result += '\x1f';
+		result += s.has_default ? "1" : "0";
+		result += '\x1f';
+		result += s.default_is_null ? "1" : "0";
+		result += '\x1f';
+		result += EncodeField(s.default_raw);
+		result += '\x1f';
+		result += s.has_ge ? "1" : "0";
+		result += '\x1f';
+		result += std::to_string(s.ge);
+		result += '\x1f';
+		result += s.has_gt ? "1" : "0";
+		result += '\x1f';
+		result += std::to_string(s.gt);
+		result += '\x1f';
+		result += s.has_le ? "1" : "0";
+		result += '\x1f';
+		result += std::to_string(s.le);
+		result += '\x1f';
+		result += s.has_lt ? "1" : "0";
+		result += '\x1f';
+		result += std::to_string(s.lt);
+		result += '\x1f';
+		result += s.has_min_length ? "1" : "0";
+		result += '\x1f';
+		result += std::to_string(s.min_length);
+		result += '\x1f';
+		result += s.has_max_length ? "1" : "0";
+		result += '\x1f';
+		result += std::to_string(s.max_length);
+	}
+	return result;
+}
+
+vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
+	vector<QuackapiParamSpec> specs;
+	if (blob.empty()) {
+		return specs;
+	}
+	// char Split preserves empty fields (string Split drops them).
+	auto entries = StringUtil::Split(blob, '\x1e');
+	for (auto &entry : entries) {
+		if (entry.empty()) {
+			continue;
+		}
+		auto fields = StringUtil::Split(entry, '\x1f');
+		// Pad so we never index OOB on partial data.
+		while (fields.size() < 17) {
+			fields.push_back("");
+		}
+		QuackapiParamSpec s;
+		s.name = DecodeField(fields[0]);
+		s.type_name = DecodeField(fields[1]);
+		s.has_default = fields[2] == "1";
+		s.default_is_null = fields[3] == "1";
+		s.default_raw = DecodeField(fields[4]);
+		s.has_ge = fields[5] == "1";
+		s.ge = atof(fields[6].c_str());
+		s.has_gt = fields[7] == "1";
+		s.gt = atof(fields[8].c_str());
+		s.has_le = fields[9] == "1";
+		s.le = atof(fields[10].c_str());
+		s.has_lt = fields[11] == "1";
+		s.lt = atof(fields[12].c_str());
+		s.has_min_length = fields[13] == "1";
+		s.min_length = (idx_t)atoll(fields[14].c_str());
+		s.has_max_length = fields[15] == "1";
+		s.max_length = (idx_t)atoll(fields[16].c_str());
+		if (!s.name.empty()) {
+			specs.push_back(std::move(s));
+		}
+	}
+	return specs;
+}
+
 //! Grammar:
-//!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>' [STATUS <n>] [REQUIRE <auth>] AS <select>
+//!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
+//!     [STATUS <n>] [REQUIRE <auth>]
+//!     [PARAM <name> [<type>] [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
+//!     AS <select>
 //!   DROP ROUTE <name>
 ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &query) {
 	auto q = Trim(query);
@@ -155,6 +286,117 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		rest_upper = StringUtil::Upper(rest);
 	}
 
+	// Zero or more PARAM clauses (optional defaults + constraints).
+	vector<QuackapiParamSpec> params;
+	while (StringUtil::StartsWith(rest_upper, "PARAM") &&
+	       (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
+		rest = Trim(rest.substr(5));
+		if (rest.empty()) {
+			return ParserExtensionParseResult("PARAM expects a parameter name");
+		}
+		QuackapiParamSpec spec;
+		auto te = NextTokenEnd(rest);
+		spec.name = rest.substr(0, te);
+		rest = Trim(rest.substr(te));
+
+		// optional type
+		if (!rest.empty()) {
+			te = NextTokenEnd(rest);
+			auto tok = rest.substr(0, te);
+			if (IsParamTypeName(tok)) {
+				spec.type_name = StringUtil::Upper(tok);
+				if (spec.type_name == "INT") {
+					spec.type_name = "INTEGER";
+				} else if (spec.type_name == "BOOL") {
+					spec.type_name = "BOOLEAN";
+				} else if (spec.type_name == "TEXT" || spec.type_name == "STRING") {
+					spec.type_name = "VARCHAR";
+				} else if (spec.type_name == "REAL") {
+					spec.type_name = "FLOAT";
+				}
+				rest = Trim(rest.substr(te));
+			}
+		}
+
+		// DEFAULT / GE / GT / LE / LT / MIN_LENGTH / MAX_LENGTH
+		while (!rest.empty()) {
+			rest_upper = StringUtil::Upper(rest);
+			if (StringUtil::StartsWith(rest_upper, "PARAM") &&
+			    (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
+				break;
+			}
+			if (StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
+			    StringUtil::CharacterIsSpace(rest[2])) {
+				break;
+			}
+			te = NextTokenEnd(rest);
+			auto key = StringUtil::Upper(rest.substr(0, te));
+			string after_key = Trim(rest.substr(te));
+
+			if (key == "DEFAULT") {
+				if (after_key.empty()) {
+					return ParserExtensionParseResult("PARAM DEFAULT expects a literal or NULL");
+				}
+				spec.has_default = true;
+				if (after_key[0] == '\'') {
+					auto endq = after_key.find('\'', 1);
+					if (endq == string::npos) {
+						return ParserExtensionParseResult("Unterminated DEFAULT string");
+					}
+					spec.default_raw = after_key.substr(1, endq - 1);
+					spec.default_is_null = false;
+					rest = Trim(after_key.substr(endq + 1));
+				} else {
+					auto lit_end = NextTokenEnd(after_key);
+					auto lit = after_key.substr(0, lit_end);
+					rest = Trim(after_key.substr(lit_end));
+					if (StringUtil::Upper(lit) == "NULL") {
+						spec.default_is_null = true;
+						spec.default_raw.clear();
+					} else {
+						spec.default_is_null = false;
+						spec.default_raw = lit;
+					}
+				}
+				continue;
+			}
+			if (key == "GE" || key == "GT" || key == "LE" || key == "LT" || key == "MIN_LENGTH" ||
+			    key == "MAX_LENGTH") {
+				if (after_key.empty()) {
+					return ParserExtensionParseResult("PARAM " + key + " expects a number");
+				}
+				auto num_end = NextTokenEnd(after_key);
+				auto num = after_key.substr(0, num_end);
+				rest = Trim(after_key.substr(num_end));
+				if (key == "GE") {
+					spec.has_ge = true;
+					spec.ge = atof(num.c_str());
+				} else if (key == "GT") {
+					spec.has_gt = true;
+					spec.gt = atof(num.c_str());
+				} else if (key == "LE") {
+					spec.has_le = true;
+					spec.le = atof(num.c_str());
+				} else if (key == "LT") {
+					spec.has_lt = true;
+					spec.lt = atof(num.c_str());
+				} else if (key == "MIN_LENGTH") {
+					spec.has_min_length = true;
+					spec.min_length = (idx_t)atoll(num.c_str());
+				} else {
+					spec.has_max_length = true;
+					spec.max_length = (idx_t)atoll(num.c_str());
+				}
+				continue;
+			}
+			return ParserExtensionParseResult("Unknown PARAM option \"" + key +
+			                                  "\" — expected DEFAULT, GE, GT, LE, LT, MIN_LENGTH, MAX_LENGTH");
+		}
+
+		params.push_back(std::move(spec));
+		rest_upper = StringUtil::Upper(rest);
+	}
+
 	// AS <select> — any whitespace (spaces/tabs/newlines) after AS is accepted.
 	// "AS SELECT …" and "AS\nSELECT …" are both valid; bare "AS" is not.
 	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
@@ -175,6 +417,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.handler_sql = handler;
 	data->route.status = status;
 	data->route.require_auth = require_auth;
+	data->route.params = std::move(params);
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -199,6 +442,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	bind_data->route.handler_sql = input.inputs[5].GetValue<string>();
 	bind_data->route.status = input.inputs[6].GetValue<int32_t>();
 	bind_data->route.require_auth = input.inputs[7].GetValue<string>();
+	if (input.inputs.size() > 8 && !input.inputs[8].IsNull()) {
+		bind_data->route.params = DeserializeParamSpecs(input.inputs[8].GetValue<string>());
+	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	return std::move(bind_data);
@@ -241,7 +487,8 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyRouteFunction() {
 	TableFunction function("quackapi_apply_route",
 	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                        LogicalType::VARCHAR},
 	                       ApplyRouteExec, ApplyRouteBind);
 	return function;
 }
@@ -259,6 +506,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.route.handler_sql));
 	result.parameters.push_back(Value::INTEGER(data.route.status));
 	result.parameters.push_back(Value(data.route.require_auth));
+	result.parameters.push_back(Value(SerializeParamSpecs(data.route.params)));
 	result.requires_valid_transaction = false;
 	result.return_type = StatementReturnType::QUERY_RESULT;
 	return result;

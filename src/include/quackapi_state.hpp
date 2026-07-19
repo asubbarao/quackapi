@@ -38,6 +38,30 @@ struct QuackapiApiKeyEntry {
 	string subject;
 };
 
+//! Optional/constraint metadata for a route parameter (FastAPI Query(...) parity).
+//! Declared via CREATE ROUTE … PARAM <name> [TYPE] [DEFAULT …] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH …]
+struct QuackapiParamSpec {
+	string name;
+	//! Optional type hint (INTEGER, BIGINT, VARCHAR, …). Empty = infer from SQL.
+	string type_name;
+	bool has_default = false;
+	bool default_is_null = false;
+	//! Raw default literal (digits / true / false / unquoted text). Empty when default_is_null.
+	string default_raw;
+	bool has_ge = false;
+	double ge = 0;
+	bool has_gt = false;
+	double gt = 0;
+	bool has_le = false;
+	double le = 0;
+	bool has_lt = false;
+	double lt = 0;
+	bool has_min_length = false;
+	idx_t min_length = 0;
+	bool has_max_length = false;
+	idx_t max_length = 0;
+};
+
 //! One registered route. Immutable once snapshotted; the registry replaces
 //! entries wholesale on CREATE OR REPLACE ROUTE.
 struct QuackapiRoute {
@@ -48,6 +72,8 @@ struct QuackapiRoute {
 	int status = 200;   // success status code
 	//! Empty = public. Non-empty = name of a CREATE AUTH scheme required to call.
 	string require_auth;
+	//! PARAM specs: optional defaults + FastAPI-style numeric/string constraints.
+	vector<QuackapiParamSpec> params;
 };
 
 //! Per-database quackapi state: the route registry, auth registry, and running servers.
