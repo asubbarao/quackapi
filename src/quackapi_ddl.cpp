@@ -50,7 +50,7 @@ bool IsHttpMethod(const string &method) {
 }
 
 //! Grammar:
-//!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>' [STATUS <n>] AS <select>
+//!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>' [STATUS <n>] [REQUIRE <auth>] AS <select>
 //!   DROP ROUTE <name>
 ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &query) {
 	auto q = Trim(query);
@@ -128,6 +128,22 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		rest_upper = StringUtil::Upper(rest);
 	}
 
+	// [REQUIRE <auth-name>]
+	string require_auth;
+	if (StringUtil::StartsWith(rest_upper, "REQUIRE ")) {
+		rest = Trim(rest.substr(8));
+		auto space = rest.find(' ');
+		if (space == string::npos) {
+			return ParserExtensionParseResult("Expected AS <select> after REQUIRE <auth>");
+		}
+		require_auth = rest.substr(0, space);
+		if (require_auth.empty()) {
+			return ParserExtensionParseResult("REQUIRE expects an auth name");
+		}
+		rest = Trim(rest.substr(space));
+		rest_upper = StringUtil::Upper(rest);
+	}
+
 	// AS <select>
 	if (!StringUtil::StartsWith(rest_upper, "AS ")) {
 		return ParserExtensionParseResult("Expected AS <select> in CREATE ROUTE");
@@ -145,6 +161,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.pattern = pattern;
 	data->route.handler_sql = handler;
 	data->route.status = status;
+	data->route.require_auth = require_auth;
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -168,6 +185,7 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	bind_data->route.pattern = input.inputs[4].GetValue<string>();
 	bind_data->route.handler_sql = input.inputs[5].GetValue<string>();
 	bind_data->route.status = input.inputs[6].GetValue<int32_t>();
+	bind_data->route.require_auth = input.inputs[7].GetValue<string>();
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	return std::move(bind_data);
@@ -210,7 +228,7 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyRouteFunction() {
 	TableFunction function("quackapi_apply_route",
 	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
 	                       ApplyRouteExec, ApplyRouteBind);
 	return function;
 }
@@ -227,6 +245,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.route.pattern));
 	result.parameters.push_back(Value(data.route.handler_sql));
 	result.parameters.push_back(Value::INTEGER(data.route.status));
+	result.parameters.push_back(Value(data.route.require_auth));
 	result.requires_valid_transaction = false;
 	result.return_type = StatementReturnType::QUERY_RESULT;
 	return result;

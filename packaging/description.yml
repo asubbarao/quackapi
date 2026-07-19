@@ -50,12 +50,22 @@ docs:
 
     **Routes**
 
-    - `CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>' [STATUS <n>] AS <select>`
+    - `CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>' [STATUS <n>] [REQUIRE <auth>] AS <select>`
       — `<pattern>` supports `:param` (or `{param}`) path segments; the handler
       is any SELECT, and request parameters bind to its named parameters
-      (`$id`). `STATUS` sets the success status code.
+      (`$id`). `STATUS` sets the success status code. `REQUIRE` names a
+      `CREATE AUTH` scheme that must pass before the handler runs.
     - `DROP ROUTE <name>` removes a route. Routes update live — a route created
       after `quackapi_serve()` is served immediately.
+
+    **Auth**
+
+    - `CREATE [OR REPLACE] AUTH <name> AS API_KEY [( HEADER '...' )]` or
+      `AS JWT ( SECRET '...' [, ALGORITHM HS256] )`.
+    - `DROP AUTH <name>` removes a scheme and its stored API-key hashes.
+    - `quackapi_add_api_key(auth, key, subject)` stores only a SHA-256 hash.
+    - `quackapi_auths()` lists name/kind/header — never secrets or hashes.
+    - Verified claims bind as `$claims_<name>` (missing claims bind SQL NULL).
 
     **Validation, typed by the database**
 
@@ -66,7 +76,7 @@ docs:
     JSON types derived from the query's column types (integers stay numbers,
     booleans stay booleans, structs and lists nest).
 
-    **Serving**
+    **Serving (inbound)**
 
     `quackapi_serve([port], host := ...)` starts an HTTP server on background
     threads (default `127.0.0.1:8000`) using DuckDB's bundled httplib —
@@ -74,6 +84,23 @@ docs:
     `quackapi_servers()` and `quackapi_routes()` manage and inspect state.
     Nothing is written to the database catalog: the route registry lives with
     the database instance and dies with it.
+
+    **Outbound HTTP (companion: curl_httpfs)**
+
+    quackapi does not link libcurl. Route handlers are arbitrary SQL, so any
+    handler that calls `read_text` / httpfs over `https://` already performs
+    outbound HTTP through DuckDB's shared `HTTPUtil`. Loading the community
+    extension `curl_httpfs` replaces that util with a libcurl MultiCurl client
+    (HTTP/2, connection pooling, async IO) with no quackapi code change:
+
+        INSTALL curl_httpfs FROM community;
+        LOAD curl_httpfs;
+        LOAD quackapi;
+        SELECT curl_httpfs_http_util_name();  -- MultiCurl
+        SELECT quackapi_http_util_name();     -- same underlying GetName()
+
+    See `examples/proxy_curl_httpfs.sql` and `docs/curl_httpfs.md`. Future
+    OAuth/OIDC support will use the same HTTPUtil path (never the curl binary).
 
     **Platform support**
 

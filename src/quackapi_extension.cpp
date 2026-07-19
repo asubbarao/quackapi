@@ -11,7 +11,9 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 
+#include "quackapi_auth.hpp"
 #include "quackapi_ddl.hpp"
+#include "quackapi_http_fetch.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
 
@@ -119,6 +121,8 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("status");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("handler");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("require_auth");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -138,6 +142,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(2, row, Value(route.pattern));
 		output.SetValue(3, row, Value::INTEGER(route.status));
 		output.SetValue(4, row, Value(route.handler_sql));
+		output.SetValue(5, row, Value(route.require_auth));
 		row++;
 		state.offset++;
 	}
@@ -187,6 +192,17 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 }
 
 //===--------------------------------------------------------------------===//
+// quackapi_http_util_name() — active outbound HTTPUtil (no curl_httpfs dep)
+//===--------------------------------------------------------------------===//
+// When curl_httpfs is LOADed this is typically "MultiCurl". Same underlying
+// DBConfig::GetHTTPUtil().GetName() that curl_httpfs_http_util_name() reads.
+
+static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &result) {
+	auto &db = *state.GetContext().db;
+	result.Reference(Value(QuackapiHttpFetch::ActiveHttpUtilName(db)));
+}
+
+//===--------------------------------------------------------------------===//
 // Load
 //===--------------------------------------------------------------------===//
 
@@ -211,9 +227,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));
 	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind, ServersInit));
 
-	// CREATE ROUTE / DROP ROUTE syntax
+	// Auth inspection + API key management (secrets/hashes never exposed).
+	loader.RegisterFunction(GetQuackapiAuthsFunction());
+	loader.RegisterFunction(GetQuackapiAddApiKeyFunction());
+
+	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
+	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
+	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
+
+	// CREATE ROUTE / DROP ROUTE and CREATE AUTH / DROP AUTH syntax
 	auto &db = loader.GetDatabaseInstance();
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
+	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

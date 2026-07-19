@@ -13,6 +13,30 @@ namespace duckdb {
 class DatabaseInstance;
 class QuackapiHttpServer;
 
+//! Auth scheme kind registered via CREATE AUTH.
+enum class QuackapiAuthKind : uint8_t {
+	API_KEY = 0,
+	JWT_HS256 = 1,
+};
+
+//! One registered auth scheme. Secret is never exposed via table functions.
+struct QuackapiAuth {
+	string name;
+	QuackapiAuthKind kind = QuackapiAuthKind::API_KEY;
+	//! For API_KEY: header to read (default "X-API-Key"). Authorization: Bearer
+	//! is always accepted as a fallback for API_KEY.
+	string header = "X-API-Key";
+	//! For JWT_HS256: HMAC secret. Empty for API_KEY.
+	string secret;
+};
+
+//! One stored API key (raw key is never retained — only SHA-256 hash).
+struct QuackapiApiKeyEntry {
+	string auth_name;
+	string key_hash; // 32 raw SHA-256 bytes
+	string subject;
+};
+
 //! One registered route. Immutable once snapshotted; the registry replaces
 //! entries wholesale on CREATE OR REPLACE ROUTE.
 struct QuackapiRoute {
@@ -21,9 +45,11 @@ struct QuackapiRoute {
 	string pattern;     // e.g. /items/:id — ':name' and '{name}' segments capture path params
 	string handler_sql; // the AS <select> body; named parameters ($id) bind request params
 	int status = 200;   // success status code
+	//! Empty = public. Non-empty = name of a CREATE AUTH scheme required to call.
+	string require_auth;
 };
 
-//! Per-database quackapi state: the route registry and running servers.
+//! Per-database quackapi state: the route registry, auth registry, and running servers.
 //! Lives in the DatabaseInstance's ObjectCache (non-evictable), so LOAD never
 //! touches the user's catalog and state dies with the database.
 class QuackapiState : public ObjectCacheEntry {
@@ -52,6 +78,20 @@ public:
 	bool DropRoute(const string &name);
 	vector<QuackapiRoute> SnapshotRoutes();
 
+	//! CREATE [OR REPLACE] AUTH. Throws on duplicate name unless or_replace.
+	void AddAuth(const QuackapiAuth &auth, bool or_replace);
+	//! DROP AUTH. Also removes API keys bound to that auth name. Returns false if missing.
+	bool DropAuth(const string &name);
+	//! Lookup by name. Returns false if not registered.
+	bool GetAuth(const string &name, QuackapiAuth &out);
+	vector<QuackapiAuth> SnapshotAuths();
+
+	//! Store a hashed API key for an API_KEY auth. Throws if auth missing / wrong kind.
+	//! Returns the subject on success.
+	string AddApiKey(const string &auth_name, const string &raw_key, const string &subject);
+	//! Snapshot of stored keys for an auth (hashes only — never raw keys).
+	vector<QuackapiApiKeyEntry> SnapshotApiKeys(const string &auth_name);
+
 	//! Start serving on host:port. Throws if a server already listens there.
 	void StartServer(DatabaseInstance &db, const string &host, int port);
 	//! Stop the server on port (any host). Returns false if none.
@@ -63,6 +103,10 @@ public:
 private:
 	std::mutex routes_mutex;
 	vector<QuackapiRoute> routes;
+
+	std::mutex auths_mutex;
+	vector<QuackapiAuth> auths;
+	vector<QuackapiApiKeyEntry> api_keys;
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;

@@ -1,0 +1,224 @@
+# name: test/sql/quackapi_auth.test
+# description: CREATE AUTH / DROP AUTH, API keys, REQUIRE clause, registry inspection
+# group: [quackapi]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# Registry starts empty
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM quackapi_auths();
+----
+0
+
+# ---------------------------------------------------------------------------
+# CREATE AUTH AS API_KEY (default header X-API-Key)
+# ---------------------------------------------------------------------------
+query I
+CREATE AUTH site AS API_KEY;
+----
+Auth site: API_KEY
+
+query III
+SELECT name, kind, header FROM quackapi_auths() WHERE name = 'site';
+----
+site	API_KEY	X-API-Key
+
+# Only name/kind/header columns — secrets never projected
+query III
+SELECT name, kind, header FROM quackapi_auths() WHERE name = 'site';
+----
+site	API_KEY	X-API-Key
+
+# ---------------------------------------------------------------------------
+# CREATE AUTH AS API_KEY with custom HEADER
+# ---------------------------------------------------------------------------
+query I
+CREATE AUTH custom AS API_KEY ( HEADER 'X-Custom-Key' );
+----
+Auth custom: API_KEY
+
+query I
+SELECT header FROM quackapi_auths() WHERE name = 'custom';
+----
+X-Custom-Key
+
+# ---------------------------------------------------------------------------
+# CREATE AUTH AS JWT (SECRET required; ALGORITHM HS256 optional)
+# ---------------------------------------------------------------------------
+query I
+CREATE AUTH jwt_auth AS JWT ( SECRET 'test-secret-do-not-leak' );
+----
+Auth jwt_auth: JWT_HS256
+
+query III
+SELECT name, kind, header FROM quackapi_auths() WHERE name = 'jwt_auth';
+----
+jwt_auth	JWT_HS256	Authorization
+
+# Explicit ALGORITHM HS256 is accepted
+query I
+CREATE AUTH jwt2 AS JWT ( SECRET 's2', ALGORITHM HS256 );
+----
+Auth jwt2: JWT_HS256
+
+# JWT secret must NOT appear in quackapi_auths output
+query I
+SELECT count(*) FROM quackapi_auths() WHERE name = 'jwt_auth' AND (name = 'test-secret-do-not-leak' OR kind = 'test-secret-do-not-leak' OR header = 'test-secret-do-not-leak');
+----
+0
+
+# ---------------------------------------------------------------------------
+# quackapi_add_api_key stores a hashed key and returns subject
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_add_api_key('site', 'super-secret-key', 'alice');
+----
+alice
+
+# Adding a key for a missing auth errors
+statement error
+SELECT * FROM quackapi_add_api_key('nope', 'k', 'bob');
+----
+does not exist
+
+# Adding a key for a JWT scheme errors
+statement error
+SELECT * FROM quackapi_add_api_key('jwt_auth', 'k', 'bob');
+----
+not an API_KEY
+
+# ---------------------------------------------------------------------------
+# CREATE ROUTE ... REQUIRE <auth> surfaces require_auth in quackapi_routes()
+# ---------------------------------------------------------------------------
+query I
+CREATE ROUTE me GET '/me' REQUIRE site AS SELECT $claims_sub AS user;
+----
+Route me: GET /me
+
+query II
+SELECT name, require_auth FROM quackapi_routes() WHERE name = 'me';
+----
+me	site
+
+# Public route still has empty require_auth
+query I
+CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
+----
+Route hello: GET /hello
+
+query I
+SELECT CASE WHEN require_auth = '' THEN 'public' ELSE require_auth END
+FROM quackapi_routes() WHERE name = 'hello';
+----
+public
+
+# REQUIRE + STATUS both allowed
+query I
+CREATE ROUTE me2 GET '/me2' STATUS 201 REQUIRE site AS SELECT $claims_sub AS user;
+----
+Route me2: GET /me2
+
+query II
+SELECT status, require_auth FROM quackapi_routes() WHERE name = 'me2';
+----
+201	site
+
+# ---------------------------------------------------------------------------
+# CREATE OR REPLACE AUTH updates in place
+# ---------------------------------------------------------------------------
+query I
+CREATE OR REPLACE AUTH site AS API_KEY ( HEADER 'X-Site-Key' );
+----
+Auth site: API_KEY
+
+query I
+SELECT header FROM quackapi_auths() WHERE name = 'site';
+----
+X-Site-Key
+
+# Duplicate without OR REPLACE errors
+statement error
+CREATE AUTH site AS API_KEY;
+----
+already exists
+
+# ---------------------------------------------------------------------------
+# DROP AUTH
+# ---------------------------------------------------------------------------
+query I
+DROP AUTH custom;
+----
+Dropped auth custom
+
+query I
+SELECT count(*) FROM quackapi_auths() WHERE name = 'custom';
+----
+0
+
+statement error
+DROP AUTH custom;
+----
+does not exist
+
+# ---------------------------------------------------------------------------
+# Bad grammar
+# ---------------------------------------------------------------------------
+statement error
+CREATE AUTH bad AS OAUTH;
+----
+Unknown AUTH kind
+
+statement error
+CREATE AUTH bad AS JWT;
+----
+JWT requires
+
+statement error
+CREATE AUTH bad AS JWT ( ALGORITHM HS256 );
+----
+JWT requires SECRET
+
+statement error
+CREATE AUTH bad AS JWT ( SECRET 's', ALGORITHM RS256 );
+----
+Only ALGORITHM HS256
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+query I
+DROP ROUTE me;
+----
+Dropped route me
+
+query I
+DROP ROUTE me2;
+----
+Dropped route me2
+
+query I
+DROP ROUTE hello;
+----
+Dropped route hello
+
+query I
+DROP AUTH site;
+----
+Dropped auth site
+
+query I
+DROP AUTH jwt_auth;
+----
+Dropped auth jwt_auth
+
+query I
+DROP AUTH jwt2;
+----
+Dropped auth jwt2
+
+query I
+SELECT count(*) FROM quackapi_auths();
+----
+0

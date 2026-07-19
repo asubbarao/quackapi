@@ -13,6 +13,7 @@
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
 
+#include "quackapi_auth.hpp"
 #include "quackapi_state.hpp"
 
 #include "httplib.hpp"
@@ -184,6 +185,32 @@ void SetInternalError(duckdb_httplib::Response &res, const string &server_side_d
 	SetJson(res, 500, "{\"detail\":\"Internal Server Error\"}");
 }
 
+//! Collect request headers into a case-insensitive map (first value wins).
+case_insensitive_map_t<string> CollectHeaders(const duckdb_httplib::Request &req) {
+	case_insensitive_map_t<string> headers;
+	for (auto &kv : req.headers) {
+		if (headers.find(kv.first) == headers.end()) {
+			headers[kv.first] = kv.second;
+		}
+	}
+	return headers;
+}
+
+//! True if a prepared named parameter is a claims binding ($claims_<k>).
+bool IsClaimsParam(const string &param_name, string &claim_key) {
+	static const string prefix = "claims_";
+	if (param_name.size() <= prefix.size()) {
+		return false;
+	}
+	// named_param_map keys are without '$'. Match prefix case-insensitively;
+	// claim key preserves the suffix casing from the SQL parameter name.
+	if (!StringUtil::StartsWith(StringUtil::Lower(param_name), prefix)) {
+		return false;
+	}
+	claim_key = param_name.substr(prefix.size());
+	return !claim_key.empty();
+}
+
 //! True if `param_name` is a path-pattern capture (`:name` or `{name}`).
 bool IsPathParam(const string &pattern, const string &param_name) {
 	auto segments = SplitPath(pattern);
@@ -270,6 +297,19 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		return;
 	}
 
+	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
+	// Public routes (require_auth empty) pass through unchanged.
+	auto headers = CollectHeaders(req);
+	auto auth_result = CheckAuth(*db, match.route, headers);
+	if (!auth_result.ok) {
+		if (!auth_result.www_authenticate.empty()) {
+			res.set_header("WWW-Authenticate", auth_result.www_authenticate);
+		}
+		SetJson(res, auth_result.status, auth_result.body);
+		return;
+	}
+	// auth_result.claims is ready for $claims_<k> binding below.
+
 	try {
 		Connection con(*db);
 		auto prepared = con.Prepare(match.route.handler_sql);
@@ -289,10 +329,26 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		// The database types the columns: cast each provided param to the type
 		// the prepared statement expects. Cast failure -> 422, FastAPI-shaped.
+		// $claims_* params are server-verified: bind from claims or SQL NULL
+		// (never 422 for a missing claim).
 		auto expected_types = prepared->GetExpectedParameterTypes();
 		case_insensitive_map_t<BoundParameterData> named_values;
 		for (auto &entry : prepared->named_param_map) {
 			auto &param_name = entry.first;
+
+			string claim_key;
+			if (IsClaimsParam(param_name, claim_key)) {
+				auto cit = auth_result.claims.find(claim_key);
+				if (cit == auth_result.claims.end()) {
+					// Absent claim → SQL NULL (do NOT 422).
+					named_values[param_name] = BoundParameterData(Value());
+				} else {
+					// Claims bind as VARCHAR; non-string/nested already JSON-encoded.
+					named_values[param_name] = BoundParameterData(Value(cit->second));
+				}
+				continue;
+			}
+
 			auto it = provided.find(param_name);
 			if (it == provided.end()) {
 				const char *loc_kind =

@@ -1,0 +1,17 @@
+# name: test/sql/quackapi_http_util_name.test
+# description: quackapi_http_util_name reports the active HTTPUtil
+# group: [quackapi]
+
+require quackapi
+
+# Without curl_httpfs / httpfs the core util is active.
+query I
+SELECT quackapi_http_util_name();
+----
+Built-In
+
+# Function is nullary and stable within a session (no curl_httpfs required).
+query I
+SELECT length(quackapi_http_util_name()) > 0;
+----
+true
