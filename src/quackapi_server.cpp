@@ -179,6 +179,25 @@ void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
 	res.set_content(body, "application/json");
 }
 
+//! Response mode inferred from the single output column's name — the database
+//! names the payload. `html` -> text/html, `text` -> text/plain; anything else
+//! serializes as the JSON array of row objects.
+enum class ResponseMode { JSON, HTML, TEXT };
+
+ResponseMode ResponseModeFor(const vector<string> &names) {
+	if (names.size() != 1) {
+		return ResponseMode::JSON;
+	}
+	auto lower = StringUtil::Lower(names[0]);
+	if (lower == "html") {
+		return ResponseMode::HTML;
+	}
+	if (lower == "text") {
+		return ResponseMode::TEXT;
+	}
+	return ResponseMode::JSON;
+}
+
 void SetInternalError(duckdb_httplib::Response &res, const string &server_side_detail) {
 	// Never leak SQL/relation/path text to clients; log full detail server-side.
 	fprintf(stderr, "quackapi: internal error: %s\n", server_side_detail.c_str());
@@ -228,9 +247,16 @@ bool IsPathParam(const string &pattern, const string &param_name) {
 
 } // namespace
 
-QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p)
+QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
+                                       const string &static_dir)
     : db_ptr(db.shared_from_this()), host(host_p), port(port_p) {
 	server = make_uniq<duckdb_httplib::Server>();
+
+	// Static files (FastAPI StaticFiles equivalent). httplib checks file
+	// requests before route handlers, so API routes always win over files.
+	if (!static_dir.empty() && !server->set_mount_point("/", static_dir)) {
+		throw IOException("quackapi: static_dir \"%s\" is not a directory", static_dir);
+	}
 
 	server->new_task_queue = [] {
 		return new duckdb_httplib::ThreadPool(32);
@@ -387,8 +413,33 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		// Serialize: JSON array of row objects, typed by the query's columns.
 		auto &names = result->names;
+		auto mode = ResponseModeFor(names);
+
+		// HTML/TEXT mode: a single column named `html`/`text` serves its raw
+		// string value (e.g. SELECT tera_render(...) AS html). Multiple rows are
+		// concatenated in order, so a query returning fragments streams a page.
+		if (mode != ResponseMode::JSON) {
+			string body;
+			while (true) {
+				auto chunk = result->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				for (idx_t row = 0; row < chunk->size(); row++) {
+					auto value = chunk->GetValue(0, row);
+					if (!value.IsNull()) {
+						body += value.ToString();
+					}
+				}
+			}
+			res.status = match.route.status;
+			res.set_content(body, mode == ResponseMode::HTML ? "text/html; charset=utf-8"
+			                                                  : "text/plain; charset=utf-8");
+			return;
+		}
+
+		// Serialize: JSON array of row objects, typed by the query's columns.
 		string body = "[";
 		bool first_row = true;
 		while (true) {

@@ -151,13 +151,13 @@ vector<QuackapiApiKeyEntry> QuackapiState::SnapshotApiKeys(const string &auth_na
 	return result;
 }
 
-void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port) {
+void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port, const string &static_dir) {
 	auto key = host + ":" + std::to_string(port);
 	std::lock_guard<std::mutex> lock(servers_mutex);
 	if (servers.find(key) != servers.end()) {
 		throw InvalidInputException("quackapi already serving on %s", key);
 	}
-	servers.emplace(key, make_uniq<QuackapiHttpServer>(db, host, port));
+	servers.emplace(key, make_uniq<QuackapiHttpServer>(db, host, port, static_dir));
 }
 
 bool QuackapiState::StopServer(int port) {

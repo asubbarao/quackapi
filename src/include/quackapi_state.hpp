@@ -93,7 +93,8 @@ public:
 	vector<QuackapiApiKeyEntry> SnapshotApiKeys(const string &auth_name);
 
 	//! Start serving on host:port. Throws if a server already listens there.
-	void StartServer(DatabaseInstance &db, const string &host, int port);
+	//! static_dir: optional file directory served for unrouted GETs.
+	void StartServer(DatabaseInstance &db, const string &host, int port, const string &static_dir);
 	//! Stop the server on port (any host). Returns false if none.
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).

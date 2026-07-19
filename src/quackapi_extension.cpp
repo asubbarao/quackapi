@@ -26,6 +26,7 @@ namespace duckdb {
 struct ServeBindData : public TableFunctionData {
 	string host = "127.0.0.1";
 	int32_t port = 8000;
+	string static_dir;
 	bool finished = false;
 };
 
@@ -42,6 +43,10 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &, TableFunctionBindInpu
 	if (host_entry != input.named_parameters.end()) {
 		bind_data->host = host_entry->second.GetValue<string>();
 	}
+	auto static_entry = input.named_parameters.find("static_dir");
+	if (static_entry != input.named_parameters.end()) {
+		bind_data->static_dir = static_entry->second.GetValue<string>();
+	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
 	return std::move(bind_data);
@@ -52,7 +57,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	if (bind_data.finished) {
 		return;
 	}
-	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port);
+	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, bind_data.static_dir);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
 	output.SetCardinality(1);
 	bind_data.finished = true;
@@ -207,10 +212,11 @@ static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &re
 //===--------------------------------------------------------------------===//
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// quackapi_serve() / quackapi_serve(port) with optional host named param
+	// quackapi_serve() / quackapi_serve(port) with optional host + static_dir named params
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
+	serve.named_parameters["static_dir"] = LogicalType::VARCHAR;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);

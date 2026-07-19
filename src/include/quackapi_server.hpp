@@ -27,7 +27,9 @@ static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 //! synchronous-bind discipline as the core quack extension's RPC server.
 class QuackapiHttpServer {
 public:
-	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port);
+	//! static_dir: optional directory of files to serve for GET paths that match
+	//! no registered route (FastAPI's StaticFiles equivalent). Empty = API only.
+	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port, const string &static_dir);
 	~QuackapiHttpServer();
 
 	//! Close the listener socket only; safe from a request-handler thread.
