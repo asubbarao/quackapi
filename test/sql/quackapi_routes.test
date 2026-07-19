@@ -82,3 +82,49 @@ query I
 DROP ROUTE hello;
 ----
 Dropped route hello
+
+# Handler SQL is validated at CREATE time (not deferred to first request)
+statement error
+CREATE ROUTE bad GET '/x' AS SELECT * FROM no_such_table;
+----
+Invalid handler SQL
+
+# Failed CREATE must not leave a route behind
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name = 'bad';
+----
+0
+
+# CREATE OR REPLACE must not mutate the registry when validation fails
+query I
+CREATE ROUTE keepme GET '/keep' AS SELECT 1 AS ok;
+----
+Route keepme: GET /keep
+
+statement error
+CREATE OR REPLACE ROUTE keepme GET '/keep' AS SELECT * FROM no_such_table_either;
+----
+Invalid handler SQL
+
+query I
+SELECT handler FROM quackapi_routes() WHERE name = 'keepme';
+----
+SELECT 1 AS ok
+
+query I
+DROP ROUTE keepme;
+----
+Dropped route keepme
+
+# Multi-chunk emission: > STANDARD_VECTOR_SIZE (2048) routes must not corrupt
+loop i 0 2100
+
+statement ok
+CREATE ROUTE r${i} GET '/r${i}' AS SELECT 1;
+
+endloop
+
+query I
+SELECT count(*) FROM quackapi_routes();
+----
+2100

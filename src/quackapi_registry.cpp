@@ -6,6 +6,8 @@
 
 #include "quackapi_server.hpp"
 
+#include <thread>
+
 namespace duckdb {
 
 QuackapiState::~QuackapiState() {
@@ -60,23 +62,47 @@ void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int po
 }
 
 bool QuackapiState::StopServer(int port) {
-	std::lock_guard<std::mutex> lock(servers_mutex);
-	for (auto it = servers.begin(); it != servers.end(); ++it) {
-		if (it->second->Port() == port) {
-			it->second->Close();
-			servers.erase(it);
-			return true;
+	// Under the lock: only move the server out of the map. Never hold
+	// servers_mutex across httplib teardown (Close joins the worker pool).
+	unique_ptr<QuackapiHttpServer> to_destroy;
+	{
+		std::lock_guard<std::mutex> lock(servers_mutex);
+		for (auto it = servers.begin(); it != servers.end(); ++it) {
+			if (it->second->Port() == port) {
+				to_destroy = std::move(it->second);
+				servers.erase(it);
+				break;
+			}
 		}
 	}
-	return false;
+	if (!to_destroy) {
+		return false;
+	}
+	// StopAccepting is socket-close only — safe from a request-handler worker.
+	to_destroy->StopAccepting();
+	// Full destruction (listener + worker-pool join) must run off any httplib
+	// worker thread, otherwise quackapi_stop() from inside a route self-joins.
+	std::thread([srv = std::move(to_destroy)]() mutable { srv.reset(); }).detach();
+	return true;
 }
 
 void QuackapiState::StopAllServers() {
-	std::lock_guard<std::mutex> lock(servers_mutex);
-	for (auto &kv : servers) {
-		kv.second->Close();
+	vector<unique_ptr<QuackapiHttpServer>> to_destroy;
+	{
+		std::lock_guard<std::mutex> lock(servers_mutex);
+		for (auto &kv : servers) {
+			to_destroy.push_back(std::move(kv.second));
+		}
+		servers.clear();
 	}
-	servers.clear();
+	for (auto &srv : to_destroy) {
+		if (srv) {
+			srv->StopAccepting();
+		}
+	}
+	for (auto &srv : to_destroy) {
+		std::thread([s = std::move(srv)]() mutable { s.reset(); }).detach();
+	}
 }
 
 vector<std::pair<string, int>> QuackapiState::ListServers() {

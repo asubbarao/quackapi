@@ -2,7 +2,9 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
 #include "quackapi_ddl.hpp"
@@ -180,7 +182,16 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 	string message;
 	if (bind_data.action == "CREATE") {
 		// Validate the handler SQL now so a broken route fails at CREATE time,
-		// not at first request.
+		// not at first request. Do this BEFORE mutating the registry so
+		// CREATE OR REPLACE does not leave a half-applied route on failure.
+		{
+			Connection con(*context.db);
+			auto prepared = con.Prepare(bind_data.route.handler_sql);
+			if (prepared->HasError()) {
+				throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name,
+				                            prepared->GetError());
+			}
+		}
 		state.AddRoute(bind_data.route, bind_data.or_replace);
 		message = StringUtil::Format("Route %s: %s %s", bind_data.route.name, bind_data.route.method,
 		                             bind_data.route.pattern);

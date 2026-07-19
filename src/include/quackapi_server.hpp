@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -17,6 +18,9 @@ struct Response;
 namespace duckdb {
 
 class DatabaseInstance;
+
+//! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
+static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 
 //! HTTP server that dispatches requests to routes in QuackapiState.
 //! Transport is DuckDB's bundled httplib, following the same listener-thread +
@@ -48,7 +52,7 @@ private:
 	int port;
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
-	bool is_running = false;
+	std::atomic<bool> is_running {false};
 };
 
 } // namespace duckdb

@@ -100,8 +100,11 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 // quackapi_routes() — inspect the route registry
 //===--------------------------------------------------------------------===//
 
-struct RoutesBindData : public TableFunctionData {
-	bool finished = false;
+struct RoutesBindData : public TableFunctionData {};
+
+struct RoutesGlobalState : public GlobalTableFunctionState {
+	vector<QuackapiRoute> routes;
+	idx_t offset = 0;
 };
 
 static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInput &,
@@ -119,31 +122,37 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	return make_uniq<RoutesBindData>();
 }
 
-static void RoutesExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->CastNoConst<RoutesBindData>();
-	if (bind_data.finished) {
-		return;
-	}
-	auto routes = QuackapiState::Get(*context.db).SnapshotRoutes();
+static unique_ptr<GlobalTableFunctionState> RoutesInit(ClientContext &context, TableFunctionInitInput &) {
+	auto state = make_uniq<RoutesGlobalState>();
+	state->routes = QuackapiState::Get(*context.db).SnapshotRoutes();
+	return std::move(state);
+}
+
+static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+	auto &state = data_p.global_state->Cast<RoutesGlobalState>();
 	idx_t row = 0;
-	for (auto &route : routes) {
+	while (state.offset < state.routes.size() && row < STANDARD_VECTOR_SIZE) {
+		auto &route = state.routes[state.offset];
 		output.SetValue(0, row, Value(route.name));
 		output.SetValue(1, row, Value(route.method));
 		output.SetValue(2, row, Value(route.pattern));
 		output.SetValue(3, row, Value::INTEGER(route.status));
 		output.SetValue(4, row, Value(route.handler_sql));
 		row++;
+		state.offset++;
 	}
 	output.SetCardinality(row);
-	bind_data.finished = true;
 }
 
 //===--------------------------------------------------------------------===//
 // quackapi_servers() — list running servers
 //===--------------------------------------------------------------------===//
 
-struct ServersBindData : public TableFunctionData {
-	bool finished = false;
+struct ServersBindData : public TableFunctionData {};
+
+struct ServersGlobalState : public GlobalTableFunctionState {
+	vector<std::pair<string, int>> servers;
+	idx_t offset = 0;
 };
 
 static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindInput &,
@@ -157,21 +166,24 @@ static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindIn
 	return make_uniq<ServersBindData>();
 }
 
-static void ServersExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->CastNoConst<ServersBindData>();
-	if (bind_data.finished) {
-		return;
-	}
-	auto servers = QuackapiState::Get(*context.db).ListServers();
+static unique_ptr<GlobalTableFunctionState> ServersInit(ClientContext &context, TableFunctionInitInput &) {
+	auto state = make_uniq<ServersGlobalState>();
+	state->servers = QuackapiState::Get(*context.db).ListServers();
+	return std::move(state);
+}
+
+static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+	auto &state = data_p.global_state->Cast<ServersGlobalState>();
 	idx_t row = 0;
-	for (auto &server : servers) {
+	while (state.offset < state.servers.size() && row < STANDARD_VECTOR_SIZE) {
+		auto &server = state.servers[state.offset];
 		output.SetValue(0, row, Value(server.first));
 		output.SetValue(1, row, Value::INTEGER(server.second));
 		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", server.first, server.second)));
 		row++;
+		state.offset++;
 	}
 	output.SetCardinality(row);
-	bind_data.finished = true;
 }
 
 //===--------------------------------------------------------------------===//
@@ -196,8 +208,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	stop_set.AddFunction(stop);
 	loader.RegisterFunction(stop_set);
 
-	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind));
-	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind));
+	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));
+	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind, ServersInit));
 
 	// CREATE ROUTE / DROP ROUTE syntax
 	auto &db = loader.GetDatabaseInstance();

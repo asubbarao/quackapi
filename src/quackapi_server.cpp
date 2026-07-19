@@ -178,6 +178,27 @@ void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
 	res.set_content(body, "application/json");
 }
 
+void SetInternalError(duckdb_httplib::Response &res, const string &server_side_detail) {
+	// Never leak SQL/relation/path text to clients; log full detail server-side.
+	fprintf(stderr, "quackapi: internal error: %s\n", server_side_detail.c_str());
+	SetJson(res, 500, "{\"detail\":\"Internal Server Error\"}");
+}
+
+//! True if `param_name` is a path-pattern capture (`:name` or `{name}`).
+bool IsPathParam(const string &pattern, const string &param_name) {
+	auto segments = SplitPath(pattern);
+	for (auto &ps : segments) {
+		if (!ps.empty() && ps[0] == ':' && ps.substr(1) == param_name) {
+			return true;
+		}
+		if (ps.size() >= 2 && ps.front() == '{' && ps.back() == '}' &&
+		    ps.substr(1, ps.size() - 2) == param_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p)
@@ -190,6 +211,8 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	server->set_keep_alive_max_count(128);
 	server->set_keep_alive_timeout(10);
 	server->set_tcp_nodelay(true);
+	// Cap request bodies to avoid unbounded memory DoS (httplib default is SIZE_MAX).
+	server->set_payload_max_length(QUACKAPI_PAYLOAD_MAX_LENGTH);
 
 	auto handler = [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 		HandleRequest(req, res);
@@ -205,7 +228,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	if (!server->is_valid()) {
 		throw IOException("quackapi: failed to instantiate HTTP server for %s:%d", host, port);
 	}
-	is_running = true;
+	is_running.store(true);
 
 	// Bind synchronously so EADDRINUSE etc. propagate to quackapi_serve()
 	if (!server->bind_to_port(host, port)) {
@@ -251,7 +274,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		Connection con(*db);
 		auto prepared = con.Prepare(match.route.handler_sql);
 		if (prepared->HasError()) {
-			SetJson(res, 500, "{\"detail\":\"" + JsonEscape(prepared->GetError()) + "\"}");
+			SetInternalError(res, prepared->GetError());
 			return;
 		}
 
@@ -272,7 +295,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			auto &param_name = entry.first;
 			auto it = provided.find(param_name);
 			if (it == provided.end()) {
-				SetJson(res, 422, ValidationErrorJson("query", param_name, "Field required", "missing"));
+				const char *loc_kind =
+				    IsPathParam(match.route.pattern, param_name) ? "path" : "query";
+				SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, "Field required", "missing"));
 				return;
 			}
 			Value raw_value(it->second.second);
@@ -298,9 +323,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		if (result->HasError()) {
 			auto &error = result->GetErrorObject();
 			if (error.Type() == ExceptionType::CONVERSION || error.Type() == ExceptionType::INVALID_INPUT) {
+				// Keep detailed FastAPI-shaped 422 for request-validation errors only.
 				SetJson(res, 422, ValidationErrorJson("query", "", error.RawMessage(), "type_error"));
 			} else {
-				SetJson(res, 500, "{\"detail\":\"" + JsonEscape(result->GetError()) + "\"}");
+				SetInternalError(res, result->GetError());
 			}
 			return;
 		}
@@ -332,9 +358,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		body += "]";
 		SetJson(res, match.route.status, body);
 	} catch (std::exception &ex) {
-		SetJson(res, 500, "{\"detail\":\"" + JsonEscape(ex.what()) + "\"}");
+		SetInternalError(res, ex.what());
 	} catch (...) {
-		SetJson(res, 500, "{\"detail\":\"Internal Server Error\"}");
+		SetInternalError(res, "unknown exception");
 	}
 }
 
@@ -344,14 +370,14 @@ void QuackapiHttpServer::ListenThread(QuackapiHttpServer *server) {
 	try {
 		server->server->listen_after_bind();
 	} catch (...) {
-		server->is_running = false;
+		server->is_running.store(false);
 	}
 }
 
 void QuackapiHttpServer::StopAccepting() {
-	if (is_running) {
+	// load/store: is_running is touched by ctor, listener, and stop threads.
+	if (is_running.exchange(false)) {
 		server->stop();
-		is_running = false;
 	}
 }
 
