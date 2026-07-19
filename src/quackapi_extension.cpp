@@ -7,6 +7,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
@@ -80,6 +81,24 @@ static void ComposeQuackAuthSettings(ClientContext &context) {
 	}
 }
 
+//! Apply resource guards recommended for production serve (valsafe HARDENING P1-2).
+//! Operators can raise memory_limit before/after serve if handlers need more.
+static void ApplyServeResourceGuards(ClientContext &context) {
+	try {
+		Connection con(*context.db);
+		// Cap memory so a single range()/hash join cannot OOM the host.
+		// DuckDB 1.5.4 has no statement_timeout; memory_limit is the main lever.
+		auto res = con.Query("SET memory_limit TO '256MB'");
+		if (res->HasError()) {
+			fprintf(stderr, "quackapi: could not SET memory_limit: %s\n", res->GetError().c_str());
+		}
+	} catch (std::exception &ex) {
+		fprintf(stderr, "quackapi: resource guard failed: %s\n", ex.what());
+	} catch (...) {
+		fprintf(stderr, "quackapi: resource guard failed: unknown exception\n");
+	}
+}
+
 static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->CastNoConst<ServeBindData>();
 	if (bind_data.finished) {
@@ -87,6 +106,8 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	}
 	// Compose with quack's auth settings when present (no-op if quack unloaded).
 	ComposeQuackAuthSettings(context);
+	// P1-2: default memory ceiling for the serve lifetime (override with SET).
+	ApplyServeResourceGuards(context);
 	// REST listener — justified by absence of a quack path-registration hook
 	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
 	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.

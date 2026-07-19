@@ -412,7 +412,20 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			// FastAPI-shaped 422 above. Any failure during Execute is a handler-side
 			// error — sanitize to 500 so SQL text, error(), and internal messages
 			// never reach clients (INVALID_INPUT would otherwise leak via 422).
-			SetInternalError(res, result->GetError());
+			// Exception: Conversion Errors often mean a param was bound as VARCHAR
+			// because DuckDB did not surface a concrete type (mixed $q + $n::INT).
+			// Map those to 422 without leaking SQL / cast details (valsafe P1-1).
+			auto err = result->GetError();
+			auto err_lower = StringUtil::Lower(err);
+			bool conversion = StringUtil::Contains(err_lower, "conversion error") ||
+			                  StringUtil::Contains(err_lower, "could not convert string");
+			if (conversion) {
+				fprintf(stderr, "quackapi: param conversion at execute: %s\n", err.c_str());
+				SetJson(res, 422,
+				        ValidationErrorJson("query", "_", "Invalid input for parameter type", "type_error"));
+			} else {
+				SetInternalError(res, err);
+			}
 			return;
 		}
 

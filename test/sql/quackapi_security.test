@@ -1,0 +1,76 @@
+# name: test/sql/quackapi_security.test
+# description: Valsafe hardening — mixed-param cast footgun routes stay creatable; 422 JSON shape
+# group: [quackapi]
+
+require quackapi
+
+require json
+
+# ---------------------------------------------------------------------------
+# Mixed untyped + cast params (the valsafe P1-1 footgun).
+# DuckDB reports $n as VARCHAR when mixed with untyped $q, so the pre-cast
+# path skips; Execute used to 500. After the conversion→422 fix, live HTTP
+# returns FastAPI-shaped 422. Registry-level: the route must still CREATE.
+# ---------------------------------------------------------------------------
+query I
+CREATE ROUTE mixed_cast GET '/mixed' AS SELECT $q AS q, $n::INTEGER AS n;
+----
+Route mixed_cast: GET /mixed
+
+query II
+SELECT name, method FROM quackapi_routes() WHERE name = 'mixed_cast';
+----
+mixed_cast	GET
+
+# Fully-cast variant (always 422 at pre-cast path, not Execute)
+query I
+CREATE ROUTE cast_all GET '/cast_all' AS SELECT $q::VARCHAR AS q, $n::INTEGER AS n;
+----
+Route cast_all: GET /cast_all
+
+# ---------------------------------------------------------------------------
+# FastAPI-shaped 422 detail JSON (network-free structural assertion).
+# Mirrors ValidationErrorJson("query", "_", "Invalid input for parameter type",
+# "type_error") used when Execute raises a Conversion Error.
+# ---------------------------------------------------------------------------
+query I
+SELECT '{"detail":[{"loc":["query","_"],"msg":"Invalid input for parameter type","type":"type_error"}]}' AS body;
+----
+{"detail":[{"loc":["query","_"],"msg":"Invalid input for parameter type","type":"type_error"}]}
+
+# Structural keys of a 422 body (same shape as live conversion path)
+query IIII
+SELECT
+  json_extract_string(j, '$.detail[0].loc[0]') AS loc0,
+  json_extract_string(j, '$.detail[0].loc[1]') AS loc1,
+  json_extract_string(j, '$.detail[0].msg') AS msg,
+  json_extract_string(j, '$.detail[0].type') AS err_type
+FROM (SELECT '{"detail":[{"loc":["query","_"],"msg":"Invalid input for parameter type","type":"type_error"}]}'::JSON AS j);
+----
+query	_	Invalid input for parameter type	type_error
+
+# Pre-cast type_error shape (fully typed param — same FastAPI envelope)
+query IIII
+SELECT
+  json_extract_string(j, '$.detail[0].loc[0]') AS loc0,
+  json_extract_string(j, '$.detail[0].loc[1]') AS loc1,
+  json_extract_string(j, '$.detail[0].msg') AS msg,
+  json_extract_string(j, '$.detail[0].type') AS err_type
+FROM (SELECT '{"detail":[{"loc":["query","n"],"msg":"Input should be a valid INTEGER","type":"type_error"}]}'::JSON AS j);
+----
+query	n	Input should be a valid INTEGER	type_error
+
+query I
+DROP ROUTE mixed_cast;
+----
+Dropped route mixed_cast
+
+query I
+DROP ROUTE cast_all;
+----
+Dropped route cast_all
+
+query I
+SELECT count(*) FROM quackapi_routes();
+----
+0
