@@ -55,6 +55,37 @@ vector<QuackapiRoute> QuackapiState::SnapshotRoutes() {
 	return routes;
 }
 
+void QuackapiState::AddStream(const QuackapiStream &stream, bool or_replace) {
+	std::lock_guard<std::mutex> lock(streams_mutex);
+	for (auto it = streams.begin(); it != streams.end(); ++it) {
+		if (it->name == stream.name) {
+			if (!or_replace) {
+				throw InvalidInputException("Stream \"%s\" already exists — use CREATE OR REPLACE STREAM",
+				                            stream.name);
+			}
+			*it = stream;
+			return;
+		}
+	}
+	streams.push_back(stream);
+}
+
+bool QuackapiState::DropStream(const string &name) {
+	std::lock_guard<std::mutex> lock(streams_mutex);
+	for (auto it = streams.begin(); it != streams.end(); ++it) {
+		if (it->name == name) {
+			streams.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiStream> QuackapiState::SnapshotStreams() {
+	std::lock_guard<std::mutex> lock(streams_mutex);
+	return streams;
+}
+
 void QuackapiState::AddAuth(const QuackapiAuth &auth, bool or_replace) {
 	std::lock_guard<std::mutex> lock(auths_mutex);
 	for (auto it = auths.begin(); it != auths.end(); ++it) {
