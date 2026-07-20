@@ -15,6 +15,7 @@
 
 #include "quackapi_auth.hpp"
 #include "quackapi_openapi.hpp"
+#include "quackapi_policy.hpp"
 #include "quackapi_state.hpp"
 
 #include "httplib.hpp"
@@ -1030,9 +1031,22 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 	// auth_result.claims is ready for $claims_<k> binding below.
 
+	// ---- ROW ACCESS + MASKING (claims-keyed policies on tables) ----
+	// When the handler references a table with RAP/masking bindings, wrap
+	// table refs as secure subqueries. Unauthenticated requests fail closed.
+	bool authenticated = !match.route.require_auth.empty() && auth_result.ok;
+	bool deny_unauth = false;
+	string handler_sql =
+	    RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth);
+	if (deny_unauth) {
+		SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
+		finish();
+		return;
+	}
+
 	try {
 		Connection con(*db);
-		auto prepared = con.Prepare(match.route.handler_sql);
+		auto prepared = con.Prepare(handler_sql);
 		if (prepared->HasError()) {
 			SetInternalError(res, prepared->GetError());
 			finish();

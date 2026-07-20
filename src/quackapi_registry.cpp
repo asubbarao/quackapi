@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -223,6 +224,214 @@ vector<std::pair<string, int>> QuackapiState::ListServers() {
 		result.emplace_back(kv.second->Host(), kv.second->Port());
 	}
 	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Row access + masking policies
+//===--------------------------------------------------------------------===//
+
+void QuackapiState::AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	for (auto it = row_access_policies.begin(); it != row_access_policies.end(); ++it) {
+		if (it->name == policy.name) {
+			if (!or_replace) {
+				throw InvalidInputException(
+				    "Row access policy \"%s\" already exists — use CREATE OR REPLACE ROW ACCESS POLICY", policy.name);
+			}
+			*it = policy;
+			return;
+		}
+	}
+	// Name must not collide with a masking policy.
+	for (auto &m : masking_policies) {
+		if (m.name == policy.name) {
+			throw InvalidInputException("Policy name \"%s\" is already used by a masking policy", policy.name);
+		}
+	}
+	row_access_policies.push_back(policy);
+}
+
+bool QuackapiState::DropRowAccessPolicy(const string &name) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	bool found = false;
+	for (auto it = row_access_policies.begin(); it != row_access_policies.end(); ++it) {
+		if (it->name == name) {
+			row_access_policies.erase(it);
+			found = true;
+			break;
+		}
+	}
+	if (found) {
+		row_access_bindings.erase(std::remove_if(row_access_bindings.begin(), row_access_bindings.end(),
+		                                         [&](const QuackapiRowAccessBinding &b) {
+			                                         return b.policy_name == name;
+		                                         }),
+		                          row_access_bindings.end());
+	}
+	return found;
+}
+
+bool QuackapiState::GetRowAccessPolicy(const string &name, QuackapiRowAccessPolicy &out) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	for (auto &p : row_access_policies) {
+		if (p.name == name) {
+			out = p;
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiRowAccessPolicy> QuackapiState::SnapshotRowAccessPolicies() {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	return row_access_policies;
+}
+
+void QuackapiState::AddMaskingPolicy(const QuackapiMaskingPolicy &policy, bool or_replace) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	for (auto it = masking_policies.begin(); it != masking_policies.end(); ++it) {
+		if (it->name == policy.name) {
+			if (!or_replace) {
+				throw InvalidInputException(
+				    "Masking policy \"%s\" already exists — use CREATE OR REPLACE MASKING POLICY", policy.name);
+			}
+			*it = policy;
+			return;
+		}
+	}
+	for (auto &r : row_access_policies) {
+		if (r.name == policy.name) {
+			throw InvalidInputException("Policy name \"%s\" is already used by a row access policy", policy.name);
+		}
+	}
+	masking_policies.push_back(policy);
+}
+
+bool QuackapiState::DropMaskingPolicy(const string &name) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	bool found = false;
+	for (auto it = masking_policies.begin(); it != masking_policies.end(); ++it) {
+		if (it->name == name) {
+			masking_policies.erase(it);
+			found = true;
+			break;
+		}
+	}
+	if (found) {
+		masking_bindings.erase(std::remove_if(masking_bindings.begin(), masking_bindings.end(),
+		                                      [&](const QuackapiMaskingBinding &b) { return b.policy_name == name; }),
+		                       masking_bindings.end());
+	}
+	return found;
+}
+
+bool QuackapiState::GetMaskingPolicy(const string &name, QuackapiMaskingPolicy &out) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	for (auto &p : masking_policies) {
+		if (p.name == name) {
+			out = p;
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiMaskingPolicy> QuackapiState::SnapshotMaskingPolicies() {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	return masking_policies;
+}
+
+void QuackapiState::BindRowAccessPolicy(const QuackapiRowAccessBinding &binding, bool or_replace) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	const QuackapiRowAccessPolicy *pol = nullptr;
+	for (auto &p : row_access_policies) {
+		if (p.name == binding.policy_name) {
+			pol = &p;
+			break;
+		}
+	}
+	if (!pol) {
+		throw InvalidInputException("Row access policy \"%s\" does not exist", binding.policy_name);
+	}
+	if (binding.columns.size() != pol->arg_columns.size()) {
+		throw InvalidInputException(
+		    "Row access policy \"%s\" expects %llu column(s), got %llu", binding.policy_name,
+		    (unsigned long long)pol->arg_columns.size(), (unsigned long long)binding.columns.size());
+	}
+	// One RAP per table (replace same policy name, or or_replace any).
+	for (auto it = row_access_bindings.begin(); it != row_access_bindings.end(); ++it) {
+		if (StringUtil::Lower(it->table_name) == StringUtil::Lower(binding.table_name)) {
+			if (it->policy_name == binding.policy_name || or_replace) {
+				*it = binding;
+				return;
+			}
+			throw InvalidInputException(
+			    "Table \"%s\" already has row access policy \"%s\" — DROP it first or use OR REPLACE",
+			    binding.table_name, it->policy_name);
+		}
+	}
+	row_access_bindings.push_back(binding);
+}
+
+bool QuackapiState::UnbindRowAccessPolicy(const string &table_name, const string &policy_name) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	for (auto it = row_access_bindings.begin(); it != row_access_bindings.end(); ++it) {
+		if (StringUtil::Lower(it->table_name) == StringUtil::Lower(table_name) &&
+		    (policy_name.empty() || it->policy_name == policy_name)) {
+			row_access_bindings.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiRowAccessBinding> QuackapiState::SnapshotRowAccessBindings() {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	return row_access_bindings;
+}
+
+void QuackapiState::BindMaskingPolicy(const QuackapiMaskingBinding &binding, bool or_replace) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	bool found = false;
+	for (auto &p : masking_policies) {
+		if (p.name == binding.policy_name) {
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		throw InvalidInputException("Masking policy \"%s\" does not exist", binding.policy_name);
+	}
+	for (auto it = masking_bindings.begin(); it != masking_bindings.end(); ++it) {
+		if (StringUtil::Lower(it->table_name) == StringUtil::Lower(binding.table_name) &&
+		    StringUtil::Lower(it->column_name) == StringUtil::Lower(binding.column_name)) {
+			if (!or_replace && it->policy_name != binding.policy_name) {
+				throw InvalidInputException(
+				    "Column \"%s\".\"%s\" already has masking policy \"%s\"", binding.table_name, binding.column_name,
+				    it->policy_name);
+			}
+			*it = binding;
+			return;
+		}
+	}
+	masking_bindings.push_back(binding);
+}
+
+bool QuackapiState::UnbindMaskingPolicy(const string &table_name, const string &column_name) {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	for (auto it = masking_bindings.begin(); it != masking_bindings.end(); ++it) {
+		if (StringUtil::Lower(it->table_name) == StringUtil::Lower(table_name) &&
+		    StringUtil::Lower(it->column_name) == StringUtil::Lower(column_name)) {
+			masking_bindings.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiMaskingBinding> QuackapiState::SnapshotMaskingBindings() {
+	std::lock_guard<std::mutex> lock(policies_mutex);
+	return masking_bindings;
 }
 
 } // namespace duckdb

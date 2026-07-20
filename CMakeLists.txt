@@ -22,6 +22,7 @@ set(EXTENSION_SOURCES
     src/quackapi_http_fetch.cpp
     src/quackapi_table_api.cpp
     src/quackapi_openapi.cpp
+    src/quackapi_policy.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
