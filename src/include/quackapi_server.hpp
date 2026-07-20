@@ -42,9 +42,12 @@ enum class QuackapiLogLevel : uint8_t {
 	DEBUG = 4,
 };
 
-//! Serve options (static files, CORS, batteries-included server defaults).
-//! Defaults are correct-by-default for a server process: logging on, health
-//! routes on, throughput-oriented DuckDB SETs applied at serve time.
+//! Serve options (static files, CORS, batteries-included server defaults,
+//! response compression). Defaults are correct-by-default for a server
+//! process: logging on, health routes on, throughput-oriented DuckDB SETs
+//! applied at serve time, and Accept-Encoding compression on (zstd preferred,
+//! then gzip). CORS stays off (browser cross-origin blocked) until the
+//! operator opts in with cors_origins.
 struct QuackapiServeOptions {
 	string static_dir;
 	//! Empty = CORS disabled. "*" = reflect any Origin (or * when no Origin).
@@ -87,6 +90,12 @@ struct QuackapiServeOptions {
 
 	//! Filled at serve after probing community tsid: "tsid" or "uuidv7".
 	string request_id_source;
+
+	// --- Compression (ON by default) ---
+	//! When true (default), honor Accept-Encoding: prefer zstd, then gzip.
+	bool compression = true;
+	//! Bodies smaller than this many bytes are left uncompressed (default 256).
+	idx_t compression_min_bytes = 256;
 };
 
 //! Parse log_level named param / setting. Accepts silent|error|warn|info|debug
@@ -144,6 +153,7 @@ private:
 	string NextRequestId(DatabaseInstance &db);
 	void EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
 	                   const string &request_id, double latency_ms);
+	void MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
 	weak_ptr<DatabaseInstance> db_ptr;
 	string host;
@@ -151,6 +161,8 @@ private:
 	string cors_origins;
 	QuackapiServeOptions options;
 	std::chrono::steady_clock::time_point started_at;
+	bool compression = true;
+	idx_t compression_min_bytes = 256;
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};

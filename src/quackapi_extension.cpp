@@ -50,6 +50,10 @@ struct ServeBindData : public TableFunctionData {
 	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
 	int32_t read_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	int32_t write_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
+	//! Response compression (Accept-Encoding). Default true.
+	bool compression = true;
+	//! Min body size in bytes before compression. Default 256.
+	idx_t compression_min_bytes = 256;
 	bool finished = false;
 };
 
@@ -153,6 +157,34 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	if (wrt_entry != input.named_parameters.end()) {
 		bind_data->write_timeout_sec = wrt_entry->second.GetValue<int32_t>();
 	}
+	// compression named param wins; else SET quackapi_compression (default true).
+	auto comp_entry = input.named_parameters.find("compression");
+	if (comp_entry != input.named_parameters.end()) {
+		bind_data->compression = comp_entry->second.GetValue<bool>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_compression", setting) && !setting.IsNull()) {
+			bind_data->compression = setting.GetValue<bool>();
+		}
+	}
+	// compression_min_bytes named param wins; else SET (default 256).
+	auto min_entry = input.named_parameters.find("compression_min_bytes");
+	if (min_entry != input.named_parameters.end()) {
+		auto v = min_entry->second.GetValue<int64_t>();
+		if (v < 0) {
+			throw InvalidInputException("quackapi_serve: compression_min_bytes must be >= 0");
+		}
+		bind_data->compression_min_bytes = static_cast<idx_t>(v);
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_compression_min_bytes", setting) && !setting.IsNull()) {
+			auto v = setting.GetValue<int64_t>();
+			if (v < 0) {
+				throw InvalidInputException("quackapi_serve: compression_min_bytes must be >= 0");
+			}
+			bind_data->compression_min_bytes = static_cast<idx_t>(v);
+		}
+	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
 	return std::move(bind_data);
@@ -220,6 +252,8 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	// REST listener — justified by absence of a quack path-registration hook
 	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
 	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.
+	opts.compression = bind_data.compression;
+	opts.compression_min_bytes = bind_data.compression_min_bytes;
 	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, opts);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
 	output.SetCardinality(1);
@@ -404,9 +438,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Log verbosity for quackapi_serve: silent|error|warn|info|debug. "
 	                          "Default info. Overridden by log_level named parameter.",
 	                          LogicalType::VARCHAR, Value("info"));
+	// SET quackapi_compression = true|false — response compression (zstd/gzip).
+	// Default true. Serve-time compression := false opts out.
+	config.AddExtensionOption("quackapi_compression",
+	                          "Enable Accept-Encoding response compression on quackapi_serve "
+	                          "(zstd preferred, then gzip). Default true. Overridden by "
+	                          "compression named parameter.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	// SET quackapi_compression_min_bytes = N — skip compression under this size.
+	config.AddExtensionOption("quackapi_compression_min_bytes",
+	                          "Minimum response body size (bytes) before compression. "
+	                          "Default 256. Overridden by compression_min_bytes named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(256));
 
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
+	// Also carries compression + compression_min_bytes.
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
@@ -425,6 +472,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["keep_alive_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["read_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
+	serve.named_parameters["compression"] = LogicalType::BOOLEAN;
+	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);

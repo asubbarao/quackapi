@@ -63,6 +63,23 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
 target_link_libraries(${EXTENSION_NAME} duckdb_mbedtls)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mbedtls)
 
+# Response compression: DuckDB-bundled zstd + miniz (gzip). NO new dependencies.
+# Citations (verified in this tree / upstream):
+#   duckdb/third_party/zstd/CMakeLists.txt → add_library(duckdb_zstd STATIC …)
+#   duckdb/third_party/miniz/CMakeLists.txt → add_library(duckdb_miniz STATIC …)
+#   duckdb/CMakeLists.txt → include_directories(third_party/zstd/include)
+#                         → include_directories(third_party/miniz)
+#                         → add_third_party(zstd) / add_third_party(miniz)
+#   parquet column_reader.cpp uses duckdb_zstd::ZSTD_* and MiniZStream (gzip)
+target_include_directories(${EXTENSION_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/zstd/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
+target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/zstd/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
+target_link_libraries(${EXTENSION_NAME} duckdb_zstd duckdb_miniz)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_zstd duckdb_miniz)
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"
