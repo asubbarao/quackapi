@@ -1,0 +1,106 @@
+# name: test/sql/quackapi_stream.test
+# description: CREATE STREAM / DROP STREAM DDL, quackapi_streams(), SSE registry
+# group: [quackapi]
+
+require quackapi
+
+# Registry starts empty
+query I
+SELECT count(*) FROM quackapi_streams();
+----
+0
+
+# CREATE STREAM registers an SSE endpoint
+query I
+CREATE STREAM ticks GET '/ticks' AS SELECT i AS id, 'tick' AS msg FROM range(3) t(i);
+----
+Stream ticks: GET /ticks SSE
+
+query IIIII
+SELECT name, method, pattern, transport, interval_ms FROM quackapi_streams();
+----
+ticks	GET	/ticks	sse	0
+
+# Handler SQL is retained
+query I
+SELECT handler LIKE '%range(3)%' FROM quackapi_streams() WHERE name = 'ticks';
+----
+true
+
+# WITH (interval=…) stores polling interval in ms (1s → 1000)
+query I
+CREATE STREAM live GET '/live' WITH (interval='1s') AS SELECT now() AS ts;
+----
+Stream live: GET /live SSE interval=1000ms
+
+query II
+SELECT name, interval_ms FROM quackapi_streams() WHERE name = 'live';
+----
+live	1000
+
+# Bare number = seconds
+query I
+CREATE OR REPLACE STREAM live GET '/live' WITH (interval=2) AS SELECT 1 AS n;
+----
+Stream live: GET /live SSE interval=2000ms
+
+query I
+SELECT interval_ms FROM quackapi_streams() WHERE name = 'live';
+----
+2000
+
+# Milliseconds unit
+query I
+CREATE OR REPLACE STREAM live GET '/live' WITH (interval='250ms') AS SELECT 1 AS n;
+----
+Stream live: GET /live SSE interval=250ms
+
+# Duplicate without OR REPLACE errors
+statement error
+CREATE STREAM ticks GET '/other' AS SELECT 1;
+----
+already exists
+
+# WebSocket method is rejected (httplib has no WS server)
+statement error
+CREATE STREAM chat WS '/ws' AS SELECT 1;
+----
+WebSocket is not supported
+
+# Path must start with /
+statement error
+CREATE STREAM bad GET 'nope' AS SELECT 1;
+----
+must start with '/'
+
+# Streams do not pollute quackapi_routes()
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name IN ('ticks', 'live');
+----
+0
+
+# DROP STREAM
+query I
+DROP STREAM ticks;
+----
+Dropped stream ticks
+
+query I
+SELECT count(*) FROM quackapi_streams();
+----
+1
+
+statement error
+DROP STREAM nope;
+----
+does not exist
+
+query I
+DROP STREAM live;
+----
+Dropped stream live
+
+query I
+SELECT count(*) FROM quackapi_streams();
+----
+0

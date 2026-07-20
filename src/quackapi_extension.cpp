@@ -20,6 +20,7 @@
 #include "quackapi_policy.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
+#include "quackapi_stream.hpp"
 #include "quackapi_table_api.hpp"
 
 namespace duckdb {
@@ -326,6 +327,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quack_nop_authorization so they can be SET as quack_*_function.
 	RegisterQuackAuthBridgeFunctions(loader);
 
+	// CREATE STREAM + quackapi_streams() (SSE push; WS deferred on httplib).
+	RegisterQuackapiStreamFunctions(loader);
+
 	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
@@ -334,13 +338,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Backing store is the plain quackapi_jobs table; worker = compose cronjob.
 	RegisterQuackapiQueueFunctions(loader);
 
-	// CREATE ROUTE / DROP ROUTE and CREATE AUTH / DROP AUTH / CREATE QUEUE syntax
+	// CREATE ROUTE / DROP ROUTE and CREATE AUTH / DROP AUTH / CREATE QUEUE /
+	// CREATE POLICY / CREATE STREAM syntax — all nouns registered.
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(QueueDdlParserExtension());
 	// CREATE ROW ACCESS / MASKING POLICY + ALTER TABLE policy bind
 	ExtensionCallbackManager::Get(db).Register(PolicyDdlParserExtension());
+	// CREATE STREAM (SSE)
+	ExtensionCallbackManager::Get(db).Register(StreamDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

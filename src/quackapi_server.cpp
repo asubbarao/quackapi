@@ -1,9 +1,12 @@
 #include "quackapi_server.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <thread>
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -489,6 +492,41 @@ struct RouteMatch {
 	vector<std::pair<string, string>> path_params;
 };
 
+struct StreamMatch {
+	bool matched = false;
+	QuackapiStream stream;
+	vector<std::pair<string, string>> path_params;
+};
+
+//! Format one SSE event from a result row. Includes `id:` when a column named
+//! `id` (case-insensitive) is present and non-null.
+string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
+	string event;
+	idx_t id_col = names.size();
+	for (idx_t c = 0; c < names.size(); c++) {
+		if (StringUtil::Lower(names[c]) == "id") {
+			id_col = c;
+			break;
+		}
+	}
+	if (id_col < cols.size() && !cols[id_col].IsNull()) {
+		event += "id: ";
+		event += cols[id_col].ToString();
+		event += "\n";
+	}
+	event += "data: {";
+	bool first = true;
+	for (idx_t c = 0; c < names.size() && c < cols.size(); c++) {
+		if (!first) {
+			event += ",";
+		}
+		first = false;
+		event += "\"" + JsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
+	}
+	event += "}\n\n";
+	return event;
+}
+
 vector<string> SplitPath(const string &path) {
 	vector<string> segments;
 	string current;
@@ -892,10 +930,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	// Find a route: method + pattern. Collect methods for Allow on 405.
 	// HEAD automatically matches GET when no explicit HEAD route exists.
+	// Streams (CREATE STREAM) are matched the same way; ordinary routes win
+	// when both register the same path+method.
 	RouteMatch match;
+	StreamMatch stream_match;
 	bool path_matched_other_method = false;
 	vector<string> methods_for_path;
-	auto routes = QuackapiState::Get(*db).SnapshotRoutes();
+	auto &qa_state = QuackapiState::Get(*db);
+	auto routes = qa_state.SnapshotRoutes();
+	auto streams = qa_state.SnapshotStreams();
 	for (auto &route : routes) {
 		vector<std::pair<string, string>> captures;
 		if (MatchPattern(route.pattern, req.path, captures)) {
@@ -913,8 +956,27 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 	}
-	// Auto-HEAD: if HEAD and no explicit HEAD route, reuse the GET handler.
-	if (!match.matched && req.method == "HEAD") {
+	for (auto &stream : streams) {
+		vector<std::pair<string, string>> captures;
+		if (MatchPattern(stream.pattern, req.path, captures)) {
+			if (!MethodListContains(methods_for_path, stream.method)) {
+				methods_for_path.push_back(stream.method);
+			}
+			if (stream.method == req.method) {
+				// Only take the stream if no ordinary route already matched.
+				if (!match.matched && !stream_match.matched) {
+					stream_match.matched = true;
+					stream_match.stream = stream;
+					stream_match.path_params = std::move(captures);
+				}
+			} else if (!match.matched && !stream_match.matched) {
+				path_matched_other_method = true;
+			}
+		}
+	}
+	// Auto-HEAD: if HEAD and no explicit HEAD route, reuse the GET handler
+	// (routes first, then streams).
+	if (!match.matched && !stream_match.matched && req.method == "HEAD") {
 		for (auto &route : routes) {
 			vector<std::pair<string, string>> captures;
 			if (MatchPattern(route.pattern, req.path, captures) && route.method == "GET") {
@@ -925,6 +987,20 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					methods_for_path.push_back("HEAD");
 				}
 				break;
+			}
+		}
+		if (!match.matched) {
+			for (auto &stream : streams) {
+				vector<std::pair<string, string>> captures;
+				if (MatchPattern(stream.pattern, req.path, captures) && stream.method == "GET") {
+					stream_match.matched = true;
+					stream_match.stream = stream;
+					stream_match.path_params = std::move(captures);
+					if (!MethodListContains(methods_for_path, "HEAD")) {
+						methods_for_path.push_back("HEAD");
+					}
+					break;
+				}
 			}
 		}
 	}
@@ -960,9 +1036,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		return;
 	}
 
-	if (!match.matched) {
+	if (!match.matched && !stream_match.matched) {
 		// Starlette redirect_slashes: if the alternate trailing-slash form would
-		// match a registered route, 307 to that path (preserve query string).
+		// match a registered route or stream, 307 to that path (preserve query).
 		// Built-in docs paths already accept both forms above.
 		if (!path_matched_other_method && methods_for_path.empty() && req.path != "/") {
 			string alt_path;
@@ -980,6 +1056,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				// Any method registration is enough to redirect (Starlette).
 				alt_matches = true;
 				break;
+			}
+			if (!alt_matches) {
+				for (auto &stream : streams) {
+					vector<std::pair<string, string>> captures;
+					if (MatchPattern(stream.pattern, alt_path, captures)) {
+						alt_matches = true;
+						break;
+					}
+				}
 			}
 			if (alt_matches) {
 				string location = alt_path;
@@ -1010,6 +1095,208 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		finish();
 		return;
+	}
+
+	// ---- CREATE STREAM (SSE) path — no auth schemes on streams in v1 ----
+	if (!match.matched && stream_match.matched) {
+		try {
+			auto headers = CollectHeaders(req);
+			// HEAD: headers only — do not install a long-lived provider.
+			if (req.method == "HEAD") {
+				res.status = 200;
+				res.set_header("Content-Type", "text/event-stream");
+				res.set_header("Cache-Control", "no-cache");
+				res.set_header("X-Accel-Buffering", "no");
+				res.body.clear();
+				finish();
+				return;
+			}
+
+			// Bind path + query (+ Last-Event-ID → $last_id) before installing provider.
+			auto con = make_shared_ptr<Connection>(*db);
+			auto prepared = con->Prepare(stream_match.stream.handler_sql);
+			if (prepared->HasError()) {
+				SetInternalError(res, prepared->GetError());
+				finish();
+				return;
+			}
+
+			case_insensitive_map_t<string> provided;
+			for (auto &kv : req.params) {
+				provided[kv.first] = kv.second;
+			}
+			for (auto &kv : stream_match.path_params) {
+				provided[kv.first] = kv.second;
+			}
+			// Last-Event-ID header → last_id (query ?last_id= wins if both set).
+			if (provided.find("last_id") == provided.end()) {
+				string last_event_id;
+				if (FindHeaderValue(headers, "Last-Event-ID", last_event_id) && !last_event_id.empty()) {
+					provided["last_id"] = last_event_id;
+				}
+			}
+
+			auto expected_types = prepared->GetExpectedParameterTypes();
+			case_insensitive_map_t<BoundParameterData> named_values;
+			for (auto &entry : prepared->named_param_map) {
+				auto &param_name = entry.first;
+				auto type_it = expected_types.find(param_name);
+				LogicalType expected = LogicalType::UNKNOWN;
+				if (type_it != expected_types.end()) {
+					expected = type_it->second;
+				}
+				auto it = provided.find(param_name);
+				if (it == provided.end()) {
+					// Optional last_id: missing → SQL NULL so WHERE id > $last_id works with COALESCE.
+					if (param_name == "last_id") {
+						named_values[param_name] = BoundParameterData(Value());
+						continue;
+					}
+					string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
+					SetJson(res, 422, ValidationErrorJson(loc, param_name, "Field required", "missing"));
+					finish();
+					return;
+				}
+				string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
+				BoundParameterData bound;
+				string err_json;
+				if (!BindParamValue(it->second, expected, loc, param_name, bound, err_json)) {
+					SetJson(res, 422, err_json);
+					finish();
+					return;
+				}
+				named_values[param_name] = bound;
+			}
+
+			// Prove the first execute works before committing to chunked transfer.
+			{
+				auto probe = prepared->Execute(named_values, true);
+				if (probe->HasError()) {
+					SetInternalError(res, probe->GetError());
+					finish();
+					return;
+				}
+				// Drop probe; provider re-executes so the client sees a clean stream.
+			}
+
+			struct SseProviderState {
+				shared_ptr<Connection> con;
+				string handler_sql;
+				case_insensitive_map_t<BoundParameterData> named_values;
+				int64_t interval_ms = 0;
+				unique_ptr<PreparedStatement> prepared;
+				unique_ptr<QueryResult> result;
+				bool need_execute = true;
+				bool closed = false;
+			};
+			auto state = make_shared_ptr<SseProviderState>();
+			state->con = con;
+			state->handler_sql = stream_match.stream.handler_sql;
+			state->named_values = std::move(named_values);
+			state->interval_ms = stream_match.stream.interval_ms;
+			// Re-prepare owned by provider state (original prepared is local).
+			state->prepared = state->con->Prepare(state->handler_sql);
+			if (state->prepared->HasError()) {
+				SetInternalError(res, state->prepared->GetError());
+				finish();
+				return;
+			}
+
+			res.status = 200;
+			res.set_header("Cache-Control", "no-cache");
+			res.set_header("X-Accel-Buffering", "no");
+			// CORS before provider install — headers already on res when provider runs.
+			ApplyCorsHeaders(req, res);
+
+			res.set_chunked_content_provider(
+			    "text/event-stream",
+			    [state](size_t /*offset*/, duckdb_httplib::DataSink &sink) -> bool {
+				    if (state->closed) {
+					    sink.done();
+					    return true;
+				    }
+				    try {
+					    if (state->need_execute) {
+						    state->result = state->prepared->Execute(state->named_values, true);
+						    if (state->result->HasError()) {
+							    fprintf(stderr, "quackapi stream execute error: %s\n",
+							            state->result->GetError().c_str());
+							    state->closed = true;
+							    return false;
+						    }
+						    state->need_execute = false;
+					    }
+
+					    auto chunk = state->result->Fetch();
+					    if (!chunk || chunk->size() == 0) {
+						    state->result.reset();
+						    if (state->interval_ms <= 0) {
+							    state->closed = true;
+							    sink.done();
+							    return true;
+						    }
+						    // Polling interval: sleep then re-run SELECT (compose cron-style).
+						    // Split sleep so disconnect can surface via write fail next loop.
+						    auto remaining = state->interval_ms;
+						    while (remaining > 0) {
+							    auto step = remaining > 100 ? 100 : remaining;
+							    std::this_thread::sleep_for(std::chrono::milliseconds(step));
+							    remaining -= step;
+							    if (!sink.is_writable()) {
+								    state->closed = true;
+								    return false;
+							    }
+						    }
+						    state->need_execute = true;
+						    return true;
+					    }
+
+					    auto &names = state->result->names;
+					    string buf;
+					    for (idx_t row = 0; row < chunk->size(); row++) {
+						    vector<Value> cols(chunk->ColumnCount());
+						    for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+							    cols[col] = chunk->GetValue(col, row);
+						    }
+						    buf += FormatSseEvent(names, cols);
+					    }
+					    if (!buf.empty() && !sink.write(buf.data(), buf.size())) {
+						    state->closed = true;
+						    return false;
+					    }
+					    return true;
+				    } catch (std::exception &ex) {
+					    fprintf(stderr, "quackapi stream provider exception: %s\n", ex.what());
+					    state->closed = true;
+					    return false;
+				    } catch (...) {
+					    fprintf(stderr, "quackapi stream provider: unknown exception\n");
+					    state->closed = true;
+					    return false;
+				    }
+			    },
+			    [state](bool /*success*/) {
+				    try {
+					    if (state->con) {
+						    state->con->Interrupt();
+					    }
+				    } catch (...) {
+				    }
+				    state->result.reset();
+				    state->prepared.reset();
+				    state->closed = true;
+			    });
+			// Do not call finish() again — CORS already applied; provider owns body.
+			return;
+		} catch (std::exception &ex) {
+			SetInternalError(res, ex.what());
+			finish();
+			return;
+		} catch (...) {
+			SetInternalError(res, "unknown exception");
+			finish();
+			return;
+		}
 	}
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
