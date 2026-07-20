@@ -1059,9 +1059,13 @@ void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, du
 
 	string allow_origin;
 	if (cors_origins == "*") {
-		// When credentials are not used, * is fine; if a specific Origin was
-		// sent, echo it so browser clients with credentials still work.
-		allow_origin = origin.empty() ? "*" : origin;
+		// Emit the literal wildcard — never echo the request Origin (including
+		// the literal string "null", sent by browsers for file://, sandboxed
+		// iframes, and opaque origins). Echoing turns a same-value-for-everyone
+		// wildcard into an attacker-controlled reflection, which browsers will
+		// also reject combined with credentialed requests anyway (fuzz catalog
+		// P0-sec "CORS cors_origins='*' reflects any Origin incl. null").
+		allow_origin = "*";
 	} else {
 		// Comma-separated allow-list (trim whitespace per entry).
 		auto parts = StringUtil::Split(cors_origins, ',');

@@ -163,8 +163,11 @@ bool QuackapiState::DropAuth(const string &name) {
 
 bool QuackapiState::GetAuth(const string &name, QuackapiAuth &out) {
 	std::lock_guard<std::mutex> lock(auths_mutex);
+	// Case-insensitive lookup: REQUIRE <scheme> must resolve regardless of the
+	// case used at CREATE AUTH time or in the route DDL — a mismatch here must
+	// never surface as a 500 (fuzz catalog P1 "wrong-case REQUIRE name").
 	for (auto &auth : auths) {
-		if (auth.name == name) {
+		if (StringUtil::CIEquals(auth.name, name)) {
 			out = auth;
 			return true;
 		}

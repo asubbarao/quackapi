@@ -381,6 +381,18 @@ QuackapiAuthResult Fail500(const string &detail) {
 	return r;
 }
 
+//! Fail-closed for a REQUIRE clause that names an auth scheme not present in
+//! the registry (missing entirely, or present under a different case). This
+//! is client-reachable via any route's REQUIRE — it must never surface as a
+//! 500 with the scheme name / internal registry state in the body (fuzz
+//! catalog P1 "missing/wrong-case REQUIRE auth scheme"). Every unauthenticated
+//! request is rejected exactly as if credentials were absent; the scheme name
+//! is deliberately omitted so the response looks identical to an ordinary
+//! auth failure rather than advertising server misconfiguration.
+QuackapiAuthResult FailClosedUnconfiguredScheme() {
+	return Fail401("Not authenticated");
+}
+
 bool ExtractBearer(const string &authorization, string &token) {
 	// "Bearer <token>" — case-insensitive scheme.
 	if (authorization.size() < 7) {
@@ -473,7 +485,9 @@ bool VerifyJwtHs256(const string &token, const string &secret, unordered_map<str
 		return false;
 	}
 
-	// exp check if present (numeric unix seconds)
+	// exp check if present (numeric unix seconds). RFC 7519 §4.1.4: the current
+	// time MUST be before exp — reject exp == now, not just exp < now (fuzz
+	// catalog P1 "exp == now accepted").
 	auto exp_it = claims.find("exp");
 	if (exp_it != claims.end()) {
 		// payload numbers are stored as literal text
@@ -485,7 +499,29 @@ bool VerifyJwtHs256(const string &token, const string &secret, unordered_map<str
 				error_detail = "Invalid authentication credentials";
 				return false;
 			}
-			if (exp_val < NowEpochSeconds()) {
+			if (exp_val <= NowEpochSeconds()) {
+				error_detail = "Invalid authentication credentials";
+				return false;
+			}
+		} catch (...) {
+			error_detail = "Invalid authentication credentials";
+			return false;
+		}
+	}
+
+	// nbf check if present (numeric unix seconds). RFC 7519 §4.1.5: the token
+	// MUST NOT be accepted before nbf. Previously ignored entirely — a future
+	// nbf claim was accepted (fuzz catalog P0-sec "JWT nbf ignored").
+	auto nbf_it = claims.find("nbf");
+	if (nbf_it != claims.end()) {
+		try {
+			size_t consumed = 0;
+			long long nbf_val = std::stoll(nbf_it->second, &consumed);
+			if (consumed != nbf_it->second.size()) {
+				error_detail = "Invalid authentication credentials";
+				return false;
+			}
+			if (nbf_val > NowEpochSeconds()) {
 				error_detail = "Invalid authentication credentials";
 				return false;
 			}
@@ -585,7 +621,7 @@ static void ParseClaimsJson(const string &json, unordered_map<string, string> &c
 QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_name, const string &auth_string) {
 	QuackapiAuth auth;
 	if (!QuackapiState::Get(db).GetAuth(scheme_name, auth)) {
-		return Fail500("Authentication scheme \"" + scheme_name + "\" is not configured");
+		return FailClosedUnconfiguredScheme();
 	}
 
 	if (auth.kind == QuackapiAuthKind::API_KEY) {
@@ -668,7 +704,7 @@ QuackapiAuthResult CheckAuth(DatabaseInstance &db, const QuackapiRoute &route,
 
 	QuackapiAuth auth;
 	if (!QuackapiState::Get(db).GetAuth(route.require_auth, auth)) {
-		return Fail500("Authentication scheme \"" + route.require_auth + "\" is not configured");
+		return FailClosedUnconfiguredScheme();
 	}
 
 	string auth_string = ExtractAuthString(auth, headers);
