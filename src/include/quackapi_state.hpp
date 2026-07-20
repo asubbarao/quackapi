@@ -104,6 +104,42 @@ struct QuackapiRoute {
 	string body_schema;
 };
 
+//! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).
+//! CREATE ROW ACCESS POLICY name AS (col [type], ...) RETURNS BOOLEAN USING (expr)
+struct QuackapiRowAccessPolicy {
+	string name;
+	//! Argument column names from the AS (...) signature (order preserved).
+	vector<string> arg_columns;
+	//! Optional type names parallel to arg_columns (may be empty strings).
+	vector<string> arg_types;
+	//! Boolean SQL expression; may reference arg column names and $claims_*.
+	string expression;
+};
+
+//! Dynamic data masking policy: rewrite a column value from claims context.
+//! CREATE MASKING POLICY name ON <type> USING (expr) — `val` is the column value.
+struct QuackapiMaskingPolicy {
+	string name;
+	string value_type; // e.g. VARCHAR, INTEGER
+	//! SQL expression returning the same type; use identifier `val` for the raw value.
+	string expression;
+};
+
+//! Table binding for a row-access policy (ALTER TABLE … ADD ROW ACCESS POLICY).
+struct QuackapiRowAccessBinding {
+	string table_name;
+	string policy_name;
+	//! Table columns mapped onto the policy signature (same arity as policy args).
+	vector<string> columns;
+};
+
+//! Column binding for a masking policy (ALTER TABLE … SET MASKING POLICY).
+struct QuackapiMaskingBinding {
+	string table_name;
+	string column_name;
+	string policy_name;
+};
+
 //! Per-database quackapi state: the route registry, auth registry, and running servers.
 //! Lives in the DatabaseInstance's ObjectCache (non-evictable), so LOAD never
 //! touches the user's catalog and state dies with the database.
@@ -163,6 +199,26 @@ public:
 	void StopAllServers();
 	vector<std::pair<string, int>> ListServers();
 
+	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
+	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);
+	bool DropRowAccessPolicy(const string &name);
+	bool GetRowAccessPolicy(const string &name, QuackapiRowAccessPolicy &out);
+	vector<QuackapiRowAccessPolicy> SnapshotRowAccessPolicies();
+
+	void AddMaskingPolicy(const QuackapiMaskingPolicy &policy, bool or_replace);
+	bool DropMaskingPolicy(const string &name);
+	bool GetMaskingPolicy(const string &name, QuackapiMaskingPolicy &out);
+	vector<QuackapiMaskingPolicy> SnapshotMaskingPolicies();
+
+	//! Bind / unbind row-access policy on a table. Throws if policy missing or arity mismatch.
+	void BindRowAccessPolicy(const QuackapiRowAccessBinding &binding, bool or_replace);
+	bool UnbindRowAccessPolicy(const string &table_name, const string &policy_name);
+	vector<QuackapiRowAccessBinding> SnapshotRowAccessBindings();
+
+	void BindMaskingPolicy(const QuackapiMaskingBinding &binding, bool or_replace);
+	bool UnbindMaskingPolicy(const string &table_name, const string &column_name);
+	vector<QuackapiMaskingBinding> SnapshotMaskingBindings();
+
 private:
 	std::mutex routes_mutex;
 	vector<QuackapiRoute> routes;
@@ -173,6 +229,12 @@ private:
 
 	std::mutex queues_mutex;
 	vector<QuackapiQueue> queues;
+
+	std::mutex policies_mutex;
+	vector<QuackapiRowAccessPolicy> row_access_policies;
+	vector<QuackapiMaskingPolicy> masking_policies;
+	vector<QuackapiRowAccessBinding> row_access_bindings;
+	vector<QuackapiMaskingBinding> masking_bindings;
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;

@@ -17,6 +17,7 @@
 #include "quackapi_ddl.hpp"
 #include "quackapi_http_fetch.hpp"
 #include "quackapi_queue.hpp"
+#include "quackapi_policy.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_table_api.hpp"
@@ -317,6 +318,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetQuackapiAuthsFunction());
 	loader.RegisterFunction(GetQuackapiAddApiKeyFunction());
 
+	// Row-access + masking policy inspection (claims-keyed, not DB roles).
+	loader.RegisterFunction(GetQuackapiPoliciesFunction());
+
 	// quack auth bridge: quackapi_authentication / quackapi_authorization /
 	// quackapi_verify_auth — same signatures as quack_check_token /
 	// quack_nop_authorization so they can be SET as quack_*_function.
@@ -335,6 +339,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(QueueDdlParserExtension());
+	// CREATE ROW ACCESS / MASKING POLICY + ALTER TABLE policy bind
+	ExtensionCallbackManager::Get(db).Register(PolicyDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

@@ -1,0 +1,285 @@
+# name: test/sql/quackapi_policy.test
+# description: CREATE ROW ACCESS / MASKING POLICY, ALTER TABLE bind, quackapi_policies()
+# group: [quackapi]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# Registry starts empty
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM quackapi_policies();
+----
+0
+
+# ---------------------------------------------------------------------------
+# CREATE ROW ACCESS POLICY (claims-keyed predicate)
+# ---------------------------------------------------------------------------
+query I
+CREATE ROW ACCESS POLICY tenant_isolation
+  AS (tenant_id VARCHAR) RETURNS BOOLEAN
+  USING (tenant_id = $claims_tenant OR $claims_role = 'admin');
+----
+Row access policy tenant_isolation
+
+query IIII
+SELECT name, kind, signature, expression FROM quackapi_policies() WHERE name = 'tenant_isolation';
+----
+tenant_isolation	ROW_ACCESS	(tenant_id VARCHAR) RETURNS BOOLEAN	tenant_id = $claims_tenant OR $claims_role = 'admin'
+
+# Duplicate without OR REPLACE errors
+statement error
+CREATE ROW ACCESS POLICY tenant_isolation
+  AS (tenant_id VARCHAR) RETURNS BOOLEAN
+  USING (true);
+----
+already exists
+
+# CREATE OR REPLACE updates expression
+query I
+CREATE OR REPLACE ROW ACCESS POLICY tenant_isolation
+  AS (tenant_id VARCHAR) RETURNS BOOLEAN
+  USING (tenant_id = $claims_tenant OR $claims_role IN ('admin', 'support'));
+----
+Row access policy tenant_isolation
+
+query I
+SELECT expression FROM quackapi_policies() WHERE name = 'tenant_isolation';
+----
+tenant_id = $claims_tenant OR $claims_role IN ('admin', 'support')
+
+# ---------------------------------------------------------------------------
+# CREATE MASKING POLICY (val placeholder + $claims_*)
+# ---------------------------------------------------------------------------
+query I
+CREATE MASKING POLICY mask_email ON VARCHAR
+  USING (CASE WHEN $claims_role = 'admin' THEN val ELSE '***' END);
+----
+Masking policy mask_email ON VARCHAR
+
+query III
+SELECT name, kind, signature FROM quackapi_policies() WHERE name = 'mask_email';
+----
+mask_email	MASKING	ON VARCHAR
+
+# Name collision across kinds errors
+statement error
+CREATE MASKING POLICY tenant_isolation ON VARCHAR USING (val);
+----
+already used by a row access policy
+
+# ---------------------------------------------------------------------------
+# Bind to tables (ALTER TABLE)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE policy_orders (id INTEGER, tenant_id VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE policy_users (id INTEGER, email VARCHAR, tenant_id VARCHAR);
+
+query I
+ALTER TABLE policy_orders ADD ROW ACCESS POLICY tenant_isolation ON (tenant_id);
+----
+Bound row access policy tenant_isolation on policy_orders
+
+query II
+SELECT bound_table, bound_columns FROM quackapi_policies()
+WHERE name = 'tenant_isolation' AND bound_table = 'policy_orders';
+----
+policy_orders	tenant_id
+
+query I
+ALTER TABLE policy_users MODIFY COLUMN email SET MASKING POLICY mask_email;
+----
+Set masking policy mask_email on policy_users.email
+
+query II
+SELECT bound_table, bound_columns FROM quackapi_policies()
+WHERE name = 'mask_email' AND bound_table = 'policy_users';
+----
+policy_users	email
+
+# Also bind RAP on users so claim-filter routes can use it
+query I
+ALTER TABLE policy_users ADD ROW ACCESS POLICY tenant_isolation ON (tenant_id);
+----
+Bound row access policy tenant_isolation on policy_users
+
+# ---------------------------------------------------------------------------
+# CREATE ROUTE + AUTH — policied tables registered (enforcement is request-time)
+# ---------------------------------------------------------------------------
+query I
+CREATE AUTH jwt_pol AS JWT ( SECRET 'policy-test-secret' );
+----
+Auth jwt_pol: JWT_HS256
+
+query I
+CREATE ROUTE list_orders GET '/orders' REQUIRE jwt_pol AS
+  SELECT id, tenant_id, amount FROM policy_orders ORDER BY id;
+----
+Route list_orders: GET /orders
+
+query I
+CREATE ROUTE list_users GET '/users' REQUIRE jwt_pol AS
+  SELECT id, email, tenant_id FROM policy_users ORDER BY id;
+----
+Route list_users: GET /users
+
+query I
+SELECT require_auth FROM quackapi_routes() WHERE name = 'list_orders';
+----
+jwt_pol
+
+# Public route on policied table — allowed to CREATE; HTTP will 403 unauth
+query I
+CREATE ROUTE public_orders GET '/public_orders' AS
+  SELECT id, tenant_id FROM policy_orders;
+----
+Route public_orders: GET /public_orders
+
+# Seed data (claim-filter semantics: acme vs beta; admin sees all)
+statement ok
+INSERT INTO policy_orders VALUES
+  (1, 'acme', 100),
+  (2, 'beta', 200),
+  (3, 'acme', 150);
+
+statement ok
+INSERT INTO policy_users VALUES
+  (1, 'alice@acme.test', 'acme'),
+  (2, 'bob@beta.test', 'beta');
+
+# Manual claim-filter equivalence (same predicate as RAP USING, bound claims)
+query III
+SELECT id, tenant_id, amount FROM policy_orders
+WHERE tenant_id = 'acme' OR 'user' = 'admin'
+ORDER BY id;
+----
+1	acme	100
+3	acme	150
+
+# Admin claim equivalence
+query III
+SELECT id, tenant_id, amount FROM policy_orders
+WHERE tenant_id = 'acme' OR 'admin' = 'admin'
+ORDER BY id;
+----
+1	acme	100
+2	beta	200
+3	acme	150
+
+# Masking equivalence: non-admin sees ***
+query II
+SELECT id,
+  CASE WHEN 'user' = 'admin' THEN email ELSE '***' END AS email
+FROM policy_users WHERE tenant_id = 'acme' ORDER BY id;
+----
+1	***
+
+# Masking equivalence: admin sees raw
+query II
+SELECT id,
+  CASE WHEN 'admin' = 'admin' THEN email ELSE '***' END AS email
+FROM policy_users WHERE tenant_id = 'acme' ORDER BY id;
+----
+1	alice@acme.test
+
+# ---------------------------------------------------------------------------
+# Inspection: both policies listed
+# ---------------------------------------------------------------------------
+query II
+SELECT name, kind FROM quackapi_policies() ORDER BY kind, name, bound_table;
+----
+mask_email	MASKING
+tenant_isolation	ROW_ACCESS
+tenant_isolation	ROW_ACCESS
+
+# ---------------------------------------------------------------------------
+# Bad grammar
+# ---------------------------------------------------------------------------
+statement error
+CREATE ROW ACCESS POLICY bad AS (x) USING (true);
+----
+RETURNS BOOLEAN
+
+statement error
+CREATE MASKING POLICY bad ON VARCHAR AS (val);
+----
+USING
+
+statement error
+ALTER TABLE policy_orders ADD ROW ACCESS POLICY nope ON (tenant_id);
+----
+does not exist
+
+# ---------------------------------------------------------------------------
+# DROP / unbind
+# ---------------------------------------------------------------------------
+query I
+ALTER TABLE policy_orders DROP ROW ACCESS POLICY tenant_isolation;
+----
+Dropped row access policy tenant_isolation from policy_orders
+
+query I
+SELECT count(*) FROM quackapi_policies()
+WHERE name = 'tenant_isolation' AND bound_table = 'policy_orders';
+----
+0
+
+query I
+ALTER TABLE policy_users ALTER COLUMN email UNSET MASKING POLICY;
+----
+Unset masking policy on policy_users.email
+
+query I
+DROP MASKING POLICY mask_email;
+----
+Dropped masking policy mask_email
+
+query I
+DROP ROW ACCESS POLICY tenant_isolation;
+----
+Dropped row access policy tenant_isolation
+
+# DROP cascades bindings
+query I
+SELECT count(*) FROM quackapi_policies() WHERE name = 'tenant_isolation';
+----
+0
+
+statement error
+DROP ROW ACCESS POLICY tenant_isolation;
+----
+does not exist
+
+# Cleanup routes/auth/tables
+query I
+DROP ROUTE list_orders;
+----
+Dropped route list_orders
+
+query I
+DROP ROUTE list_users;
+----
+Dropped route list_users
+
+query I
+DROP ROUTE public_orders;
+----
+Dropped route public_orders
+
+query I
+DROP AUTH jwt_pol;
+----
+Dropped auth jwt_pol
+
+statement ok
+DROP TABLE policy_orders;
+
+statement ok
+DROP TABLE policy_users;
+
+query I
+SELECT count(*) FROM quackapi_policies();
+----
+0
