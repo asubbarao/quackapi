@@ -37,6 +37,19 @@ struct ServeBindData : public TableFunctionData {
 	string cors_origins;
 	//! Empty = not provided by operator. Named param wins over SET quackapi_memory_limit.
 	string memory_limit;
+	//! Batteries defaults — all correct-by-default for servers; overridable.
+	string log_level = "info";
+	bool access_log = true;
+	bool enable_logging = true;
+	bool health_routes = true;
+	string threads;
+	bool preserve_insertion_order = false;
+	bool enable_http_metadata_cache = true;
+	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
+	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
+	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
+	int32_t read_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
+	int32_t write_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	bool finished = false;
 };
 
@@ -68,7 +81,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		}
 	}
 	// memory_limit named param wins; else fall back to SET quackapi_memory_limit.
-	// Empty means "not provided" — ApplyServeResourceGuards uses non-clobber logic.
+	// Empty means "not provided" — ApplyQuackapiServerDefaults uses non-clobber logic.
 	auto mem_entry = input.named_parameters.find("memory_limit");
 	if (mem_entry != input.named_parameters.end()) {
 		bind_data->memory_limit = mem_entry->second.GetValue<string>();
@@ -77,6 +90,68 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		if (context.TryGetCurrentSetting("quackapi_memory_limit", setting) && !setting.IsNull()) {
 			bind_data->memory_limit = setting.GetValue<string>();
 		}
+	}
+	// log_level named param wins; else SET quackapi_log_level.
+	auto log_entry = input.named_parameters.find("log_level");
+	if (log_entry != input.named_parameters.end()) {
+		bind_data->log_level = log_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_log_level", setting) && !setting.IsNull()) {
+			auto s = setting.GetValue<string>();
+			if (!s.empty()) {
+				bind_data->log_level = s;
+			}
+		}
+	}
+	auto access_entry = input.named_parameters.find("access_log");
+	if (access_entry != input.named_parameters.end()) {
+		bind_data->access_log = access_entry->second.GetValue<bool>();
+	}
+	auto enlog_entry = input.named_parameters.find("enable_logging");
+	if (enlog_entry != input.named_parameters.end()) {
+		bind_data->enable_logging = enlog_entry->second.GetValue<bool>();
+	}
+	auto health_entry = input.named_parameters.find("health_routes");
+	if (health_entry != input.named_parameters.end()) {
+		bind_data->health_routes = health_entry->second.GetValue<bool>();
+	}
+	auto threads_entry = input.named_parameters.find("threads");
+	if (threads_entry != input.named_parameters.end()) {
+		// Accept INTEGER or VARCHAR.
+		if (threads_entry->second.type().id() == LogicalTypeId::VARCHAR) {
+			bind_data->threads = threads_entry->second.GetValue<string>();
+		} else {
+			bind_data->threads = threads_entry->second.ToString();
+		}
+	}
+	auto pio_entry = input.named_parameters.find("preserve_insertion_order");
+	if (pio_entry != input.named_parameters.end()) {
+		bind_data->preserve_insertion_order = pio_entry->second.GetValue<bool>();
+	}
+	auto http_meta_entry = input.named_parameters.find("enable_http_metadata_cache");
+	if (http_meta_entry != input.named_parameters.end()) {
+		bind_data->enable_http_metadata_cache = http_meta_entry->second.GetValue<bool>();
+	}
+	auto wt_entry = input.named_parameters.find("worker_threads");
+	if (wt_entry != input.named_parameters.end()) {
+		bind_data->worker_threads = wt_entry->second.GetValue<int32_t>();
+	}
+	auto kam_entry = input.named_parameters.find("keep_alive_max_count");
+	if (kam_entry != input.named_parameters.end()) {
+		bind_data->keep_alive_max_count = kam_entry->second.GetValue<int32_t>();
+	}
+	auto kat_entry = input.named_parameters.find("keep_alive_timeout_sec");
+	if (kat_entry != input.named_parameters.end()) {
+		bind_data->keep_alive_timeout_sec = kat_entry->second.GetValue<int32_t>();
+	}
+	auto rt_entry = input.named_parameters.find("read_timeout_sec");
+	if (rt_entry != input.named_parameters.end()) {
+		bind_data->read_timeout_sec = rt_entry->second.GetValue<int32_t>();
+	}
+	auto wrt_entry = input.named_parameters.find("write_timeout_sec");
+	if (wrt_entry != input.named_parameters.end()) {
+		bind_data->write_timeout_sec = wrt_entry->second.GetValue<int32_t>();
 	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
@@ -109,70 +184,6 @@ static void ComposeQuackAuthSettings(ClientContext &context) {
 	}
 }
 
-//! Safe serve default when nothing was configured (valsafe HARDENING P1-2).
-static constexpr const char *SERVE_DEFAULT_MEMORY_LIMIT = "256MB";
-
-//! True when the database still has DuckDB's auto-computed system default
-//! memory_limit (≈80% of available RAM). An explicit SET memory_limit (or a
-//! prior serve that applied our guard) yields a different value.
-static bool IsAtSystemDefaultMemoryLimit(DatabaseInstance &db) {
-	auto &config = DBConfig::GetConfig(db);
-	if (!config.file_system) {
-		return false;
-	}
-	auto available = DBConfig::GetSystemAvailableMemory(*config.file_system);
-	idx_t system_default;
-	if (available == DBConfigOptions().maximum_memory) {
-		system_default = available;
-	} else {
-		// Match DBConfig::SetDefaultMaxMemory().
-		system_default = available * 8 / 10;
-	}
-	return config.options.maximum_memory == system_default;
-}
-
-//! Apply resource guards for production serve (valsafe HARDENING P1-2).
-//!
-//! Precedence:
-//!   1. Explicit operator value (serve memory_limit := … or SET quackapi_memory_limit)
-//!   2. Else if the DB already has a non-default memory_limit → leave it alone
-//!   3. Else apply SERVE_DEFAULT_MEMORY_LIMIT (256MB)
-//!
-//! Never silently clobbers an operator-set DuckDB memory_limit.
-static void ApplyServeResourceGuards(ClientContext &context, const string &requested_limit) {
-	try {
-		string limit_to_apply;
-		if (!requested_limit.empty()) {
-			limit_to_apply = requested_limit;
-		} else if (IsAtSystemDefaultMemoryLimit(*context.db)) {
-			// Nothing configured — apply the conservative serve default.
-			limit_to_apply = SERVE_DEFAULT_MEMORY_LIMIT;
-		} else {
-			// Operator (or a prior serve) already set a non-default limit.
-			return;
-		}
-		// Validate early so a bad knob fails at serve, not as a silent stderr line.
-		try {
-			DBConfig::ParseMemoryLimit(limit_to_apply);
-		} catch (std::exception &ex) {
-			throw InvalidInputException("quackapi_serve: invalid memory_limit '%s': %s", limit_to_apply, ex.what());
-		}
-		Connection con(*context.db);
-		// Escape single quotes for the SET literal (memory strings are usually clean).
-		auto escaped = StringUtil::Replace(limit_to_apply, "'", "''");
-		auto res = con.Query(StringUtil::Format("SET memory_limit TO '%s'", escaped));
-		if (res->HasError()) {
-			fprintf(stderr, "quackapi: could not SET memory_limit: %s\n", res->GetError().c_str());
-		}
-	} catch (InvalidInputException &) {
-		throw;
-	} catch (std::exception &ex) {
-		fprintf(stderr, "quackapi: resource guard failed: %s\n", ex.what());
-	} catch (...) {
-		fprintf(stderr, "quackapi: resource guard failed: unknown exception\n");
-	}
-}
-
 static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->CastNoConst<ServeBindData>();
 	if (bind_data.finished) {
@@ -180,14 +191,35 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	}
 	// Compose with quack's auth settings when present (no-op if quack unloaded).
 	ComposeQuackAuthSettings(context);
-	// P1-2: memory ceiling — configurable, never clobbers an operator SET.
-	ApplyServeResourceGuards(context, bind_data.memory_limit);
-	// REST listener — justified by absence of a quack path-registration hook
-	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
-	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.
+
+	// Batteries-included serve options (all ON / server-optimal by default).
 	QuackapiServeOptions opts;
 	opts.static_dir = bind_data.static_dir;
 	opts.cors_origins = bind_data.cors_origins;
+	opts.memory_limit = bind_data.memory_limit;
+	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
+	opts.access_log = bind_data.access_log;
+	opts.enable_logging = bind_data.enable_logging;
+	opts.health_routes = bind_data.health_routes;
+	opts.threads = bind_data.threads;
+	opts.preserve_insertion_order = bind_data.preserve_insertion_order;
+	opts.enable_http_metadata_cache = bind_data.enable_http_metadata_cache;
+	opts.worker_threads = bind_data.worker_threads;
+	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
+	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
+	opts.read_timeout_sec = bind_data.read_timeout_sec;
+	opts.write_timeout_sec = bind_data.write_timeout_sec;
+
+	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
+	ApplyQuackapiServerDefaults(context, opts);
+	// Compose request_id source: community tsid if LOADable, else core uuidv7.
+	ProbeQuackapiRequestIdSource(*context.db, opts);
+	// Auto-register /health + /healthz into the route registry (listed by routes()).
+	RegisterQuackapiHealthRoutes(*context.db, opts);
+
+	// REST listener — justified by absence of a quack path-registration hook
+	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
+	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.
 	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, opts);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
 	output.SetCardinality(1);
@@ -366,15 +398,33 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "only apply the 256MB serve default when nothing was configured. "
 	                          "Overridden by memory_limit named parameter.",
 	                          LogicalType::VARCHAR, Value(""));
+	// SET quackapi_log_level = 'info' | 'debug' | 'warn' | 'error' | 'silent'
+	// Default info — informative access + DuckDB logs, not silent.
+	config.AddExtensionOption("quackapi_log_level",
+	                          "Log verbosity for quackapi_serve: silent|error|warn|info|debug. "
+	                          "Default info. Overridden by log_level named parameter.",
+	                          LogicalType::VARCHAR, Value("info"));
 
-	// quackapi_serve() / quackapi_serve(port) with optional host + static_dir +
-	// cors_origins + memory_limit
+	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
+	// All logging / health / server SETs ON by default; every knob overridable.
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
 	serve.named_parameters["static_dir"] = LogicalType::VARCHAR;
 	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
 	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
+	serve.named_parameters["log_level"] = LogicalType::VARCHAR;
+	serve.named_parameters["access_log"] = LogicalType::BOOLEAN;
+	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
+	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
+	serve.named_parameters["threads"] = LogicalType::VARCHAR;
+	serve.named_parameters["preserve_insertion_order"] = LogicalType::BOOLEAN;
+	serve.named_parameters["enable_http_metadata_cache"] = LogicalType::BOOLEAN;
+	serve.named_parameters["worker_threads"] = LogicalType::INTEGER;
+	serve.named_parameters["keep_alive_max_count"] = LogicalType::INTEGER;
+	serve.named_parameters["keep_alive_timeout_sec"] = LogicalType::INTEGER;
+	serve.named_parameters["read_timeout_sec"] = LogicalType::INTEGER;
+	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);

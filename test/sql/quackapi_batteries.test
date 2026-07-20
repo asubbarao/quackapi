@@ -1,0 +1,119 @@
+# name: test/sql/quackapi_batteries.test
+# description: batteries-included server defaults — SETs, health routes in registry, log_level setting
+# group: [quackapi]
+
+require quackapi
+
+# log_level extension option defaults to info
+query I
+SELECT current_setting('quackapi_log_level');
+----
+info
+
+# Setting is listed among duckdb_settings
+query I
+SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_log_level';
+----
+true
+
+statement ok
+SET quackapi_log_level = 'debug';
+
+query I
+SELECT current_setting('quackapi_log_level');
+----
+debug
+
+statement ok
+SET quackapi_log_level = 'info';
+
+# ---------------------------------------------------------------------------
+# Serve with defaults → health routes appear in quackapi_routes()
+# + applied PRAGMAs/SETs are in effect
+# ---------------------------------------------------------------------------
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+SET enable_http_metadata_cache = false;
+
+query I
+SELECT * FROM quackapi_serve(29201, host := '127.0.0.1');
+----
+http://127.0.0.1:29201
+
+# preserve_insertion_order flipped to false by default (server throughput)
+query I
+SELECT current_setting('preserve_insertion_order');
+----
+false
+
+# enable_http_metadata_cache ON by default
+query I
+SELECT current_setting('enable_http_metadata_cache');
+----
+true
+
+# DuckDB built-in logging enabled
+query I
+SELECT current_setting('enable_logging');
+----
+1
+
+# Health routes auto-registered and listed
+query II
+SELECT name, pattern FROM quackapi_routes() WHERE name LIKE '__quackapi_health%' ORDER BY name;
+----
+__quackapi_health	/health
+__quackapi_healthz	/healthz
+
+query I
+SELECT * FROM quackapi_stop(29201);
+----
+Stopped quackapi server on port 29201
+
+# ---------------------------------------------------------------------------
+# Overridable: preserve_insertion_order := true keeps insertion order
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29202, host := '127.0.0.1', preserve_insertion_order := true);
+----
+http://127.0.0.1:29202
+
+query I
+SELECT current_setting('preserve_insertion_order');
+----
+true
+
+query I
+SELECT * FROM quackapi_stop(29202);
+----
+Stopped quackapi server on port 29202
+
+# ---------------------------------------------------------------------------
+# health_routes := false → not re-registered after explicit drop
+# ---------------------------------------------------------------------------
+query I
+DROP ROUTE __quackapi_health;
+----
+Dropped route __quackapi_health
+
+query I
+DROP ROUTE __quackapi_healthz;
+----
+Dropped route __quackapi_healthz
+
+query I
+SELECT * FROM quackapi_serve(29203, host := '127.0.0.1', health_routes := false);
+----
+http://127.0.0.1:29203
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name LIKE '__quackapi_health%';
+----
+0
+
+query I
+SELECT * FROM quackapi_stop(29203);
+----
+Stopped quackapi server on port 29203
