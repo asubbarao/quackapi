@@ -197,6 +197,10 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("handler");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("require_auth");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("group_name");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("tags");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -217,6 +221,8 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(3, row, Value::INTEGER(route.status));
 		output.SetValue(4, row, Value(route.handler_sql));
 		output.SetValue(5, row, Value(route.require_auth));
+		output.SetValue(6, row, Value(route.group_name));
+		output.SetValue(7, row, Value(route.tags));
 		row++;
 		state.offset++;
 	}
@@ -311,6 +317,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));
 	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind, ServersInit));
+	loader.RegisterFunction(GetQuackapiGroupsFunction());
 
 	// Auth inspection + API key management (secrets/hashes never exposed).
 	loader.RegisterFunction(GetQuackapiAuthsFunction());
@@ -325,8 +332,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
 
-	// CREATE ROUTE / DROP ROUTE and CREATE AUTH / DROP AUTH syntax
+	// CREATE ROUTE / DROP ROUTE, CREATE GROUP, CREATE AUTH, CREATE API FOR TABLE
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
+	ExtensionCallbackManager::Get(db).Register(GroupDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
 }

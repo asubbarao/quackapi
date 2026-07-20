@@ -207,9 +207,33 @@ vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
 	return specs;
 }
 
+//! Join group.prefix + route path once at CREATE time (flat registry at runtime).
+//! prefix='/api/v1' + '/items' or 'items' → '/api/v1/items'. Rejects double-prefix.
+string JoinGroupPrefix(const string &prefix, const string &path) {
+	if (prefix.empty() || prefix[0] != '/') {
+		throw InvalidInputException("Group prefix must start with '/'");
+	}
+	string p = prefix;
+	while (p.size() > 1 && p.back() == '/') {
+		p.pop_back();
+	}
+	string r = path;
+	if (r.empty()) {
+		return p.empty() ? string("/") : p;
+	}
+	if (r[0] != '/') {
+		r = "/" + r;
+	}
+	if (r == p || StringUtil::StartsWith(r, p + "/")) {
+		throw InvalidInputException(
+		    "Route path \"%s\" already starts with group prefix \"%s\" — omit the prefix or drop GROUP", path, prefix);
+	}
+	return p + r;
+}
+
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-//!     [STATUS <n>] [REQUIRE <auth>]
+//!     [STATUS <n>] [REQUIRE <auth>] [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
 //!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
@@ -220,6 +244,7 @@ vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
 //! the param name with underscores converted to hyphens (x_token → x-token).
 //! COOKIE binds from the Cookie header (FastAPI Cookie); default wire name is
 //! the param name as-is.
+//! GROUP expands prefix+auth at CREATE (APIRouter-style); pattern may be relative.
 ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &query) {
 	auto q = Trim(query);
 	auto upper = StringUtil::Upper(q);
@@ -265,7 +290,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	}
 	rest = Trim(rest.substr(second_space));
 
-	// '<pattern>'
+	// '<pattern>' — ungrouped routes must start with '/'; GROUP may use relative paths.
 	if (rest.empty() || rest[0] != '\'') {
 		return ParserExtensionParseResult("Expected quoted '<pattern>' after method");
 	}
@@ -274,8 +299,8 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult("Unterminated route pattern");
 	}
 	auto pattern = rest.substr(1, pattern_end - 1);
-	if (pattern.empty() || pattern[0] != '/') {
-		return ParserExtensionParseResult("Route pattern must start with '/'");
+	if (pattern.empty()) {
+		return ParserExtensionParseResult("Route pattern must not be empty");
 	}
 	rest = Trim(rest.substr(pattern_end + 1));
 
@@ -288,39 +313,84 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return i;
 	};
 
-	// [STATUS <n>]
+	// Optional clauses in any order: STATUS / REQUIRE / GROUP|IN GROUP
 	int status = 200;
-	auto rest_upper = StringUtil::Upper(rest);
-	if (StringUtil::StartsWith(rest_upper, "STATUS") &&
-	    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
-		rest = Trim(rest.substr(6));
-		auto token_end = NextTokenEnd(rest);
-		if (token_end == 0) {
-			return ParserExtensionParseResult("Expected AS <select> after STATUS <n>");
-		}
-		status = atoi(rest.substr(0, token_end).c_str());
-		if (status < 100 || status > 599) {
-			return ParserExtensionParseResult("STATUS must be a valid HTTP status code");
-		}
-		rest = Trim(rest.substr(token_end));
-		rest_upper = StringUtil::Upper(rest);
-	}
-
-	// [REQUIRE <auth-name>]
 	string require_auth;
-	if (StringUtil::StartsWith(rest_upper, "REQUIRE") &&
-	    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
-		rest = Trim(rest.substr(7));
-		auto token_end = NextTokenEnd(rest);
-		if (token_end == 0) {
-			return ParserExtensionParseResult("Expected AS <select> after REQUIRE <auth>");
-		}
-		require_auth = rest.substr(0, token_end);
-		if (require_auth.empty()) {
-			return ParserExtensionParseResult("REQUIRE expects an auth name");
-		}
-		rest = Trim(rest.substr(token_end));
+	string group_name;
+	auto rest_upper = StringUtil::Upper(rest);
+	for (int clause_round = 0; clause_round < 6; clause_round++) {
 		rest_upper = StringUtil::Upper(rest);
+		// [STATUS <n>]
+		if (StringUtil::StartsWith(rest_upper, "STATUS") &&
+		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
+			rest = Trim(rest.substr(6));
+			auto token_end = NextTokenEnd(rest);
+			if (token_end == 0) {
+				return ParserExtensionParseResult("Expected AS <select> after STATUS <n>");
+			}
+			status = atoi(rest.substr(0, token_end).c_str());
+			if (status < 100 || status > 599) {
+				return ParserExtensionParseResult("STATUS must be a valid HTTP status code");
+			}
+			rest = Trim(rest.substr(token_end));
+			continue;
+		}
+		// [REQUIRE <auth-name>]
+		if (StringUtil::StartsWith(rest_upper, "REQUIRE") &&
+		    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+			rest = Trim(rest.substr(7));
+			auto token_end = NextTokenEnd(rest);
+			if (token_end == 0) {
+				return ParserExtensionParseResult("Expected AS <select> after REQUIRE <auth>");
+			}
+			require_auth = rest.substr(0, token_end);
+			if (require_auth.empty()) {
+				return ParserExtensionParseResult("REQUIRE expects an auth name");
+			}
+			rest = Trim(rest.substr(token_end));
+			continue;
+		}
+		// [IN GROUP <name>] or [GROUP <name>]
+		if (StringUtil::StartsWith(rest_upper, "IN") && rest.size() > 2 &&
+		    StringUtil::CharacterIsSpace(rest[2])) {
+			string after_in = Trim(rest.substr(2));
+			auto after_upper = StringUtil::Upper(after_in);
+			if (StringUtil::StartsWith(after_upper, "GROUP") &&
+			    (after_in.size() == 5 || StringUtil::CharacterIsSpace(after_in[5]))) {
+				after_in = Trim(after_in.substr(5));
+				auto token_end = NextTokenEnd(after_in);
+				if (token_end == 0) {
+					return ParserExtensionParseResult("IN GROUP expects a group name");
+				}
+				if (!group_name.empty()) {
+					return ParserExtensionParseResult("GROUP specified more than once");
+				}
+				group_name = after_in.substr(0, token_end);
+				rest = Trim(after_in.substr(token_end));
+				continue;
+			}
+		}
+		if (StringUtil::StartsWith(rest_upper, "GROUP") &&
+		    (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
+			rest = Trim(rest.substr(5));
+			auto token_end = NextTokenEnd(rest);
+			if (token_end == 0) {
+				return ParserExtensionParseResult("GROUP expects a group name");
+			}
+			if (!group_name.empty()) {
+				return ParserExtensionParseResult("GROUP specified more than once");
+			}
+			group_name = rest.substr(0, token_end);
+			rest = Trim(rest.substr(token_end));
+			continue;
+		}
+		break;
+	}
+	rest_upper = StringUtil::Upper(rest);
+
+	// Ungrouped routes still require an absolute path starting with '/'.
+	if (group_name.empty() && pattern[0] != '/') {
+		return ParserExtensionParseResult("Route pattern must start with '/'");
 	}
 
 	// [BODY SCHEMA '<json-schema>'] — may appear before PARAM or after PARAM blocks.
@@ -590,6 +660,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.require_auth = require_auth;
 	data->route.params = std::move(params);
 	data->route.body_schema = std::move(body_schema);
+	data->route.group_name = group_name;
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -620,6 +691,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	if (input.inputs.size() > 9 && !input.inputs[9].IsNull()) {
 		bind_data->route.body_schema = input.inputs[9].GetValue<string>();
 	}
+	if (input.inputs.size() > 10 && !input.inputs[10].IsNull()) {
+		bind_data->route.group_name = input.inputs[10].GetValue<string>();
+	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	return std::move(bind_data);
@@ -633,6 +707,24 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 	auto &state = QuackapiState::Get(*context.db);
 	string message;
 	if (bind_data.action == "CREATE") {
+		// Expand GROUP prefix / default auth / tags before registry insert.
+		// Runtime MatchPattern stays absolute — no request-time rewrite.
+		if (!bind_data.route.group_name.empty()) {
+			QuackapiGroup group;
+			if (!state.GetGroup(bind_data.route.group_name, group)) {
+				throw InvalidInputException("Group \"%s\" does not exist", bind_data.route.group_name);
+			}
+			bind_data.route.pattern = JoinGroupPrefix(group.prefix, bind_data.route.pattern);
+			if (bind_data.route.require_auth.empty() && !group.require_auth.empty()) {
+				bind_data.route.require_auth = group.require_auth;
+			}
+			if (bind_data.route.tags.empty() && !group.tags.empty()) {
+				bind_data.route.tags = group.tags;
+			}
+			// policy seam: group.policy reserved for future shared policy; unused in v1.
+		} else if (bind_data.route.pattern.empty() || bind_data.route.pattern[0] != '/') {
+			throw InvalidInputException("Route pattern must start with '/'");
+		}
 		// Validate the handler SQL now so a broken route fails at CREATE time,
 		// not at first request. Do this BEFORE mutating the registry so
 		// CREATE OR REPLACE does not leave a half-applied route on failure.
@@ -663,7 +755,7 @@ TableFunction MakeApplyRouteFunction() {
 	TableFunction function("quackapi_apply_route",
 	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       ApplyRouteExec, ApplyRouteBind);
 	return function;
 }
@@ -683,9 +775,414 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.route.require_auth));
 	result.parameters.push_back(Value(SerializeParamSpecs(data.route.params)));
 	result.parameters.push_back(Value(data.route.body_schema));
+	result.parameters.push_back(Value(data.route.group_name));
 	result.requires_valid_transaction = false;
 	result.return_type = StatementReturnType::QUERY_RESULT;
 	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// CREATE [OR REPLACE] GROUP / DROP GROUP
+//===--------------------------------------------------------------------===//
+
+struct GroupDdlParseData : public ParserExtensionParseData {
+	string action; // CREATE / DROP
+	bool or_replace = false;
+	QuackapiGroup group;
+
+	unique_ptr<ParserExtensionParseData> Copy() const override {
+		auto copy = make_uniq<GroupDdlParseData>();
+		copy->action = action;
+		copy->or_replace = or_replace;
+		copy->group = group;
+		return std::move(copy);
+	}
+	string ToString() const override {
+		return action + " GROUP " + group.name;
+	}
+};
+
+//! Parse a single quoted SQL string starting at s[0]=='\''; advances *end past close.
+bool ParseQuotedString(const string &s, idx_t start, string &out, idx_t &end) {
+	if (start >= s.size() || s[start] != '\'') {
+		return false;
+	}
+	string result;
+	idx_t i = start + 1;
+	while (i < s.size()) {
+		if (s[i] == '\'') {
+			if (i + 1 < s.size() && s[i + 1] == '\'') {
+				result += '\'';
+				i += 2;
+				continue;
+			}
+			out = result;
+			end = i + 1;
+			return true;
+		}
+		result += s[i];
+		i++;
+	}
+	return false;
+}
+
+//! Grammar:
+//!   CREATE [OR REPLACE] [API] GROUP <name> WITH (
+//!     prefix='/abs', [auth=<name>|require=<name>], [tags='csv'], [policy=<name>]
+//!   )
+//!   DROP [API] GROUP <name>
+//!
+//! Also accepts positional-ish keywords without WITH for SPEC compatibility:
+//!   CREATE API GROUP <name> PREFIX '/p' [TAGS 't'] [REQUIRE <auth>]
+ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &query) {
+	auto q = Trim(query);
+	auto upper = StringUtil::Upper(q);
+
+	bool or_replace = false;
+	idx_t pos = 0;
+	bool matched = false;
+
+	// DROP forms
+	if (StringUtil::StartsWith(upper, "DROP API GROUP ")) {
+		auto name = Trim(q.substr(15));
+		if (name.empty() || name.find(' ') != string::npos) {
+			return ParserExtensionParseResult("DROP API GROUP expects a single group name");
+		}
+		auto data = make_uniq<GroupDdlParseData>();
+		data->action = "DROP";
+		data->group.name = name;
+		return ParserExtensionParseResult(std::move(data));
+	}
+	if (StringUtil::StartsWith(upper, "DROP GROUP ")) {
+		auto name = Trim(q.substr(11));
+		if (name.empty() || name.find(' ') != string::npos) {
+			return ParserExtensionParseResult("DROP GROUP expects a single group name");
+		}
+		auto data = make_uniq<GroupDdlParseData>();
+		data->action = "DROP";
+		data->group.name = name;
+		return ParserExtensionParseResult(std::move(data));
+	}
+
+	// CREATE forms
+	if (StringUtil::StartsWith(upper, "CREATE OR REPLACE API GROUP ")) {
+		pos = 28;
+		or_replace = true;
+		matched = true;
+	} else if (StringUtil::StartsWith(upper, "CREATE OR REPLACE GROUP ")) {
+		pos = 24;
+		or_replace = true;
+		matched = true;
+	} else if (StringUtil::StartsWith(upper, "CREATE API GROUP ")) {
+		pos = 17;
+		matched = true;
+	} else if (StringUtil::StartsWith(upper, "CREATE GROUP ")) {
+		pos = 13;
+		matched = true;
+	}
+	if (!matched) {
+		return ParserExtensionParseResult();
+	}
+
+	auto rest = Trim(q.substr(pos));
+	auto first_space = rest.find(' ');
+	if (first_space == string::npos) {
+		// bare name only is invalid
+		if (rest.empty()) {
+			return ParserExtensionParseResult("CREATE GROUP <name> WITH (prefix='...', ...)");
+		}
+		// name with no options
+		return ParserExtensionParseResult("CREATE GROUP requires WITH (prefix='...') or PREFIX '...'");
+	}
+	// name may be followed by WITH or PREFIX
+	string name;
+	{
+		// take first token as name
+		idx_t i = 0;
+		while (i < rest.size() && !StringUtil::CharacterIsSpace(rest[i])) {
+			i++;
+		}
+		name = rest.substr(0, i);
+		rest = Trim(rest.substr(i));
+	}
+	if (name.empty()) {
+		return ParserExtensionParseResult("CREATE GROUP expects a group name");
+	}
+
+	QuackapiGroup group;
+	group.name = name;
+	auto rest_upper = StringUtil::Upper(rest);
+
+	auto NextTokenEnd = [](const string &s) -> idx_t {
+		idx_t i = 0;
+		while (i < s.size() && !StringUtil::CharacterIsSpace(s[i])) {
+			i++;
+		}
+		return i;
+	};
+
+	if (StringUtil::StartsWith(rest_upper, "WITH")) {
+		rest = Trim(rest.substr(4));
+		if (rest.empty() || rest[0] != '(') {
+			return ParserExtensionParseResult("Expected WITH (prefix='...', ...)");
+		}
+		auto close = rest.rfind(')');
+		if (close == string::npos) {
+			return ParserExtensionParseResult("Unterminated WITH (...) options");
+		}
+		auto opts = Trim(rest.substr(1, close - 1));
+		rest = Trim(rest.substr(close + 1));
+		if (!rest.empty()) {
+			return ParserExtensionParseResult("Unexpected tokens after GROUP WITH (...)");
+		}
+		// Parse comma-separated key=value
+		idx_t oi = 0;
+		bool have_prefix = false;
+		while (oi < opts.size()) {
+			while (oi < opts.size() && (StringUtil::CharacterIsSpace(opts[oi]) || opts[oi] == ',')) {
+				oi++;
+			}
+			if (oi >= opts.size()) {
+				break;
+			}
+			// key
+			idx_t key_start = oi;
+			while (oi < opts.size() && !StringUtil::CharacterIsSpace(opts[oi]) && opts[oi] != '=' && opts[oi] != ',') {
+				oi++;
+			}
+			auto key = StringUtil::Lower(opts.substr(key_start, oi - key_start));
+			while (oi < opts.size() && StringUtil::CharacterIsSpace(opts[oi])) {
+				oi++;
+			}
+			if (oi >= opts.size() || opts[oi] != '=') {
+				return ParserExtensionParseResult("GROUP option \"" + key + "\" expects =value");
+			}
+			oi++; // =
+			while (oi < opts.size() && StringUtil::CharacterIsSpace(opts[oi])) {
+				oi++;
+			}
+			if (oi >= opts.size()) {
+				return ParserExtensionParseResult("GROUP option \"" + key + "\" expects a value");
+			}
+			string value;
+			if (opts[oi] == '\'') {
+				idx_t end = 0;
+				if (!ParseQuotedString(opts, oi, value, end)) {
+					return ParserExtensionParseResult("Unterminated quoted value for " + key);
+				}
+				oi = end;
+			} else {
+				idx_t vstart = oi;
+				while (oi < opts.size() && opts[oi] != ',' && !StringUtil::CharacterIsSpace(opts[oi])) {
+					oi++;
+				}
+				value = opts.substr(vstart, oi - vstart);
+			}
+			if (key == "prefix") {
+				if (value.empty() || value[0] != '/') {
+					return ParserExtensionParseResult("GROUP prefix must start with '/'");
+				}
+				group.prefix = value;
+				have_prefix = true;
+			} else if (key == "auth" || key == "require" || key == "require_auth") {
+				group.require_auth = value;
+			} else if (key == "tags") {
+				group.tags = value;
+			} else if (key == "policy") {
+				// Seam for future shared policy; stored, unused at request time in v1.
+				group.policy = value;
+			} else {
+				return ParserExtensionParseResult(
+				    "Unknown GROUP option \"" + key + "\" — expected prefix, auth, tags, policy");
+			}
+		}
+		if (!have_prefix) {
+			return ParserExtensionParseResult("CREATE GROUP requires prefix='/...'");
+		}
+	} else if (StringUtil::StartsWith(rest_upper, "PREFIX")) {
+		// SPEC form: PREFIX '/p' [TAGS 't'] [REQUIRE auth]
+		rest = Trim(rest.substr(6));
+		if (rest.empty() || rest[0] != '\'') {
+			return ParserExtensionParseResult("PREFIX expects a quoted path");
+		}
+		idx_t end = 0;
+		if (!ParseQuotedString(rest, 0, group.prefix, end)) {
+			return ParserExtensionParseResult("Unterminated PREFIX string");
+		}
+		if (group.prefix.empty() || group.prefix[0] != '/') {
+			return ParserExtensionParseResult("GROUP prefix must start with '/'");
+		}
+		rest = Trim(rest.substr(end));
+		while (!rest.empty()) {
+			rest_upper = StringUtil::Upper(rest);
+			if (StringUtil::StartsWith(rest_upper, "TAGS") &&
+			    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]))) {
+				rest = Trim(rest.substr(4));
+				if (rest.empty() || rest[0] != '\'') {
+					return ParserExtensionParseResult("TAGS expects a quoted string");
+				}
+				idx_t tend = 0;
+				if (!ParseQuotedString(rest, 0, group.tags, tend)) {
+					return ParserExtensionParseResult("Unterminated TAGS string");
+				}
+				rest = Trim(rest.substr(tend));
+				continue;
+			}
+			if (StringUtil::StartsWith(rest_upper, "REQUIRE") &&
+			    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+				rest = Trim(rest.substr(7));
+				auto te = NextTokenEnd(rest);
+				if (te == 0) {
+					return ParserExtensionParseResult("REQUIRE expects an auth name");
+				}
+				group.require_auth = rest.substr(0, te);
+				rest = Trim(rest.substr(te));
+				continue;
+			}
+			return ParserExtensionParseResult("Unexpected token in CREATE GROUP — expected TAGS or REQUIRE");
+		}
+	} else {
+		return ParserExtensionParseResult("CREATE GROUP requires WITH (prefix='...') or PREFIX '...'");
+	}
+
+	auto data = make_uniq<GroupDdlParseData>();
+	data->action = "CREATE";
+	data->or_replace = or_replace;
+	data->group = group;
+	return ParserExtensionParseResult(std::move(data));
+}
+
+struct ApplyGroupBindData : public TableFunctionData {
+	string action;
+	bool or_replace = false;
+	QuackapiGroup group;
+	bool finished = false;
+};
+
+unique_ptr<FunctionData> ApplyGroupBind(ClientContext &, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<ApplyGroupBindData>();
+	bind_data->action = input.inputs[0].GetValue<string>();
+	bind_data->or_replace = input.inputs[1].GetValue<bool>();
+	bind_data->group.name = input.inputs[2].GetValue<string>();
+	bind_data->group.prefix = input.inputs[3].GetValue<string>();
+	bind_data->group.require_auth = input.inputs[4].GetValue<string>();
+	bind_data->group.tags = input.inputs[5].GetValue<string>();
+	bind_data->group.policy = input.inputs[6].GetValue<string>();
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("status");
+	return std::move(bind_data);
+}
+
+void ApplyGroupExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->CastNoConst<ApplyGroupBindData>();
+	if (bind_data.finished) {
+		return;
+	}
+	auto &state = QuackapiState::Get(*context.db);
+	string message;
+	if (bind_data.action == "CREATE") {
+		if (bind_data.group.prefix.empty() || bind_data.group.prefix[0] != '/') {
+			throw InvalidInputException("Group prefix must start with '/'");
+		}
+		state.AddGroup(bind_data.group, bind_data.or_replace);
+		message = StringUtil::Format("Group %s: %s", bind_data.group.name, bind_data.group.prefix);
+	} else {
+		if (state.DropGroup(bind_data.group.name)) {
+			message = StringUtil::Format("Dropped group %s", bind_data.group.name);
+		} else {
+			throw InvalidInputException("Group \"%s\" does not exist", bind_data.group.name);
+		}
+	}
+	output.SetValue(0, 0, Value(message));
+	output.SetCardinality(1);
+	bind_data.finished = true;
+}
+
+TableFunction MakeApplyGroupFunction() {
+	TableFunction function("quackapi_apply_group",
+	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                       ApplyGroupExec, ApplyGroupBind);
+	return function;
+}
+
+ParserExtensionPlanResult GroupDdlPlan(ParserExtensionInfo *, ClientContext &,
+                                       unique_ptr<ParserExtensionParseData> parse_data) {
+	auto &data = static_cast<GroupDdlParseData &>(*parse_data);
+	ParserExtensionPlanResult result;
+	result.function = MakeApplyGroupFunction();
+	result.parameters.push_back(Value(data.action));
+	result.parameters.push_back(Value::BOOLEAN(data.or_replace));
+	result.parameters.push_back(Value(data.group.name));
+	result.parameters.push_back(Value(data.group.prefix));
+	result.parameters.push_back(Value(data.group.require_auth));
+	result.parameters.push_back(Value(data.group.tags));
+	result.parameters.push_back(Value(data.group.policy));
+	result.requires_valid_transaction = false;
+	result.return_type = StatementReturnType::QUERY_RESULT;
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// quackapi_groups() — name, prefix, require_auth, tags, members
+//===--------------------------------------------------------------------===//
+
+struct GroupsBindData : public TableFunctionData {};
+
+struct GroupsGlobalState : public GlobalTableFunctionState {
+	vector<QuackapiGroup> groups;
+	vector<QuackapiRoute> routes;
+	idx_t offset = 0;
+};
+
+unique_ptr<FunctionData> GroupsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
+                                    vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("name");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("prefix");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("require_auth");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("tags");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("members");
+	return make_uniq<GroupsBindData>();
+}
+
+unique_ptr<GlobalTableFunctionState> GroupsInit(ClientContext &context, TableFunctionInitInput &) {
+	auto state = make_uniq<GroupsGlobalState>();
+	auto &qa = QuackapiState::Get(*context.db);
+	state->groups = qa.SnapshotGroups();
+	state->routes = qa.SnapshotRoutes();
+	return std::move(state);
+}
+
+void GroupsExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+	auto &state = data_p.global_state->Cast<GroupsGlobalState>();
+	idx_t row = 0;
+	while (state.offset < state.groups.size() && row < STANDARD_VECTOR_SIZE) {
+		auto &g = state.groups[state.offset];
+		// members: comma-separated route names that joined this group
+		string members;
+		for (auto &r : state.routes) {
+			if (r.group_name == g.name) {
+				if (!members.empty()) {
+					members += ",";
+				}
+				members += r.name;
+			}
+		}
+		output.SetValue(0, row, Value(g.name));
+		output.SetValue(1, row, Value(g.prefix));
+		output.SetValue(2, row, Value(g.require_auth));
+		output.SetValue(3, row, Value(g.tags));
+		output.SetValue(4, row, Value(members));
+		row++;
+		state.offset++;
+	}
+	output.SetCardinality(row);
 }
 
 } // namespace
@@ -697,6 +1194,19 @@ RouteDdlParserExtension::RouteDdlParserExtension() {
 
 TableFunction GetApplyRouteFunction() {
 	return MakeApplyRouteFunction();
+}
+
+GroupDdlParserExtension::GroupDdlParserExtension() {
+	parse_function = GroupDdlParse;
+	plan_function = GroupDdlPlan;
+}
+
+TableFunction GetApplyGroupFunction() {
+	return MakeApplyGroupFunction();
+}
+
+TableFunction GetQuackapiGroupsFunction() {
+	return TableFunction("quackapi_groups", {}, GroupsExec, GroupsBind, GroupsInit);
 }
 
 } // namespace duckdb

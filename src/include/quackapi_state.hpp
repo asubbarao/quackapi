@@ -73,6 +73,20 @@ struct QuackapiParamSpec {
 	idx_t max_length = 0;
 };
 
+//! One registered route group (FastAPI APIRouter-style prefix + default auth).
+//! Expanded into routes at CREATE ROUTE time — runtime registry stays flat.
+struct QuackapiGroup {
+	string name;
+	//! Absolute URL prefix (must start with /). Joined onto route paths at CREATE.
+	string prefix;
+	//! Default auth scheme name. Empty = public. Inherited when route omits REQUIRE.
+	string require_auth;
+	//! OpenAPI tags CSV (e.g. "items,v1"). Inherited by routes that join the group.
+	string tags;
+	//! Seam for future shared policy / middleware name. Unused in v1 — do not depend.
+	string policy;
+};
+
 //! One registered route. Immutable once snapshotted; the registry replaces
 //! entries wholesale on CREATE OR REPLACE ROUTE.
 struct QuackapiRoute {
@@ -88,6 +102,10 @@ struct QuackapiRoute {
 	//! Optional JSON Schema (draft) for the request body. Empty = no schema check.
 	//! Validated via the community `json_schema` extension at request time.
 	string body_schema;
+	//! Group this route joined (empty if none). Pattern/auth already expanded.
+	string group_name;
+	//! OpenAPI tags CSV (from group inheritance or future per-route tags).
+	string tags;
 };
 
 //! Per-database quackapi state: the route registry, auth registry, and running servers.
@@ -119,6 +137,14 @@ public:
 	bool DropRoute(const string &name);
 	vector<QuackapiRoute> SnapshotRoutes();
 
+	//! CREATE [OR REPLACE] GROUP. Throws on duplicate name unless or_replace.
+	void AddGroup(const QuackapiGroup &group, bool or_replace);
+	//! DROP GROUP. Does NOT cascade-drop member routes. Returns false if missing.
+	bool DropGroup(const string &name);
+	//! Lookup by name. Returns false if not registered.
+	bool GetGroup(const string &name, QuackapiGroup &out);
+	vector<QuackapiGroup> SnapshotGroups();
+
 	//! CREATE [OR REPLACE] AUTH. Throws on duplicate name unless or_replace.
 	void AddAuth(const QuackapiAuth &auth, bool or_replace);
 	//! DROP AUTH. Also removes API keys bound to that auth name. Returns false if missing.
@@ -144,6 +170,9 @@ public:
 private:
 	std::mutex routes_mutex;
 	vector<QuackapiRoute> routes;
+
+	std::mutex groups_mutex;
+	vector<QuackapiGroup> groups;
 
 	std::mutex auths_mutex;
 	vector<QuackapiAuth> auths;

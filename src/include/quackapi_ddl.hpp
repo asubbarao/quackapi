@@ -15,4 +15,13 @@ public:
 //! planned statement can resolve it by name.
 TableFunction GetApplyRouteFunction();
 
+//! CREATE [OR REPLACE] GROUP / DROP GROUP syntax (route groups / APIRouter).
+class GroupDdlParserExtension : public ParserExtension {
+public:
+	GroupDdlParserExtension();
+};
+
+TableFunction GetApplyGroupFunction();
+TableFunction GetQuackapiGroupsFunction();
+
 } // namespace duckdb

@@ -396,6 +396,42 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		string op = "{";
 		op += "\"operationId\":" + JsonString(route.name) + ",";
 		op += "\"summary\":" + JsonString(route.name) + ",";
+		// OpenAPI tags from group inheritance (CSV → JSON array)
+		if (!route.tags.empty()) {
+			string tags_json = "[";
+			bool first_tag = true;
+			idx_t ti = 0;
+			while (ti < route.tags.size()) {
+				while (ti < route.tags.size() &&
+				       (StringUtil::CharacterIsSpace(route.tags[ti]) || route.tags[ti] == ',')) {
+					ti++;
+				}
+				if (ti >= route.tags.size()) {
+					break;
+				}
+				idx_t te = ti;
+				while (te < route.tags.size() && route.tags[te] != ',') {
+					te++;
+				}
+				string tag = route.tags.substr(ti, te - ti);
+				// trim trailing space
+				while (!tag.empty() && StringUtil::CharacterIsSpace(tag.back())) {
+					tag.pop_back();
+				}
+				if (!tag.empty()) {
+					if (!first_tag) {
+						tags_json += ",";
+					}
+					first_tag = false;
+					tags_json += JsonString(tag);
+				}
+				ti = te;
+			}
+			tags_json += "]";
+			if (!first_tag) {
+				op += "\"tags\":" + tags_json + ",";
+			}
+		}
 		op += "\"parameters\":" + params_json + ",";
 		op += "\"responses\":" + responses + ",";
 		op += "\"security\":" + security;

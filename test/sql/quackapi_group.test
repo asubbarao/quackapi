@@ -1,0 +1,192 @@
+# name: test/sql/quackapi_group.test
+# description: CREATE GROUP (route groups) — prefix join, auth inheritance, inspection
+# group: [quackapi]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# Registry starts empty
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM quackapi_groups();
+----
+0
+
+# ---------------------------------------------------------------------------
+# CREATE GROUP WITH (prefix, auth, tags)
+# ---------------------------------------------------------------------------
+query I
+CREATE AUTH api AS API_KEY;
+----
+Auth api: API_KEY
+
+query I
+CREATE GROUP v1 WITH (prefix='/api/v1', auth=api, tags='items,v1');
+----
+Group v1: /api/v1
+
+query IIII
+SELECT name, prefix, require_auth, tags FROM quackapi_groups() WHERE name = 'v1';
+----
+v1	/api/v1	api	items,v1
+
+# ---------------------------------------------------------------------------
+# CREATE ROUTE … GROUP <name> expands path + inherits auth
+# ---------------------------------------------------------------------------
+query I
+CREATE ROUTE items_list GET '/items' GROUP v1 AS SELECT 1 AS id, 'x' AS name;
+----
+Route items_list: GET /api/v1/items
+
+query IIII
+SELECT name, pattern, require_auth, group_name FROM quackapi_routes() WHERE name = 'items_list';
+----
+items_list	/api/v1/items	api	v1
+
+query I
+SELECT tags FROM quackapi_routes() WHERE name = 'items_list';
+----
+items,v1
+
+# IN GROUP synonym
+query I
+CREATE ROUTE items_get GET '/items/:id' IN GROUP v1 AS SELECT $id::INTEGER AS id;
+----
+Route items_get: GET /api/v1/items/:id
+
+query II
+SELECT pattern, require_auth FROM quackapi_routes() WHERE name = 'items_get';
+----
+/api/v1/items/:id	api
+
+# Relative path without leading slash joins cleanly
+query I
+CREATE ROUTE items_alt GET 'alt' GROUP v1 AS SELECT 1 AS n;
+----
+Route items_alt: GET /api/v1/alt
+
+query I
+SELECT pattern FROM quackapi_routes() WHERE name = 'items_alt';
+----
+/api/v1/alt
+
+# ---------------------------------------------------------------------------
+# quackapi_groups() lists members
+# ---------------------------------------------------------------------------
+query I
+SELECT members FROM quackapi_groups() WHERE name = 'v1';
+----
+items_list,items_get,items_alt
+
+# ---------------------------------------------------------------------------
+# Route-level REQUIRE wins over group auth
+# ---------------------------------------------------------------------------
+query I
+CREATE AUTH other AS API_KEY;
+----
+Auth other: API_KEY
+
+query I
+CREATE ROUTE override GET '/admin' GROUP v1 REQUIRE other AS SELECT 1 AS n;
+----
+Route override: GET /api/v1/admin
+
+query II
+SELECT pattern, require_auth FROM quackapi_routes() WHERE name = 'override';
+----
+/api/v1/admin	other
+
+# ---------------------------------------------------------------------------
+# Ungrouped absolute route still works
+# ---------------------------------------------------------------------------
+query I
+CREATE ROUTE health GET '/health' AS SELECT 'ok' AS status;
+----
+Route health: GET /health
+
+query II
+SELECT pattern, CASE WHEN group_name = '' THEN '(none)' ELSE group_name END
+FROM quackapi_routes() WHERE name = 'health';
+----
+/health	(none)
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+# duplicate group
+statement error
+CREATE GROUP v1 WITH (prefix='/other');
+----
+already exists
+
+# unknown group
+statement error
+CREATE ROUTE z GET '/z' GROUP missing AS SELECT 1;
+----
+does not exist
+
+# double-prefix footgun
+statement error
+CREATE ROUTE y GET '/api/v1/items' GROUP v1 AS SELECT 1;
+----
+already starts with group prefix
+
+# prefix must start with /
+statement error
+CREATE GROUP bad WITH (prefix='api/v1');
+----
+must start with '/'
+
+# CREATE OR REPLACE GROUP
+query I
+CREATE OR REPLACE GROUP v1 WITH (prefix='/api/v1', auth=api, tags='items');
+----
+Group v1: /api/v1
+
+query I
+SELECT tags FROM quackapi_groups() WHERE name = 'v1';
+----
+items
+
+# DROP GROUP does not cascade routes
+query I
+DROP GROUP v1;
+----
+Dropped group v1
+
+query I
+SELECT count(*) FROM quackapi_groups();
+----
+0
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name = 'items_list';
+----
+1
+
+query I
+SELECT pattern FROM quackapi_routes() WHERE name = 'items_list';
+----
+/api/v1/items
+
+# DROP missing group
+statement error
+DROP GROUP v1;
+----
+does not exist
+
+# SPEC-style CREATE API GROUP PREFIX …
+query I
+CREATE API GROUP v2 PREFIX '/api/v2' TAGS 'v2' REQUIRE api;
+----
+Group v2: /api/v2
+
+query III
+SELECT name, prefix, require_auth FROM quackapi_groups() WHERE name = 'v2';
+----
+v2	/api/v2	api
+
+query I
+DROP API GROUP v2;
+----
+Dropped group v2
