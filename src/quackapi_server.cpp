@@ -22,10 +22,172 @@
 #include "quackapi_state.hpp"
 
 #include "httplib.hpp"
+#include "miniz_wrapper.hpp"
+#include "zstd.h"
 
 namespace duckdb {
 
 namespace {
+
+//! Content-Encoding choice after Accept-Encoding negotiation.
+enum class NegotiatedEncoding { IDENTITY, ZSTD, GZIP };
+
+//! Parse one Accept-Encoding token's q-value (default 1.0 when omitted).
+double ParseEncodingQ(const string &token) {
+	// token forms: "zstd", "gzip;q=0.8", " *; q=0.1"
+	auto parts = StringUtil::Split(token, ';');
+	if (parts.size() < 2) {
+		return 1.0;
+	}
+	for (idx_t i = 1; i < parts.size(); i++) {
+		string p = parts[i];
+		StringUtil::Trim(p);
+		auto lower = StringUtil::Lower(p);
+		if (StringUtil::StartsWith(lower, "q=")) {
+			auto qstr = p.substr(2);
+			StringUtil::Trim(qstr);
+			try {
+				return std::stod(qstr);
+			} catch (...) {
+				return 0.0;
+			}
+		}
+	}
+	return 1.0;
+}
+
+//! Negotiate Content-Encoding: prefer zstd, then gzip, then identity.
+//! Missing Accept-Encoding → identity. q=0 rejects a coding. `*` accepts any.
+NegotiatedEncoding NegotiateContentEncoding(const duckdb_httplib::Request &req) {
+	auto it = req.headers.find("Accept-Encoding");
+	if (it == req.headers.end() || it->second.empty()) {
+		return NegotiatedEncoding::IDENTITY;
+	}
+	// Case-insensitive multimap: first value wins (CollectHeaders pattern).
+	string header = it->second;
+	double zstd_q = -1.0;
+	double gzip_q = -1.0;
+	double identity_q = -1.0;
+	double star_q = -1.0;
+	auto tokens = StringUtil::Split(header, ',');
+	for (auto &raw : tokens) {
+		string tok = raw;
+		StringUtil::Trim(tok);
+		if (tok.empty()) {
+			continue;
+		}
+		// Coding name is before optional parameters.
+		string name = tok;
+		auto semi = name.find(';');
+		if (semi != string::npos) {
+			name = name.substr(0, semi);
+		}
+		StringUtil::Trim(name);
+		auto lower = StringUtil::Lower(name);
+		double q = ParseEncodingQ(tok);
+		if (lower == "zstd") {
+			zstd_q = q;
+		} else if (lower == "gzip" || lower == "x-gzip") {
+			gzip_q = q;
+		} else if (lower == "identity") {
+			identity_q = q;
+		} else if (lower == "*") {
+			star_q = q;
+		}
+	}
+	auto accepted = [](double explicit_q, double star) -> bool {
+		if (explicit_q >= 0.0) {
+			return explicit_q > 0.0;
+		}
+		if (star >= 0.0) {
+			return star > 0.0;
+		}
+		return false;
+	};
+	// Owner default: zstd first whenever the client accepts it.
+	if (accepted(zstd_q, star_q)) {
+		return NegotiatedEncoding::ZSTD;
+	}
+	if (accepted(gzip_q, star_q)) {
+		return NegotiatedEncoding::GZIP;
+	}
+	(void)identity_q;
+	return NegotiatedEncoding::IDENTITY;
+}
+
+//! True for content types that are already compressed (skip re-compression).
+bool IsAlreadyCompressedContentType(const string &content_type) {
+	if (content_type.empty()) {
+		return false;
+	}
+	string ct = StringUtil::Lower(content_type);
+	auto semi = ct.find(';');
+	if (semi != string::npos) {
+		ct = ct.substr(0, semi);
+	}
+	StringUtil::Trim(ct);
+	// SVG is text-like and compresses well; other images are already compressed.
+	if (StringUtil::StartsWith(ct, "image/") && ct != "image/svg+xml") {
+		return true;
+	}
+	if (StringUtil::StartsWith(ct, "audio/") || StringUtil::StartsWith(ct, "video/")) {
+		return true;
+	}
+	static const char *kCompressed[] = {
+	    "application/gzip",
+	    "application/x-gzip",
+	    "application/zip",
+	    "application/x-zip-compressed",
+	    "application/zstd",
+	    "application/x-zstd",
+	    "application/brotli",
+	    "application/x-brotli",
+	    "application/x-compress",
+	    "application/x-xz",
+	    "application/x-rar-compressed",
+	    "application/wasm",
+	    "font/woff",
+	    "font/woff2",
+	    "application/font-woff",
+	    "application/font-woff2",
+	};
+	for (auto *t : kCompressed) {
+		if (ct == t) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Compress body with DuckDB-bundled zstd (duckdb_zstd). Returns false on failure.
+bool CompressZstd(const string &input, string &output) {
+	size_t bound = duckdb_zstd::ZSTD_compressBound(input.size());
+	if (duckdb_zstd::ZSTD_isError(bound)) {
+		return false;
+	}
+	output.resize(bound);
+	auto written = duckdb_zstd::ZSTD_compress(&output[0], bound, input.data(), input.size(),
+	                                          /*level=*/3);
+	if (duckdb_zstd::ZSTD_isError(written)) {
+		return false;
+	}
+	output.resize(written);
+	return true;
+}
+
+//! Compress body with DuckDB-bundled miniz gzip wrapper. Returns false on failure.
+bool CompressGzip(const string &input, string &output) {
+	try {
+		MiniZStream s;
+		size_t out_size = MiniZStream::MaxCompressedLength(input.size());
+		output.resize(out_size);
+		s.Compress(input.data(), input.size(), &output[0], &out_size);
+		output.resize(out_size);
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
 
 string JsonEscape(const string &input) {
 	string result;
@@ -767,7 +929,8 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
                                        const QuackapiServeOptions &opts)
-    : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins) {
+    : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins),
+      compression(opts.compression), compression_min_bytes(opts.compression_min_bytes) {
 	server = make_uniq<duckdb_httplib::Server>();
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
@@ -863,14 +1026,68 @@ void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, du
 	}
 }
 
+void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &req,
+                                               duckdb_httplib::Response &res) {
+	if (!compression) {
+		return;
+	}
+	// No entity / no point compressing tiny payloads.
+	if (res.body.empty() || res.body.size() < compression_min_bytes) {
+		return;
+	}
+	// 204/304 must not carry a body; leave alone.
+	if (res.status == 204 || res.status == 304) {
+		return;
+	}
+	// Already encoded (shouldn't happen on our paths).
+	if (res.has_header("Content-Encoding")) {
+		return;
+	}
+	string content_type = res.get_header_value("Content-Type");
+	if (IsAlreadyCompressedContentType(content_type)) {
+		return;
+	}
+	auto encoding = NegotiateContentEncoding(req);
+	if (encoding == NegotiatedEncoding::IDENTITY) {
+		return;
+	}
+	string compressed;
+	const char *encoding_name = nullptr;
+	if (encoding == NegotiatedEncoding::ZSTD) {
+		if (!CompressZstd(res.body, compressed)) {
+			return;
+		}
+		encoding_name = "zstd";
+	} else if (encoding == NegotiatedEncoding::GZIP) {
+		if (!CompressGzip(res.body, compressed)) {
+			return;
+		}
+		encoding_name = "gzip";
+	} else {
+		return;
+	}
+	// Only swap body if compression actually shrank it.
+	if (compressed.size() >= res.body.size()) {
+		return;
+	}
+	res.body = std::move(compressed);
+	res.set_header("Content-Encoding", encoding_name);
+	// Content-Length is recomputed by httplib from body; strip any stale value.
+	res.headers.erase("Content-Length");
+	// Advertise negotiation variance (may coexist with Vary: Origin from CORS).
+	res.set_header("Vary", "Accept-Encoding");
+}
+
 void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 	// Always attach CORS headers when configured (including error responses).
 	// Applied once at the end via a small RAII-ish pattern: call ApplyCors on
 	// every exit path is error-prone, so we apply after handling via a lambda
 	// wrapper pattern below. For simplicity apply at each return is avoided —
 	// we set a flag and apply once before returning from the outer path.
+	// Compression runs after CORS so both sets of headers land on the response.
 	auto finish = [&]() {
 		ApplyCorsHeaders(req, res);
+		MaybeCompressResponse(req, res);
 	};
 
 	auto db = db_ptr.lock();

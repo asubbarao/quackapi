@@ -22,13 +22,18 @@ class DatabaseInstance;
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 
-//! Serve options (static files, CORS). Defaults keep CORS off (browser
-//! cross-origin blocked) until the operator opts in with cors_origins.
+//! Serve options (static files, CORS, response compression). Defaults keep CORS
+//! off (browser cross-origin blocked) until the operator opts in with
+//! cors_origins. Compression is ON by default (zstd preferred, then gzip).
 struct QuackapiServeOptions {
 	string static_dir;
 	//! Empty = CORS disabled. "*" = reflect any Origin (or * when no Origin).
 	//! Otherwise a comma-separated allow-list of origins.
 	string cors_origins;
+	//! When true (default), honor Accept-Encoding: prefer zstd, then gzip.
+	bool compression = true;
+	//! Bodies smaller than this many bytes are left uncompressed (default 256).
+	idx_t compression_min_bytes = 256;
 };
 
 //! REST sidecar that dispatches requests to routes in QuackapiState.
@@ -72,11 +77,14 @@ private:
 	static void ListenThread(QuackapiHttpServer *server);
 	void HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 	void ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
+	void MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
 	weak_ptr<DatabaseInstance> db_ptr;
 	string host;
 	int port;
 	string cors_origins;
+	bool compression = true;
+	idx_t compression_min_bytes = 256;
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};

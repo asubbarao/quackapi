@@ -1,0 +1,46 @@
+# name: test/sql/quackapi_compression.test
+# description: Compression config surface (SET + serve named params)
+# group: [quackapi]
+
+require quackapi
+
+# Defaults: compression on, min 256 bytes
+query I
+SELECT current_setting('quackapi_compression');
+----
+true
+
+query I
+SELECT current_setting('quackapi_compression_min_bytes');
+----
+256
+
+# SET surface
+statement ok
+SET quackapi_compression = false;
+
+query I
+SELECT current_setting('quackapi_compression');
+----
+false
+
+statement ok
+SET quackapi_compression = true;
+
+statement ok
+SET quackapi_compression_min_bytes = 1024;
+
+query I
+SELECT current_setting('quackapi_compression_min_bytes');
+----
+1024
+
+statement ok
+SET quackapi_compression_min_bytes = 256;
+
+# Settings are listed among duckdb_settings
+query I
+SELECT count(*) = 2 FROM duckdb_settings()
+WHERE name IN ('quackapi_compression', 'quackapi_compression_min_bytes');
+----
+true

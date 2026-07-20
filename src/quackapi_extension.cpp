@@ -37,6 +37,10 @@ struct ServeBindData : public TableFunctionData {
 	string cors_origins;
 	//! Empty = not provided by operator. Named param wins over SET quackapi_memory_limit.
 	string memory_limit;
+	//! Response compression (Accept-Encoding). Default true.
+	bool compression = true;
+	//! Min body size in bytes before compression. Default 256.
+	idx_t compression_min_bytes = 256;
 	bool finished = false;
 };
 
@@ -76,6 +80,34 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		Value setting;
 		if (context.TryGetCurrentSetting("quackapi_memory_limit", setting) && !setting.IsNull()) {
 			bind_data->memory_limit = setting.GetValue<string>();
+		}
+	}
+	// compression named param wins; else SET quackapi_compression (default true).
+	auto comp_entry = input.named_parameters.find("compression");
+	if (comp_entry != input.named_parameters.end()) {
+		bind_data->compression = comp_entry->second.GetValue<bool>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_compression", setting) && !setting.IsNull()) {
+			bind_data->compression = setting.GetValue<bool>();
+		}
+	}
+	// compression_min_bytes named param wins; else SET (default 256).
+	auto min_entry = input.named_parameters.find("compression_min_bytes");
+	if (min_entry != input.named_parameters.end()) {
+		auto v = min_entry->second.GetValue<int64_t>();
+		if (v < 0) {
+			throw InvalidInputException("quackapi_serve: compression_min_bytes must be >= 0");
+		}
+		bind_data->compression_min_bytes = static_cast<idx_t>(v);
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_compression_min_bytes", setting) && !setting.IsNull()) {
+			auto v = setting.GetValue<int64_t>();
+			if (v < 0) {
+				throw InvalidInputException("quackapi_serve: compression_min_bytes must be >= 0");
+			}
+			bind_data->compression_min_bytes = static_cast<idx_t>(v);
 		}
 	}
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -188,6 +220,8 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	QuackapiServeOptions opts;
 	opts.static_dir = bind_data.static_dir;
 	opts.cors_origins = bind_data.cors_origins;
+	opts.compression = bind_data.compression;
+	opts.compression_min_bytes = bind_data.compression_min_bytes;
 	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, opts);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
 	output.SetCardinality(1);
@@ -366,15 +400,29 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "only apply the 256MB serve default when nothing was configured. "
 	                          "Overridden by memory_limit named parameter.",
 	                          LogicalType::VARCHAR, Value(""));
+	// SET quackapi_compression = true|false — response compression (zstd/gzip).
+	// Default true. Serve-time compression := false opts out.
+	config.AddExtensionOption("quackapi_compression",
+	                          "Enable Accept-Encoding response compression on quackapi_serve "
+	                          "(zstd preferred, then gzip). Default true. Overridden by "
+	                          "compression named parameter.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	// SET quackapi_compression_min_bytes = N — skip compression under this size.
+	config.AddExtensionOption("quackapi_compression_min_bytes",
+	                          "Minimum response body size (bytes) before compression. "
+	                          "Default 256. Overridden by compression_min_bytes named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(256));
 
 	// quackapi_serve() / quackapi_serve(port) with optional host + static_dir +
-	// cors_origins + memory_limit
+	// cors_origins + memory_limit + compression + compression_min_bytes
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
 	serve.named_parameters["static_dir"] = LogicalType::VARCHAR;
 	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
 	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
+	serve.named_parameters["compression"] = LogicalType::BOOLEAN;
+	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);
