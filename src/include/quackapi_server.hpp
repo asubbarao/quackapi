@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -17,19 +18,80 @@ struct Response;
 
 namespace duckdb {
 
+class ClientContext;
 class DatabaseInstance;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 
-//! Serve options (static files, CORS). Defaults keep CORS off (browser
-//! cross-origin blocked) until the operator opts in with cors_origins.
+//! Default HTTP worker thread-pool size (httplib TaskQueue).
+static constexpr size_t QUACKAPI_DEFAULT_WORKER_THREADS = 32;
+//! Default keep-alive max requests per connection.
+static constexpr size_t QUACKAPI_DEFAULT_KEEP_ALIVE_MAX = 128;
+//! Default keep-alive idle timeout (seconds).
+static constexpr time_t QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC = 10;
+//! Default socket read/write timeout (seconds).
+static constexpr time_t QUACKAPI_DEFAULT_IO_TIMEOUT_SEC = 30;
+
+//! Access-log / server log verbosity. Default INFO is informative, not silent.
+enum class QuackapiLogLevel : uint8_t {
+	SILENT = 0,
+	ERROR = 1,
+	WARN = 2,
+	INFO = 3,
+	DEBUG = 4,
+};
+
+//! Serve options (static files, CORS, batteries-included server defaults).
+//! Defaults are correct-by-default for a server process: logging on, health
+//! routes on, throughput-oriented DuckDB SETs applied at serve time.
 struct QuackapiServeOptions {
 	string static_dir;
 	//! Empty = CORS disabled. "*" = reflect any Origin (or * when no Origin).
 	//! Otherwise a comma-separated allow-list of origins.
 	string cors_origins;
+
+	// --- Batteries: logging (ON by default) ---
+	//! Access log + server log verbosity. Default INFO.
+	QuackapiLogLevel log_level = QuackapiLogLevel::INFO;
+	//! Emit one structured access-log line per request (stderr, JSON). Default true.
+	bool access_log = true;
+	//! Enable DuckDB built-in logging at serve (CALL enable_logging). Default true.
+	bool enable_logging = true;
+
+	// --- Batteries: health routes (ON by default) ---
+	//! Auto-register GET /health + GET /healthz. Default true.
+	bool health_routes = true;
+
+	// --- Batteries: transport (overridable; sensible server defaults) ---
+	//! httplib worker threads (max concurrent handlers). Default 32.
+	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
+	//! Keep-alive max requests per connection. Default 128.
+	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
+	//! Keep-alive idle timeout seconds. Default 10.
+	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
+	//! Socket read timeout seconds. Default 30.
+	int32_t read_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
+	//! Socket write timeout seconds. Default 30.
+	int32_t write_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
+
+	// --- Batteries: DuckDB SETs applied at serve (overridable) ---
+	//! Empty = apply non-clobber memory guard (256MB when still at system default).
+	string memory_limit;
+	//! Empty = leave DuckDB threads at system default (all cores). Else e.g. "8".
+	string threads;
+	//! When true (default), SET preserve_insertion_order=false for throughput.
+	bool preserve_insertion_order = false;
+	//! When true (default), SET enable_http_metadata_cache=true for outbound HTTP.
+	bool enable_http_metadata_cache = true;
+
+	//! Filled at serve after probing community tsid: "tsid" or "uuidv7".
+	string request_id_source;
 };
+
+//! Parse log_level named param / setting. Accepts silent|error|warn|info|debug
+//! (case-insensitive). Unknown → INFO.
+QuackapiLogLevel ParseQuackapiLogLevel(const string &raw);
 
 //! REST sidecar that dispatches requests to routes in QuackapiState.
 //!
@@ -67,19 +129,44 @@ public:
 	const string &CorsOrigins() const {
 		return cors_origins;
 	}
+	const QuackapiServeOptions &Options() const {
+		return options;
+	}
+	//! Monotonic serve start (for /healthz uptime_sec).
+	std::chrono::steady_clock::time_point StartedAt() const {
+		return started_at;
+	}
 
 private:
 	static void ListenThread(QuackapiHttpServer *server);
 	void HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 	void ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
+	string NextRequestId(DatabaseInstance &db);
+	void EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
+	                   const string &request_id, double latency_ms);
 
 	weak_ptr<DatabaseInstance> db_ptr;
 	string host;
 	int port;
 	string cors_origins;
+	QuackapiServeOptions options;
+	std::chrono::steady_clock::time_point started_at;
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
 };
+
+//! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
+//! Overridable via QuackapiServeOptions; never disables safety features.
+//! Returns a human-readable summary of what was applied (for docs / debugging).
+string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions &opts);
+
+//! Auto-register GET /health + GET /healthz into the route registry (OR REPLACE
+//! reserved names). No-op when opts.health_routes is false.
+void RegisterQuackapiHealthRoutes(DatabaseInstance &db, const QuackapiServeOptions &opts);
+
+//! Probe community tsid extension once; set opts.request_id_source to "tsid" or
+//! "uuidv7". Compose-only (LOAD); never fails serve.
+void ProbeQuackapiRequestIdSource(DatabaseInstance &db, QuackapiServeOptions &opts);
 
 } // namespace duckdb

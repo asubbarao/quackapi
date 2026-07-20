@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <thread>
 
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -9,6 +10,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -767,7 +769,8 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
                                        const QuackapiServeOptions &opts)
-    : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins) {
+    : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins), options(opts),
+      started_at(std::chrono::steady_clock::now()) {
 	server = make_uniq<duckdb_httplib::Server>();
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
@@ -776,11 +779,22 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		throw IOException("quackapi: static_dir \"%s\" is not a directory", opts.static_dir);
 	}
 
-	server->new_task_queue = [] {
-		return new duckdb_httplib::ThreadPool(32);
+	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
+	int32_t workers = opts.worker_threads > 0 ? opts.worker_threads
+	                                          : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
+	server->new_task_queue = [workers] {
+		return new duckdb_httplib::ThreadPool(static_cast<size_t>(workers));
 	};
-	server->set_keep_alive_max_count(128);
-	server->set_keep_alive_timeout(10);
+	server->set_keep_alive_max_count(opts.keep_alive_max_count > 0
+	                                     ? static_cast<size_t>(opts.keep_alive_max_count)
+	                                     : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
+	server->set_keep_alive_timeout(opts.keep_alive_timeout_sec > 0
+	                                   ? static_cast<time_t>(opts.keep_alive_timeout_sec)
+	                                   : QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
+	server->set_read_timeout(opts.read_timeout_sec > 0 ? static_cast<time_t>(opts.read_timeout_sec)
+	                                                   : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
+	server->set_write_timeout(opts.write_timeout_sec > 0 ? static_cast<time_t>(opts.write_timeout_sec)
+	                                                     : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	server->set_tcp_nodelay(true);
 	// Cap request bodies to avoid unbounded memory DoS (httplib default is SIZE_MAX).
 	server->set_payload_max_length(QUACKAPI_PAYLOAD_MAX_LENGTH);
@@ -811,6 +825,63 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		                  host, port);
 	}
 	listen_threads.emplace_back(ListenThread, this);
+}
+
+string QuackapiHttpServer::NextRequestId(DatabaseInstance &db) {
+	// Prefer community tsid() when probe succeeded; else core uuidv7 (C++ — no SQL).
+	if (options.request_id_source == "tsid") {
+		try {
+			Connection con(db);
+			auto res = con.Query("SELECT tsid()");
+			if (!res->HasError()) {
+				auto chunk = res->Fetch();
+				if (chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull()) {
+					return chunk->GetValue(0, 0).ToString();
+				}
+			}
+		} catch (...) {
+			// fall through to uuidv7
+		}
+	}
+	return UUID::ToString(UUIDv7::GenerateRandomUUID());
+}
+
+void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
+                                       const string &request_id, double latency_ms) {
+	if (!options.access_log || options.log_level < QuackapiLogLevel::INFO) {
+		return;
+	}
+	// Structured JSON (one line) — method, path, status, latency_ms, request_id, bytes.
+	size_t bytes = res.body.size();
+	// Prefer Content-Length when set; body may be empty for HEAD.
+	auto cl = res.headers.find("Content-Length");
+	if (cl != res.headers.end()) {
+		try {
+			bytes = static_cast<size_t>(std::stoull(cl->second));
+		} catch (...) {
+		}
+	}
+	// Escape path for JSON (minimal: quotes + backslash + control chars).
+	string path_esc;
+	path_esc.reserve(req.path.size() + 8);
+	for (unsigned char c : req.path) {
+		if (c == '"' || c == '\\') {
+			path_esc += '\\';
+			path_esc += static_cast<char>(c);
+		} else if (c < 0x20) {
+			char buf[8];
+			snprintf(buf, sizeof(buf), "\\u%04x", c);
+			path_esc += buf;
+		} else {
+			path_esc += static_cast<char>(c);
+		}
+	}
+	fprintf(stderr,
+	        "{\"type\":\"access\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,"
+	        "\"latency_ms\":%.3f,\"request_id\":\"%s\",\"bytes\":%llu}\n",
+	        req.method.c_str(), path_esc.c_str(), res.status, latency_ms, request_id.c_str(),
+	        (unsigned long long)bytes);
+	fflush(stderr);
 }
 
 void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
@@ -865,12 +936,19 @@ void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, du
 
 void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 	// Always attach CORS headers when configured (including error responses).
-	// Applied once at the end via a small RAII-ish pattern: call ApplyCors on
-	// every exit path is error-prone, so we apply after handling via a lambda
-	// wrapper pattern below. For simplicity apply at each return is avoided —
-	// we set a flag and apply once before returning from the outer path.
+	// Stamp X-Request-ID + emit structured access log on every exit path.
+	const auto t0 = std::chrono::steady_clock::now();
+	string request_id; // filled once db is available; may be empty on 503 shutdown
+
 	auto finish = [&]() {
+		if (!request_id.empty()) {
+			res.set_header("X-Request-ID", request_id);
+		}
 		ApplyCorsHeaders(req, res);
+		auto t1 = std::chrono::steady_clock::now();
+		double latency_ms =
+		    std::chrono::duration<double, std::milli>(t1 - t0).count();
+		EmitAccessLog(req, res, request_id.empty() ? string("-") : request_id, latency_ms);
 	};
 
 	auto db = db_ptr.lock();
@@ -878,6 +956,50 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		SetJson(res, 503, "{\"detail\":\"database shutting down\"}");
 		finish();
 		return;
+	}
+	request_id = NextRequestId(*db);
+
+	// Built-in health routes (also registered in quackapi_routes() for listing).
+	// Liveness: process accepting HTTP. Readiness: DB handle + version + uptime.
+	if (options.health_routes && (req.method == "GET" || req.method == "HEAD")) {
+		if (req.path == "/health" || req.path == "/health/") {
+			// Object body (not row-array) — standard k8s/load-balancer shape.
+			SetJson(res, 200, "{\"status\":\"ok\"}");
+			finish();
+			return;
+		}
+		if (req.path == "/healthz" || req.path == "/healthz/") {
+			// Readiness: verify the DB handle can run a trivial query.
+			string version = "unknown";
+			bool ready = false;
+			try {
+				Connection con(*db);
+				auto resq = con.Query("SELECT version()");
+				if (!resq->HasError()) {
+					auto chunk = resq->Fetch();
+					if (chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull()) {
+						version = chunk->GetValue(0, 0).ToString();
+						ready = true;
+					}
+				}
+			} catch (...) {
+				ready = false;
+			}
+			auto uptime_sec =
+			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at)
+			        .count();
+			if (ready) {
+				SetJson(res, 200,
+				        StringUtil::Format(
+				            "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,\"request_id_source\":\"%s\"}",
+				            JsonEscape(version), (long long)uptime_sec,
+				            JsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source)));
+			} else {
+				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
+			}
+			finish();
+			return;
+		}
 	}
 
 	// Built-in docs routes (always present while serving; not in quackapi_routes()).
