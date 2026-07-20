@@ -1,0 +1,321 @@
+# name: test/sql/quackapi_queue.test
+# description: First-class durable job queue — CREATE QUEUE, enqueue/dequeue/ack/nack/DLQ
+# group: [quackapi]
+
+require quackapi
+# json is optional for enqueue(VARCHAR); required only for the ::JSON overload path below
+require json
+
+# ---------------------------------------------------------------------------
+# Registry starts empty
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM quackapi_queues();
+----
+0
+
+# ---------------------------------------------------------------------------
+# CREATE QUEUE registers options and creates quackapi_jobs
+# ---------------------------------------------------------------------------
+query I
+CREATE QUEUE default WITH (max_attempts=3, visibility_timeout='30s', backoff_base_seconds=2);
+----
+Queue default: max_attempts=3 visibility_timeout=30s
+
+query IIII
+SELECT name, depth, in_flight, dead FROM quackapi_queues();
+----
+default	0	0	0
+
+query III
+SELECT max_attempts, visibility_timeout_sec, backoff_base_sec FROM quackapi_queues() WHERE name='default';
+----
+3	30	2
+
+# Durable backing table exists
+query I
+SELECT count(*) FROM quackapi_jobs;
+----
+0
+
+# Duplicate without OR REPLACE errors
+statement error
+CREATE QUEUE default;
+----
+already exists
+
+# CREATE OR REPLACE updates options
+query I
+CREATE OR REPLACE QUEUE default WITH (max_attempts=5, visibility_timeout=60);
+----
+Queue default: max_attempts=5 visibility_timeout=60s
+
+query II
+SELECT max_attempts, visibility_timeout_sec FROM quackapi_queues() WHERE name='default';
+----
+5	60
+
+# Restore defaults for remaining tests
+query I
+CREATE OR REPLACE QUEUE default WITH (max_attempts=3, visibility_timeout='30s');
+----
+Queue default: max_attempts=3 visibility_timeout=30s
+
+# ---------------------------------------------------------------------------
+# enqueue → job_id; depth math
+# ---------------------------------------------------------------------------
+query I
+SELECT quackapi_enqueue('default', '{"task":"send_email","to":"a@b.com"}');
+----
+1
+
+query I
+SELECT quackapi_enqueue('default', '{"task":"resize","id":42}'::JSON);
+----
+2
+
+query III
+SELECT name, depth, in_flight FROM quackapi_queues() WHERE name='default';
+----
+default	2	0
+
+# Unknown queue errors
+statement error
+SELECT quackapi_enqueue('nope', '{}');
+----
+does not exist
+
+# ---------------------------------------------------------------------------
+# dequeue claims exactly once (exclusive under single-writer)
+# ---------------------------------------------------------------------------
+query IIII
+SELECT id, status, attempts, queue FROM quackapi_dequeue('default', 1);
+----
+1	running	1	default
+
+query III
+SELECT name, depth, in_flight FROM quackapi_queues() WHERE name='default';
+----
+default	1	1
+
+# Second claim gets the other job, not the leased one
+query II
+SELECT id, attempts FROM quackapi_dequeue('default', 1);
+----
+2	1
+
+# Nothing left claimable
+query I
+SELECT count(*) FROM quackapi_dequeue('default', 5);
+----
+0
+
+query III
+SELECT name, depth, in_flight FROM quackapi_queues() WHERE name='default';
+----
+default	0	2
+
+# ---------------------------------------------------------------------------
+# ack removes from in_flight (status=done)
+# ---------------------------------------------------------------------------
+query I
+SELECT quackapi_ack('default', 1);
+----
+true
+
+query I
+SELECT status FROM quackapi_jobs WHERE id=1;
+----
+done
+
+# Ack of non-running is false
+query I
+SELECT quackapi_ack('default', 1);
+----
+false
+
+query I
+SELECT quackapi_ack('default', 2);
+----
+true
+
+query III
+SELECT depth, in_flight, dead FROM quackapi_queues() WHERE name='default';
+----
+0	0	0
+
+# ---------------------------------------------------------------------------
+# visibility timeout re-claims an unacked job
+# ---------------------------------------------------------------------------
+query I
+CREATE QUEUE lease WITH (max_attempts=3, visibility_timeout='3600s');
+----
+Queue lease: max_attempts=3 visibility_timeout=3600s
+
+query I
+SELECT quackapi_enqueue('lease', '{"x":1}');
+----
+3
+
+query II
+SELECT id, status FROM quackapi_dequeue('lease');
+----
+3	running
+
+# Still leased — second dequeue empty
+query I
+SELECT count(*) FROM quackapi_dequeue('lease');
+----
+0
+
+# Expire the lease by rewriting visible_at into the past
+statement ok
+UPDATE quackapi_jobs SET visible_at = now()::TIMESTAMP - INTERVAL 1 SECOND WHERE id = 3;
+
+# Re-claim: attempts increment
+query III
+SELECT id, status, attempts FROM quackapi_dequeue('lease');
+----
+3	running	2
+
+query I
+SELECT quackapi_ack('lease', 3);
+----
+true
+
+# ---------------------------------------------------------------------------
+# nack requeues with backoff; max_attempts → dead (DLQ)
+# ---------------------------------------------------------------------------
+query I
+CREATE QUEUE nackdemo WITH (max_attempts=2, visibility_timeout='30s', backoff_base_seconds=0);
+----
+Queue nackdemo: max_attempts=2 visibility_timeout=30s
+
+query I
+SELECT quackapi_enqueue('nackdemo', '{"x":1}');
+----
+4
+
+query I
+SELECT id FROM quackapi_dequeue('nackdemo');
+----
+4
+
+# First nack → pending (retry)
+query I
+SELECT quackapi_nack('nackdemo', 4, true, 'try_again');
+----
+pending
+
+query II
+SELECT status, last_error FROM quackapi_jobs WHERE id=4;
+----
+pending	try_again
+
+# Reclaim
+query II
+SELECT id, attempts FROM quackapi_dequeue('nackdemo');
+----
+4	2
+
+# Second nack at max_attempts → dead
+query I
+SELECT quackapi_nack('nackdemo', 4, true, 'final');
+----
+dead
+
+query II
+SELECT status, attempts FROM quackapi_jobs WHERE id=4;
+----
+dead	2
+
+query I
+SELECT dead FROM quackapi_queues() WHERE name='nackdemo';
+----
+1
+
+# nack with requeue=false goes straight to dead
+query I
+SELECT quackapi_enqueue('nackdemo', '{"y":2}');
+----
+5
+
+query I
+SELECT id FROM quackapi_dequeue('nackdemo');
+----
+5
+
+query I
+SELECT quackapi_nack('nackdemo', 5, false, 'no_retry');
+----
+dead
+
+query I
+SELECT status FROM quackapi_jobs WHERE id=5;
+----
+dead
+
+query I
+SELECT dead FROM quackapi_queues() WHERE name='nackdemo';
+----
+2
+
+# ---------------------------------------------------------------------------
+# DROP QUEUE removes registry entry (jobs table retained)
+# ---------------------------------------------------------------------------
+query I
+DROP QUEUE lease;
+----
+Dropped queue lease
+
+statement error
+DROP QUEUE lease;
+----
+does not exist
+
+query I
+SELECT count(*) FROM quackapi_queues() WHERE name='lease';
+----
+0
+
+# Jobs from dropped queue still durable on disk
+query I
+SELECT count(*) FROM quackapi_jobs WHERE queue='lease';
+----
+1
+
+# ---------------------------------------------------------------------------
+# Bad option / parse errors
+# ---------------------------------------------------------------------------
+statement error
+CREATE QUEUE bad WITH (nope=1);
+----
+Unknown QUEUE option
+
+statement error
+CREATE QUEUE bad WITH (max_attempts=0);
+----
+max_attempts must be between 1 and 1000
+
+# ---------------------------------------------------------------------------
+# Enqueue with per-job max_attempts override
+# ---------------------------------------------------------------------------
+query I
+SELECT quackapi_enqueue('default', '{"z":1}', 1);
+----
+6
+
+query I
+SELECT max_attempts FROM quackapi_jobs WHERE id=6;
+----
+1
+
+query I
+SELECT id FROM quackapi_dequeue('default');
+----
+6
+
+query I
+SELECT quackapi_nack('default', 6);
+----
+dead

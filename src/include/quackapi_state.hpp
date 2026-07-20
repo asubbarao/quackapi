@@ -73,6 +73,20 @@ struct QuackapiParamSpec {
 	idx_t max_length = 0;
 };
 
+//! One durable job queue registered via CREATE QUEUE.
+//! Jobs live in the shared `quackapi_jobs` table (survives restart in the .db
+//! file). Queue options live on the DatabaseInstance (like routes) and must be
+//! re-declared after reopen — same lifecycle as CREATE ROUTE.
+struct QuackapiQueue {
+	string name;
+	//! Attempts before a job is moved to status='dead' (dead-letter).
+	int32_t max_attempts = 3;
+	//! Lease duration in seconds after a successful claim (visibility timeout).
+	int32_t visibility_timeout_sec = 30;
+	//! Base delay in seconds for exponential nack backoff: base^min(attempts,6).
+	int32_t backoff_base_sec = 2;
+};
+
 //! One registered route. Immutable once snapshotted; the registry replaces
 //! entries wholesale on CREATE OR REPLACE ROUTE.
 struct QuackapiRoute {
@@ -133,6 +147,14 @@ public:
 	//! Snapshot of stored keys for an auth (hashes only — never raw keys).
 	vector<QuackapiApiKeyEntry> SnapshotApiKeys(const string &auth_name);
 
+	//! CREATE [OR REPLACE] QUEUE. Throws on duplicate name unless or_replace.
+	void AddQueue(const QuackapiQueue &queue, bool or_replace);
+	//! DROP QUEUE. Returns false if no such queue. Does not delete job rows.
+	bool DropQueue(const string &name);
+	//! Lookup by name. Returns false if not registered.
+	bool GetQueue(const string &name, QuackapiQueue &out);
+	vector<QuackapiQueue> SnapshotQueues();
+
 	//! Start serving on host:port. Throws if a server already listens there.
 	void StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
 	//! Stop the server on port (any host). Returns false if none.
@@ -148,6 +170,9 @@ private:
 	std::mutex auths_mutex;
 	vector<QuackapiAuth> auths;
 	vector<QuackapiApiKeyEntry> api_keys;
+
+	std::mutex queues_mutex;
+	vector<QuackapiQueue> queues;
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;

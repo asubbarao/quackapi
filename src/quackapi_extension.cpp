@@ -16,6 +16,7 @@
 #include "quackapi_auth.hpp"
 #include "quackapi_ddl.hpp"
 #include "quackapi_http_fetch.hpp"
+#include "quackapi_queue.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_table_api.hpp"
@@ -325,10 +326,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
 
-	// CREATE ROUTE / DROP ROUTE and CREATE AUTH / DROP AUTH syntax
+	// Durable broker-less job queue (CREATE QUEUE + enqueue/dequeue/ack/nack).
+	// Backing store is the plain quackapi_jobs table; worker = compose cronjob.
+	RegisterQuackapiQueueFunctions(loader);
+
+	// CREATE ROUTE / DROP ROUTE and CREATE AUTH / DROP AUTH / CREATE QUEUE syntax
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
+	ExtensionCallbackManager::Get(db).Register(QueueDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

@@ -34,8 +34,51 @@ response, so the framework doesn't need a model layer to re-declare it.
 | `DROP ROUTE <name>` | Remove an endpoint. Changes apply live while serving. |
 | `quackapi_serve([port], host := '127.0.0.1')` | Serve on background threads; the shell stays usable. |
 | `quackapi_stop([port])` | Stop one server, or all. |
-| `quackapi_routes()` | Inspect the registry. |
+| `quackapi_routes()` | Inspect the route registry. |
 | `quackapi_servers()` | List running servers. |
+| `CREATE [OR REPLACE] QUEUE <name> [WITH (max_attempts=3, visibility_timeout='30s', backoff_base_seconds=2)]` | Register a durable, broker-less job queue. Jobs live in the `quackapi_jobs` table (your `.db` file). |
+| `DROP QUEUE <name>` | Unregister a queue (job rows are kept). |
+| `quackapi_enqueue(queue, payload [, max_attempts])` | Enqueue a job (payload is JSON text); returns `job_id`. Callable from a route handler. |
+| `quackapi_dequeue(queue [, n])` | Atomically claim up to `n` ready jobs (visibility lease). |
+| `quackapi_ack(queue, job_id)` / `quackapi_nack(queue, job_id [, requeue [, error]])` | Complete or retry/dead-letter a claimed job. |
+| `quackapi_queues()` | Inspect name, depth, in_flight, dead (+ options). |
+
+### Durable job queue (broker-less)
+
+No Redis, no NATS: your job queue is a table. Semantics match the SQS/BullMQ-lite
+tier — durable enqueue, atomic claim with a visibility timeout, ack, nack with
+exponential backoff, and a dead-letter status after `max_attempts`.
+
+```sql
+LOAD quackapi;
+
+CREATE QUEUE emails WITH (max_attempts=5, visibility_timeout='30s');
+
+-- From a route (or any SQL):
+CREATE ROUTE enqueue POST '/jobs' STATUS 201 PARAM payload VARCHAR
+  AS SELECT quackapi_enqueue('emails', $payload) AS job_id;
+
+-- Worker tick (run from a session, or schedule via the community cronjob ext):
+SELECT id, payload, quackapi_ack('emails', id) AS acked
+FROM quackapi_dequeue('emails', 10);
+```
+
+**Worker story — compose `cronjob`, do not build a C++ thread pool:**
+
+```sql
+INSTALL cronjob FROM community;
+LOAD cronjob;
+
+-- Drain one job per second: claim → process → ack (or nack on failure).
+SELECT cron($$
+  SELECT quackapi_ack('emails', id)
+  FROM quackapi_dequeue('emails', 1)
+  -- add your processing here; on failure use quackapi_nack('emails', id, true, 'err')
+$$, '*/1 * * * * *');
+```
+
+Redis remains available when you already run a broker; the native table-queue is
+the zero-dependency default for single-node BackgroundTasks / Celery-lite work.
 
 ## Behavior
 

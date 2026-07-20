@@ -152,6 +152,47 @@ vector<QuackapiApiKeyEntry> QuackapiState::SnapshotApiKeys(const string &auth_na
 	return result;
 }
 
+void QuackapiState::AddQueue(const QuackapiQueue &queue, bool or_replace) {
+	std::lock_guard<std::mutex> lock(queues_mutex);
+	for (auto it = queues.begin(); it != queues.end(); ++it) {
+		if (it->name == queue.name) {
+			if (!or_replace) {
+				throw InvalidInputException("Queue \"%s\" already exists — use CREATE OR REPLACE QUEUE", queue.name);
+			}
+			*it = queue;
+			return;
+		}
+	}
+	queues.push_back(queue);
+}
+
+bool QuackapiState::DropQueue(const string &name) {
+	std::lock_guard<std::mutex> lock(queues_mutex);
+	for (auto it = queues.begin(); it != queues.end(); ++it) {
+		if (it->name == name) {
+			queues.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool QuackapiState::GetQueue(const string &name, QuackapiQueue &out) {
+	std::lock_guard<std::mutex> lock(queues_mutex);
+	for (auto &q : queues) {
+		if (q.name == name) {
+			out = q;
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiQueue> QuackapiState::SnapshotQueues() {
+	std::lock_guard<std::mutex> lock(queues_mutex);
+	return queues;
+}
+
 void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts) {
 	// Mirrors QuackStorageExtensionInfo::CreateServer (duckdb-quack
 	// src/quack_storage.cpp): lock map → reject duplicate key → construct
