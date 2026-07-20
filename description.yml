@@ -1,5 +1,5 @@
 # Community-extensions submission descriptor for the `quackapi` extension.
-# Keep in sync with /description.yml at the repository root.
+# Canonical submission copy for community-extensions (also packaging/description.yml).
 #
 # Submit:
 #   1. Fork https://github.com/duckdb/community-extensions

@@ -1,0 +1,113 @@
+# name: test/sql/quackapi_memory_limit.test
+# description: memory_limit knob — SET quackapi_memory_limit + serve named param; non-clobber
+# group: [quackapi]
+
+require quackapi
+
+# Default: empty string (non-clobber / safe-default logic)
+query I
+SELECT current_setting('quackapi_memory_limit');
+----
+(empty)
+
+# SET surface (mirrors cors_origins / other extension options)
+statement ok
+SET quackapi_memory_limit = '4GB';
+
+query I
+SELECT current_setting('quackapi_memory_limit');
+----
+4GB
+
+statement ok
+SET quackapi_memory_limit = '512MB';
+
+query I
+SELECT current_setting('quackapi_memory_limit');
+----
+512MB
+
+# Reset to empty (fall back to non-clobber logic)
+statement ok
+SET quackapi_memory_limit = '';
+
+query I
+SELECT current_setting('quackapi_memory_limit');
+----
+(empty)
+
+# Setting is listed among duckdb_settings
+query I
+SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_memory_limit';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Non-clobber: operator SET memory_limit before serve must stick
+# ---------------------------------------------------------------------------
+statement ok
+SET memory_limit = '2GB';
+
+query I
+SELECT current_setting('memory_limit');
+----
+1.8 GiB
+
+# Serve with no quackapi memory knob — must not overwrite 2GB with 256MB
+query I
+SELECT * FROM quackapi_serve(29101, host := '127.0.0.1');
+----
+http://127.0.0.1:29101
+
+query I
+SELECT current_setting('memory_limit');
+----
+1.8 GiB
+
+query I
+SELECT * FROM quackapi_stop(29101);
+----
+Stopped quackapi server on port 29101
+
+# ---------------------------------------------------------------------------
+# Named param wins and applies
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29102, host := '127.0.0.1', memory_limit := '4GB');
+----
+http://127.0.0.1:29102
+
+query I
+SELECT current_setting('memory_limit');
+----
+3.7 GiB
+
+query I
+SELECT * FROM quackapi_stop(29102);
+----
+Stopped quackapi server on port 29102
+
+# ---------------------------------------------------------------------------
+# Extension setting applies when named param omitted
+# ---------------------------------------------------------------------------
+statement ok
+SET quackapi_memory_limit = '512MB';
+
+query I
+SELECT * FROM quackapi_serve(29103, host := '127.0.0.1');
+----
+http://127.0.0.1:29103
+
+query I
+SELECT current_setting('memory_limit');
+----
+488.2 MiB
+
+query I
+SELECT * FROM quackapi_stop(29103);
+----
+Stopped quackapi server on port 29103
+
+# Cleanup setting
+statement ok
+SET quackapi_memory_limit = '';

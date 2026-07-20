@@ -35,6 +35,8 @@ struct ServeBindData : public TableFunctionData {
 	string static_dir;
 	//! Empty (default) = CORS off. Pass '*' or a comma-separated origin list.
 	string cors_origins;
+	//! Empty = not provided by operator. Named param wins over SET quackapi_memory_limit.
+	string memory_limit;
 	bool finished = false;
 };
 
@@ -63,6 +65,17 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		Value setting;
 		if (context.TryGetCurrentSetting("quackapi_cors_origins", setting) && !setting.IsNull()) {
 			bind_data->cors_origins = setting.GetValue<string>();
+		}
+	}
+	// memory_limit named param wins; else fall back to SET quackapi_memory_limit.
+	// Empty means "not provided" — ApplyServeResourceGuards uses non-clobber logic.
+	auto mem_entry = input.named_parameters.find("memory_limit");
+	if (mem_entry != input.named_parameters.end()) {
+		bind_data->memory_limit = mem_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_memory_limit", setting) && !setting.IsNull()) {
+			bind_data->memory_limit = setting.GetValue<string>();
 		}
 	}
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -96,17 +109,63 @@ static void ComposeQuackAuthSettings(ClientContext &context) {
 	}
 }
 
-//! Apply resource guards recommended for production serve (valsafe HARDENING P1-2).
-//! Operators can raise memory_limit before/after serve if handlers need more.
-static void ApplyServeResourceGuards(ClientContext &context) {
+//! Safe serve default when nothing was configured (valsafe HARDENING P1-2).
+static constexpr const char *SERVE_DEFAULT_MEMORY_LIMIT = "256MB";
+
+//! True when the database still has DuckDB's auto-computed system default
+//! memory_limit (≈80% of available RAM). An explicit SET memory_limit (or a
+//! prior serve that applied our guard) yields a different value.
+static bool IsAtSystemDefaultMemoryLimit(DatabaseInstance &db) {
+	auto &config = DBConfig::GetConfig(db);
+	if (!config.file_system) {
+		return false;
+	}
+	auto available = DBConfig::GetSystemAvailableMemory(*config.file_system);
+	idx_t system_default;
+	if (available == DBConfigOptions().maximum_memory) {
+		system_default = available;
+	} else {
+		// Match DBConfig::SetDefaultMaxMemory().
+		system_default = available * 8 / 10;
+	}
+	return config.options.maximum_memory == system_default;
+}
+
+//! Apply resource guards for production serve (valsafe HARDENING P1-2).
+//!
+//! Precedence:
+//!   1. Explicit operator value (serve memory_limit := … or SET quackapi_memory_limit)
+//!   2. Else if the DB already has a non-default memory_limit → leave it alone
+//!   3. Else apply SERVE_DEFAULT_MEMORY_LIMIT (256MB)
+//!
+//! Never silently clobbers an operator-set DuckDB memory_limit.
+static void ApplyServeResourceGuards(ClientContext &context, const string &requested_limit) {
 	try {
+		string limit_to_apply;
+		if (!requested_limit.empty()) {
+			limit_to_apply = requested_limit;
+		} else if (IsAtSystemDefaultMemoryLimit(*context.db)) {
+			// Nothing configured — apply the conservative serve default.
+			limit_to_apply = SERVE_DEFAULT_MEMORY_LIMIT;
+		} else {
+			// Operator (or a prior serve) already set a non-default limit.
+			return;
+		}
+		// Validate early so a bad knob fails at serve, not as a silent stderr line.
+		try {
+			DBConfig::ParseMemoryLimit(limit_to_apply);
+		} catch (std::exception &ex) {
+			throw InvalidInputException("quackapi_serve: invalid memory_limit '%s': %s", limit_to_apply, ex.what());
+		}
 		Connection con(*context.db);
-		// Cap memory so a single range()/hash join cannot OOM the host.
-		// DuckDB 1.5.4 has no statement_timeout; memory_limit is the main lever.
-		auto res = con.Query("SET memory_limit TO '256MB'");
+		// Escape single quotes for the SET literal (memory strings are usually clean).
+		auto escaped = StringUtil::Replace(limit_to_apply, "'", "''");
+		auto res = con.Query(StringUtil::Format("SET memory_limit TO '%s'", escaped));
 		if (res->HasError()) {
 			fprintf(stderr, "quackapi: could not SET memory_limit: %s\n", res->GetError().c_str());
 		}
+	} catch (InvalidInputException &) {
+		throw;
 	} catch (std::exception &ex) {
 		fprintf(stderr, "quackapi: resource guard failed: %s\n", ex.what());
 	} catch (...) {
@@ -121,8 +180,8 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	}
 	// Compose with quack's auth settings when present (no-op if quack unloaded).
 	ComposeQuackAuthSettings(context);
-	// P1-2: default memory ceiling for the serve lifetime (override with SET).
-	ApplyServeResourceGuards(context);
+	// P1-2: memory ceiling — configurable, never clobbers an operator SET.
+	ApplyServeResourceGuards(context, bind_data.memory_limit);
 	// REST listener — justified by absence of a quack path-registration hook
 	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
 	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.
@@ -298,13 +357,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "CORS allowed origins for quackapi_serve (* or comma-separated list). "
 	                          "Empty (default) disables CORS. Overridden by cors_origins named parameter.",
 	                          LogicalType::VARCHAR, Value(""));
+	// SET quackapi_memory_limit = '4GB' | '512MB' | …
+	// Empty (default) = leave DuckDB memory_limit alone if already non-default;
+	// otherwise apply the 256MB serve guard. Serve-time memory_limit := '…' wins.
+	config.AddExtensionOption("quackapi_memory_limit",
+	                          "Memory limit applied by quackapi_serve (e.g. '4GB', '512MB'). "
+	                          "Empty (default): do not clobber a non-default DuckDB memory_limit; "
+	                          "only apply the 256MB serve default when nothing was configured. "
+	                          "Overridden by memory_limit named parameter.",
+	                          LogicalType::VARCHAR, Value(""));
 
-	// quackapi_serve() / quackapi_serve(port) with optional host + static_dir + cors_origins
+	// quackapi_serve() / quackapi_serve(port) with optional host + static_dir +
+	// cors_origins + memory_limit
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
 	serve.named_parameters["static_dir"] = LogicalType::VARCHAR;
 	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
+	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);
