@@ -1,0 +1,137 @@
+# name: test/sql/quackapi_from_x_bridge.test
+# description: sitting_duck quack_from_x extraction — FastAPI routes + Pydantic models from a committed fixture
+# group: [quackapi]
+
+require quackapi
+
+require json
+
+# sitting_duck / parser_tools are community extensions used by the corpus
+# extractors in bridges/from_x/extract/*.sql. They are loaded here as plain
+# statements (not `require <ext>`) so the test works whether or not they are
+# on the runner's built-in require allowlist — INSTALL is a no-op once the
+# extension is already cached under ~/.duckdb/extensions.
+statement ok
+INSTALL sitting_duck FROM community;
+
+statement ok
+LOAD sitting_duck;
+
+statement ok
+INSTALL parser_tools FROM community;
+
+statement ok
+LOAD parser_tools;
+
+# ---------------------------------------------------------------------------
+# Ingest the fixture FastAPI app AST (mirrors extract/extract_python_ir.sql,
+# stage 1 — literal glob only, sitting_duck does not support lateral paths).
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE TABLE source_ast AS
+SELECT a.*
+FROM read_ast(
+  'bridges/from_x/fixtures/fastapi_mini/app/**/*.py',
+  'python',
+  peek := 'full',
+  ignore_errors := true
+) a;
+
+# Fixture has exactly one file (app/main.py)
+query I
+SELECT count(DISTINCT file_path) FROM source_ast;
+----
+1
+
+# ---------------------------------------------------------------------------
+# FastAPI routes: @router.get / @router.post decorator → call → path string
+# (same decorator join as extract/extract_python_ir.sql section 2a).
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE TABLE routes_fastapi AS
+WITH dec AS (
+  SELECT
+    a.repo, a.file_path, a.node_id AS dec_node_id, a.start_line,
+    call_n.node_id AS call_id, lower(call_n.name) AS method_raw
+  FROM (SELECT NULL AS repo, source_ast.* FROM source_ast) a
+  JOIN source_ast dec
+    ON dec.file_path = a.file_path AND dec.parent_id = a.node_id AND dec.type = 'decorator'
+  JOIN source_ast call_n
+    ON call_n.file_path = a.file_path AND call_n.parent_id = dec.node_id AND call_n.type = 'call'
+  WHERE a.type = 'decorated_definition'
+    AND lower(call_n.name) IN ('get','post','put','delete','patch','options','head','trace','api_route','websocket')
+),
+path_arg AS (
+  SELECT d.*, s.name AS path_quoted
+  FROM dec d
+  JOIN source_ast al ON al.file_path = d.file_path AND al.parent_id = d.call_id AND al.type = 'argument_list'
+  JOIN source_ast s  ON s.file_path = d.file_path AND s.parent_id = al.node_id AND s.type = 'string'
+  QUALIFY row_number() OVER (PARTITION BY d.file_path, d.call_id ORDER BY s.sibling_index) = 1
+),
+handler AS (
+  SELECT p.*, fn.name AS handler_name
+  FROM path_arg p
+  JOIN source_ast fn
+    ON fn.file_path = p.file_path AND fn.parent_id = p.dec_node_id AND fn.type = 'function_definition'
+)
+SELECT method_raw AS method, path_quoted, handler_name
+FROM handler;
+
+# Two routes: GET /articles/{slug}, POST /login (quoted string form)
+query I
+SELECT count(*) FROM routes_fastapi;
+----
+2
+
+query III
+SELECT method, path_quoted, handler_name FROM routes_fastapi ORDER BY method;
+----
+get	"/articles/{slug}"	get_article
+post	"/login"	login
+
+# ---------------------------------------------------------------------------
+# Pydantic model: UserInLogin(BaseModel) with 3 fields (2 required, 1 default)
+# (mirrors the class_definition -> BaseModel closure used by the corpus
+# extractor's model-IR stage; trimmed to direct-inheritance for the fixture).
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE TABLE models_pydantic AS
+WITH cls AS (
+  SELECT a.node_id AS class_node_id, a.name AS model_name
+  FROM source_ast a
+  JOIN source_ast base_list
+    ON base_list.file_path = a.file_path AND base_list.parent_id = a.node_id AND base_list.type = 'argument_list'
+  JOIN source_ast base_id
+    ON base_id.file_path = a.file_path AND base_id.parent_id = base_list.node_id AND base_id.type = 'identifier'
+  WHERE a.type = 'class_definition'
+    AND base_id.name = 'BaseModel'
+),
+body AS (
+  SELECT c.model_name, blk.node_id AS block_id
+  FROM cls c
+  JOIN source_ast blk
+    ON blk.parent_id = c.class_node_id AND blk.type = 'block'
+),
+field AS (
+  SELECT
+    b.model_name,
+    stmt.node_id AS stmt_id,
+    stmt.type AS stmt_type
+  FROM body b
+  JOIN source_ast stmt
+    ON stmt.parent_id = b.block_id
+   AND stmt.type IN ('expression_statement')
+)
+SELECT model_name, count(*) AS n_fields
+FROM field
+GROUP BY model_name;
+
+query I
+SELECT model_name FROM models_pydantic;
+----
+UserInLogin
+
+query I
+SELECT n_fields FROM models_pydantic WHERE model_name = 'UserInLogin';
+----
+3

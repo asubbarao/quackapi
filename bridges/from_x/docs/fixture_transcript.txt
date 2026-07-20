@@ -1,0 +1,68 @@
+quack_from_fastapi live transcript against the committed fixture
+(bridges/from_x/fixtures/fastapi_mini), captured while homing the
+sitting_duck quack_from_x bridge on feat/from-x.
+
+Command:
+  DUCKDB_BIN=/Users/aloksubbarao/personal/quackapi/build/release/duckdb \
+    bridges/from_x/one_callers/quack_from_fastapi.sh \
+    bridges/from_x/fixtures/fastapi_mini 18855 serve
+
+--- generation summary (phase 1) ---
+repo=fastapi_mini
+ast_nodes=182  ast_files=1
+routes_found=2  routes_resolved=2  routes_registered_sql=2
+models_found=1  model_fields=3  model_validate_routes=1
+total_create_route_stmts=4
+routes_with_body_schema=0  routes_with_path_params=1  include_router_calls=1
+
+--- generated routes.sql (phase 1 output, fed via FIFO in phase 2) ---
+CREATE OR REPLACE ROUTE qf_health GET '/_qf/health' AS SELECT 'ok' AS status, 'fastapi_mini' AS repo;
+
+CREATE OR REPLACE ROUTE get_get_article GET '/api/articles/{slug}'
+  PARAM slug VARCHAR
+  AS
+SELECT $slug::VARCHAR AS slug;
+
+CREATE OR REPLACE ROUTE post_login POST '/api/login' STATUS 201
+  AS
+SELECT 'login' AS handler, 'POST' AS method, '/api/login' AS path, 'from_fastapi' AS source;
+
+CREATE OR REPLACE ROUTE validate_UserInLogin POST '/_qf/validate/UserInLogin' STATUS 200
+  BODY SCHEMA '{"type":"object","required":["email","password"],"properties":{"email":{"type":"string"},"password":{"type":"string"},"remember_me":{"type":"boolean"}}}'
+  AS
+SELECT $email::VARCHAR AS email, $password::VARCHAR AS password, 'UserInLogin' AS model;
+
+--- phase 2: FIFO register + quackapi_serve(18855) ---
+server up pid=20082 port=18855
+
+--- live curl probes (all against the running server) ---
+$ curl -sS http://127.0.0.1:18855/_qf/health
+[{"status":"ok","repo":"fastapi_mini"}]
+
+$ curl -sS http://127.0.0.1:18855/api/articles/how-to-quack
+[{"slug":"how-to-quack"}]
+
+$ curl -sS -X POST http://127.0.0.1:18855/api/login -H 'Content-Type: application/json' -d '{}'
+status=201
+[{"handler":"login","method":"POST","path":"/api/login","source":"from_fastapi"}]
+
+$ curl -sS -X POST http://127.0.0.1:18855/_qf/validate/UserInLogin -H 'Content-Type: application/json' -d '{"email":"a@b.com","password":"x"}'
+[{"email":"a@b.com","password":"x","model":"UserInLogin"}]
+
+$ curl -sS -X POST http://127.0.0.1:18855/_qf/validate/UserInLogin -H 'Content-Type: application/json' -d '{"email":"a@b.com"}'
+status=422
+{"detail":[{"loc":["body","_schema"],"msg":"Validation of JSON schema failed, here is why: At  of {\"email\":\"a@b.com\"} - required property 'password' not found in object\n\nValue: {\"email\":\"a@b.com\"}","type":"value_error"}]}
+
+--- observed gap (matches docs/fromfast.md gap analysis) ---
+POST /api/login carries no BODY SCHEMA because the fixture handler binds the
+body implicitly (`def login(user: UserInLogin)`), not via explicit
+`Body(..., embed=True)`. The driver only emits BODY SCHEMA for the explicit-
+Body pattern proven on fastapi-realworld; implicit Pydantic-typed parameters
+are a known, documented gap, not a silent failure — the route still registers
+and returns 201, just without body validation.
+
+--- shutdown ---
+$ kill $(cat out/fastapi_mini/server.pid) $(cat out/fastapi_mini/hold.pid)
+$ curl --connect-timeout 1 http://127.0.0.1:18855/_qf/health
+curl: (7) Failed to connect to 127.0.0.1 port 18855 after 0 ms: Couldn't connect to server
+(server down, confirmed clean shutdown)

@@ -1,0 +1,5 @@
+# Scratch output from running one_callers/quack_from_fastapi.sh — logs,
+# generated routes.sql, pid files, FIFOs. Never committed; regenerate with
+# `bridges/from_x/one_callers/quack_from_fastapi.sh <path> <port> [serve|gen-only]`.
+one_callers/out/
+one_callers/work/

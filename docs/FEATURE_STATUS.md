@@ -326,13 +326,13 @@ Ship community-extensions `description.yml` **0.1.0** with the surface proven on
 
 | Companion | Form | Status |
 |-----------|------|--------|
-| `quack_from_fastapi.sh` | shell + SQL under `/tmp/quackapi_fromfast/` | partial one-caller, e2e green |
-| `quack_from_rails` | same shape | proven rails-realworld |
+| `quack_from_fastapi.sh` | shell + SQL, **homed in-repo**: `bridges/from_x/one_callers/` | partial one-caller, e2e green (corpus + fixture in `bridges/from_x/fixtures/fastapi_mini`, `test/sql/quackapi_from_x_bridge.test`) |
+| `quack_from_rails` | same shape, corpus proof homed in `bridges/from_x/docs/rails_bridge.md` | proven rails-realworld |
 | `quack_from_openapi` | pure SQL over OpenAPI/JSON Schema | designed + fixtures |
-| Pydantic → BODY SCHEMA emitter | SQL/scripts | ~81% feature map |
-| Future: express / gin / DRF one-callers | IR already in corpus | not shipped |
+| Pydantic → BODY SCHEMA emitter | SQL/scripts, extraction homed in `bridges/from_x/extract/extract_python_ir.sql` | ~81% feature map |
+| Future: express / gin / DRF one-callers | IR extractors homed in `bridges/from_x/extract/` (node/go); ruby extractor `bridges/from_x/extract/extract_ruby_ir.py` | not shipped as one-callers |
 
-Promote into-repo `examples/` or a `bridges/` package **after** v1 lands; optional later C++ `quack_from_*(path)` TVFs.
+**Promoted into-repo:** `bridges/from_x/` (branch `feat/from-x`) now carries the extraction SQL (Python/Node/Go/Ruby), the `quack_from_fastapi` one-caller driver, a committed fixture, and a passing sqllogictest — closing the "promote after v1" TODO below for the extraction half. The one-caller is still shell+SQL, not an in-tree C++ `quack_from_*(path)` TVF; that remains open (see `bridges/from_x/README.md` §4 and the P0 items in `bridges/from_x/docs/fromfast.md` §4).
 
 ### Blocked on transport
 
