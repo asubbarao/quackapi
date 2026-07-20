@@ -87,6 +87,47 @@ vector<QuackapiStream> QuackapiState::SnapshotStreams() {
 	return streams;
 }
 
+void QuackapiState::AddGroup(const QuackapiGroup &group, bool or_replace) {
+	std::lock_guard<std::mutex> lock(groups_mutex);
+	for (auto it = groups.begin(); it != groups.end(); ++it) {
+		if (it->name == group.name) {
+			if (!or_replace) {
+				throw InvalidInputException("Group \"%s\" already exists — use CREATE OR REPLACE GROUP", group.name);
+			}
+			*it = group;
+			return;
+		}
+	}
+	groups.push_back(group);
+}
+
+bool QuackapiState::DropGroup(const string &name) {
+	std::lock_guard<std::mutex> lock(groups_mutex);
+	for (auto it = groups.begin(); it != groups.end(); ++it) {
+		if (it->name == name) {
+			groups.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool QuackapiState::GetGroup(const string &name, QuackapiGroup &out) {
+	std::lock_guard<std::mutex> lock(groups_mutex);
+	for (auto &group : groups) {
+		if (group.name == name) {
+			out = group;
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiGroup> QuackapiState::SnapshotGroups() {
+	std::lock_guard<std::mutex> lock(groups_mutex);
+	return groups;
+}
+
 void QuackapiState::AddAuth(const QuackapiAuth &auth, bool or_replace) {
 	std::lock_guard<std::mutex> lock(auths_mutex);
 	for (auto it = auths.begin(); it != auths.end(); ++it) {
