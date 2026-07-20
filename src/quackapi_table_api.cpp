@@ -241,14 +241,12 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	get_route.name = bind_data.table + "_get";
 	get_route.method = "GET";
 	get_route.pattern = base + "/:" + bind_data.key;
-	get_route.handler_sql =
-	    "SELECT * FROM " + quoted_table + " WHERE " + quoted_key + " = $" + bind_data.key;
+	get_route.handler_sql = "SELECT * FROM " + quoted_table + " WHERE " + quoted_key + " = $" + bind_data.key;
 	get_route.status = 200;
 	state.AddRoute(get_route, bind_data.or_replace);
 
-	output.SetValue(0, 0,
-	                Value(StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base,
-	                                         bind_data.key)));
+	output.SetValue(
+	    0, 0, Value(StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key)));
 	output.SetCardinality(1);
 	bind_data.finished = true;
 }

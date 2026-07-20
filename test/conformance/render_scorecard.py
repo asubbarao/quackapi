@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Recompute headline numbers from results.jsonl into a short SUMMARY block."""
+
 import json
 from collections import defaultdict
 from pathlib import Path

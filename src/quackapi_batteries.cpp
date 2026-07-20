@@ -98,15 +98,14 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			try {
 				DBConfig::ParseMemoryLimit(limit_to_apply);
 			} catch (std::exception &ex) {
-				throw InvalidInputException("quackapi_serve: invalid memory_limit '%s': %s", limit_to_apply,
-				                            ex.what());
+				throw InvalidInputException("quackapi_serve: invalid memory_limit '%s': %s", limit_to_apply, ex.what());
 			}
 			auto escaped = StringUtil::Replace(limit_to_apply, "'", "''");
 			if (RunSet(con, StringUtil::Format("SET memory_limit TO '%s'", escaped), err)) {
-				applied.push_back(StringUtil::Format(
-				    "memory_limit=%s (WHY: RAM guardrail for multi-query HTTP workers; "
-				    "prevents one handler from OOMing the process)",
-				    limit_to_apply));
+				applied.push_back(
+				    StringUtil::Format("memory_limit=%s (WHY: RAM guardrail for multi-query HTTP workers; "
+				                       "prevents one handler from OOMing the process)",
+				                       limit_to_apply));
 			} else {
 				fprintf(stderr, "quackapi: could not SET memory_limit: %s\n", err.c_str());
 			}
@@ -121,11 +120,10 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	{
 		const char *pio = opts.preserve_insertion_order ? "true" : "false";
 		if (RunSet(con, StringUtil::Format("SET preserve_insertion_order = %s", pio), err)) {
-			applied.push_back(StringUtil::Format(
-			    "preserve_insertion_order=%s (WHY: %s)", pio,
-			    opts.preserve_insertion_order
-			        ? "operator requested stable scan order"
-			        : "server throughput — allow reordering when no ORDER BY"));
+			applied.push_back(StringUtil::Format("preserve_insertion_order=%s (WHY: %s)", pio,
+			                                     opts.preserve_insertion_order
+			                                         ? "operator requested stable scan order"
+			                                         : "server throughput — allow reordering when no ORDER BY"));
 		} else {
 			fprintf(stderr, "quackapi: could not SET preserve_insertion_order: %s\n", err.c_str());
 		}
@@ -138,10 +136,10 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	{
 		const char *v = opts.enable_http_metadata_cache ? "true" : "false";
 		if (RunSet(con, StringUtil::Format("SET enable_http_metadata_cache = %s", v), err)) {
-			applied.push_back(StringUtil::Format(
-			    "enable_http_metadata_cache=%s (WHY: cache HTTP ETag/Last-Modified for "
-			    "outbound companion fetches)",
-			    v));
+			applied.push_back(
+			    StringUtil::Format("enable_http_metadata_cache=%s (WHY: cache HTTP ETag/Last-Modified for "
+			                       "outbound companion fetches)",
+			                       v));
 		} else {
 			fprintf(stderr, "quackapi: could not SET enable_http_metadata_cache: %s\n", err.c_str());
 		}
@@ -168,8 +166,8 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			sql = StringUtil::Format("SET threads TO '%s'", escaped);
 		}
 		if (RunSet(con, sql, err)) {
-			applied.push_back(StringUtil::Format(
-			    "threads=%s (WHY: operator-capped worker pool for multi-tenant hosts)", opts.threads));
+			applied.push_back(StringUtil::Format("threads=%s (WHY: operator-capped worker pool for multi-tenant hosts)",
+			                                     opts.threads));
 		} else {
 			fprintf(stderr, "quackapi: could not SET threads: %s\n", err.c_str());
 		}
@@ -184,29 +182,25 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	if (opts.enable_logging && opts.log_level != QuackapiLogLevel::SILENT) {
 		const char *level = LogLevelDuckDBName(opts.log_level);
 		// Prefer CALL enable_logging (current DuckDB API) — sets storage + level.
-		auto call = con.Query(StringUtil::Format(
-		    "CALL enable_logging(level:='%s', storage:='stdout')", level));
+		auto call = con.Query(StringUtil::Format("CALL enable_logging(level:='%s', storage:='stdout')", level));
 		if (call->HasError()) {
 			// Fall back to SET surface if CALL signature differs.
 			RunSet(con, "SET enable_logging = true", err);
 			RunSet(con, StringUtil::Format("SET logging_level = '%s'", level), err);
 			RunSet(con, "SET logging_storage = 'stdout'", err);
-			applied.push_back(StringUtil::Format(
-			    "enable_logging=true logging_level=%s logging_storage=stdout "
-			    "(WHY: built-in query/error capture for server ops; CALL failed: %s)",
-			    level, call->GetError()));
+			applied.push_back(StringUtil::Format("enable_logging=true logging_level=%s logging_storage=stdout "
+			                                     "(WHY: built-in query/error capture for server ops; CALL failed: %s)",
+			                                     level, call->GetError()));
 		} else {
-			applied.push_back(StringUtil::Format(
-			    "CALL enable_logging(level:='%s', storage:='stdout') "
-			    "(WHY: DuckDB built-in logger ON — queries + errors to stdout)",
-			    level));
+			applied.push_back(StringUtil::Format("CALL enable_logging(level:='%s', storage:='stdout') "
+			                                     "(WHY: DuckDB built-in logger ON — queries + errors to stdout)",
+			                                     level));
 		}
 		// Deprecated but still present: keep HTTP client logging on (already true
 		// by default on v1.5.4 — re-assert for older forks).
 		if (RunSet(con, "SET enable_http_logging = true", err)) {
-			applied.push_back(
-			    "enable_http_logging=true (WHY: outbound HTTP client request log; "
-			    "deprecated DuckDB setting, still effective)");
+			applied.push_back("enable_http_logging=true (WHY: outbound HTTP client request log; "
+			                  "deprecated DuckDB setting, still effective)");
 		}
 	} else {
 		applied.push_back("enable_logging=<skipped> (WHY: operator disabled or log_level=silent)");
@@ -234,28 +228,22 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	}
 
 	// Transport knobs are applied in QuackapiHttpServer ctor (httplib).
-	applied.push_back(StringUtil::Format(
-	    "http keep_alive_max_count=%d keep_alive_timeout_sec=%d "
-	    "(WHY: connection reuse cuts TCP/TLS handshake cost)",
-	    opts.keep_alive_max_count, opts.keep_alive_timeout_sec));
-	applied.push_back(StringUtil::Format(
-	    "http read_timeout_sec=%d write_timeout_sec=%d "
-	    "(WHY: bound stalled clients so workers are not pinned forever)",
-	    opts.read_timeout_sec, opts.write_timeout_sec));
-	applied.push_back(StringUtil::Format(
-	    "http worker_threads=%d (WHY: concurrent request handlers; cap prevents "
-	    "unbounded thread spawn under load)",
-	    opts.worker_threads));
-	applied.push_back(StringUtil::Format(
-	    "http payload_max_length=%llu (WHY: body size DoS guard — 413 above cap)",
-	    (unsigned long long)QUACKAPI_PAYLOAD_MAX_LENGTH));
-	applied.push_back(StringUtil::Format(
-	    "access_log=%s log_level=%s (WHY: every request → structured stderr line "
-	    "for correlation with X-Request-ID)",
-	    opts.access_log ? "true" : "false", LogLevelDuckDBName(opts.log_level)));
-	applied.push_back(StringUtil::Format(
-	    "health_routes=%s (WHY: /health liveness + /healthz readiness out of the box)",
-	    opts.health_routes ? "true" : "false"));
+	applied.push_back(StringUtil::Format("http keep_alive_max_count=%d keep_alive_timeout_sec=%d "
+	                                     "(WHY: connection reuse cuts TCP/TLS handshake cost)",
+	                                     opts.keep_alive_max_count, opts.keep_alive_timeout_sec));
+	applied.push_back(StringUtil::Format("http read_timeout_sec=%d write_timeout_sec=%d "
+	                                     "(WHY: bound stalled clients so workers are not pinned forever)",
+	                                     opts.read_timeout_sec, opts.write_timeout_sec));
+	applied.push_back(StringUtil::Format("http worker_threads=%d (WHY: concurrent request handlers; cap prevents "
+	                                     "unbounded thread spawn under load)",
+	                                     opts.worker_threads));
+	applied.push_back(StringUtil::Format("http payload_max_length=%llu (WHY: body size DoS guard — 413 above cap)",
+	                                     (unsigned long long)QUACKAPI_PAYLOAD_MAX_LENGTH));
+	applied.push_back(StringUtil::Format("access_log=%s log_level=%s (WHY: every request → structured stderr line "
+	                                     "for correlation with X-Request-ID)",
+	                                     opts.access_log ? "true" : "false", LogLevelDuckDBName(opts.log_level)));
+	applied.push_back(StringUtil::Format("health_routes=%s (WHY: /health liveness + /healthz readiness out of the box)",
+	                                     opts.health_routes ? "true" : "false"));
 
 	string summary = StringUtil::Join(applied, "\n");
 	if (opts.log_level >= QuackapiLogLevel::INFO) {

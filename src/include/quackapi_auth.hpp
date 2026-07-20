@@ -50,8 +50,7 @@ struct QuackapiAuthResult {
 //! Policy engine for one CREATE AUTH scheme against a raw credential string
 //! (API key material or JWT). Used by the SQL surface and by REST handlers via
 //! EvaluateAuthQuery-style SQL (mirrors quack_server.cpp::EvaluateAuthQuery).
-QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_name,
-                                    const string &auth_string);
+QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_name, const string &auth_string);
 
 //! Extract the credential string a scheme expects from HTTP headers
 //! (X-API-Key / custom header / Authorization: Bearer). Empty if missing.

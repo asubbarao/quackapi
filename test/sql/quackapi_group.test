@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_group.test
 # description: CREATE GROUP (route groups) — prefix join, auth inheritance, inspection
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

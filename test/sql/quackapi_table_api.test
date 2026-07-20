@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_table_api.test
 # description: CREATE API FOR TABLE generates read routes into the registry
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

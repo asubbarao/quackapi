@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_routes.test
 # description: CREATE ROUTE / DROP ROUTE DDL and the route registry
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

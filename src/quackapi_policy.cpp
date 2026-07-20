@@ -431,8 +431,8 @@ struct PolicyDdlParseData : public ParserExtensionParseData {
 	string action;
 	bool or_replace = false;
 	string name;
-	string value_type;           // masking ON <type>
-	vector<string> arg_columns;  // RAP signature / bind ON cols / mask column
+	string value_type;          // masking ON <type>
+	vector<string> arg_columns; // RAP signature / bind ON cols / mask column
 	vector<string> arg_types;
 	string expression;
 	string table_name;
@@ -728,7 +728,8 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 				data->name = pname;
 				return ParserExtensionParseResult(std::move(data));
 			}
-			if (StringUtil::StartsWith(ru, "UNSET MASKING POLICY") || StringUtil::StartsWith(ru, "DROP MASKING POLICY")) {
+			if (StringUtil::StartsWith(ru, "UNSET MASKING POLICY") ||
+			    StringUtil::StartsWith(ru, "DROP MASKING POLICY")) {
 				auto data = make_uniq<PolicyDdlParseData>();
 				data->action = "UNBIND_MASK";
 				data->table_name = table;
@@ -909,11 +910,11 @@ void ApplyPolicyExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 
 TableFunction MakeApplyPolicyFunction() {
 	// action, or_replace, name, value_type, arg_columns_csv, arg_types_csv, expression, table, column
-	TableFunction function(
-	    "quackapi_apply_policy",
-	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	     LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	    ApplyPolicyExec, ApplyPolicyBind);
+	TableFunction function("quackapi_apply_policy",
+	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                        LogicalType::VARCHAR},
+	                       ApplyPolicyExec, ApplyPolicyBind);
 	return function;
 }
 
@@ -1159,8 +1160,7 @@ string RewriteHandlerWithPolicies(DatabaseInstance &db, const string &handler_sq
 	for (auto &kv : table_canonical) {
 		tables.push_back(kv.second);
 	}
-	std::sort(tables.begin(), tables.end(),
-	          [](const string &a, const string &b) { return a.size() > b.size(); });
+	std::sort(tables.begin(), tables.end(), [](const string &a, const string &b) { return a.size() > b.size(); });
 
 	string sql = handler_sql;
 	for (auto &table : tables) {

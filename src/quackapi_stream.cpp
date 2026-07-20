@@ -63,8 +63,7 @@ bool ParseIntervalMs(const string &raw, int64_t &out_ms, string &err) {
 	int64_t mult_ms = 1000; // bare number = seconds (same as queue-style durations)
 	if (i < s.size()) {
 		auto unit = StringUtil::Lower(s.substr(i));
-		if (unit == "ms" || unit == "msec" || unit == "millis" || unit == "millisecond" ||
-		    unit == "milliseconds") {
+		if (unit == "ms" || unit == "msec" || unit == "millis" || unit == "millisecond" || unit == "milliseconds") {
 			mult_ms = 1;
 		} else if (unit == "s" || unit == "sec" || unit == "secs" || unit == "second" || unit == "seconds") {
 			mult_ms = 1000;
@@ -161,9 +160,8 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 		    "Bidirectional duplex belongs on the quack protocol, not HTTP Upgrade.");
 	}
 	if (method != "GET") {
-		return ParserExtensionParseResult(
-		    "CREATE STREAM only supports GET (SSE). Unknown method \"" + method +
-		    "\" — WebSocket is deferred (no WS on httplib transport)");
+		return ParserExtensionParseResult("CREATE STREAM only supports GET (SSE). Unknown method \"" + method +
+		                                  "\" — WebSocket is deferred (no WS on httplib transport)");
 	}
 	rest = Trim(rest.substr(second_space));
 
@@ -213,9 +211,8 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 				break;
 			}
 			idx_t key_start = oi;
-			while (oi < opts.size() &&
-			       (StringUtil::CharacterIsAlpha(opts[oi]) || StringUtil::CharacterIsDigit(opts[oi]) ||
-			        opts[oi] == '_')) {
+			while (oi < opts.size() && (StringUtil::CharacterIsAlpha(opts[oi]) ||
+			                            StringUtil::CharacterIsDigit(opts[oi]) || opts[oi] == '_')) {
 				oi++;
 			}
 			auto key = StringUtil::Lower(opts.substr(key_start, oi - key_start));
@@ -276,8 +273,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 	}
 
 	// AS <select>
-	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
-	      StringUtil::CharacterIsSpace(rest[2]))) {
+	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2]))) {
 		return ParserExtensionParseResult("Expected AS <select> in CREATE STREAM");
 	}
 	auto handler = Trim(rest.substr(2));

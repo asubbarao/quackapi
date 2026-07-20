@@ -351,8 +351,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			continue;
 		}
 		// [IN GROUP <name>] or [GROUP <name>]
-		if (StringUtil::StartsWith(rest_upper, "IN") && rest.size() > 2 &&
-		    StringUtil::CharacterIsSpace(rest[2])) {
+		if (StringUtil::StartsWith(rest_upper, "IN") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2])) {
 			string after_in = Trim(rest.substr(2));
 			auto after_upper = StringUtil::Upper(after_in);
 			if (StringUtil::StartsWith(after_upper, "GROUP") &&
@@ -396,8 +395,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	// [BODY SCHEMA '<json-schema>'] — may appear before PARAM or after PARAM blocks.
 	// Returns false and sets err on syntax error; true when clause absent or consumed.
 	auto TryConsumeBodySchema = [&](string &err_out) -> bool {
-		if (!(StringUtil::StartsWith(rest_upper, "BODY") && rest.size() > 4 &&
-		      StringUtil::CharacterIsSpace(rest[4]))) {
+		if (!(StringUtil::StartsWith(rest_upper, "BODY") && rest.size() > 4 && StringUtil::CharacterIsSpace(rest[4]))) {
 			return true; // not present
 		}
 		string after_body = Trim(rest.substr(4));
@@ -463,8 +461,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 
 	// Zero or more PARAM clauses (optional defaults + constraints).
 	vector<QuackapiParamSpec> params;
-	while (StringUtil::StartsWith(rest_upper, "PARAM") &&
-	       (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
+	while (StringUtil::StartsWith(rest_upper, "PARAM") && (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
 		rest = Trim(rest.substr(5));
 		if (rest.empty()) {
 			return ParserExtensionParseResult("PARAM expects a parameter name");
@@ -526,10 +523,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					te = NextTokenEnd(rest);
 					auto maybe = rest.substr(0, te);
 					auto mu = StringUtil::Upper(maybe);
-					if (mu != "DEFAULT" && mu != "GE" && mu != "GT" && mu != "LE" && mu != "LT" &&
-					    mu != "MIN_LENGTH" && mu != "MAX_LENGTH" && mu != "PARAM" && mu != "BODY" &&
-					    mu != "AS" && mu != "HEADER" && mu != "COOKIE" && mu != "QUERY" &&
-					    !IsParamTypeName(maybe)) {
+					if (mu != "DEFAULT" && mu != "GE" && mu != "GT" && mu != "LE" && mu != "LT" && mu != "MIN_LENGTH" &&
+					    mu != "MAX_LENGTH" && mu != "PARAM" && mu != "BODY" && mu != "AS" && mu != "HEADER" &&
+					    mu != "COOKIE" && mu != "QUERY" && !IsParamTypeName(maybe)) {
 						spec.external_name = maybe;
 						rest = Trim(rest.substr(te));
 					}
@@ -550,8 +546,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			    StringUtil::CharacterIsSpace(rest[4])) {
 				break;
 			}
-			if (StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
-			    StringUtil::CharacterIsSpace(rest[2])) {
+			if (StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2])) {
 				break;
 			}
 			// HEADER / COOKIE may appear after DEFAULT/constraints too.
@@ -640,8 +635,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 
 	// AS <select> — any whitespace (spaces/tabs/newlines) after AS is accepted.
 	// "AS SELECT …" and "AS\nSELECT …" are both valid; bare "AS" is not.
-	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 &&
-	      StringUtil::CharacterIsSpace(rest[2]))) {
+	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2]))) {
 		return ParserExtensionParseResult("Expected AS <select> in CREATE ROUTE");
 	}
 	auto handler = Trim(rest.substr(2));
@@ -992,8 +986,8 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 				// Seam for future shared policy; stored, unused at request time in v1.
 				group.policy = value;
 			} else {
-				return ParserExtensionParseResult(
-				    "Unknown GROUP option \"" + key + "\" — expected prefix, auth, tags, policy");
+				return ParserExtensionParseResult("Unknown GROUP option \"" + key +
+				                                  "\" — expected prefix, auth, tags, policy");
 			}
 		}
 		if (!have_prefix) {

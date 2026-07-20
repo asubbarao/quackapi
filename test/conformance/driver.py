@@ -35,9 +35,7 @@ def b64url(data: bytes) -> str:
 
 def make_jwt(secret: bytes = JWT_SECRET, sub: str = "alice", exp_delta: int = 3600) -> str:
     header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    payload = b64url(
-        json.dumps({"sub": sub, "exp": int(time.time()) + exp_delta}, separators=(",", ":")).encode()
-    )
+    payload = b64url(json.dumps({"sub": sub, "exp": int(time.time()) + exp_delta}, separators=(",", ":")).encode())
     sig = b64url(hmac.new(secret, f"{header}.{payload}".encode(), hashlib.sha256).digest())
     return f"{header}.{payload}.{sig}"
 
@@ -189,7 +187,9 @@ def evaluate(case: dict, status: int, headers: Dict[str, str], body: bytes) -> T
 
     if case.get("expect_json_len") is not None:
         if not isinstance(j, list) or len(j) != case["expect_json_len"]:
-            failures.append(f"json len: observed={type(j).__name__}/{getattr(j,'__len__',lambda: '?')()} expected list len={case['expect_json_len']}")
+            failures.append(
+                f"json len: observed={type(j).__name__}/{getattr(j,'__len__',lambda: '?')()} expected list len={case['expect_json_len']}"
+            )
 
     for path, exp in (case.get("expect_json_path_eq") or {}).items():
         got = get_json_path(j, path)
@@ -239,7 +239,11 @@ def evaluate(case: dict, status: int, headers: Dict[str, str], body: bytes) -> T
     if case.get("id") == "health_head_auto":
         if status == 200:
             return "PASS", "auto or explicit HEAD works", []
-        return "FAIL", "no auto-HEAD for GET (explicit HEAD route exists but httplib may not dispatch HEAD)", failures or [f"status={status}"]
+        return (
+            "FAIL",
+            "no auto-HEAD for GET (explicit HEAD route exists but httplib may not dispatch HEAD)",
+            failures or [f"status={status}"],
+        )
 
     if case.get("id") == "get_user_head_explicit":
         if status == 200:
@@ -369,15 +373,16 @@ def main() -> int:
             failures: List[str] = []
             observed = {"status": None, "headers": {}, "body": None}
         else:
-            status, hdrs, body = http_request(
-                args.base, case["method"], case["path"], headers, case.get("body")
-            )
+            status, hdrs, body = http_request(args.base, case["method"], case["path"], headers, case.get("body"))
             verdict, notes, failures = evaluate(case, status, hdrs, body)
             observed = {
                 "status": status,
-                "headers": {k: v for k, v in hdrs.items() if k.lower() in (
-                    "content-type", "allow", "location", "www-authenticate", "set-cookie", "content-length"
-                )},
+                "headers": {
+                    k: v
+                    for k, v in hdrs.items()
+                    if k.lower()
+                    in ("content-type", "allow", "location", "www-authenticate", "set-cookie", "content-length")
+                },
                 "body": body.decode("utf-8", errors="replace")[:500],
             }
 
@@ -386,19 +391,32 @@ def main() -> int:
         if verdict == "FAIL":
             if case.get("id") in ("list_users_trailing_slash", "health_trailing_slash"):
                 cls = "FASTAPI-QUIRK"
-            elif case.get("id") in ("search_limit_missing", "search_limit_le", "get_user_head_explicit",
-                                    "post_users_json_body", "post_users_malformed_json", "post_users_wrong_ct",
-                                    "health_options"):
+            elif case.get("id") in (
+                "search_limit_missing",
+                "search_limit_le",
+                "get_user_head_explicit",
+                "post_users_json_body",
+                "post_users_malformed_json",
+                "post_users_wrong_ct",
+                "health_options",
+            ):
                 cls = "NOT-BUILT-YET"
             elif case.get("id") in ("health_head_auto",) and status == 405:
                 # explicit HEAD is registered but server may not wire Head handler
                 cls = "BUG"
-            elif case.get("id") in ("allow_header_on_405", "health_post_405", "method_mismatch_users_delete") and "Allow" in notes or any("Allow" in f for f in failures):
+            elif (
+                case.get("id") in ("allow_header_on_405", "health_post_405", "method_mismatch_users_delete")
+                and "Allow" in notes
+                or any("Allow" in f for f in failures)
+            ):
                 if status == 405:
                     cls = "BUG"  # 405 correct, Allow missing
             elif case.get("id") == "get_user_bad_float" and status == 200:
                 cls = "BUG"
-            elif case.get("id") in ("post_users_age_float_str", "search_limit_float", "search_limit_1e2") and status == 200:
+            elif (
+                case.get("id") in ("post_users_age_float_str", "search_limit_float", "search_limit_1e2")
+                and status == 200
+            ):
                 cls = "BUG"
             elif case.get("id") == "post_users_missing_age" and status == 422:
                 # loc query vs body is intentional surface difference if using query binder

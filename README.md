@@ -374,6 +374,22 @@ no libcurl, no extra toolchains (`requires_toolchains` not needed).
 
 ---
 
+## Security
+
+- **Default bind is `127.0.0.1`** — the server is loopback-only unless you opt
+  in with `host := '0.0.0.0'` (or `SET quackapi_host`).
+- **Binding a non-loopback host exposes your SQL-backed routes to the
+  network.** Anything a route's SQL can read, a caller can read. Before doing
+  so, put `CREATE AUTH` (API key or JWT) plus `CREATE GROUP` / row policies in
+  front of every route, or terminate at a reverse proxy that handles TLS and
+  auth.
+- **No TLS termination in-process** — use a reverse proxy (nginx/caddy) for
+  HTTPS.
+- Treat the extension as **experimental**: don't point it at production data
+  on an exposed interface.
+
+---
+
 ## Honest limits
 
 - **Write concurrency / OLTP:** single-writer semantics; not a replacement for

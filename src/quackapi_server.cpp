@@ -389,21 +389,20 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 	                   ? type_chunk->GetValue(0, 0).GetValue<string>()
 	                   : string();
 	if (jtype != "OBJECT") {
-		err_json = ValidationErrorJsonBody(
-		    "Input should be a valid dictionary or object to extract fields from", "model_attributes_type");
+		err_json = ValidationErrorJsonBody("Input should be a valid dictionary or object to extract fields from",
+		                                   "model_attributes_type");
 		return false;
 	}
 	// Flatten top-level scalars: key → string form for BindParamValue.
-	auto fields_res = con.Query(
-	    "SELECT k AS key, "
-	    "  CASE json_type(json_extract(doc, '$.' || k)) "
-	    "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
-	    "    WHEN 'NULL' THEN NULL "
-	    "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
-	    "  END AS val "
-	    "FROM (SELECT ?::JSON AS doc) t, "
-	    "     UNNEST(json_keys(doc)) AS u(k)",
-	    Value(raw_body));
+	auto fields_res = con.Query("SELECT k AS key, "
+	                            "  CASE json_type(json_extract(doc, '$.' || k)) "
+	                            "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
+	                            "    WHEN 'NULL' THEN NULL "
+	                            "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
+	                            "  END AS val "
+	                            "FROM (SELECT ?::JSON AS doc) t, "
+	                            "     UNNEST(json_keys(doc)) AS u(k)",
+	                            Value(raw_body));
 	if (fields_res->HasError()) {
 		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
 		return false;
@@ -555,14 +554,12 @@ bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, con
                            string &err_type) {
 	// String length constraints use the raw request string (FastAPI min_length/max_length).
 	if (spec.has_min_length && raw.size() < spec.min_length) {
-		msg = StringUtil::Format("String should have at least %llu characters",
-		                         (unsigned long long)spec.min_length);
+		msg = StringUtil::Format("String should have at least %llu characters", (unsigned long long)spec.min_length);
 		err_type = "string_too_short";
 		return false;
 	}
 	if (spec.has_max_length && raw.size() > spec.max_length) {
-		msg = StringUtil::Format("String should have at most %llu characters",
-		                         (unsigned long long)spec.max_length);
+		msg = StringUtil::Format("String should have at most %llu characters", (unsigned long long)spec.max_length);
 		err_type = "string_too_long";
 		return false;
 	}
@@ -910,8 +907,7 @@ bool IsPathParam(const string &pattern, const string &param_name) {
 		if (!ps.empty() && ps[0] == ':' && ps.substr(1) == param_name) {
 			return true;
 		}
-		if (ps.size() >= 2 && ps.front() == '{' && ps.back() == '}' &&
-		    ps.substr(1, ps.size() - 2) == param_name) {
+		if (ps.size() >= 2 && ps.front() == '{' && ps.back() == '}' && ps.substr(1, ps.size() - 2) == param_name) {
 			return true;
 		}
 	}
@@ -943,17 +939,15 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	}
 
 	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
-	int32_t workers = opts.worker_threads > 0 ? opts.worker_threads
-	                                          : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
+	int32_t workers =
+	    opts.worker_threads > 0 ? opts.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	server->new_task_queue = [workers] {
 		return new duckdb_httplib::ThreadPool(static_cast<size_t>(workers));
 	};
-	server->set_keep_alive_max_count(opts.keep_alive_max_count > 0
-	                                     ? static_cast<size_t>(opts.keep_alive_max_count)
-	                                     : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
-	server->set_keep_alive_timeout(opts.keep_alive_timeout_sec > 0
-	                                   ? static_cast<time_t>(opts.keep_alive_timeout_sec)
-	                                   : QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
+	server->set_keep_alive_max_count(opts.keep_alive_max_count > 0 ? static_cast<size_t>(opts.keep_alive_max_count)
+	                                                               : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
+	server->set_keep_alive_timeout(opts.keep_alive_timeout_sec > 0 ? static_cast<time_t>(opts.keep_alive_timeout_sec)
+	                                                               : QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
 	server->set_read_timeout(opts.read_timeout_sec > 0 ? static_cast<time_t>(opts.read_timeout_sec)
 	                                                   : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	server->set_write_timeout(opts.write_timeout_sec > 0 ? static_cast<time_t>(opts.write_timeout_sec)
@@ -1101,8 +1095,7 @@ void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, du
 	}
 }
 
-void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &req,
-                                               duckdb_httplib::Response &res) {
+void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 	if (!compression) {
 		return;
 	}
@@ -1171,8 +1164,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		ApplyCorsHeaders(req, res);
 		MaybeCompressResponse(req, res);
 		auto t1 = std::chrono::steady_clock::now();
-		double latency_ms =
-		    std::chrono::duration<double, std::milli>(t1 - t0).count();
+		double latency_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 		EmitAccessLog(req, res, request_id.empty() ? string("-") : request_id, latency_ms);
 	};
 
@@ -1211,8 +1203,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				ready = false;
 			}
 			auto uptime_sec =
-			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at)
-			        .count();
+			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count();
 			if (ready) {
 				SetJson(res, 200,
 				        StringUtil::Format(
@@ -1260,9 +1251,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	// Built-in OPTIONS for docs paths: 204 preflight only when CORS is on;
 	// otherwise 405 like FastAPI without CORSMiddleware.
-	if (req.method == "OPTIONS" &&
-	    (req.path == "/openapi.json" || req.path == "/docs" || req.path == "/docs/" || req.path == "/redoc" ||
-	     req.path == "/redoc/")) {
+	if (req.method == "OPTIONS" && (req.path == "/openapi.json" || req.path == "/docs" || req.path == "/docs/" ||
+	                                req.path == "/redoc" || req.path == "/redoc/")) {
 		if (cors_origins.empty()) {
 			res.set_header("Allow", "GET, HEAD");
 			SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
@@ -1670,8 +1660,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// table refs as secure subqueries. Unauthenticated requests fail closed.
 	bool authenticated = !match.route.require_auth.empty() && auth_result.ok;
 	bool deny_unauth = false;
-	string handler_sql =
-	    RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth);
+	string handler_sql = RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth);
 	if (deny_unauth) {
 		SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
 		finish();
@@ -1715,8 +1704,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				string val;
 				if (FindHeaderValue(headers, wire, val)) {
 					// Header fills only if not already path-bound (path still wins).
-					if (provided.find(pspec.name) == provided.end() ||
-					    provided[pspec.name].first != "path") {
+					if (provided.find(pspec.name) == provided.end() || provided[pspec.name].first != "path") {
 						provided[pspec.name] = {"header", val};
 					}
 				}
@@ -1731,8 +1719,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				string wire = ParamWireName(pspec);
 				auto cit = cookies.find(wire);
 				if (cit != cookies.end()) {
-					if (provided.find(pspec.name) == provided.end() ||
-					    provided[pspec.name].first != "path") {
+					if (provided.find(pspec.name) == provided.end() || provided[pspec.name].first != "path") {
 						provided[pspec.name] = {"cookie", cit->second};
 					}
 				}
@@ -1766,8 +1753,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					continue;
 				}
 				// Header/Cookie params are not body-derived.
-				if (ps && (ps->source == QuackapiParamSource::HEADER ||
-				           ps->source == QuackapiParamSource::COOKIE)) {
+				if (ps && (ps->source == QuackapiParamSource::HEADER || ps->source == QuackapiParamSource::COOKIE)) {
 					continue;
 				}
 				// File filename helpers are body-derived.
@@ -1777,8 +1763,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		if (body_method) {
-			if (IsJsonMediaType(media) || (media.empty() && !req.body.empty() &&
-			                               (req.body[0] == '{' || req.body[0] == '['))) {
+			if (IsJsonMediaType(media) ||
+			    (media.empty() && !req.body.empty() && (req.body[0] == '{' || req.body[0] == '['))) {
 				// JSON body path.
 				if (req.body.empty() && !needs_body_fields && match.route.body_schema.empty()) {
 					// Empty JSON body with fully-bound query/path params — ignore.
@@ -1843,17 +1829,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			} else if (!media.empty() && !req.body.empty() && needs_body_fields) {
 				// Wrong Content-Type for a body-expecting route (FastAPI model_attributes_type).
 				SetJson(res, 422,
-				        ValidationErrorJsonBody(
-				            "Input should be a valid dictionary or object to extract fields from",
-				            "model_attributes_type"));
+				        ValidationErrorJsonBody("Input should be a valid dictionary or object to extract fields from",
+				                                "model_attributes_type"));
 				finish();
 				return;
 			} else if (!match.route.body_schema.empty()) {
 				// BODY SCHEMA requires JSON.
 				SetJson(res, 422,
-				        ValidationErrorJsonBody(
-				            "Input should be a valid dictionary or object to extract fields from",
-				            "model_attributes_type"));
+				        ValidationErrorJsonBody("Input should be a valid dictionary or object to extract fields from",
+				                                "model_attributes_type"));
 				finish();
 				return;
 			}
@@ -1959,8 +1943,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			if (IsIntegralType(expected)) {
 				if (!IsStrictIntegerString(raw, !IsUnsignedIntegralType(expected))) {
 					SetJson(res, 422,
-					        ValidationErrorJson(loc_kind, param_name, "Input should be a valid integer",
-					                            "type_error"));
+					        ValidationErrorJson(loc_kind, param_name, "Input should be a valid integer", "type_error"));
 					finish();
 					return;
 				}
@@ -2094,8 +2077,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						loc_kind = kv.second.first;
 					}
 				}
-				SetJson(res, 422,
-				        ValidationErrorJson(loc_kind, pname, "Invalid input for parameter", "value_error"));
+				SetJson(res, 422, ValidationErrorJson(loc_kind, pname, "Invalid input for parameter", "value_error"));
 			} else {
 				SetInternalError(res, err);
 			}
@@ -2191,8 +2173,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				}
 			}
 			res.status = match.route.status;
-			res.set_content(body, mode == ResponseMode::HTML ? "text/html; charset=utf-8"
-			                                                  : "text/plain; charset=utf-8");
+			res.set_content(body,
+			                mode == ResponseMode::HTML ? "text/html; charset=utf-8" : "text/plain; charset=utf-8");
 			// Keep body so Content-Length is correct; httplib omits the body for HEAD.
 			finish();
 			return;

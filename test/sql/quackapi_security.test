@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_security.test
 # description: Valsafe hardening — mixed-param cast footgun routes stay creatable; 422 JSON shape
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

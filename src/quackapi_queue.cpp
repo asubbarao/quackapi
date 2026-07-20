@@ -228,8 +228,7 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 	// Reject path-like names
 	for (char c : name) {
 		if (!(StringUtil::CharacterIsAlpha(c) || StringUtil::CharacterIsDigit(c) || c == '_' || c == '-')) {
-			return ParserExtensionParseResult(
-			    "Queue name must be an identifier ([A-Za-z0-9_-]+)");
+			return ParserExtensionParseResult("Queue name must be an identifier ([A-Za-z0-9_-]+)");
 		}
 	}
 	rest = Trim(rest.substr(name_end));
@@ -243,8 +242,7 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 	if (!rest.empty()) {
 		if (!(StringUtil::StartsWith(rest_upper, "WITH") &&
 		      (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '('))) {
-			return ParserExtensionParseResult(
-			    "Expected WITH (...) after queue name, or end of statement");
+			return ParserExtensionParseResult("Expected WITH (...) after queue name, or end of statement");
 		}
 		rest = Trim(rest.substr(4));
 		if (rest.empty() || rest[0] != '(') {
@@ -271,9 +269,8 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 			}
 			// key
 			idx_t key_start = oi;
-			while (oi < opts.size() &&
-			       (StringUtil::CharacterIsAlpha(opts[oi]) || StringUtil::CharacterIsDigit(opts[oi]) ||
-			        opts[oi] == '_')) {
+			while (oi < opts.size() && (StringUtil::CharacterIsAlpha(opts[oi]) ||
+			                            StringUtil::CharacterIsDigit(opts[oi]) || opts[oi] == '_')) {
 				oi++;
 			}
 			auto key = StringUtil::Lower(opts.substr(key_start, oi - key_start));
@@ -452,7 +449,8 @@ QuackapiQueue RequireQueue(DatabaseInstance &db, const string &name) {
 // quackapi_enqueue(queue, payload [, max_attempts]) → job_id BIGINT
 //===--------------------------------------------------------------------===//
 
-int64_t EnqueueJob(DatabaseInstance &db, const string &queue_name, const string &payload_json, int32_t max_attempts_override) {
+int64_t EnqueueJob(DatabaseInstance &db, const string &queue_name, const string &payload_json,
+                   int32_t max_attempts_override) {
 	auto q = RequireQueue(db, queue_name);
 	EnsureQuackapiJobsTable(db);
 	int32_t max_att = max_attempts_override > 0 ? max_attempts_override : q.max_attempts;
@@ -460,13 +458,13 @@ int64_t EnqueueJob(DatabaseInstance &db, const string &queue_name, const string 
 		throw InvalidInputException("quackapi_enqueue: max_attempts must be >= 1");
 	}
 	// Store payload as JSON text (VARCHAR). Callers may pass JSON or VARCHAR.
-	string sql = StringUtil::Format(
-	    "INSERT INTO quackapi_jobs "
-	    "(id, queue, payload, status, attempts, max_attempts, visible_at, created_at, updated_at) "
-	    "SELECT nextval('quackapi_job_seq'), %s, %s, 'pending', 0, %d, "
-	    "now()::TIMESTAMP, now()::TIMESTAMP, now()::TIMESTAMP "
-	    "RETURNING id",
-	    SqlQuote(queue_name), SqlQuote(payload_json), max_att);
+	string sql =
+	    StringUtil::Format("INSERT INTO quackapi_jobs "
+	                       "(id, queue, payload, status, attempts, max_attempts, visible_at, created_at, updated_at) "
+	                       "SELECT nextval('quackapi_job_seq'), %s, %s, 'pending', 0, %d, "
+	                       "now()::TIMESTAMP, now()::TIMESTAMP, now()::TIMESTAMP "
+	                       "RETURNING id",
+	                       SqlQuote(queue_name), SqlQuote(payload_json), max_att);
 	Connection con(db);
 	auto res = con.Query(sql);
 	CheckQuery(res, "enqueue");
@@ -551,7 +549,7 @@ unique_ptr<FunctionData> DequeueBind(ClientContext &, TableFunctionBindInput &in
 	if (bind_data->n > 1000) {
 		throw InvalidInputException("quackapi_dequeue: n max is 1000");
 	}
-	return_types = {LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	return_types = {LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::TIMESTAMP, LogicalType::VARCHAR};
 	names = {"id", "queue", "payload", "status", "attempts", "max_attempts", "visible_at", "last_error"};
 	return std::move(bind_data);
@@ -567,22 +565,22 @@ unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFu
 	// Ready set: pending OR running-with-expired-lease (visibility timeout).
 	Connection con(*context.db);
 	for (int32_t i = 0; i < bind.n; i++) {
-		string sql = StringUtil::Format(
-		    "UPDATE quackapi_jobs SET "
-		    "status = 'running', "
-		    "attempts = attempts + 1, "
-		    "visible_at = now()::TIMESTAMP + to_seconds(%d), "
-		    "updated_at = now()::TIMESTAMP, "
-		    "worker_id = 'dequeue' "
-		    "WHERE id = ("
-		    "  SELECT id FROM quackapi_jobs "
-		    "  WHERE queue = %s "
-		    "    AND status IN ('pending', 'running') "
-		    "    AND visible_at <= now()::TIMESTAMP "
-		    "  ORDER BY id LIMIT 1"
-		    ") "
-		    "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error",
-		    q.visibility_timeout_sec, SqlQuote(bind.queue_name));
+		string sql =
+		    StringUtil::Format("UPDATE quackapi_jobs SET "
+		                       "status = 'running', "
+		                       "attempts = attempts + 1, "
+		                       "visible_at = now()::TIMESTAMP + to_seconds(%d), "
+		                       "updated_at = now()::TIMESTAMP, "
+		                       "worker_id = 'dequeue' "
+		                       "WHERE id = ("
+		                       "  SELECT id FROM quackapi_jobs "
+		                       "  WHERE queue = %s "
+		                       "    AND status IN ('pending', 'running') "
+		                       "    AND visible_at <= now()::TIMESTAMP "
+		                       "  ORDER BY id LIMIT 1"
+		                       ") "
+		                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error",
+		                       q.visibility_timeout_sec, SqlQuote(bind.queue_name));
 		auto res = con.Query(sql);
 		CheckQuery(res, "dequeue");
 		if (res->RowCount() == 0) {
@@ -618,11 +616,11 @@ void DequeueExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output)
 bool AckJob(DatabaseInstance &db, const string &queue_name, int64_t job_id) {
 	RequireQueue(db, queue_name);
 	EnsureQuackapiJobsTable(db);
-	string sql = StringUtil::Format(
-	    "UPDATE quackapi_jobs SET status = 'done', updated_at = now()::TIMESTAMP, worker_id = NULL "
-	    "WHERE id = %lld AND queue = %s AND status = 'running' "
-	    "RETURNING id",
-	    static_cast<long long>(job_id), SqlQuote(queue_name));
+	string sql =
+	    StringUtil::Format("UPDATE quackapi_jobs SET status = 'done', updated_at = now()::TIMESTAMP, worker_id = NULL "
+	                       "WHERE id = %lld AND queue = %s AND status = 'running' "
+	                       "RETURNING id",
+	                       static_cast<long long>(job_id), SqlQuote(queue_name));
 	Connection con(db);
 	auto res = con.Query(sql);
 	CheckQuery(res, "ack");
@@ -659,10 +657,9 @@ string NackJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, b
 	EnsureQuackapiJobsTable(db);
 
 	// Read current attempts/max for decision; single-writer so this is safe.
-	string read_sql = StringUtil::Format(
-	    "SELECT attempts, max_attempts FROM quackapi_jobs "
-	    "WHERE id = %lld AND queue = %s AND status = 'running'",
-	    static_cast<long long>(job_id), SqlQuote(queue_name));
+	string read_sql = StringUtil::Format("SELECT attempts, max_attempts FROM quackapi_jobs "
+	                                     "WHERE id = %lld AND queue = %s AND status = 'running'",
+	                                     static_cast<long long>(job_id), SqlQuote(queue_name));
 	Connection con(db);
 	auto read = con.Query(read_sql);
 	CheckQuery(read, "nack read");
@@ -695,22 +692,21 @@ string NackJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, b
 
 	string sql;
 	if (to_dead) {
-		sql = StringUtil::Format(
-		    "UPDATE quackapi_jobs SET status = 'dead', "
-		    "visible_at = now()::TIMESTAMP, "
-		    "last_error = %s, updated_at = now()::TIMESTAMP, worker_id = NULL "
-		    "WHERE id = %lld AND queue = %s AND status = 'running' "
-		    "RETURNING status",
-		    SqlQuote(error.empty() ? "nack" : error), static_cast<long long>(job_id), SqlQuote(queue_name));
+		sql = StringUtil::Format("UPDATE quackapi_jobs SET status = 'dead', "
+		                         "visible_at = now()::TIMESTAMP, "
+		                         "last_error = %s, updated_at = now()::TIMESTAMP, worker_id = NULL "
+		                         "WHERE id = %lld AND queue = %s AND status = 'running' "
+		                         "RETURNING status",
+		                         SqlQuote(error.empty() ? "nack" : error), static_cast<long long>(job_id),
+		                         SqlQuote(queue_name));
 	} else {
-		sql = StringUtil::Format(
-		    "UPDATE quackapi_jobs SET status = 'pending', "
-		    "visible_at = now()::TIMESTAMP + to_seconds(%d), "
-		    "last_error = %s, updated_at = now()::TIMESTAMP, worker_id = NULL "
-		    "WHERE id = %lld AND queue = %s AND status = 'running' "
-		    "RETURNING status",
-		    backoff, SqlQuote(error.empty() ? "nack" : error), static_cast<long long>(job_id),
-		    SqlQuote(queue_name));
+		sql = StringUtil::Format("UPDATE quackapi_jobs SET status = 'pending', "
+		                         "visible_at = now()::TIMESTAMP + to_seconds(%d), "
+		                         "last_error = %s, updated_at = now()::TIMESTAMP, worker_id = NULL "
+		                         "WHERE id = %lld AND queue = %s AND status = 'running' "
+		                         "RETURNING status",
+		                         backoff, SqlQuote(error.empty() ? "nack" : error), static_cast<long long>(job_id),
+		                         SqlQuote(queue_name));
 	}
 	auto res = con.Query(sql);
 	CheckQuery(res, "nack");
@@ -847,13 +843,13 @@ unique_ptr<GlobalTableFunctionState> QueuesInit(ClientContext &context, TableFun
 	// depth = claimable (pending OR running with expired lease)
 	// in_flight = running with active lease
 	// dead = dead
-	auto res = con.Query(
-	    "SELECT queue, "
-	    "count(*) FILTER (WHERE status = 'pending' OR "
-	    "  (status = 'running' AND visible_at <= now()::TIMESTAMP))::BIGINT AS depth, "
-	    "count(*) FILTER (WHERE status = 'running' AND visible_at > now()::TIMESTAMP)::BIGINT AS in_flight, "
-	    "count(*) FILTER (WHERE status = 'dead')::BIGINT AS dead "
-	    "FROM quackapi_jobs GROUP BY queue");
+	auto res =
+	    con.Query("SELECT queue, "
+	              "count(*) FILTER (WHERE status = 'pending' OR "
+	              "  (status = 'running' AND visible_at <= now()::TIMESTAMP))::BIGINT AS depth, "
+	              "count(*) FILTER (WHERE status = 'running' AND visible_at > now()::TIMESTAMP)::BIGINT AS in_flight, "
+	              "count(*) FILTER (WHERE status = 'dead')::BIGINT AS dead "
+	              "FROM quackapi_jobs GROUP BY queue");
 	if (res->HasError()) {
 		return std::move(state);
 	}
@@ -910,14 +906,14 @@ TableFunction GetApplyQueueFunction() {
 void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	// enqueue(queue, payload) / enqueue(queue, payload, max_attempts)
 	ScalarFunctionSet enqueue_set("quackapi_enqueue");
-	enqueue_set.AddFunction(
-	    ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT, EnqueueScalar2));
+	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                       LogicalType::BIGINT, EnqueueScalar2));
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
 	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
 	                                       LogicalType::BIGINT, EnqueueScalar3));
 	// JSON payload overload (JSON is a logical type alias of VARCHAR storage)
-	enqueue_set.AddFunction(
-	    ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::BIGINT, EnqueueScalar2));
+	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::JSON()},
+	                                       LogicalType::BIGINT, EnqueueScalar2));
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
 	                                       {LogicalType::VARCHAR, LogicalType::JSON(), LogicalType::INTEGER},
 	                                       LogicalType::BIGINT, EnqueueScalar3));
@@ -938,9 +934,10 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 
 	// nack(queue, job_id) / nack(queue, job_id, requeue) / nack(queue, job_id, requeue, error)
 	ScalarFunctionSet nack_set("quackapi_nack");
-	nack_set.AddFunction(
-	    ScalarFunction("quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR, NackScalar2));
-	nack_set.AddFunction(ScalarFunction("quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN},
+	nack_set.AddFunction(ScalarFunction("quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT},
+	                                    LogicalType::VARCHAR, NackScalar2));
+	nack_set.AddFunction(ScalarFunction("quackapi_nack",
+	                                    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN},
 	                                    LogicalType::VARCHAR, NackScalar3));
 	nack_set.AddFunction(ScalarFunction(
 	    "quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::VARCHAR},

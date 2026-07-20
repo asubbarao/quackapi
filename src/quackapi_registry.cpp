@@ -61,8 +61,7 @@ void QuackapiState::AddStream(const QuackapiStream &stream, bool or_replace) {
 	for (auto it = streams.begin(); it != streams.end(); ++it) {
 		if (it->name == stream.name) {
 			if (!or_replace) {
-				throw InvalidInputException("Stream \"%s\" already exists — use CREATE OR REPLACE STREAM",
-				                            stream.name);
+				throw InvalidInputException("Stream \"%s\" already exists — use CREATE OR REPLACE STREAM", stream.name);
 			}
 			*it = stream;
 			return;
@@ -378,11 +377,10 @@ bool QuackapiState::DropRowAccessPolicy(const string &name) {
 		}
 	}
 	if (found) {
-		row_access_bindings.erase(std::remove_if(row_access_bindings.begin(), row_access_bindings.end(),
-		                                         [&](const QuackapiRowAccessBinding &b) {
-			                                         return b.policy_name == name;
-		                                         }),
-		                          row_access_bindings.end());
+		row_access_bindings.erase(
+		    std::remove_if(row_access_bindings.begin(), row_access_bindings.end(),
+		                   [&](const QuackapiRowAccessBinding &b) { return b.policy_name == name; }),
+		    row_access_bindings.end());
 	}
 	return found;
 }
@@ -470,9 +468,9 @@ void QuackapiState::BindRowAccessPolicy(const QuackapiRowAccessBinding &binding,
 		throw InvalidInputException("Row access policy \"%s\" does not exist", binding.policy_name);
 	}
 	if (binding.columns.size() != pol->arg_columns.size()) {
-		throw InvalidInputException(
-		    "Row access policy \"%s\" expects %llu column(s), got %llu", binding.policy_name,
-		    (unsigned long long)pol->arg_columns.size(), (unsigned long long)binding.columns.size());
+		throw InvalidInputException("Row access policy \"%s\" expects %llu column(s), got %llu", binding.policy_name,
+		                            (unsigned long long)pol->arg_columns.size(),
+		                            (unsigned long long)binding.columns.size());
 	}
 	// One RAP per table (replace same policy name, or or_replace any).
 	for (auto it = row_access_bindings.begin(); it != row_access_bindings.end(); ++it) {
@@ -522,9 +520,8 @@ void QuackapiState::BindMaskingPolicy(const QuackapiMaskingBinding &binding, boo
 		if (StringUtil::Lower(it->table_name) == StringUtil::Lower(binding.table_name) &&
 		    StringUtil::Lower(it->column_name) == StringUtil::Lower(binding.column_name)) {
 			if (!or_replace && it->policy_name != binding.policy_name) {
-				throw InvalidInputException(
-				    "Column \"%s\".\"%s\" already has masking policy \"%s\"", binding.table_name, binding.column_name,
-				    it->policy_name);
+				throw InvalidInputException("Column \"%s\".\"%s\" already has masking policy \"%s\"",
+				                            binding.table_name, binding.column_name, it->policy_name);
 			}
 			*it = binding;
 			return;

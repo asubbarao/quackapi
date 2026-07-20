@@ -294,8 +294,8 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			if (tit != expected_types.end()) {
 				ptype = tit->second;
 			}
-			params_json += "{\"name\":" + JsonString(n) + ",\"in\":\"path\",\"required\":true,\"schema\":" +
-			               ParamTypeToOas(ptype) + "}";
+			params_json += "{\"name\":" + JsonString(n) +
+			               ",\"in\":\"path\",\"required\":true,\"schema\":" + ParamTypeToOas(ptype) + "}";
 		}
 		for (auto &n : named_params) {
 			if (IsClaimsParamName(n) || ListContains(path_params, n)) {
@@ -327,8 +327,8 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				}
 			}
 			params_json += "{\"name\":" + JsonString(oas_name) + ",\"in\":" + JsonString(in_loc) +
-			               ",\"required\":" + (required ? "true" : "false") +
-			               ",\"schema\":" + ParamTypeToOas(ptype) + "}";
+			               ",\"required\":" + (required ? "true" : "false") + ",\"schema\":" + ParamTypeToOas(ptype) +
+			               "}";
 		}
 		params_json += "]";
 
@@ -339,13 +339,11 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		if (mode == ResponseMode::HTML) {
 			content_type = "text/html";
 			response_desc = "HTML response";
-			response_schema =
-			    "{\"type\":\"string\",\"description\":\"Raw HTML body (single-column handler AS html)\"}";
+			response_schema = "{\"type\":\"string\",\"description\":\"Raw HTML body (single-column handler AS html)\"}";
 		} else if (mode == ResponseMode::TEXT) {
 			content_type = "text/plain";
 			response_desc = "Plain text response";
-			response_schema =
-			    "{\"type\":\"string\",\"description\":\"Raw text body (single-column handler AS text)\"}";
+			response_schema = "{\"type\":\"string\",\"description\":\"Raw text body (single-column handler AS text)\"}";
 		} else if (data_col_names.empty()) {
 			content_type = "application/json";
 			response_desc = "Empty body (redirect / Set-Cookie control columns only)";
@@ -372,20 +370,22 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		}
 
 		string status_key = std::to_string(route.status);
-		string responses =
-		    "{" + JsonString(status_key) + ":{"
-		                                   "\"description\":" +
-		    JsonString(response_desc) + ","
-		                                "\"content\":{" +
-		    JsonString(content_type) + ":{\"schema\":" + response_schema + "}}"
-		                                                                   "}," +
-		    "\"422\":{"
-		    "\"description\":\"Validation error (FastAPI-shaped detail)\","
-		    "\"content\":{\"application/json\":{\"schema\":{"
-		    "\"type\":\"object\","
-		    "\"properties\":{\"detail\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}}"
-		    "}}}}"
-		    "}";
+		string responses = "{" + JsonString(status_key) +
+		                   ":{"
+		                   "\"description\":" +
+		                   JsonString(response_desc) +
+		                   ","
+		                   "\"content\":{" +
+		                   JsonString(content_type) + ":{\"schema\":" + response_schema +
+		                   "}}"
+		                   "}," +
+		                   "\"422\":{"
+		                   "\"description\":\"Validation error (FastAPI-shaped detail)\","
+		                   "\"content\":{\"application/json\":{\"schema\":{"
+		                   "\"type\":\"object\","
+		                   "\"properties\":{\"detail\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}}"
+		                   "}}}}"
+		                   "}";
 
 		string security = "[]";
 		if (!route.require_auth.empty()) {

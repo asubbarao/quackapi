@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_quack_bridge.test
 # description: quack auth bridge scalars (verify_auth / authentication / authorization)
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

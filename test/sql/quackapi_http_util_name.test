@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_http_util_name.test
 # description: quackapi_http_util_name reports the active HTTPUtil
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_batteries.test
 # description: batteries-included server defaults — SETs, health routes in registry, log_level setting
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

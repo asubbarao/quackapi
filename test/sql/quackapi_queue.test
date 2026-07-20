@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_queue.test
 # description: First-class durable job queue — CREATE QUEUE, enqueue/dequeue/ack/nack/DLQ
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 # json is optional for enqueue(VARCHAR); required only for the ::JSON overload path below

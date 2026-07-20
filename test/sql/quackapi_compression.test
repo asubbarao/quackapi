@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_compression.test
 # description: Compression config surface (SET + serve named params)
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

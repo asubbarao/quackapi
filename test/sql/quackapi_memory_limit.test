@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_memory_limit.test
 # description: memory_limit knob — SET quackapi_memory_limit + serve named param; non-clobber
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

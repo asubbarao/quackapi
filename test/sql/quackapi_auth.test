@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_auth.test
 # description: CREATE AUTH / DROP AUTH, API keys, REQUIRE clause, registry inspection
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

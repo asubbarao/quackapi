@@ -311,8 +311,8 @@ struct RoutesGlobalState : public GlobalTableFunctionState {
 	idx_t offset = 0;
 };
 
-static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInput &,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
+                                           vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);

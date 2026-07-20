@@ -714,8 +714,8 @@ QuackapiAuthResult CheckAuth(DatabaseInstance &db, const QuackapiRoute &route,
 	// QuackServer::HandleMessageInternal CONNECTION_REQUEST:
 	//   SELECT <auth_fn>(?, ?, ?)
 	// (duckdb-quack src/quack_server.cpp ~L279-L281).
-	auto struct_val = EvaluateAuthQuery(
-	    db, "SELECT quackapi_verify_auth(?, ?)", Value(route.require_auth), Value(auth_string));
+	auto struct_val =
+	    EvaluateAuthQuery(db, "SELECT quackapi_verify_auth(?, ?)", Value(route.require_auth), Value(auth_string));
 	if (struct_val.IsNull() || struct_val.type().id() != LogicalTypeId::STRUCT) {
 		// Function missing or error — fail closed via direct policy (still no
 		// private header-only branch that skips the engine).
@@ -818,9 +818,8 @@ void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader) {
 	verify.SetVolatile();
 	loader.RegisterFunction(verify);
 
-	ScalarFunction authn("quackapi_authentication",
-	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
-	                     QuackapiAuthenticationFunction);
+	ScalarFunction authn("quackapi_authentication", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                     LogicalType::BOOLEAN, QuackapiAuthenticationFunction);
 	authn.SetVolatile();
 	loader.RegisterFunction(authn);
 
@@ -1029,7 +1028,7 @@ struct ApplyAuthBindData : public TableFunctionData {
 	string action;
 	bool or_replace = false;
 	string name;
-	string kind;   // "API_KEY" / "JWT_HS256"
+	string kind; // "API_KEY" / "JWT_HS256"
 	string header;
 	string secret;
 	bool finished = false;

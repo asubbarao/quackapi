@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_cors.test
 # description: CORS config surface (SET quackapi_cors_origins + serve named param)
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

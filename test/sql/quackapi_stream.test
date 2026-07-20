@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_stream.test
 # description: CREATE STREAM / DROP STREAM DDL, quackapi_streams(), SSE registry
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 
