@@ -1178,14 +1178,17 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	// Built-in health routes (also registered in quackapi_routes() for listing).
 	// Liveness: process accepting HTTP. Readiness: DB handle + version + uptime.
+	// Exact-path only: the trailing-slash form falls through to normal route
+	// matching below, which 307-redirects to the registered "/health"/"/healthz"
+	// route (Starlette redirect_slashes policy — see trailing_slash.test.sh).
 	if (options.health_routes && (req.method == "GET" || req.method == "HEAD")) {
-		if (req.path == "/health" || req.path == "/health/") {
+		if (req.path == "/health") {
 			// Object body (not row-array) — standard k8s/load-balancer shape.
 			SetJson(res, 200, "{\"status\":\"ok\"}");
 			finish();
 			return;
 		}
-		if (req.path == "/healthz" || req.path == "/healthz/") {
+		if (req.path == "/healthz") {
 			// Readiness: verify the DB handle can run a trivial query.
 			string version = "unknown";
 			bool ready = false;
