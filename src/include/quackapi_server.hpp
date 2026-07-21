@@ -88,6 +88,17 @@ struct QuackapiServeOptions {
 	//! When true (default), SET enable_http_metadata_cache=true for outbound HTTP.
 	bool enable_http_metadata_cache = true;
 
+	// --- Batteries: outbound HTTP client (curl_httpfs preferred) ---
+	//! Preference: "auto" (default — prefer curl_httpfs, fall back to httplib),
+	//! "curl" (same prefer/fallback), or "httplib" (skip curl_httpfs).
+	//! Named param / SET quackapi_http_client. Does NOT touch the inbound
+	//! httplib SERVER — only the client used by httpfs / read_* over https.
+	string http_client = "auto";
+	//! Filled at serve after probe: "curl" or "httplib".
+	string http_client_active;
+	//! When active is httplib after prefer-curl path: why (e.g. curl_httpfs_unavailable).
+	string http_client_reason;
+
 	//! Filled at serve after probing community tsid: "tsid" or "uuidv7".
 	string request_id_source;
 

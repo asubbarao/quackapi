@@ -55,6 +55,8 @@ struct ServeBindData : public TableFunctionData {
 	bool compression = true;
 	//! Min body size in bytes before compression. Default 256.
 	idx_t compression_min_bytes = 256;
+	//! Outbound HTTP client preference: auto|curl|httplib (default auto).
+	string http_client = "auto";
 	bool finished = false;
 };
 
@@ -186,6 +188,19 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->compression_min_bytes = static_cast<idx_t>(v);
 		}
 	}
+	// http_client named param wins; else SET quackapi_http_client (default auto).
+	auto hc_entry = input.named_parameters.find("http_client");
+	if (hc_entry != input.named_parameters.end()) {
+		bind_data->http_client = hc_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_http_client", setting) && !setting.IsNull()) {
+			auto s = setting.GetValue<string>();
+			if (!s.empty()) {
+				bind_data->http_client = s;
+			}
+		}
+	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
 	return std::move(bind_data);
@@ -242,8 +257,10 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
 	opts.read_timeout_sec = bind_data.read_timeout_sec;
 	opts.write_timeout_sec = bind_data.write_timeout_sec;
+	opts.http_client = bind_data.http_client;
 
 	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
+	// Also prefers curl_httpfs as the outbound HTTP client (graceful fallback).
 	ApplyQuackapiServerDefaults(context, opts);
 	// Compose request_id source: community tsid if LOADable, else core uuidv7.
 	ProbeQuackapiRequestIdSource(*context.db, opts);
@@ -365,7 +382,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 struct ServersBindData : public TableFunctionData {};
 
 struct ServersGlobalState : public GlobalTableFunctionState {
-	vector<std::pair<string, int>> servers;
+	vector<std::tuple<string, int, string>> servers;
 	idx_t offset = 0;
 };
 
@@ -377,6 +394,8 @@ static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindIn
 	names.emplace_back("port");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("http_client");
 	return make_uniq<ServersBindData>();
 }
 
@@ -391,9 +410,13 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 	idx_t row = 0;
 	while (state.offset < state.servers.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &server = state.servers[state.offset];
-		output.SetValue(0, row, Value(server.first));
-		output.SetValue(1, row, Value::INTEGER(server.second));
-		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", server.first, server.second)));
+		const auto &host = std::get<0>(server);
+		const auto port = std::get<1>(server);
+		const auto &http_client = std::get<2>(server);
+		output.SetValue(0, row, Value(host));
+		output.SetValue(1, row, Value::INTEGER(port));
+		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", host, port)));
+		output.SetValue(3, row, Value(http_client));
 		row++;
 		state.offset++;
 	}
@@ -451,10 +474,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Minimum response body size (bytes) before compression. "
 	                          "Default 256. Overridden by compression_min_bytes named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
+	// SET quackapi_http_client = 'auto' | 'curl' | 'httplib'
+	// Default auto: INSTALL+LOAD curl_httpfs and SET httpfs_client_implementation='curl';
+	// fall back to httplib if the community extension is unavailable (Windows/WASM/offline).
+	// Serve-time http_client := '…' wins. Inbound server remains httplib regardless.
+	config.AddExtensionOption("quackapi_http_client",
+	                          "Outbound HTTP client for httpfs/route fetches: auto|curl|httplib. "
+	                          "Default auto prefers curl_httpfs (connection pool, HTTP/2, async IO) "
+	                          "and falls back to httplib when unavailable. Overridden by http_client "
+	                          "named parameter. Does not change the inbound HTTP server.",
+	                          LogicalType::VARCHAR, Value("auto"));
 
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
-	// Also carries compression + compression_min_bytes.
+	// Also carries compression + compression_min_bytes + http_client.
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
@@ -475,6 +508,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["compression"] = LogicalType::BOOLEAN;
 	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
+	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);

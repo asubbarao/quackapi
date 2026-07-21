@@ -204,12 +204,13 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := '127.0.0.1', static_dir := '', cors_origins := '', memory_limit := '')` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', …)` | `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags` |
-| `quackapi_servers` | `()` | `host, port, listen_url` |
+| `quackapi_servers` | `()` | `host, port, listen_url, http_client` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
+| Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | prefer curl_httpfs outbound client |
 
 Built-in OpenAPI (not listed in `quackapi_routes()`):
 
@@ -318,8 +319,9 @@ SELECT * FROM quackapi_policies();
 | `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
 
 Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
-`LOAD curl_httpfs` upgrades the process-wide client; handlers that call
-`read_text` / httpfs over `https://` pick it up automatically.
+`quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async) and fall
+back to httplib when the community extension is unavailable — see
+[`docs/curl_httpfs.md`](docs/curl_httpfs.md).
 
 ---
 

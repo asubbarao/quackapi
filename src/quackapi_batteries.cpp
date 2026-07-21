@@ -227,7 +227,108 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		}
 	}
 
-	// Transport knobs are applied in QuackapiHttpServer ctor (httplib).
+	// --- Outbound HTTP client: prefer curl_httpfs (pooled libcurl + HTTP/2 + async) ---
+	// WHY: routes that read remote https (read_json/read_parquet/read_csv/read_text)
+	// or proxy upstream APIs collapse under concurrency on DuckDB's default
+	// per-request httplib client. curl_httpfs is a drop-in httpfs client layer.
+	// CLIENT only — does not replace the inbound httplib SERVER.
+	// Platform matrix (community description.yml excluded_platforms): unavailable on
+	// wasm_* and windows_*; available on linux_* and osx_*. INSTALL/LOAD may still
+	// fail (offline, old catalog) — never fail serve; fall back to httplib.
+	{
+		string pref = StringUtil::Lower(opts.http_client);
+		StringUtil::Trim(pref);
+		if (pref.empty()) {
+			pref = "auto";
+		}
+		if (pref != "auto" && pref != "curl" && pref != "httplib") {
+			throw InvalidInputException(
+			    "quackapi_serve: http_client must be 'auto', 'curl', or 'httplib' (got '%s')", opts.http_client);
+		}
+
+		if (pref == "httplib") {
+			// Operator forced stock client — do not INSTALL/LOAD curl_httpfs.
+			// If curl_httpfs was already LOADed earlier in the process, flip the
+			// backend back to httplib so this serve matches the knob.
+			string set_err;
+			if (RunSet(con, "SET httpfs_client_implementation = 'httplib'", set_err)) {
+				// ok
+			} else {
+				// Setting may not exist until httpfs/curl_httpfs is loaded — fine.
+				(void)set_err;
+			}
+			opts.http_client_active = "httplib";
+			opts.http_client_reason = "operator_forced";
+			fprintf(stderr, "quackapi.http_client=httplib reason=operator_forced\n");
+			applied.push_back("http_client=httplib (WHY: operator forced stock httplib client; "
+			                  "no curl_httpfs install)");
+		} else {
+			// auto | curl — prefer curl_httpfs; graceful fallback on any failure.
+			string fail_detail;
+			bool loaded = false;
+
+			// Best-effort: ensure core httpfs first (curl_httpfs is 100% compatible
+			// with it and usually loads it, but explicit order matches the README).
+			auto httpfs_load = con.Query("LOAD httpfs");
+			if (httpfs_load->HasError()) {
+				auto httpfs_inst = con.Query("INSTALL httpfs");
+				if (!httpfs_inst->HasError()) {
+					httpfs_load = con.Query("LOAD httpfs");
+				}
+			}
+			// httpfs failure is non-fatal here — curl_httpfs may still provide the layer.
+
+			auto curl_load = con.Query("LOAD curl_httpfs");
+			if (curl_load->HasError()) {
+				auto curl_inst = con.Query("INSTALL curl_httpfs FROM community");
+				if (curl_inst->HasError()) {
+					fail_detail = curl_inst->GetError();
+				} else {
+					curl_load = con.Query("LOAD curl_httpfs");
+					if (curl_load->HasError()) {
+						fail_detail = curl_load->GetError();
+					} else {
+						loaded = true;
+					}
+				}
+			} else {
+				loaded = true;
+			}
+
+			if (loaded) {
+				// Toggle the shared httpfs client backend. 'curl' selects the
+				// curl-based implementation (MultiCurl / HTTPFS-Curl depending on
+				// curl_httpfs version); leave multi_curl default if SET fails.
+				string set_err;
+				if (!RunSet(con, "SET httpfs_client_implementation = 'curl'", set_err)) {
+					// Some builds expose only curl_httpfs_client_implementation.
+					if (!RunSet(con, "SET curl_httpfs_client_implementation = 'curl'", set_err) &&
+					    !RunSet(con, "SET curl_httpfs_client_implementation = 'multi_curl'", set_err)) {
+						// Still loaded — default after LOAD is already MultiCurl.
+						(void)set_err;
+					}
+				}
+				opts.http_client_active = "curl";
+				opts.http_client_reason.clear();
+				fprintf(stderr, "quackapi.http_client=curl\n");
+				applied.push_back(
+				    "http_client=curl (WHY: curl_httpfs — libcurl pool + HTTP/2 + async IO for "
+				    "outbound https reads from handlers; 100% httpfs-compatible)");
+			} else {
+				opts.http_client_active = "httplib";
+				opts.http_client_reason = "curl_httpfs_unavailable";
+				// One structured line for ops (and a short applied summary).
+				fprintf(stderr, "quackapi.http_client=httplib reason=curl_httpfs_unavailable\n");
+				applied.push_back(StringUtil::Format(
+				    "http_client=httplib reason=curl_httpfs_unavailable (WHY: graceful fallback — "
+				    "curl_httpfs not installable/loadable on this platform or environment; "
+				    "detail=%s)",
+				    fail_detail.empty() ? "unknown" : StringUtil::Replace(fail_detail, "\n", " ")));
+			}
+		}
+	}
+
+	// Transport knobs are applied in QuackapiHttpServer ctor (httplib SERVER).
 	applied.push_back(StringUtil::Format("http keep_alive_max_count=%d keep_alive_timeout_sec=%d "
 	                                     "(WHY: connection reuse cuts TCP/TLS handshake cost)",
 	                                     opts.keep_alive_max_count, opts.keep_alive_timeout_sec));

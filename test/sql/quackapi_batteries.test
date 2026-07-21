@@ -10,9 +10,20 @@ SELECT current_setting('quackapi_log_level');
 ----
 info
 
+# http_client extension option defaults to auto (prefer curl_httpfs)
+query I
+SELECT current_setting('quackapi_http_client');
+----
+auto
+
 # Setting is listed among duckdb_settings
 query I
 SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_log_level';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_http_client';
 ----
 true
 
@@ -117,3 +128,22 @@ query I
 SELECT * FROM quackapi_stop(29203);
 ----
 Stopped quackapi server on port 29203
+
+# ---------------------------------------------------------------------------
+# http_client := 'httplib' forces stock client (always available; no network
+# needed for the force path). Active backend is reported on quackapi_servers().
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29204, host := '127.0.0.1', http_client := 'httplib');
+----
+http://127.0.0.1:29204
+
+query I
+SELECT http_client FROM quackapi_servers() WHERE port = 29204;
+----
+httplib
+
+query I
+SELECT * FROM quackapi_stop(29204);
+----
+Stopped quackapi server on port 29204

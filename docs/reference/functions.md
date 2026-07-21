@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR` |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), plus batteries knobs (`log_level`, `compression`, …) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -24,11 +24,18 @@ SELECT * FROM quackapi_serve(
   host := '127.0.0.1',
   static_dir := './static',
   cors_origins := '*',
-  memory_limit := '4GB'
+  memory_limit := '4GB',
+  http_client := 'auto'   -- prefer curl_httpfs; fall back to httplib
 );
 ```
 
 **Memory limit precedence:** named param → `SET quackapi_memory_limit` → leave non-default DuckDB `memory_limit` alone → else safe default **256MB**.
+
+**Outbound HTTP client:** default `auto` INSTALL/LOADs community `curl_httpfs` and sets
+`httpfs_client_implementation='curl'` (connection pool, HTTP/2, async). If unavailable
+(Windows/WASM/offline), logs `quackapi.http_client=httplib reason=curl_httpfs_unavailable`
+and continues. Override with `http_client := 'httplib'` or `SET quackapi_http_client`.
+Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
 
 ---
 
@@ -55,7 +62,7 @@ SELECT * FROM quackapi_stop();
 | | |
 |--|--|
 | **Kind** | Table function |
-| **Returns** | `host`, `port`, `listen_url` |
+| **Returns** | `host`, `port`, `listen_url`, `http_client` (`curl` or `httplib`) |
 
 ```sql
 SELECT * FROM quackapi_servers();
@@ -311,10 +318,12 @@ Outbound HTTPS for handlers that call `read_text` / httpfs uses DuckDB’s share
 |---------|---------|
 | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | CORS allow list; empty = off |
 | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | Serve memory preference when named param omitted |
+| `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | Outbound httpfs client preference (default `auto` → curl_httpfs) |
 
 ```sql
 SET quackapi_cors_origins = '*';
 SET quackapi_memory_limit = '4GB';
+SET quackapi_http_client = 'auto';
 ```
 
 ---

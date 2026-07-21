@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <tuple>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -331,12 +332,14 @@ void QuackapiState::StopAllServers() {
 	}
 }
 
-vector<std::pair<string, int>> QuackapiState::ListServers() {
+vector<std::tuple<string, int, string>> QuackapiState::ListServers() {
 	std::lock_guard<std::mutex> lock(servers_mutex);
-	vector<std::pair<string, int>> result;
+	vector<std::tuple<string, int, string>> result;
 	result.reserve(servers.size());
 	for (auto &kv : servers) {
-		result.emplace_back(kv.second->Host(), kv.second->Port());
+		const auto &opts = kv.second->Options();
+		string client = opts.http_client_active.empty() ? string("httplib") : opts.http_client_active;
+		result.emplace_back(kv.second->Host(), kv.second->Port(), std::move(client));
 	}
 	return result;
 }

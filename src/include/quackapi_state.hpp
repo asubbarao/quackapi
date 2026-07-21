@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <thread>
+#include <tuple>
 
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/unordered_map.hpp"
@@ -248,7 +249,8 @@ public:
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).
 	void StopAllServers();
-	vector<std::pair<string, int>> ListServers();
+	//! (host, port, http_client_active) for each running server.
+	vector<std::tuple<string, int, string>> ListServers();
 
 	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
 	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);
