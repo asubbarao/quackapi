@@ -53,8 +53,9 @@ assert_status "$_QA_LAST_STATUS" "200" "stats_before"
 assert_body_contains "$_QA_LAST_BODY" '"depth":1' "depth before"
 
 echo "-- 4. POST /drain worker"
-# httplib returns 400 for POST with no Content-Length; send empty JSON body.
-curl_json POST "/drain" -H 'Content-Type: application/json' -d '{}'
+# Vendored httplib (third_party/httplib) treats empty bodies per RFC 7230 §3.3.3
+# when neither Content-Length nor Transfer-Encoding is present — genuine empty POST.
+curl_json POST "/drain"
 assert_status "$_QA_LAST_STATUS" "200" "drain"
 assert_body_contains "$_QA_LAST_BODY" "\"job_id\":${JOB_ID}" "drain job_id"
 assert_body_contains "$_QA_LAST_BODY" '"acked":true' "drain acked"
