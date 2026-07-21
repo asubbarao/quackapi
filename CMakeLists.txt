@@ -26,6 +26,7 @@ set(EXTENSION_SOURCES
     src/quackapi_queue.cpp
     src/quackapi_policy.cpp
     src/quackapi_stream.cpp
+    src/quackapi_from_x.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

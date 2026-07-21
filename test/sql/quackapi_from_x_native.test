@@ -1,0 +1,97 @@
+# name: test/sql/quackapi_from_x_native.test
+# description: Native quack_from_* table functions — FastAPI fixture + embed drift
+# group: [quackapi]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# Routes from committed fastapi_mini fixture (2 routes)
+# ---------------------------------------------------------------------------
+query III
+SELECT method, path, handler_name
+FROM quack_from_fastapi('bridges/from_x/fixtures/fastapi_mini')
+ORDER BY method, path;
+----
+GET	/articles/{slug}	get_article
+POST	/login	login
+
+query I
+SELECT count(*) FROM quack_from_fastapi('bridges/from_x/fixtures/fastapi_mini');
+----
+2
+
+# ---------------------------------------------------------------------------
+# Models: UserInLogin with 3 fields (2 required, 1 defaulted optional-ish)
+# ---------------------------------------------------------------------------
+query IIIII
+SELECT model_name, field_name, field_type, is_required, has_default
+FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini')
+ORDER BY field_line, field_name;
+----
+UserInLogin	email	str	true	false
+UserInLogin	password	str	true	false
+UserInLogin	remember_me	bool	false	true
+
+query I
+SELECT count(*) FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini');
+----
+3
+
+query I
+SELECT default_expr FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini')
+WHERE field_name = 'remember_me';
+----
+False
+
+# ---------------------------------------------------------------------------
+# Embed drift: on-disk src/sql/*.sql must byte-match embedded constants.
+# (unittest cwd is the extension repo root. read_text needs literal paths —
+# no lateral column params — so each pair is checked separately.)
+# ---------------------------------------------------------------------------
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_fastapi_routes.sql'))
+     = quack_from_x_sql('fastapi', 'routes');
+----
+true
+
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_fastapi_models.sql'))
+     = quack_from_x_sql('fastapi', 'models');
+----
+true
+
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_rails_routes.sql'))
+     = quack_from_x_sql('rails', 'routes');
+----
+true
+
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_rails_models.sql'))
+     = quack_from_x_sql('rails', 'models');
+----
+true
+
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_express_routes.sql'))
+     = quack_from_x_sql('express', 'routes');
+----
+true
+
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_express_models.sql'))
+     = quack_from_x_sql('express', 'models');
+----
+true
+
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_gin_routes.sql'))
+     = quack_from_x_sql('gin', 'routes');
+----
+true
+
+query I
+SELECT (SELECT content FROM read_text('src/sql/quack_from_gin_models.sql'))
+     = quack_from_x_sql('gin', 'models');
+----
+true
