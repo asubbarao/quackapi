@@ -167,16 +167,15 @@ bool ParseJsonObjectClaims(DatabaseInstance &db, const string &json, unordered_m
 	if (jtype != "OBJECT") {
 		return false;
 	}
-	auto fields_res = con.Query(
-	    "SELECT k AS key, "
-	    "  CASE json_type(json_extract(doc, '$.' || k)) "
-	    "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
-	    "    WHEN 'NULL' THEN NULL "
-	    "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
-	    "  END AS val "
-	    "FROM (SELECT ?::JSON AS doc) t, "
-	    "     UNNEST(json_keys(doc)) AS u(k)",
-	    Value(json));
+	auto fields_res = con.Query("SELECT k AS key, "
+	                            "  CASE json_type(json_extract(doc, '$.' || k)) "
+	                            "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
+	                            "    WHEN 'NULL' THEN NULL "
+	                            "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
+	                            "  END AS val "
+	                            "FROM (SELECT ?::JSON AS doc) t, "
+	                            "     UNNEST(json_keys(doc)) AS u(k)",
+	                            Value(json));
 	if (fields_res->HasError()) {
 		return false;
 	}
