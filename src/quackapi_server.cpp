@@ -26,6 +26,7 @@
 #include "httplib.hpp"
 #include "miniz_wrapper.hpp"
 #include "zstd.h"
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
@@ -191,45 +192,6 @@ bool CompressGzip(const string &input, string &output) {
 	}
 }
 
-string JsonEscape(const string &input) {
-	string result;
-	result.reserve(input.size() + 2);
-	for (unsigned char c : input) {
-		switch (c) {
-		case '"':
-			result += "\\\"";
-			break;
-		case '\\':
-			result += "\\\\";
-			break;
-		case '\b':
-			result += "\\b";
-			break;
-		case '\f':
-			result += "\\f";
-			break;
-		case '\n':
-			result += "\\n";
-			break;
-		case '\r':
-			result += "\\r";
-			break;
-		case '\t':
-			result += "\\t";
-			break;
-		default:
-			if (c < 0x20) {
-				char buf[8];
-				snprintf(buf, sizeof(buf), "\\u%04x", c);
-				result += buf;
-			} else {
-				result += static_cast<char>(c);
-			}
-		}
-	}
-	return result;
-}
-
 //! Render a DuckDB Value as JSON. The database typed the column — the JSON
 //! representation follows the type, not string-formatting heuristics.
 string ValueToJson(const Value &value) {
@@ -280,26 +242,26 @@ string ValueToJson(const Value &value) {
 			if (i > 0) {
 				result += ",";
 			}
-			result += "\"" + JsonEscape(child_types[i].first) + "\":" + ValueToJson(children[i]);
+			result += "\"" + QuackapiJsonEscape(child_types[i].first) + "\":" + ValueToJson(children[i]);
 		}
 		result += "}";
 		return result;
 	}
 	default:
-		return "\"" + JsonEscape(value.ToString()) + "\"";
+		return "\"" + QuackapiJsonEscape(value.ToString()) + "\"";
 	}
 }
 
 //! FastAPI-shaped validation error body (loc = [kind, name]).
 string ValidationErrorJson(const string &loc_kind, const string &param_name, const string &msg, const string &type) {
-	return "{\"detail\":[{\"loc\":[\"" + JsonEscape(loc_kind) + "\",\"" + JsonEscape(param_name) + "\"],\"msg\":\"" +
-	       JsonEscape(msg) + "\",\"type\":\"" + JsonEscape(type) + "\"}]}";
+	return "{\"detail\":[{\"loc\":[\"" + QuackapiJsonEscape(loc_kind) + "\",\"" + QuackapiJsonEscape(param_name) +
+	       "\"],\"msg\":\"" + QuackapiJsonEscape(msg) + "\",\"type\":\"" + QuackapiJsonEscape(type) + "\"}]}";
 }
 
 //! FastAPI-shaped body-only validation error (loc = ["body"]).
 string ValidationErrorJsonBody(const string &msg, const string &type) {
-	return "{\"detail\":[{\"loc\":[\"body\"],\"msg\":\"" + JsonEscape(msg) + "\",\"type\":\"" + JsonEscape(type) +
-	       "\"}]}";
+	return "{\"detail\":[{\"loc\":[\"body\"],\"msg\":\"" + QuackapiJsonEscape(msg) + "\",\"type\":\"" +
+	       QuackapiJsonEscape(type) + "\"}]}";
 }
 
 //! Media type from Content-Type (strip parameters; lowercased).
@@ -682,7 +644,7 @@ string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
 			event += ",";
 		}
 		first = false;
-		event += "\"" + JsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
+		event += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
 	}
 	event += "}\n\n";
 	return event;
@@ -1212,13 +1174,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				// operators / readiness probes can confirm batteries applied.
 				const string http_client =
 				    options.http_client_active.empty() ? string("httplib") : options.http_client_active;
-				SetJson(res, 200,
-				        StringUtil::Format("{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
-				                           "\"request_id_source\":\"%s\",\"http_client\":\"%s\"}",
-				                           JsonEscape(version), (long long)uptime_sec,
-				                           JsonEscape(options.request_id_source.empty() ? "uuidv7"
-				                                                                       : options.request_id_source),
-				                           JsonEscape(http_client)));
+				SetJson(
+				    res, 200,
+				    StringUtil::Format(
+				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
+				        "\"request_id_source\":\"%s\",\"http_client\":\"%s\"}",
+				        QuackapiJsonEscape(version), (long long)uptime_sec,
+				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
+				        QuackapiJsonEscape(http_client)));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
 			}
@@ -2204,7 +2167,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					body += ",";
 				}
 				first_col = false;
-				body += "\"" + JsonEscape(names[col]) + "\":" + ValueToJson(rv.cols[col]);
+				body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(rv.cols[col]);
 			}
 			body += "}";
 		}

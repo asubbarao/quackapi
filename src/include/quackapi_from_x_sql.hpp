@@ -11,7 +11,8 @@ namespace duckdb {
 namespace quackapi_from_x_sql {
 
 // src/sql/quack_from_fastapi_routes.sql
-static constexpr const char *k_fastapi_routes = R"__QUACKAPI_SQL__(-- quack_from_fastapi routes — sitting_duck AST extraction
+static constexpr const char *k_fastapi_routes =
+    R"__QUACKAPI_SQL__(-- quack_from_fastapi routes — sitting_duck AST extraction
 -- Placeholder: __REPO__  (directory or glob; C++ expands bare dirs to __REPO__/**/*.py)
 -- Returns: method, path, handler_name, file, start_line, evidence
 WITH source_ast AS (
@@ -79,7 +80,8 @@ ORDER BY file, start_line, method, path
 )__QUACKAPI_SQL__";
 
 // src/sql/quack_from_fastapi_models.sql
-static constexpr const char *k_fastapi_models = R"__QUACKAPI_SQL__(-- quack_from_fastapi_models — Pydantic BaseModel/SQLModel fields via sitting_duck
+static constexpr const char *k_fastapi_models =
+    R"__QUACKAPI_SQL__(-- quack_from_fastapi_models — Pydantic BaseModel/SQLModel fields via sitting_duck
 -- Placeholder: __REPO__  (directory or glob; C++ expands bare dirs to __REPO__/**/*.py)
 -- Returns: model_name, field_name, field_type, is_required, is_optional, has_default,
 --          default_expr, file, field_line
@@ -183,7 +185,8 @@ ORDER BY model_name, field_line, field_name
 )__QUACKAPI_SQL__";
 
 // src/sql/quack_from_rails_routes.sql
-static constexpr const char *k_rails_routes = R"__QUACKAPI_SQL__(-- quack_from_rails routes — Rails routes.rb via sitting_duck
+static constexpr const char *k_rails_routes =
+    R"__QUACKAPI_SQL__(-- quack_from_rails routes — Rails routes.rb via sitting_duck
 -- Placeholder: __REPO__  (app root; C++ maps bare dirs to __REPO__/config/routes.rb)
 -- Returns: method, path, handler_name, file, start_line, evidence
 WITH
@@ -327,7 +330,8 @@ ORDER BY file, start_line, method, path
 )__QUACKAPI_SQL__";
 
 // src/sql/quack_from_rails_models.sql
-static constexpr const char *k_rails_models = R"__QUACKAPI_SQL__(-- quack_from_rails_models — validates + strong params via sitting_duck
+static constexpr const char *k_rails_models =
+    R"__QUACKAPI_SQL__(-- quack_from_rails_models — validates + strong params via sitting_duck
 -- Placeholder: __REPO__  (app root; C++ maps bare dirs to models+controllers globs)
 -- Returns: model_name, field_name, field_type, is_required, is_optional, has_default,
 --          default_expr, file, field_line
@@ -421,7 +425,8 @@ ORDER BY model_name, field_name
 )__QUACKAPI_SQL__";
 
 // src/sql/quack_from_express_routes.sql
-static constexpr const char *k_express_routes = R"__QUACKAPI_SQL__(-- quack_from_express routes — Express HTTP routes via sitting_duck
+static constexpr const char *k_express_routes =
+    R"__QUACKAPI_SQL__(-- quack_from_express routes — Express HTTP routes via sitting_duck
 -- Placeholder: __REPO__  (app root; C++ expands bare dirs to ts+js globs)
 -- Returns: method, path, handler_name, file, start_line, evidence
 WITH express_ast AS (
@@ -552,7 +557,8 @@ ORDER BY file, start_line, method, path
 )__QUACKAPI_SQL__";
 
 // src/sql/quack_from_express_models.sql
-static constexpr const char *k_express_models = R"__QUACKAPI_SQL__(-- quack_from_express_models — TS interfaces/classes/zod via sitting_duck
+static constexpr const char *k_express_models =
+    R"__QUACKAPI_SQL__(-- quack_from_express_models — TS interfaces/classes/zod via sitting_duck
 -- Placeholder: __REPO__  (app root; C++ expands bare dirs to ts+js globs)
 -- Returns: model_name, field_name, field_type, is_required, is_optional, has_default,
 --          default_expr, file, field_line
@@ -674,7 +680,8 @@ ORDER BY model_name, field_line, field_name
 )__QUACKAPI_SQL__";
 
 // src/sql/quack_from_gin_routes.sql
-static constexpr const char *k_gin_routes = R"__QUACKAPI_SQL__(-- quack_from_gin routes — Gin HTTP routes via sitting_duck
+static constexpr const char *k_gin_routes =
+    R"__QUACKAPI_SQL__(-- quack_from_gin routes — Gin HTTP routes via sitting_duck
 -- Placeholder: __REPO__  (app root; C++ expands bare dirs to __REPO__/**/*.go)
 -- Returns: method, path, handler_name, file, start_line, evidence
 WITH
@@ -847,7 +854,8 @@ ORDER BY file, start_line, method, path
 )__QUACKAPI_SQL__";
 
 // src/sql/quack_from_gin_models.sql
-static constexpr const char *k_gin_models = R"__QUACKAPI_SQL__(-- quack_from_gin_models — Go struct fields with tags via sitting_duck
+static constexpr const char *k_gin_models =
+    R"__QUACKAPI_SQL__(-- quack_from_gin_models — Go struct fields with tags via sitting_duck
 -- Placeholder: __REPO__  (app root; C++ expands bare dirs to __REPO__/**/*.go)
 -- Returns: model_name, field_name, field_type, is_required, is_optional, has_default,
 --          default_expr, file, field_line
@@ -909,21 +917,21 @@ ORDER BY model_name, field_line, field_name
 
 struct EmbeddedSql {
 	const char *framework;
-	const char *kind; // "routes" | "models"
+	const char *kind;    // "routes" | "models"
 	const char *relpath; // path under repo root
 	const char *sql;
 };
 
 inline const std::vector<EmbeddedSql> &All() {
 	static const std::vector<EmbeddedSql> k = {
-		{"fastapi", "routes", "src/sql/quack_from_fastapi_routes.sql", k_fastapi_routes},
-		{"fastapi", "models", "src/sql/quack_from_fastapi_models.sql", k_fastapi_models},
-		{"rails", "routes", "src/sql/quack_from_rails_routes.sql", k_rails_routes},
-		{"rails", "models", "src/sql/quack_from_rails_models.sql", k_rails_models},
-		{"express", "routes", "src/sql/quack_from_express_routes.sql", k_express_routes},
-		{"express", "models", "src/sql/quack_from_express_models.sql", k_express_models},
-		{"gin", "routes", "src/sql/quack_from_gin_routes.sql", k_gin_routes},
-		{"gin", "models", "src/sql/quack_from_gin_models.sql", k_gin_models},
+	    {"fastapi", "routes", "src/sql/quack_from_fastapi_routes.sql", k_fastapi_routes},
+	    {"fastapi", "models", "src/sql/quack_from_fastapi_models.sql", k_fastapi_models},
+	    {"rails", "routes", "src/sql/quack_from_rails_routes.sql", k_rails_routes},
+	    {"rails", "models", "src/sql/quack_from_rails_models.sql", k_rails_models},
+	    {"express", "routes", "src/sql/quack_from_express_routes.sql", k_express_routes},
+	    {"express", "models", "src/sql/quack_from_express_models.sql", k_express_models},
+	    {"gin", "routes", "src/sql/quack_from_gin_routes.sql", k_gin_routes},
+	    {"gin", "models", "src/sql/quack_from_gin_models.sql", k_gin_models},
 	};
 	return k;
 }

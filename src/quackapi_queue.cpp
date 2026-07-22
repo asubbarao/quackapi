@@ -16,6 +16,7 @@
 #include "quackapi_state.hpp"
 
 #include <cmath>
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
@@ -24,18 +25,6 @@ namespace {
 //===--------------------------------------------------------------------===//
 // SQL helpers
 //===--------------------------------------------------------------------===//
-
-string Trim(const string &input) {
-	idx_t begin = 0;
-	idx_t end = input.size();
-	while (begin < end && StringUtil::CharacterIsSpace(input[begin])) {
-		begin++;
-	}
-	while (end > begin && (StringUtil::CharacterIsSpace(input[end - 1]) || input[end - 1] == ';')) {
-		end--;
-	}
-	return input.substr(begin, end - begin);
-}
 
 //! Escape a string for use as a single-quoted SQL literal.
 string SqlQuote(const string &s) {
@@ -100,7 +89,7 @@ namespace {
 //===--------------------------------------------------------------------===//
 
 bool ParseDurationSeconds(const string &raw, int32_t &out_sec, string &err) {
-	auto s = Trim(raw);
+	auto s = QuackapiTrim(raw);
 	if (s.empty()) {
 		err = "empty duration";
 		return false;
@@ -188,7 +177,7 @@ struct QueueDdlParseData : public ParserExtensionParseData {
 //!     [WITH ( max_attempts=<n> , visibility_timeout='30s'|30 , backoff_base_seconds=<n> )]
 //!   DROP QUEUE <name>
 ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = Trim(query);
+	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -199,7 +188,7 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 		pos = 24;
 		or_replace = true;
 	} else if (StringUtil::StartsWith(upper, "DROP QUEUE ")) {
-		auto name = Trim(q.substr(11));
+		auto name = QuackapiTrim(q.substr(11));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP QUEUE expects a single queue name");
 		}
@@ -211,7 +200,7 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = Trim(q.substr(pos));
+	auto rest = QuackapiTrim(q.substr(pos));
 	if (rest.empty()) {
 		return ParserExtensionParseResult("CREATE QUEUE expects a queue name");
 	}
@@ -231,7 +220,7 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 			return ParserExtensionParseResult("Queue name must be an identifier ([A-Za-z0-9_-]+)");
 		}
 	}
-	rest = Trim(rest.substr(name_end));
+	rest = QuackapiTrim(rest.substr(name_end));
 	auto rest_upper = StringUtil::Upper(rest);
 
 	QuackapiQueue queue;
@@ -244,7 +233,7 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 		      (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '('))) {
 			return ParserExtensionParseResult("Expected WITH (...) after queue name, or end of statement");
 		}
-		rest = Trim(rest.substr(4));
+		rest = QuackapiTrim(rest.substr(4));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("WITH expects a parenthesized option list");
 		}
@@ -252,8 +241,8 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 		if (close == string::npos) {
 			return ParserExtensionParseResult("Unterminated WITH ( ... ) options");
 		}
-		auto opts = Trim(rest.substr(1, close - 1));
-		rest = Trim(rest.substr(close + 1));
+		auto opts = QuackapiTrim(rest.substr(1, close - 1));
+		rest = QuackapiTrim(rest.substr(close + 1));
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after WITH options");
 		}
