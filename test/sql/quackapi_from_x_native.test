@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_from_x_native.test
 # description: Native quack_from_* table functions — FastAPI fixture + embed drift
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 

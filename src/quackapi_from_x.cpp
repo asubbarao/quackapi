@@ -28,10 +28,9 @@ void EnsureSittingDuck(Connection &con) {
 	}
 	auto inst = con.Query("INSTALL sitting_duck FROM community");
 	if (inst->HasError()) {
-		throw InvalidInputException(
-		    "quack_from_x: could not INSTALL sitting_duck FROM community: %s\n"
-		    "sitting_duck is a runtime dependency of quack_from_* extractors.",
-		    inst->GetError().c_str());
+		throw InvalidInputException("quack_from_x: could not INSTALL sitting_duck FROM community: %s\n"
+		                            "sitting_duck is a runtime dependency of quack_from_* extractors.",
+		                            inst->GetError().c_str());
 	}
 	load = con.Query("LOAD sitting_duck");
 	if (load->HasError()) {
@@ -82,8 +81,9 @@ string ExpandRepoPath(const string &raw_path, const string &framework, const str
 	}
 	// Specific source file extensions: use as-is.
 	auto lower = StringUtil::Lower(path);
-	if (StringUtil::EndsWith(lower, ".py") || StringUtil::EndsWith(lower, ".rb") || StringUtil::EndsWith(lower, ".ts") ||
-	    StringUtil::EndsWith(lower, ".js") || StringUtil::EndsWith(lower, ".go")) {
+	if (StringUtil::EndsWith(lower, ".py") || StringUtil::EndsWith(lower, ".rb") ||
+	    StringUtil::EndsWith(lower, ".ts") || StringUtil::EndsWith(lower, ".js") ||
+	    StringUtil::EndsWith(lower, ".go")) {
 		return path;
 	}
 
@@ -141,17 +141,17 @@ struct FromXGlobalState : public GlobalTableFunctionState {
 };
 
 void SetRouteReturnTypes(vector<LogicalType> &return_types, vector<string> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR,  LogicalType::UINTEGER, LogicalType::VARCHAR};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,  LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::UINTEGER, LogicalType::VARCHAR};
 	names = {"method", "path", "handler_name", "file", "start_line", "evidence"};
 }
 
 void SetModelReturnTypes(vector<LogicalType> &return_types, vector<string> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN,  LogicalType::BOOLEAN,  LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::UINTEGER};
-	names = {"model_name", "field_name",  "field_type", "is_required", "is_optional",
-	         "has_default", "default_expr", "file",      "field_line"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UINTEGER};
+	names = {"model_name",  "field_name",   "field_type", "is_required", "is_optional",
+	         "has_default", "default_expr", "file",       "field_line"};
 }
 
 unique_ptr<FunctionData> FromXBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
@@ -285,10 +285,9 @@ void FromXSqlScalar(DataChunk &args, ExpressionState &, Vector &result) {
 	    args.data[0], args.data[1], result, args.size(), [&](string_t fw, string_t kind) {
 		    auto *sql = quackapi_from_x_sql::Lookup(fw.GetString().c_str(), kind.GetString().c_str());
 		    if (!sql) {
-			    throw InvalidInputException(
-			        "quack_from_x_sql: unknown framework/kind '%s'/'%s' "
-			        "(frameworks: fastapi|rails|express|gin; kind: routes|models)",
-			        fw.GetString(), kind.GetString());
+			    throw InvalidInputException("quack_from_x_sql: unknown framework/kind '%s'/'%s' "
+			                                "(frameworks: fastapi|rails|express|gin; kind: routes|models)",
+			                                fw.GetString(), kind.GetString());
 		    }
 		    return StringVector::AddString(result, sql);
 	    });
