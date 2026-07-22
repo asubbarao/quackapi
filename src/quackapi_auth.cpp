@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <cstring>
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
@@ -136,232 +137,74 @@ bool QuackapiBase64UrlDecode(const string &input, string &out) {
 }
 
 //===--------------------------------------------------------------------===//
-// Minimal top-level JSON object claim extraction for JWT payloads
+//===--------------------------------------------------------------------===//
+// JWT claims JSON — DuckDB json_* (same substrate as body parse in server.cpp)
 //===--------------------------------------------------------------------===//
 
 namespace {
 
-void SkipWs(const string &s, idx_t &i) {
-	while (i < s.size() && StringUtil::CharacterIsSpace(s[i])) {
-		i++;
-	}
-}
-
-bool ParseJsonString(const string &s, idx_t &i, string &out) {
-	if (i >= s.size() || s[i] != '"') {
-		return false;
-	}
-	i++;
-	out.clear();
-	while (i < s.size()) {
-		char c = s[i++];
-		if (c == '"') {
-			return true;
-		}
-		if (c == '\\' && i < s.size()) {
-			char e = s[i++];
-			switch (e) {
-			case '"':
-			case '\\':
-			case '/':
-				out += e;
-				break;
-			case 'b':
-				out += '\b';
-				break;
-			case 'f':
-				out += '\f';
-				break;
-			case 'n':
-				out += '\n';
-				break;
-			case 'r':
-				out += '\r';
-				break;
-			case 't':
-				out += '\t';
-				break;
-			case 'u': {
-				// Keep \uXXXX as literal UTF-16 code unit hex for VARCHAR binding.
-				if (i + 4 > s.size()) {
-					return false;
-				}
-				out += "\\u";
-				out += s.substr(i, 4);
-				i += 4;
-				break;
-			}
-			default:
-				out += e;
-				break;
-			}
-		} else {
-			out += c;
-		}
-	}
-	return false;
-}
-
-//! Parse a JSON value starting at i; advance i past it. For objects/arrays the
-//! raw JSON substring is returned (for nested claims). Strings return unquoted
-//! content. Numbers/bools/null return their literal text ("null", "true", "42").
-bool ParseJsonValue(const string &s, idx_t &i, string &out, bool &is_null) {
-	SkipWs(s, i);
-	if (i >= s.size()) {
-		return false;
-	}
-	is_null = false;
-	char c = s[i];
-	if (c == '"') {
-		return ParseJsonString(s, i, out);
-	}
-	if (c == '{' || c == '[') {
-		// Capture balanced raw JSON.
-		char open = c;
-		char close = (c == '{') ? '}' : ']';
-		idx_t start = i;
-		int depth = 0;
-		bool in_str = false;
-		bool esc = false;
-		for (; i < s.size(); i++) {
-			char ch = s[i];
-			if (in_str) {
-				if (esc) {
-					esc = false;
-				} else if (ch == '\\') {
-					esc = true;
-				} else if (ch == '"') {
-					in_str = false;
-				}
-				continue;
-			}
-			if (ch == '"') {
-				in_str = true;
-				continue;
-			}
-			if (ch == open) {
-				depth++;
-			} else if (ch == close) {
-				depth--;
-				if (depth == 0) {
-					i++;
-					out = s.substr(start, i - start);
-					return true;
-				}
-			}
-		}
-		return false;
-	}
-	// literal: null / true / false / number
-	idx_t start = i;
-	if (s.compare(i, 4, "null") == 0) {
-		i += 4;
-		out = "null";
-		is_null = true;
-		return true;
-	}
-	if (s.compare(i, 4, "true") == 0) {
-		i += 4;
-		out = "true";
-		return true;
-	}
-	if (s.compare(i, 5, "false") == 0) {
-		i += 5;
-		out = "false";
-		return true;
-	}
-	// number
-	if (c == '-' || (c >= '0' && c <= '9')) {
-		if (s[i] == '-') {
-			i++;
-		}
-		while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
-			i++;
-		}
-		if (i < s.size() && s[i] == '.') {
-			i++;
-			while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
-				i++;
-			}
-		}
-		if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
-			i++;
-			if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
-				i++;
-			}
-			while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
-				i++;
-			}
-		}
-		out = s.substr(start, i - start);
-		return !out.empty() && out != "-";
-	}
-	return false;
-}
-
-bool ParseJsonObjectClaims(const string &json, unordered_map<string, string> &claims,
+//! Flatten top-level JSON object keys via DuckDB (no hand-rolled recursive parser).
+bool ParseJsonObjectClaims(DatabaseInstance &db, const string &json, unordered_map<string, string> &claims,
                            unordered_map<string, bool> &null_claims) {
-	idx_t i = 0;
-	SkipWs(json, i);
-	if (i >= json.size() || json[i] != '{') {
+	Connection con(db);
+	auto check = con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(json));
+	if (check->HasError()) {
 		return false;
 	}
-	i++;
-	SkipWs(json, i);
-	if (i < json.size() && json[i] == '}') {
-		return true;
-	}
-	while (i < json.size()) {
-		SkipWs(json, i);
-		string key;
-		if (!ParseJsonString(json, i, key)) {
-			return false;
-		}
-		SkipWs(json, i);
-		if (i >= json.size() || json[i] != ':') {
-			return false;
-		}
-		i++;
-		string val;
-		bool is_null = false;
-		if (!ParseJsonValue(json, i, val, is_null)) {
-			return false;
-		}
-		if (is_null) {
-			null_claims[key] = true;
-		} else {
-			claims[key] = val;
-		}
-		SkipWs(json, i);
-		if (i < json.size() && json[i] == ',') {
-			i++;
-			continue;
-		}
-		if (i < json.size() && json[i] == '}') {
-			return true;
-		}
+	auto check_chunk = check->Fetch();
+	if (!check_chunk || check_chunk->size() == 0 || check_chunk->GetValue(0, 0).IsNull() ||
+	    !check_chunk->GetValue(0, 0).GetValue<bool>()) {
 		return false;
 	}
-	return false;
+	auto type_res = con.Query("SELECT json_type(?::JSON)", Value(json));
+	if (type_res->HasError()) {
+		return false;
+	}
+	auto type_chunk = type_res->Fetch();
+	string jtype = type_chunk && type_chunk->size() > 0 && !type_chunk->GetValue(0, 0).IsNull()
+	                   ? type_chunk->GetValue(0, 0).GetValue<string>()
+	                   : string();
+	if (jtype != "OBJECT") {
+		return false;
+	}
+	auto fields_res = con.Query(
+	    "SELECT k AS key, "
+	    "  CASE json_type(json_extract(doc, '$.' || k)) "
+	    "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
+	    "    WHEN 'NULL' THEN NULL "
+	    "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
+	    "  END AS val "
+	    "FROM (SELECT ?::JSON AS doc) t, "
+	    "     UNNEST(json_keys(doc)) AS u(k)",
+	    Value(json));
+	if (fields_res->HasError()) {
+		return false;
+	}
+	while (true) {
+		auto chunk = fields_res->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto key_v = chunk->GetValue(0, row);
+			if (key_v.IsNull()) {
+				continue;
+			}
+			string key = key_v.GetValue<string>();
+			auto val_v = chunk->GetValue(1, row);
+			if (val_v.IsNull()) {
+				null_claims[key] = true;
+			} else {
+				claims[key] = val_v.GetValue<string>();
+			}
+		}
+	}
+	return true;
 }
 
 string DetailJson(const string &detail) {
 	// FastAPI-shaped simple string detail (not the 422 array form).
-	string esc;
-	for (unsigned char c : detail) {
-		if (c == '"') {
-			esc += "\\\"";
-		} else if (c == '\\') {
-			esc += "\\\\";
-		} else if (c < 0x20) {
-			char buf[8];
-			snprintf(buf, sizeof(buf), "\\u%04x", c);
-			esc += buf;
-		} else {
-			esc += static_cast<char>(c);
-		}
-	}
-	return "{\"detail\":\"" + esc + "\"}";
+	return "{\"detail\":\"" + QuackapiJsonEscape(detail) + "\"}";
 }
 
 QuackapiAuthResult Fail401(const string &detail, const string &www_auth = "") {
@@ -419,8 +262,8 @@ int64_t NowEpochSeconds() {
 }
 
 //! Verify HS256 JWT. On success fills claims map.
-bool VerifyJwtHs256(const string &token, const string &secret, unordered_map<string, string> &claims,
-                    string &error_detail) {
+bool VerifyJwtHs256(DatabaseInstance &db, const string &token, const string &secret,
+                    unordered_map<string, string> &claims, string &error_detail) {
 	// header.payload.signature
 	auto d1 = token.find('.');
 	if (d1 == string::npos) {
@@ -463,7 +306,7 @@ bool VerifyJwtHs256(const string &token, const string &secret, unordered_map<str
 	}
 	unordered_map<string, string> header_claims;
 	unordered_map<string, bool> header_nulls;
-	if (!ParseJsonObjectClaims(header_json, header_claims, header_nulls)) {
+	if (!ParseJsonObjectClaims(db, header_json, header_claims, header_nulls)) {
 		error_detail = "Invalid authentication credentials";
 		return false;
 	}
@@ -480,7 +323,7 @@ bool VerifyJwtHs256(const string &token, const string &secret, unordered_map<str
 		return false;
 	}
 	unordered_map<string, bool> null_claims;
-	if (!ParseJsonObjectClaims(payload_json, claims, null_claims)) {
+	if (!ParseJsonObjectClaims(db, payload_json, claims, null_claims)) {
 		error_detail = "Invalid authentication credentials";
 		return false;
 	}
@@ -570,7 +413,7 @@ string ExtractAuthString(const QuackapiAuth &auth, const case_insensitive_map_t<
 	return "";
 }
 
-//! Encode claims map as a compact JSON object for SQL return / $claims_* rebind.
+//! Encode claims map as JSON (control-safe QuackapiJsonEscape).
 static string ClaimsToJson(const unordered_map<string, string> &claims) {
 	string out = "{";
 	bool first = true;
@@ -579,43 +422,16 @@ static string ClaimsToJson(const unordered_map<string, string> &claims) {
 			out += ",";
 		}
 		first = false;
-		// Keys and values are escaped via the same FastAPI-shaped helper path.
-		string key_esc;
-		for (unsigned char c : kv.first) {
-			if (c == '"') {
-				key_esc += "\\\"";
-			} else if (c == '\\') {
-				key_esc += "\\\\";
-			} else {
-				key_esc += static_cast<char>(c);
-			}
-		}
-		string val_esc;
-		for (unsigned char c : kv.second) {
-			if (c == '"') {
-				val_esc += "\\\"";
-			} else if (c == '\\') {
-				val_esc += "\\\\";
-			} else if (c == '\n') {
-				val_esc += "\\n";
-			} else if (c == '\r') {
-				val_esc += "\\r";
-			} else if (c == '\t') {
-				val_esc += "\\t";
-			} else {
-				val_esc += static_cast<char>(c);
-			}
-		}
-		out += "\"" + key_esc + "\":\"" + val_esc + "\"";
+		out += "\"" + QuackapiJsonEscape(kv.first) + "\":\"" + QuackapiJsonEscape(kv.second) + "\"";
 	}
 	out += "}";
 	return out;
 }
 
 //! Parse claims_json produced by ClaimsToJson back into a map (for REST rebind).
-static void ParseClaimsJson(const string &json, unordered_map<string, string> &claims) {
+static void ParseClaimsJson(DatabaseInstance &db, const string &json, unordered_map<string, string> &claims) {
 	unordered_map<string, bool> nulls;
-	ParseJsonObjectClaims(json, claims, nulls);
+	ParseJsonObjectClaims(db, json, claims, nulls);
 }
 
 QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_name, const string &auth_string) {
@@ -656,7 +472,7 @@ QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_n
 		}
 		unordered_map<string, string> claims;
 		string err;
-		if (!VerifyJwtHs256(auth_string, auth.secret, claims, err)) {
+		if (!VerifyJwtHs256(db, auth_string, auth.secret, claims, err)) {
 			return Fail401(err);
 		}
 		QuackapiAuthResult ok;
@@ -734,7 +550,7 @@ QuackapiAuthResult CheckAuth(DatabaseInstance &db, const QuackapiRoute &route,
 	result.body = children[2].IsNull() ? string() : children[2].GetValue<string>();
 	result.www_authenticate = children[3].IsNull() ? string() : children[3].GetValue<string>();
 	if (result.ok && !children[4].IsNull()) {
-		ParseClaimsJson(children[4].GetValue<string>(), result.claims);
+		ParseClaimsJson(db, children[4].GetValue<string>(), result.claims);
 	}
 	(void)child_types;
 	return result;
@@ -835,18 +651,6 @@ void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader) {
 
 namespace {
 
-string Trim(const string &input) {
-	idx_t begin = 0;
-	idx_t end = input.size();
-	while (begin < end && StringUtil::CharacterIsSpace(input[begin])) {
-		begin++;
-	}
-	while (end > begin && (StringUtil::CharacterIsSpace(input[end - 1]) || input[end - 1] == ';')) {
-		end--;
-	}
-	return input.substr(begin, end - begin);
-}
-
 //! Parsed CREATE/DROP AUTH, carried from parse to plan.
 struct AuthDdlParseData : public ParserExtensionParseData {
 	string action; // CREATE / DROP
@@ -870,7 +674,7 @@ struct AuthDdlParseData : public ParserExtensionParseData {
 //!   CREATE [OR REPLACE] AUTH <name> AS JWT ( SECRET '<secret>' [, ALGORITHM HS256 ] );
 //!   DROP AUTH <name>;
 ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = Trim(query);
+	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -881,7 +685,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		pos = 23;
 		or_replace = true;
 	} else if (StringUtil::StartsWith(upper, "DROP AUTH ")) {
-		auto name = Trim(q.substr(10));
+		auto name = QuackapiTrim(q.substr(10));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP AUTH expects a single auth name");
 		}
@@ -893,7 +697,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = Trim(q.substr(pos));
+	auto rest = QuackapiTrim(q.substr(pos));
 
 	// <name>
 	auto first_space = rest.find(' ');
@@ -901,14 +705,14 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		return ParserExtensionParseResult("CREATE AUTH <name> AS API_KEY | JWT (...)");
 	}
 	auto name = rest.substr(0, first_space);
-	rest = Trim(rest.substr(first_space));
+	rest = QuackapiTrim(rest.substr(first_space));
 	auto rest_upper = StringUtil::Upper(rest);
 
 	// AS <kind>
 	if (!StringUtil::StartsWith(rest_upper, "AS ")) {
 		return ParserExtensionParseResult("Expected AS API_KEY | JWT after auth name");
 	}
-	rest = Trim(rest.substr(3));
+	rest = QuackapiTrim(rest.substr(3));
 	rest_upper = StringUtil::Upper(rest);
 
 	QuackapiAuth auth;
@@ -917,7 +721,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 	if (StringUtil::StartsWith(rest_upper, "API_KEY")) {
 		auth.kind = QuackapiAuthKind::API_KEY;
 		auth.header = "X-API-Key";
-		rest = Trim(rest.substr(7));
+		rest = QuackapiTrim(rest.substr(7));
 		rest_upper = StringUtil::Upper(rest);
 		// optional ( HEADER '<hdr>' )
 		if (!rest.empty() && rest[0] == '(') {
@@ -925,10 +729,10 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 			if (close == string::npos) {
 				return ParserExtensionParseResult("Unterminated API_KEY options");
 			}
-			auto opts = Trim(rest.substr(1, close - 1));
+			auto opts = QuackapiTrim(rest.substr(1, close - 1));
 			auto opts_upper = StringUtil::Upper(opts);
 			if (StringUtil::StartsWith(opts_upper, "HEADER ")) {
-				auto hrest = Trim(opts.substr(7));
+				auto hrest = QuackapiTrim(opts.substr(7));
 				if (hrest.size() < 2 || hrest.front() != '\'' || hrest.back() != '\'') {
 					return ParserExtensionParseResult("HEADER expects a quoted string");
 				}
@@ -939,14 +743,14 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 			} else if (!opts.empty()) {
 				return ParserExtensionParseResult("API_KEY options: expected HEADER '<name>'");
 			}
-			rest = Trim(rest.substr(close + 1));
+			rest = QuackapiTrim(rest.substr(close + 1));
 		}
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after API_KEY");
 		}
 	} else if (StringUtil::StartsWith(rest_upper, "JWT")) {
 		auth.kind = QuackapiAuthKind::JWT_HS256;
-		rest = Trim(rest.substr(3));
+		rest = QuackapiTrim(rest.substr(3));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("JWT requires ( SECRET '<secret>' [, ALGORITHM HS256 ] )");
 		}
@@ -954,7 +758,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		if (close == string::npos) {
 			return ParserExtensionParseResult("Unterminated JWT options");
 		}
-		auto opts = Trim(rest.substr(1, close - 1));
+		auto opts = QuackapiTrim(rest.substr(1, close - 1));
 		if (opts.empty()) {
 			return ParserExtensionParseResult("JWT requires SECRET '<secret>'");
 		}
@@ -1009,7 +813,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		if (!have_secret) {
 			return ParserExtensionParseResult("JWT requires SECRET '<secret>'");
 		}
-		rest = Trim(rest.substr(close + 1));
+		rest = QuackapiTrim(rest.substr(close + 1));
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after JWT options");
 		}
