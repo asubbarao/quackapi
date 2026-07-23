@@ -319,3 +319,48 @@ query I
 SELECT quackapi_nack('default', 6);
 ----
 dead
+
+# ---------------------------------------------------------------------------
+# Arity collapse coverage: 3-arg nack + JSON+max enqueue
+# ---------------------------------------------------------------------------
+query I
+CREATE QUEUE arity WITH (max_attempts=5, backoff_base_seconds=0);
+----
+Queue arity: max_attempts=5 visibility_timeout=30s
+
+query I
+SELECT quackapi_enqueue('arity', '{"z":1}'::JSON, 7);
+----
+7
+
+query I
+SELECT max_attempts FROM quackapi_jobs WHERE id=7;
+----
+7
+
+query I
+SELECT id FROM quackapi_dequeue('arity');
+----
+7
+
+# 3-arg nack: requeue=true, default error text "nack"
+query I
+SELECT quackapi_nack('arity', 7, true);
+----
+pending
+
+query I
+SELECT last_error FROM quackapi_jobs WHERE id=7;
+----
+nack
+
+query I
+SELECT id FROM quackapi_dequeue('arity');
+----
+7
+
+# 3-arg nack: requeue=false → dead
+query I
+SELECT quackapi_nack('arity', 7, false);
+----
+dead
