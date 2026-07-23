@@ -34,8 +34,8 @@ inline void BindStatusColumn(vector<LogicalType> &return_types, vector<string> &
 	names.emplace_back("status");
 }
 
-inline TableFunction MakeApplyDdlFunction(const char *name, vector<LogicalType> arg_types,
-                                          table_function_t function, table_function_bind_t bind) {
+inline TableFunction MakeApplyDdlFunction(const char *name, vector<LogicalType> arg_types, table_function_t function,
+                                          table_function_bind_t bind) {
 	return TableFunction(name, std::move(arg_types), function, bind);
 }
 

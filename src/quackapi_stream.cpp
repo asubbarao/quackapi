@@ -334,8 +334,10 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 }
 
 TableFunction MakeApplyStreamFunction() {
-	return MakeApplyDdlFunction("quackapi_apply_stream", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, ApplyStreamExec, ApplyStreamBind);
+	return MakeApplyDdlFunction("quackapi_apply_stream",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                            ApplyStreamExec, ApplyStreamBind);
 }
 
 ParserExtensionPlanResult StreamDdlPlan(ParserExtensionInfo *, ClientContext &,

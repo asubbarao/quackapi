@@ -396,8 +396,10 @@ void ApplyQueueExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 }
 
 TableFunction MakeApplyQueueFunction() {
-	return MakeApplyDdlFunction("quackapi_apply_queue", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                        LogicalType::INTEGER, LogicalType::INTEGER}, ApplyQueueExec, ApplyQueueBind);
+	return MakeApplyDdlFunction("quackapi_apply_queue",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                             LogicalType::INTEGER, LogicalType::INTEGER},
+	                            ApplyQueueExec, ApplyQueueBind);
 }
 
 ParserExtensionPlanResult QueueDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -863,8 +865,8 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 
 	// nack(queue, job_id) / nack(queue, job_id, requeue) / nack(queue, job_id, requeue, error)
 	ScalarFunctionSet nack_set("quackapi_nack");
-	nack_set.AddFunction(ScalarFunction("quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT},
-	                                    LogicalType::VARCHAR, NackScalar));
+	nack_set.AddFunction(
+	    ScalarFunction("quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR, NackScalar));
 	nack_set.AddFunction(ScalarFunction("quackapi_nack",
 	                                    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN},
 	                                    LogicalType::VARCHAR, NackScalar));

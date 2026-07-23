@@ -896,9 +896,11 @@ void ApplyPolicyExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 
 TableFunction MakeApplyPolicyFunction() {
 	// action, or_replace, name, value_type, arg_columns_csv, arg_types_csv, expression, table, column
-	return MakeApplyDdlFunction("quackapi_apply_policy", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR}, ApplyPolicyExec, ApplyPolicyBind);
+	return MakeApplyDdlFunction("quackapi_apply_policy",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR},
+	                            ApplyPolicyExec, ApplyPolicyBind);
 }
 
 ParserExtensionPlanResult PolicyDdlPlan(ParserExtensionInfo *, ClientContext &,

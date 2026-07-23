@@ -732,9 +732,11 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 }
 
 TableFunction MakeApplyRouteFunction() {
-	return MakeApplyDdlFunction("quackapi_apply_route", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyRouteExec, ApplyRouteBind);
+	return MakeApplyDdlFunction("quackapi_apply_route",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                            ApplyRouteExec, ApplyRouteBind);
 }
 
 ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -1073,8 +1075,10 @@ void ApplyGroupExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 }
 
 TableFunction MakeApplyGroupFunction() {
-	return MakeApplyDdlFunction("quackapi_apply_group", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyGroupExec, ApplyGroupBind);
+	return MakeApplyDdlFunction("quackapi_apply_group",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                            ApplyGroupExec, ApplyGroupBind);
 }
 
 ParserExtensionPlanResult GroupDdlPlan(ParserExtensionInfo *, ClientContext &,

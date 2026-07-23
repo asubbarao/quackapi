@@ -882,8 +882,10 @@ void ApplyAuthExec(ClientContext &context, TableFunctionInput &data_p, DataChunk
 }
 
 TableFunction MakeApplyAuthFunction() {
-	return MakeApplyDdlFunction("quackapi_apply_auth", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyAuthExec, ApplyAuthBind);
+	return MakeApplyDdlFunction("quackapi_apply_auth",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                            ApplyAuthExec, ApplyAuthBind);
 }
 
 string AuthKindToString(QuackapiAuthKind kind) {

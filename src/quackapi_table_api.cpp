@@ -233,13 +233,15 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	get_route.status = 200;
 	state.AddRoute(get_route, bind_data.or_replace);
 
-	EmitOneShotStatus(
-	    output, bind_data.finished,
-	    StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key));
+	EmitOneShotStatus(output, bind_data.finished,
+	                  StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key));
 }
 
 TableFunction MakeApplyApiFunction() {
-	return MakeApplyDdlFunction("quackapi_apply_table_api", {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyApiExec, ApplyApiBind);
+	return MakeApplyDdlFunction(
+	    "quackapi_apply_table_api",
+	    {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyApiExec,
+	    ApplyApiBind);
 }
 
 ParserExtensionPlanResult TableApiPlan(ParserExtensionInfo *, ClientContext &,
