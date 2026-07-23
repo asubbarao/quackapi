@@ -819,8 +819,7 @@ unique_ptr<FunctionData> ApplyPolicyBind(ClientContext &, TableFunctionBindInput
 	bind_data->expression = input.inputs[6].GetValue<string>();
 	bind_data->table_name = input.inputs[7].GetValue<string>();
 	bind_data->column_name = input.inputs[8].GetValue<string>();
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -892,19 +891,14 @@ void ApplyPolicyExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 		throw InvalidInputException("Unknown policy action \"%s\"", bind_data.action);
 	}
 
-	output.SetValue(0, 0, Value(message));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(output, bind_data.finished, message);
 }
 
 TableFunction MakeApplyPolicyFunction() {
 	// action, or_replace, name, value_type, arg_columns_csv, arg_types_csv, expression, table, column
-	TableFunction function("quackapi_apply_policy",
-	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	return MakeApplyDdlFunction("quackapi_apply_policy", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR},
-	                       ApplyPolicyExec, ApplyPolicyBind);
-	return function;
+	                        LogicalType::VARCHAR}, ApplyPolicyExec, ApplyPolicyBind);
 }
 
 ParserExtensionPlanResult PolicyDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -921,8 +915,7 @@ ParserExtensionPlanResult PolicyDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.expression));
 	result.parameters.push_back(Value(data.table_name));
 	result.parameters.push_back(Value(data.column_name));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 

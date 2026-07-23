@@ -677,8 +677,7 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	if (input.inputs.size() > 10 && !input.inputs[10].IsNull()) {
 		bind_data->route.group_name = input.inputs[10].GetValue<string>();
 	}
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -729,18 +728,13 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			throw InvalidInputException("Route \"%s\" does not exist", bind_data.route.name);
 		}
 	}
-	output.SetValue(0, 0, Value(message));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(output, bind_data.finished, message);
 }
 
 TableFunction MakeApplyRouteFunction() {
-	TableFunction function("quackapi_apply_route",
-	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	return MakeApplyDdlFunction("quackapi_apply_route", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                       ApplyRouteExec, ApplyRouteBind);
-	return function;
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyRouteExec, ApplyRouteBind);
 }
 
 ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -759,8 +753,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(SerializeParamSpecs(data.route.params)));
 	result.parameters.push_back(Value(data.route.body_schema));
 	result.parameters.push_back(Value(data.route.group_name));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 
@@ -1052,8 +1045,7 @@ unique_ptr<FunctionData> ApplyGroupBind(ClientContext &, TableFunctionBindInput 
 	bind_data->group.require_auth = input.inputs[4].GetValue<string>();
 	bind_data->group.tags = input.inputs[5].GetValue<string>();
 	bind_data->group.policy = input.inputs[6].GetValue<string>();
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -1077,17 +1069,12 @@ void ApplyGroupExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			throw InvalidInputException("Group \"%s\" does not exist", bind_data.group.name);
 		}
 	}
-	output.SetValue(0, 0, Value(message));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(output, bind_data.finished, message);
 }
 
 TableFunction MakeApplyGroupFunction() {
-	TableFunction function("quackapi_apply_group",
-	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                       ApplyGroupExec, ApplyGroupBind);
-	return function;
+	return MakeApplyDdlFunction("quackapi_apply_group", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyGroupExec, ApplyGroupBind);
 }
 
 ParserExtensionPlanResult GroupDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -1102,8 +1089,7 @@ ParserExtensionPlanResult GroupDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.group.require_auth));
 	result.parameters.push_back(Value(data.group.tags));
 	result.parameters.push_back(Value(data.group.policy));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 

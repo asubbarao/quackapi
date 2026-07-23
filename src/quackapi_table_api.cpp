@@ -181,8 +181,7 @@ unique_ptr<FunctionData> ApplyApiBind(ClientContext &, TableFunctionBindInput &i
 	bind_data->table = input.inputs[1].GetValue<string>();
 	bind_data->base_path = input.inputs[2].GetValue<string>();
 	bind_data->key = input.inputs[3].GetValue<string>();
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -234,16 +233,13 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	get_route.status = 200;
 	state.AddRoute(get_route, bind_data.or_replace);
 
-	output.SetValue(
-	    0, 0, Value(StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key)));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(
+	    output, bind_data.finished,
+	    StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key));
 }
 
 TableFunction MakeApplyApiFunction() {
-	return TableFunction("quackapi_apply_table_api",
-	                     {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                     ApplyApiExec, ApplyApiBind);
+	return MakeApplyDdlFunction("quackapi_apply_table_api", {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyApiExec, ApplyApiBind);
 }
 
 ParserExtensionPlanResult TableApiPlan(ParserExtensionInfo *, ClientContext &,
@@ -255,8 +251,7 @@ ParserExtensionPlanResult TableApiPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.table));
 	result.parameters.push_back(Value(data.base_path));
 	result.parameters.push_back(Value(data.key));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 

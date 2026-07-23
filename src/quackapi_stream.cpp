@@ -296,8 +296,7 @@ unique_ptr<FunctionData> ApplyStreamBind(ClientContext &, TableFunctionBindInput
 	bind_data->stream.handler_sql = input.inputs[5].GetValue<string>();
 	bind_data->stream.interval_ms = input.inputs[6].GetValue<int64_t>();
 	bind_data->stream.transport = QuackapiStreamTransport::SSE;
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -331,17 +330,12 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 			throw InvalidInputException("Stream \"%s\" does not exist", bind_data.stream.name);
 		}
 	}
-	output.SetValue(0, 0, Value(message));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(output, bind_data.finished, message);
 }
 
 TableFunction MakeApplyStreamFunction() {
-	TableFunction function("quackapi_apply_stream",
-	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
-	                       ApplyStreamExec, ApplyStreamBind);
-	return function;
+	return MakeApplyDdlFunction("quackapi_apply_stream", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, ApplyStreamExec, ApplyStreamBind);
 }
 
 ParserExtensionPlanResult StreamDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -356,8 +350,7 @@ ParserExtensionPlanResult StreamDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.stream.pattern));
 	result.parameters.push_back(Value(data.stream.handler_sql));
 	result.parameters.push_back(Value::BIGINT(data.stream.interval_ms));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 

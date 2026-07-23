@@ -363,8 +363,7 @@ unique_ptr<FunctionData> ApplyQueueBind(ClientContext &, TableFunctionBindInput 
 	bind_data->max_attempts = input.inputs[3].GetValue<int32_t>();
 	bind_data->visibility_timeout_sec = input.inputs[4].GetValue<int32_t>();
 	bind_data->backoff_base_sec = input.inputs[5].GetValue<int32_t>();
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -393,17 +392,12 @@ void ApplyQueueExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			throw InvalidInputException("Queue \"%s\" does not exist", bind_data.name);
 		}
 	}
-	output.SetValue(0, 0, Value(message));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(output, bind_data.finished, message);
 }
 
 TableFunction MakeApplyQueueFunction() {
-	TableFunction function("quackapi_apply_queue",
-	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                        LogicalType::INTEGER, LogicalType::INTEGER},
-	                       ApplyQueueExec, ApplyQueueBind);
-	return function;
+	return MakeApplyDdlFunction("quackapi_apply_queue", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                        LogicalType::INTEGER, LogicalType::INTEGER}, ApplyQueueExec, ApplyQueueBind);
 }
 
 ParserExtensionPlanResult QueueDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -417,8 +411,7 @@ ParserExtensionPlanResult QueueDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::INTEGER(data.queue.max_attempts));
 	result.parameters.push_back(Value::INTEGER(data.queue.visibility_timeout_sec));
 	result.parameters.push_back(Value::INTEGER(data.queue.backoff_base_sec));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 
@@ -463,40 +456,23 @@ int64_t EnqueueJob(DatabaseInstance &db, const string &queue_name, const string 
 	return res->GetValue(0, 0).GetValue<int64_t>();
 }
 
-void EnqueueScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	UnifiedVectorFormat qdata, pdata;
-	args.data[0].ToUnifiedFormat(args.size(), qdata);
-	args.data[1].ToUnifiedFormat(args.size(), pdata);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<int64_t>(result);
-	auto &validity = FlatVector::Validity(result);
-	for (idx_t i = 0; i < args.size(); i++) {
-		auto qi = qdata.sel->get_index(i);
-		auto pi = pdata.sel->get_index(i);
-		if (!qdata.validity.RowIsValid(qi) || !pdata.validity.RowIsValid(pi)) {
-			validity.SetInvalid(i);
-			continue;
-		}
-		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
-		auto payload = UnifiedVectorFormat::GetData<string_t>(pdata)[pi].GetString();
-		out[i] = EnqueueJob(db, qn, payload, 0);
-	}
-}
-
-void EnqueueScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+//! enqueue(queue, payload) / enqueue(queue, payload, max_attempts) — one body.
+//! Optional 3rd arg via args.ColumnCount() (same pattern as nack).
+void EnqueueScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
 	UnifiedVectorFormat qdata, pdata, mdata;
 	args.data[0].ToUnifiedFormat(args.size(), qdata);
 	args.data[1].ToUnifiedFormat(args.size(), pdata);
-	args.data[2].ToUnifiedFormat(args.size(), mdata);
+	const bool has_max = args.ColumnCount() >= 3;
+	if (has_max) {
+		args.data[2].ToUnifiedFormat(args.size(), mdata);
+	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto out = FlatVector::GetData<int64_t>(result);
 	auto &validity = FlatVector::Validity(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto pi = pdata.sel->get_index(i);
-		auto mi = mdata.sel->get_index(i);
 		if (!qdata.validity.RowIsValid(qi) || !pdata.validity.RowIsValid(pi)) {
 			validity.SetInvalid(i);
 			continue;
@@ -504,8 +480,11 @@ void EnqueueScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
 		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
 		auto payload = UnifiedVectorFormat::GetData<string_t>(pdata)[pi].GetString();
 		int32_t max_att = 0;
-		if (mdata.validity.RowIsValid(mi)) {
-			max_att = UnifiedVectorFormat::GetData<int32_t>(mdata)[mi];
+		if (has_max) {
+			auto mi = mdata.sel->get_index(i);
+			if (mdata.validity.RowIsValid(mi)) {
+				max_att = UnifiedVectorFormat::GetData<int32_t>(mdata)[mi];
+			}
 		}
 		out[i] = EnqueueJob(db, qn, payload, max_att);
 	}
@@ -705,71 +684,26 @@ string NackJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, b
 	return res->GetValue(0, 0).GetValue<string>();
 }
 
-void NackScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	UnifiedVectorFormat qdata, idata;
-	args.data[0].ToUnifiedFormat(args.size(), qdata);
-	args.data[1].ToUnifiedFormat(args.size(), idata);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<string_t>(result);
-	auto &validity = FlatVector::Validity(result);
-	for (idx_t i = 0; i < args.size(); i++) {
-		auto qi = qdata.sel->get_index(i);
-		auto ii = idata.sel->get_index(i);
-		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii)) {
-			validity.SetInvalid(i);
-			continue;
-		}
-		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
-		auto jid = UnifiedVectorFormat::GetData<int64_t>(idata)[ii];
-		auto st = NackJob(db, qn, jid, true, "nack");
-		out[i] = StringVector::AddString(result, st);
-	}
-}
-
-void NackScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	UnifiedVectorFormat qdata, idata, rdata;
-	args.data[0].ToUnifiedFormat(args.size(), qdata);
-	args.data[1].ToUnifiedFormat(args.size(), idata);
-	args.data[2].ToUnifiedFormat(args.size(), rdata);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<string_t>(result);
-	auto &validity = FlatVector::Validity(result);
-	for (idx_t i = 0; i < args.size(); i++) {
-		auto qi = qdata.sel->get_index(i);
-		auto ii = idata.sel->get_index(i);
-		auto ri = rdata.sel->get_index(i);
-		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii)) {
-			validity.SetInvalid(i);
-			continue;
-		}
-		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
-		auto jid = UnifiedVectorFormat::GetData<int64_t>(idata)[ii];
-		bool requeue = true;
-		if (rdata.validity.RowIsValid(ri)) {
-			requeue = UnifiedVectorFormat::GetData<bool>(rdata)[ri];
-		}
-		auto st = NackJob(db, qn, jid, requeue, "nack");
-		out[i] = StringVector::AddString(result, st);
-	}
-}
-
-void NackScalar4(DataChunk &args, ExpressionState &state, Vector &result) {
+//! nack(queue, job_id [, requeue [, error]]) — one body, optional args by arity.
+void NackScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
 	UnifiedVectorFormat qdata, idata, rdata, edata;
 	args.data[0].ToUnifiedFormat(args.size(), qdata);
 	args.data[1].ToUnifiedFormat(args.size(), idata);
-	args.data[2].ToUnifiedFormat(args.size(), rdata);
-	args.data[3].ToUnifiedFormat(args.size(), edata);
+	const bool has_requeue = args.ColumnCount() >= 3;
+	const bool has_error = args.ColumnCount() >= 4;
+	if (has_requeue) {
+		args.data[2].ToUnifiedFormat(args.size(), rdata);
+	}
+	if (has_error) {
+		args.data[3].ToUnifiedFormat(args.size(), edata);
+	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto out = FlatVector::GetData<string_t>(result);
 	auto &validity = FlatVector::Validity(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto ii = idata.sel->get_index(i);
-		auto ri = rdata.sel->get_index(i);
-		auto ei = edata.sel->get_index(i);
 		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii)) {
 			validity.SetInvalid(i);
 			continue;
@@ -777,12 +711,18 @@ void NackScalar4(DataChunk &args, ExpressionState &state, Vector &result) {
 		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
 		auto jid = UnifiedVectorFormat::GetData<int64_t>(idata)[ii];
 		bool requeue = true;
-		if (rdata.validity.RowIsValid(ri)) {
-			requeue = UnifiedVectorFormat::GetData<bool>(rdata)[ri];
+		if (has_requeue) {
+			auto ri = rdata.sel->get_index(i);
+			if (rdata.validity.RowIsValid(ri)) {
+				requeue = UnifiedVectorFormat::GetData<bool>(rdata)[ri];
+			}
 		}
 		string err = "nack";
-		if (edata.validity.RowIsValid(ei)) {
-			err = UnifiedVectorFormat::GetData<string_t>(edata)[ei].GetString();
+		if (has_error) {
+			auto ei = edata.sel->get_index(i);
+			if (edata.validity.RowIsValid(ei)) {
+				err = UnifiedVectorFormat::GetData<string_t>(edata)[ei].GetString();
+			}
 		}
 		auto st = NackJob(db, qn, jid, requeue, err);
 		out[i] = StringVector::AddString(result, st);
@@ -896,16 +836,16 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	// enqueue(queue, payload) / enqueue(queue, payload, max_attempts)
 	ScalarFunctionSet enqueue_set("quackapi_enqueue");
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::BIGINT, EnqueueScalar2));
+	                                       LogicalType::BIGINT, EnqueueScalar));
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
 	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
-	                                       LogicalType::BIGINT, EnqueueScalar3));
+	                                       LogicalType::BIGINT, EnqueueScalar));
 	// JSON payload overload (JSON is a logical type alias of VARCHAR storage)
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::JSON()},
-	                                       LogicalType::BIGINT, EnqueueScalar2));
+	                                       LogicalType::BIGINT, EnqueueScalar));
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
 	                                       {LogicalType::VARCHAR, LogicalType::JSON(), LogicalType::INTEGER},
-	                                       LogicalType::BIGINT, EnqueueScalar3));
+	                                       LogicalType::BIGINT, EnqueueScalar));
 	loader.RegisterFunction(enqueue_set);
 
 	// dequeue(queue) / dequeue(queue, n)
@@ -924,13 +864,13 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	// nack(queue, job_id) / nack(queue, job_id, requeue) / nack(queue, job_id, requeue, error)
 	ScalarFunctionSet nack_set("quackapi_nack");
 	nack_set.AddFunction(ScalarFunction("quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT},
-	                                    LogicalType::VARCHAR, NackScalar2));
+	                                    LogicalType::VARCHAR, NackScalar));
 	nack_set.AddFunction(ScalarFunction("quackapi_nack",
 	                                    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN},
-	                                    LogicalType::VARCHAR, NackScalar3));
+	                                    LogicalType::VARCHAR, NackScalar));
 	nack_set.AddFunction(ScalarFunction(
 	    "quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::VARCHAR},
-	    LogicalType::VARCHAR, NackScalar4));
+	    LogicalType::VARCHAR, NackScalar));
 	loader.RegisterFunction(nack_set);
 
 	// queues() inspection

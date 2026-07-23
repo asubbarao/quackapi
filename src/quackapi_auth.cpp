@@ -846,8 +846,7 @@ unique_ptr<FunctionData> ApplyAuthBind(ClientContext &, TableFunctionBindInput &
 	bind_data->kind = input.inputs[3].GetValue<string>();
 	bind_data->header = input.inputs[4].GetValue<string>();
 	bind_data->secret = input.inputs[5].GetValue<string>();
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -879,17 +878,12 @@ void ApplyAuthExec(ClientContext &context, TableFunctionInput &data_p, DataChunk
 			throw InvalidInputException("Auth \"%s\" does not exist", bind_data.name);
 		}
 	}
-	output.SetValue(0, 0, Value(message));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(output, bind_data.finished, message);
 }
 
 TableFunction MakeApplyAuthFunction() {
-	TableFunction function("quackapi_apply_auth",
-	                       {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                        LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                       ApplyAuthExec, ApplyAuthBind);
-	return function;
+	return MakeApplyDdlFunction("quackapi_apply_auth", {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                        LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyAuthExec, ApplyAuthBind);
 }
 
 string AuthKindToString(QuackapiAuthKind kind) {
@@ -915,8 +909,7 @@ ParserExtensionPlanResult AuthDdlPlan(ParserExtensionInfo *, ClientContext &,
 	// Secret is passed only through the plan→exec pipeline; never exposed via
 	// quackapi_auths() or HTTP responses.
 	result.parameters.push_back(Value(data.auth.secret));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 
