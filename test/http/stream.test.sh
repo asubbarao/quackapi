@@ -3,7 +3,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 
-PORT="${PORT:-18765}"
+PORT="${QUACKAPI_TEST_PORT:-18765}"
 INIT="$(mktemp /tmp/quackapi_stream_init_XXXXXX.sql)"
 cat >"$INIT" <<'SQL'
 CREATE STREAM ticks GET '/ticks' AS

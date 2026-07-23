@@ -24,7 +24,16 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// Crypto helpers
+// Crypto helpers (JWT HS256 — intentionally self-contained)
+//
+// Community extension `crypto` (query-farm) exposes crypto_hash / crypto_hmac /
+// crypto_random_bytes only. It is NOT a JWT stack: no compact-token parse, no
+// alg allowlist, no exp/nbf, no claims map for $claims_*.
+//
+// JWT verify here uses DuckDB-bundled mbedtls (same as httpfs/parquet) so
+// INSTALL quackapi does not require INSTALL crypto, and auth works offline in
+// one process. If crypto ever gains first-class JWT verify, re-evaluate; until
+// then HMAC-SHA256 + json_* claims parse is the product surface.
 //===--------------------------------------------------------------------===//
 
 string QuackapiSha256(const string &data) {
@@ -261,6 +270,10 @@ int64_t NowEpochSeconds() {
 }
 
 //! Verify HS256 JWT. On success fills claims map.
+//! Full RFC 7519 subset we implement (not "crypto_hmac of the whole token"):
+//!   header.payload.signature → base64url decode → alg must be HS256 →
+//!   constant-time HMAC-SHA256 over "header.payload" → payload claims via
+//!   ParseJsonObjectClaims (DuckDB json_*) → optional exp/nbf checks.
 bool VerifyJwtHs256(DatabaseInstance &db, const string &token, const string &secret,
                     unordered_map<string, string> &claims, string &error_detail) {
 	// header.payload.signature

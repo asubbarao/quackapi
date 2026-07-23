@@ -41,19 +41,24 @@ if ! echo "$_QA_LAST_HEADERS" | tr -d '\r' | grep -qi '^WWW-Authenticate:'; then
   exit 1
 fi
 
+echo "-- 2b. JWT missing → 401 + WWW-Authenticate Bearer"
+curl_json GET "/jwt"
+assert_status "$_QA_LAST_STATUS" "401" "jwt_missing_hdr"
+if ! echo "$_QA_LAST_HEADERS" | tr -d '\r' | grep -qi '^WWW-Authenticate:.*[Bb]earer'; then
+  echo "ASSERT FAIL (jwt_missing_hdr): WWW-Authenticate Bearer missing" >&2
+  echo "  headers: $_QA_LAST_HEADERS" >&2
+  exit 1
+fi
+
 echo "-- 3. API key bad → 401"
 curl_json GET "/secure" -H "X-API-Key: wrong"
 assert_status "$_QA_LAST_STATUS" "401" "secure_bad_key"
 
-echo "-- 4. JWT missing → 401"
-curl_json GET "/jwt"
-assert_status "$_QA_LAST_STATUS" "401" "jwt_missing"
-
-echo "-- 5. JWT bad token → 401"
+echo "-- 4. JWT bad token → 401"
 curl_json GET "/jwt" -H "Authorization: Bearer not.a.jwt"
 assert_status "$_QA_LAST_STATUS" "401" "jwt_bad"
 
-echo "-- 6. JWT happy path (HS256) — claims bound into response"
+echo "-- 5. JWT happy path (HS256) — claims bound into response"
 # Build HS256 JWT with secret conformance-secret, sub=alice, role=admin, exp far future
 JWT="$(python3 - <<'PY'
 import base64, hashlib, hmac, json, time
@@ -73,7 +78,7 @@ assert_status "$_QA_LAST_STATUS" "200" "jwt_happy"
 assert_body_contains "$_QA_LAST_BODY" '"sub":"alice"' "jwt_happy claims_sub"
 assert_body_contains "$_QA_LAST_BODY" '"role":"admin"' "jwt_happy claims_role"
 
-echo "-- 7. JWT expired → 401"
+echo "-- 6. JWT expired → 401"
 JWT_EXP="$(python3 - <<'PY'
 import base64, hashlib, hmac, json, time
 def b64url(data: bytes) -> str:
@@ -90,7 +95,7 @@ PY
 curl_json GET "/jwt" -H "Authorization: Bearer ${JWT_EXP}"
 assert_status "$_QA_LAST_STATUS" "401" "jwt_expired"
 
-echo "-- 8. JWT alg none → 401"
+echo "-- 7. JWT alg none → 401"
 JWT_NONE="$(python3 - <<'PY'
 import base64, json
 def b64url(data: bytes) -> str:

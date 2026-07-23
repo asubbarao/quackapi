@@ -1,5 +1,5 @@
 # Community-extensions submission descriptor for the `quackapi` extension.
-# Canonical submission copy for community-extensions (also packaging/description.yml).
+# Keep in sync with /description.yml at the repository root.
 #
 # Submit:
 #   1. Fork https://github.com/duckdb/community-extensions
@@ -112,7 +112,9 @@ docs:
 
     - **Auth:** `CREATE AUTH … AS API_KEY | JWT (SECRET … [, ALGORITHM HS256])`,
       `REQUIRE` on routes, `quackapi_add_api_key`, `quackapi_auths`, claims as
-      `$claims_*`.
+      `$claims_*`. JWT verify is self-contained (DuckDB-bundled mbedtls +
+      `json_*` claims) — does not depend on community `crypto` (that extension
+      is hash/HMAC only, not JWT parse/exp/nbf/claims).
     - **Groups:** `CREATE GROUP … WITH (prefix=…, auth=…, tags=…)` — path prefix
       + auth inheritance (`quackapi_groups()`).
     - **Table API:** `CREATE API FOR TABLE t [AT '/path'] [KEY 'id']` → GET list
@@ -139,7 +141,8 @@ docs:
     - Serve `memory_limit` default is 256MB only when nothing is configured;
       use `memory_limit := '4GB'` / `SET quackapi_memory_limit` (never clobbers
       an operator `SET memory_limit`).
-    - Request body max 8 MiB; JWT HS256 only; table API is read-only scaffold.
+    - Request body max 8 MiB; JWT **HS256 only** (no RS256/OIDC); table API is
+      read-only scaffold.
     - Route registry is instance-scoped (re-run DDL after reopen); queue jobs
       persist in `quackapi_jobs`.
 

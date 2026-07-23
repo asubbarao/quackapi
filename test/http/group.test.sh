@@ -6,7 +6,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
 source "$DIR/lib.sh"
 
-PORT="${QUACKAPI_TEST_PORT:-18971}"
+PORT="${QUACKAPI_TEST_PORT:-18974}"
 INIT="$(mktemp /tmp/quackapi_group.XXXXXX.sql)"
 
 cat >"$INIT" <<'SQL'
