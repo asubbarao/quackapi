@@ -427,6 +427,7 @@ bash test/conformance/run.sh       # FastAPI parity harness
 | [`docs/community-page.md`](docs/community-page.md) | Community-extensions page copy |
 | [`packaging/description.yml`](packaging/description.yml) / [`description.yml`](description.yml) | Community submission manifest |
 | [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md) | Scorecard vs FastAPI |
+| [`docs/SUPERIORITY_ORDER.md`](docs/SUPERIORITY_ORDER.md) | Equivalence → slaughter → leapfrog (work order) |
 | [`docs/QUEUE.md`](docs/QUEUE.md) | Job queue semantics |
 | [`docs/curl_httpfs.md`](docs/curl_httpfs.md) | Outbound HTTP via curl_httpfs |
 
