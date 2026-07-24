@@ -41,7 +41,7 @@ struct ServeBindData : public TableFunctionData {
 	//! Batteries defaults — all correct-by-default for servers; overridable.
 	string log_level = "info";
 	bool access_log = true;
-	bool enable_logging = true;
+	bool enable_logging = false;
 	bool health_routes = true;
 	string threads;
 	bool preserve_insertion_order = false;

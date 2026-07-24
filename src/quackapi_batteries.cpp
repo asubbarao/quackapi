@@ -80,6 +80,11 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	// Each SET is documented (WHY) and overridable via serve() named params.
 	// NEVER disables safety (no allow_unsigned_extensions, no disabled checks).
 	vector<string> applied;
+	// Build stamp so operators/agents can confirm the loaded extension matches the tree.
+	applied.push_back(StringUtil::Format(
+	    "quackapi_request_path=perf (enable_logging=%s access_log=%s) "
+	    "(WHY: thread-local Connection + prepare cache + static body cache + uuidv7 ids)",
+	    opts.enable_logging ? "true" : "false", opts.access_log ? "true" : "false"));
 	Connection con(*context.db);
 	string err;
 
@@ -175,10 +180,10 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		applied.push_back("threads=<DuckDB default=all cores> (WHY: max parallel query work for server)");
 	}
 
-	// --- DuckDB built-in logging (ALL ON by default) ---
-	// WHY: without a logger, production incidents have no query/error trail.
-	// enable_logging + INFO + stdout captures QueryLog and errors for the process.
-	// logging_storage=stdout so a supervised server process pipes logs to the host.
+	// --- DuckDB built-in logging (OFF by default) ---
+	// WHY: QueryLog-per-handler-SQL to stdout is a multi-ms tax under load and
+	// serializes workers. HTTP ops use access_log (structured stderr). Opt in
+	// with enable_logging:=true when debugging query plans / errors.
 	if (opts.enable_logging && opts.log_level != QuackapiLogLevel::SILENT) {
 		const char *level = LogLevelDuckDBName(opts.log_level);
 		// Prefer CALL enable_logging (current DuckDB API) — sets storage + level.
@@ -203,7 +208,15 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			                  "deprecated DuckDB setting, still effective)");
 		}
 	} else {
-		applied.push_back("enable_logging=<skipped> (WHY: operator disabled or log_level=silent)");
+		// Force OFF — DuckDB may ship with enable_logging true; a silent skip
+		// would leave QueryLog serializing every handler SQL under load.
+		if (RunSet(con, "SET enable_logging = false", err)) {
+			applied.push_back("enable_logging=false (WHY: default — QueryLog-per-request kills HTTP RPS; "
+			                  "opt in with enable_logging:=true; use access_log for ops)");
+		} else {
+			applied.push_back(StringUtil::Format("enable_logging=<could not disable: %s>", err));
+		}
+		RunSet(con, "SET enable_http_logging = false", err);
 	}
 
 	// --- Compose quack transport log if the option exists ---
@@ -353,29 +366,10 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 }
 
 void ProbeQuackapiRequestIdSource(DatabaseInstance &db, QuackapiServeOptions &opts) {
-	// Prefer community tsid() when it LOADs; else DuckDB core uuidv7().
-	// Compose only — INSTALL FROM community is best-effort (may need network).
-	Connection con(db);
-	auto try_tsid = [&]() -> bool {
-		auto res = con.Query("SELECT tsid()");
-		return !res->HasError();
-	};
-	if (try_tsid()) {
-		opts.request_id_source = "tsid";
-		return;
-	}
-	auto load = con.Query("LOAD tsid");
-	if (load->HasError()) {
-		auto inst = con.Query("INSTALL tsid FROM community");
-		if (!inst->HasError()) {
-			load = con.Query("LOAD tsid");
-		}
-	}
-	if (!load->HasError() && try_tsid()) {
-		opts.request_id_source = "tsid";
-		return;
-	}
-	// uuidv7 is core (v1.5+).
+	// Request IDs are always core uuidv7 generated in C++ (see NextRequestId).
+	// Never INSTALL/LOAD/SELECT tsid at serve or per request — that path added
+	// a full SQL round-trip to every HTTP handler for no correctness gain.
+	(void)db;
 	opts.request_id_source = "uuidv7";
 }
 

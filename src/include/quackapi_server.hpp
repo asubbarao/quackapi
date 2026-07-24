@@ -59,8 +59,10 @@ struct QuackapiServeOptions {
 	QuackapiLogLevel log_level = QuackapiLogLevel::INFO;
 	//! Emit one structured access-log line per request (stderr, JSON). Default true.
 	bool access_log = true;
-	//! Enable DuckDB built-in logging at serve (CALL enable_logging). Default true.
-	bool enable_logging = true;
+	//! Enable DuckDB built-in QueryLog at serve (CALL enable_logging). Default
+	//! **false** — per-handler QueryLog to stdout destroys HTTP throughput.
+	//! Opt in with enable_logging:=true for debugging; use access_log for ops.
+	bool enable_logging = false;
 
 	// --- Batteries: health routes (ON by default) ---
 	//! Auto-register GET /health + GET /healthz. Default true.
@@ -99,7 +101,9 @@ struct QuackapiServeOptions {
 	//! When active is httplib after prefer-curl path: why (e.g. curl_httpfs_unavailable).
 	string http_client_reason;
 
-	//! Filled at serve after probing community tsid: "tsid" or "uuidv7".
+	//! Request-id source for X-Request-ID. Always **uuidv7** (C++ core, no SQL)
+	//! so the hot path never pays a SELECT per request. Probe may still record
+	//! "tsid" only if an operator forces a future path; default is uuidv7.
 	string request_id_source;
 
 	// --- Compression (ON by default) ---
