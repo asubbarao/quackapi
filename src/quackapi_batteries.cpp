@@ -134,6 +134,17 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		}
 	}
 
+	// --- postgres attach OLTP: disable ctid parallel page scan ---
+	// WHY: with pg_use_ctid_scan=true (DuckDB default), point lookups like
+	//   SELECT … FROM pg.t WHERE id = $id
+	// profile as POSTGRES_SCAN cumulative_rows_scanned ≈ whole table (~100k+),
+	// not an index probe. false forces COPY (SELECT … WHERE id=…) so Postgres
+	// uses the PK. Best-effort: no-op if postgres extension not loaded yet.
+	if (RunSet(con, "SET pg_use_ctid_scan = false", err)) {
+		applied.push_back("pg_use_ctid_scan=false (WHY: ATTACH point lookups use PG index via "
+		                  "WHERE pushdown, not full ctid range scan)");
+	}
+
 	// --- enable_http_metadata_cache ---
 	// WHY: outbound HTTP (httpfs / curl_httpfs companions) reuses ETag /
 	// Last-Modified; cuts origin load for repeated remote reads from handlers.
