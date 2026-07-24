@@ -14,7 +14,7 @@ namespace duckdb {
 //!
 //! Returns true and fills json_body on success. false → caller uses DuckDB path.
 bool QuackapiTryPgNative(const string &dsn, const string &handler_sql,
-                         const case_insensitive_map_t<std::pair<string, string>> &provided,
-                         string &json_body, string &err_out);
+                         const case_insensitive_map_t<std::pair<string, string>> &provided, string &json_body,
+                         string &err_out);
 
 } // namespace duckdb

@@ -6,8 +6,8 @@
 #ifndef QUACKAPI_HAS_LIBPQ
 // Built without libpq — always fall through to DuckDB.
 namespace duckdb {
-bool QuackapiTryPgNative(const string &, const string &,
-                         const case_insensitive_map_t<std::pair<string, string>> &, string &, string &) {
+bool QuackapiTryPgNative(const string &, const string &, const case_insensitive_map_t<std::pair<string, string>> &,
+                         string &, string &) {
 	return false;
 }
 } // namespace duckdb
@@ -149,8 +149,8 @@ bool ToPgSql(const string &in, string &out, vector<string> &param_names, string 
 	out.reserve(in.size() + 8);
 	for (idx_t i = 0; i < in.size(); i++) {
 		// strip pg. qualifier (case-insensitive)
-		if ((in[i] == 'p' || in[i] == 'P') && i + 2 < in.size() &&
-		    (in[i + 1] == 'g' || in[i + 1] == 'G') && in[i + 2] == '.') {
+		if ((in[i] == 'p' || in[i] == 'P') && i + 2 < in.size() && (in[i + 1] == 'g' || in[i + 1] == 'G') &&
+		    in[i + 2] == '.') {
 			// word boundary before p
 			if (i == 0 || !((in[i - 1] >= 'A' && in[i - 1] <= 'Z') || (in[i - 1] >= 'a' && in[i - 1] <= 'z') ||
 			                (in[i - 1] >= '0' && in[i - 1] <= '9') || in[i - 1] == '_')) {

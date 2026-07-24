@@ -719,9 +719,8 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 				// request time uses libpq when configured, else 500.
 				auto err = prepared->GetError();
 				auto el = StringUtil::Lower(err);
-				bool pg_returning =
-				    StringUtil::Contains(el, "returning clause not yet supported") &&
-				    StringUtil::Contains(el, "postgres");
+				bool pg_returning = StringUtil::Contains(el, "returning clause not yet supported") &&
+				                    StringUtil::Contains(el, "postgres");
 				if (!pg_returning) {
 					throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name, err);
 				}
