@@ -7,7 +7,9 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/helper.hpp"
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -31,6 +33,70 @@
 namespace duckdb {
 
 namespace {
+
+//! Per-worker-thread DuckDB connection + prepared-statement cache + static
+//! response cache for zero-parameter handlers.
+//! httplib's ThreadPool runs each request on a worker thread; reusing one
+//! Connection per thread (and reusing Prepare results for stable handler SQL)
+//! removes the dominant per-request tax vs a mature ASGI stack.
+struct ThreadRequestCache {
+	static constexpr idx_t MAX_PREPARED = 128;
+	static constexpr idx_t MAX_STATIC_BODIES = 64;
+
+	DatabaseInstance *db = nullptr;
+	unique_ptr<Connection> con;
+	unordered_map<string, unique_ptr<PreparedStatement>> prepared;
+	//! Fully-serialized JSON body for handlers with zero bind parameters
+	//! (e.g. SELECT 'world' AS msg). Keyed by exact handler SQL.
+	unordered_map<string, string> static_json_bodies;
+
+	Connection &GetConnection(DatabaseInstance &instance) {
+		if (!con || db != &instance) {
+			con = make_uniq<Connection>(instance);
+			prepared.clear();
+			static_json_bodies.clear();
+			db = &instance;
+		}
+		return *con;
+	}
+
+	//! Cache successful prepares keyed by exact handler SQL. Errors are not
+	//! cached so a transient prepare failure can be retried.
+	PreparedStatement *GetPrepared(const string &sql, string &error_out) {
+		auto it = prepared.find(sql);
+		if (it != prepared.end()) {
+			return it->second.get();
+		}
+		auto stmt = con->Prepare(sql);
+		if (stmt->HasError()) {
+			error_out = stmt->GetError();
+			return nullptr;
+		}
+		if (prepared.size() >= MAX_PREPARED) {
+			prepared.clear();
+		}
+		auto *raw = stmt.get();
+		prepared.emplace(sql, std::move(stmt));
+		return raw;
+	}
+
+	const string *LookupStaticBody(const string &sql) const {
+		auto it = static_json_bodies.find(sql);
+		return it == static_json_bodies.end() ? nullptr : &it->second;
+	}
+
+	void StoreStaticBody(const string &sql, string body) {
+		if (static_json_bodies.size() >= MAX_STATIC_BODIES) {
+			static_json_bodies.clear();
+		}
+		static_json_bodies[sql] = std::move(body);
+	}
+};
+
+ThreadRequestCache &TlsRequestCache() {
+	thread_local ThreadRequestCache cache;
+	return cache;
+}
 
 //! Content-Encoding choice after Accept-Encoding negotiation.
 enum class NegotiatedEncoding { IDENTITY, ZSTD, GZIP };
@@ -947,21 +1013,9 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 }
 
 string QuackapiHttpServer::NextRequestId(DatabaseInstance &db) {
-	// Prefer community tsid() when probe succeeded; else core uuidv7 (C++ — no SQL).
-	if (options.request_id_source == "tsid") {
-		try {
-			Connection con(db);
-			auto res = con.Query("SELECT tsid()");
-			if (!res->HasError()) {
-				auto chunk = res->Fetch();
-				if (chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull()) {
-					return chunk->GetValue(0, 0).ToString();
-				}
-			}
-		} catch (...) {
-			// fall through to uuidv7
-		}
-	}
+	// Always C++ uuidv7 — never SELECT per request (tsid() was a multi-ms tax
+	// on every route including /hello). request_id_source is informational.
+	(void)db;
 	return UUID::ToString(UUIDv7::GenerateRandomUUID());
 }
 
@@ -995,12 +1049,13 @@ void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const
 			path_esc += static_cast<char>(c);
 		}
 	}
+	// No fflush: stderr is typically line-buffered when attached to a terminal
+	// and block-buffered when piped; fflush-per-request serializes all workers.
 	fprintf(stderr,
 	        "{\"type\":\"access\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,"
 	        "\"latency_ms\":%.3f,\"request_id\":\"%s\",\"bytes\":%llu}\n",
 	        req.method.c_str(), path_esc.c_str(), res.status, latency_ms, request_id.c_str(),
 	        (unsigned long long)bytes);
-	fflush(stderr);
 }
 
 void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
@@ -1155,7 +1210,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			string version = "unknown";
 			bool ready = false;
 			try {
-				Connection con(*db);
+				auto &con = TlsRequestCache().GetConnection(*db);
 				auto resq = con.Query("SELECT version()");
 				if (!resq->HasError()) {
 					auto chunk = resq->Fetch();
@@ -1246,9 +1301,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	bool path_matched_other_method = false;
 	vector<string> methods_for_path;
 	auto &qa_state = QuackapiState::Get(*db);
-	auto routes = qa_state.SnapshotRoutes();
-	auto streams = qa_state.SnapshotStreams();
-	for (auto &route : routes) {
+	// Live shared views — no per-request deep copy of the full registry.
+	auto routes = qa_state.LiveRoutes();
+	auto streams = qa_state.LiveStreams();
+	for (auto &route : *routes) {
 		vector<std::pair<string, string>> captures;
 		if (MatchPattern(route.pattern, req.path, captures)) {
 			if (!MethodListContains(methods_for_path, route.method)) {
@@ -1265,7 +1321,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 	}
-	for (auto &stream : streams) {
+	for (auto &stream : *streams) {
 		vector<std::pair<string, string>> captures;
 		if (MatchPattern(stream.pattern, req.path, captures)) {
 			if (!MethodListContains(methods_for_path, stream.method)) {
@@ -1286,7 +1342,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// Auto-HEAD: if HEAD and no explicit HEAD route, reuse the GET handler
 	// (routes first, then streams).
 	if (!match.matched && !stream_match.matched && req.method == "HEAD") {
-		for (auto &route : routes) {
+		for (auto &route : *routes) {
 			vector<std::pair<string, string>> captures;
 			if (MatchPattern(route.pattern, req.path, captures) && route.method == "GET") {
 				match.matched = true;
@@ -1299,7 +1355,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 		if (!match.matched) {
-			for (auto &stream : streams) {
+			for (auto &stream : *streams) {
 				vector<std::pair<string, string>> captures;
 				if (MatchPattern(stream.pattern, req.path, captures) && stream.method == "GET") {
 					stream_match.matched = true;
@@ -1357,7 +1413,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				alt_path = req.path + "/";
 			}
 			bool alt_matches = false;
-			for (auto &route : routes) {
+			for (auto &route : *routes) {
 				vector<std::pair<string, string>> captures;
 				if (!MatchPattern(route.pattern, alt_path, captures)) {
 					continue;
@@ -1367,7 +1423,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				break;
 			}
 			if (!alt_matches) {
-				for (auto &stream : streams) {
+				for (auto &stream : *streams) {
 					vector<std::pair<string, string>> captures;
 					if (MatchPattern(stream.pattern, alt_path, captures)) {
 						alt_matches = true;
@@ -1640,12 +1696,25 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 
 	try {
-		Connection con(*db);
-		auto prepared = con.Prepare(handler_sql);
-		if (prepared->HasError()) {
-			SetInternalError(res, prepared->GetError());
+		auto &tls = TlsRequestCache();
+		auto &con = tls.GetConnection(*db);
+		string prepare_err;
+		auto *prepared = tls.GetPrepared(handler_sql, prepare_err);
+		if (!prepared) {
+			SetInternalError(res, prepare_err.empty() ? string("prepare failed") : prepare_err);
 			finish();
 			return;
+		}
+
+		// Zero-parameter handlers (e.g. SELECT 'world' AS msg): serve cached JSON
+		// after the first successful execute on this worker thread.
+		const bool zero_params = prepared->named_param_map.empty();
+		if (zero_params) {
+			if (const string *cached = tls.LookupStaticBody(handler_sql)) {
+				SetJson(res, match.route.status, *cached);
+				finish();
+				return;
+			}
 		}
 
 		// Request params: path captures shadow query params of the same name.
@@ -2172,6 +2241,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			body += "}";
 		}
 		body += "]";
+		// Cache constant responses (no bind params, pure JSON) for this worker.
+		if (zero_params && location_value.empty() && set_cookie_values.empty()) {
+			tls.StoreStaticBody(handler_sql, body);
+		}
 		SetJson(res, match.route.status, body);
 		// Keep body so Content-Length is correct; httplib omits the body for HEAD.
 	} catch (std::exception &ex) {
