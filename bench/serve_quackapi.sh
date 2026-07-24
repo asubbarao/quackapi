@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Boot stack A (quackapi). Each process is a full DuckDB: routes + Postgres ATTACH.
+# Boot stack A (quackapi). Each process is a full DuckDB: routes + libpq pg_dsn.
 # WORKERS=1 (default) → one process on PORT.
-# WORKERS=N → N processes on PORT+1..PORT+N, thin round-robin proxy on PORT
-#   (same shape as uvicorn --workers N: multi-process, shared backend).
+# WORKERS=N → N processes all bind PORT via SO_REUSEPORT (httplib default) —
+#   kernel distributes accepts (same idea as uvicorn multi-worker, no proxy tax).
 set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,8 +29,6 @@ fi
 boot_one() {
   local port="$1"
   # Cap PG pool per process so WORKERS×pool stays under Postgres max_connections.
-  # force-mode can open past the cap under parallel scans — keep pool tiny + threads low
-  # when multi-process. Single process keeps a larger pool.
   local pool=32
   local duck_threads=4
   local httpt=32
@@ -55,114 +53,42 @@ if [[ "$WORKERS" -le 1 ]]; then
   exit 0
 fi
 
-# Multi-process: workers on PORT+1 .. PORT+WORKERS, proxy on PORT.
+# Multi-process SO_REUSEPORT: every worker binds PORT (no Python RR proxy).
 PIDS=()
 cleanup() {
   local p
   for p in "${PIDS[@]:-}"; do
     kill "$p" 2>/dev/null || true
-    pkill -P "$p" 2>/dev/null || true
+    # children of the bash wrapper that owns the duckdb pipe
+    kill -- -"$p" 2>/dev/null || true
   done
 }
 trap cleanup EXIT INT TERM
 
 i=1
 while [[ $i -le $WORKERS ]]; do
-  wport=$((PORT + i))
-  boot_one "$wport" &
+  boot_one "$PORT" &
   PIDS+=($!)
+  # brief stagger so first bind establishes before peers join REUSEPORT group
+  sleep 0.05
   i=$((i + 1))
 done
 
-# Wait until every worker answers /hello.
+# Wait until PORT answers /hello (any worker).
 ready=0
 for _ in $(seq 1 120); do
-  ready=1
-  i=1
-  while [[ $i -le $WORKERS ]]; do
-    if ! curl -sf --max-time 1 "http://127.0.0.1:$((PORT + i))/hello" >/dev/null 2>&1; then
-      ready=0
-      break
-    fi
-    i=$((i + 1))
-  done
-  [[ $ready -eq 1 ]] && break
+  if curl -sf --max-time 1 "http://127.0.0.1:${PORT}/hello" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
   sleep 0.25
 done
 if [[ $ready -ne 1 ]]; then
-  echo "serve_quackapi: workers not ready on $((PORT + 1))..$((PORT + WORKERS))" >&2
+  echo "serve_quackapi: SO_REUSEPORT workers not ready on :${PORT} (n=${WORKERS})" >&2
   exit 1
 fi
 
-# Round-robin reverse proxy (stdlib only). Front door = PORT.
-export QUACK_LB_PORT="$PORT"
-export QUACK_LB_WORKERS="$WORKERS"
-exec python3 - <<'PY'
-import os, socket, threading, itertools, select, sys
+echo "serve_quackapi: ${WORKERS} workers SO_REUSEPORT on :${PORT}" >&2
 
-port = int(os.environ["QUACK_LB_PORT"])
-n = int(os.environ["QUACK_LB_WORKERS"])
-backends = itertools.cycle([("127.0.0.1", port + i) for i in range(1, n + 1)])
-lock = threading.Lock()
-
-def next_backend():
-    with lock:
-        return next(backends)
-
-def pipe(a, b):
-    try:
-        while True:
-            r, _, _ = select.select([a], [], [], 60)
-            if not r:
-                break
-            data = a.recv(65536)
-            if not data:
-                break
-            b.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try:
-            a.shutdown(socket.SHUT_RD)
-        except Exception:
-            pass
-        try:
-            b.shutdown(socket.SHUT_WR)
-        except Exception:
-            pass
-
-def handle(client):
-    upstream = None
-    try:
-        host, bport = next_backend()
-        upstream = socket.create_connection((host, bport), timeout=30)
-        t1 = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
-        t2 = threading.Thread(target=pipe, args=(upstream, client), daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-    except Exception as e:
-        try:
-            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        except Exception:
-            pass
-        print(f"lb: {e}", file=sys.stderr)
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
-        if upstream:
-            try:
-                upstream.close()
-            except Exception:
-                pass
-
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("127.0.0.1", port))
-srv.listen(512)
-print(f"serve_quackapi: proxy :{port} -> {n} workers on :{port+1}..:{port+n}", flush=True)
-while True:
-    c, _ = srv.accept()
-    threading.Thread(target=handle, args=(c,), daemon=True).start()
-PY
+# Hold until killed (trap cleans children).
+wait

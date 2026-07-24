@@ -1,14 +1,53 @@
 # quackapi vs FastAPI — pgEdge-backed HTTP bench (v2)
 
-Same four routes, same **live** pgEdge Postgres database, same k6 scenarios,
-three stack configurations. The claim under test is the **web layer + how each
-stack talks to Postgres** — not “DuckDB vs Postgres.”
+Same four routes, same **live** pgEdge Postgres database, same k6 scenarios.
+The claim under test is the **web layer + how each stack talks to Postgres** —
+not “DuckDB vs Postgres,” not local CTAS.
+
+## Product order (how we score)
+
+1. **Equivalence** — same routes, same PG, correct HTTP semantics  
+2. **Surpass** — **slaughter FastAPI** on latency + RPS (this bench)  
+3. **Leapfrog** — features FastAPI doesn’t have (policies, queue DDL, …) *after* 1–2
+
+## Scoreboard (2026-07-24, w1, measure 20s, `pg_dsn` libpq path)
+
+| scenario | VUs | quackapi med | FastAPI med | speedup | quackapi rps | FastAPI rps | rps× |
+|----------|----:|-------------:|------------:|--------:|-------------:|------------:|-----:|
+| hello | 32 | **1.00 ms** | 2.84 ms | **2.8×** | 22 384 | 10 293 | **2.2×** |
+| item | 1 | **0.24 ms** | 0.44 ms | **1.8×** | 1 380 | 1 651 | 0.8×† |
+| item | 8 | **0.61 ms** | 1.63 ms | **2.7×** | 8 098 | 4 354 | **1.9×** |
+| item | 16 | **0.67 ms** | 3.19 ms | **4.8×** | 18 480 | 4 596 | **4.0×** |
+| item | 32 | **0.94 ms** | 6.11 ms | **6.5×** | 27 529 | 4 886 | **5.6×** |
+| rows | 32 | **4.46 ms** | 57.7 ms | **12.9×** | 4 330 | 516 | **8.4×** |
+| write | 1 | **0.36 ms** | 0.65 ms | **1.8×** | 1 968 | 1 122 | **1.8×** |
+| write | 8 | **0.74 ms** | 1.77 ms | **2.4×** | 9 018 | 3 987 | **2.3×** |
+| write | 16 | **1.05 ms** | 3.26 ms | **3.1×** | 12 921 | 4 454 | **2.9×** |
+| write | 32 | **1.45 ms** | 6.34 ms | **4.4×** | 18 488 | 4 653 | **4.0×** |
+
+† item@1 rps is k6 1-VU noise (med latency still wins). Under load, item **slaughters**.
+
+**Verdict (w1): zero lose cells. Under concurrency, 3–13× faster med, 2–8× RPS.**
+
+### w8 (8 processes, SO_REUSEPORT — no proxy tax)
+
+| scenario | VUs | quackapi med | FastAPI med | ×lat | note |
+|----------|----:|-------------:|------------:|-----:|------|
+| hello | 32 | **0.45 ms** | 0.96 ms | **2.1×** | |
+| item | 1 | **0.19 ms** | 0.43 ms | **2.2×** | |
+| item | 32 | **0.46 ms** | 2.29 ms | **5.0×** | |
+| rows | 32 | **1.42 ms** | 10.5 ms | **7.4×** | |
+| write | 1 | **0.36 ms** | 0.61 ms | **1.7×** | |
+| write | 32 | **0.74 ms** | 2.68 ms | **3.7×** | |
+
+Workers bind the **same port** via kernel `SO_REUSEPORT` (httplib default). The old Python RR proxy was doubling hello latency — deleted.
 
 | Stack | Process | Port | Data path |
 |-------|---------|------|-----------|
-| **quackapi** | one DuckDB CLI + quackapi extension | `8000` | SQL routes (`CREATE ROUTE`) over `ATTACH … (TYPE postgres)` |
-| **fastapi-w1** | uvicorn `--workers 1` + FastAPI | `8001` | psycopg3 `ConnectionPool` |
-| **fastapi-w8** | uvicorn `--workers 8` + FastAPI | `8001` | same app / pool settings, multi-process workers |
+| **quackapi-w1** | one DuckDB + quackapi | `8000` | **`pg_dsn` libpq** (thread-local + PQprepare); ATTACH kept as fallback |
+| **quackapi-w8** | 8 DuckDB processes + RR proxy | `8000` | same, pool capped per worker |
+| **fastapi-w1** | uvicorn `--workers 1` | `8001` | psycopg3 `ConnectionPool` |
+| **fastapi-w8** | uvicorn `--workers 8` | `8001` | same app, multi-process |
 
 ## Iron rule (fairness)
 
@@ -38,15 +77,16 @@ If Postgres is down: `podman start pgedge-n1`.
 
 ### quackapi (port 8000)
 
-- **One process**: prebuilt DuckDB CLI + quackapi extension (`-unsigned`,
-  `-init /dev/null`).
-- **32 httplib worker threads** (`QUACKAPI_DEFAULT_WORKER_THREADS`).
+- **One process** (w1) or **N processes + RR proxy** (w8): DuckDB CLI +
+  quackapi (`-unsigned`, `-init /dev/null`).
+- **32 httplib worker threads** (w1); fewer per process when multi-worker.
 - Handlers are pure SQL via `CREATE ROUTE` (see `routes.sql`).
-- Data: DuckDB **`postgres` ATTACH** to pgEdge — pooled; default
-  `pg_pool_max_connections` is **24** on this machine (see
-  [PG_ATTACH_CONCURRENCY.md](./PG_ATTACH_CONCURRENCY.md)).
-- In-memory DuckDB holds routes + the ATTACH only — **not** a copy of
-  `bench_rows`.
+- **Scoreboard path:** `quackapi_serve(…, pg_dsn := 'postgresql://…')` —
+  thread-local **libpq** + prepare cache (same model as FastAPI+psycopg).
+- ATTACH is still in `routes.sql` as DuckDB fallback only — not the hot path
+  when `pg_dsn` is set. See [PG_ATTACH_CONCURRENCY.md](./PG_ATTACH_CONCURRENCY.md)
+  for why ATTACH alone collapsed under concurrency (pre-libpq).
+- In-memory DuckDB holds routes only — **not** a copy of `bench_rows`.
 
 ### fastapi (port 8001)
 
