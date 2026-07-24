@@ -97,5 +97,26 @@ if [[ "$RID3" == "$RID1" ]] || [[ "$RID3" == "$RID2" ]]; then
   exit 1
 fi
 
+echo "-- 5. Client X-Request-ID honored (echo + \$request_id bind)"
+stop_quackapi
+INIT2="$(mktemp /tmp/quackapi_batteries_rid_XXXXXX.sql)"
+cat >"$INIT2" <<'SQL'
+CREATE ROUTE echo_rid GET '/echo-rid' AS
+  SELECT $request_id::VARCHAR AS rid;
+SQL
+boot_quackapi "$PORT" "$INIT2"
+rm -f "$INIT2"
+
+CLIENT_RID="client-rid-deadbeef"
+curl_json GET "/echo-rid" -H "X-Request-ID: ${CLIENT_RID}"
+assert_status "$_QA_LAST_STATUS" "200" "echo-rid"
+assert_body_contains "$_QA_LAST_BODY" "\"rid\":\"${CLIENT_RID}\"" "\$request_id bind"
+OUT_RID="$(echo "$_QA_LAST_HEADERS" | awk 'BEGIN{IGNORECASE=1} /^X-Request-ID:/ {print $2}' | tr -d '\r')"
+if [[ "$OUT_RID" != "$CLIENT_RID" ]]; then
+  echo "ASSERT FAIL: response X-Request-ID not echoed (got='$OUT_RID' want='$CLIENT_RID')" >&2
+  exit 1
+fi
+echo "   client rid honored + \$request_id bound"
+
 echo "batteries.test.sh OK"
 stop_quackapi

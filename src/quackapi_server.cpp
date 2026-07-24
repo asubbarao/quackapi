@@ -1167,6 +1167,19 @@ string QuackapiHttpServer::NextRequestId(DatabaseInstance &db) {
 	return UUID::ToString(UUIDv7::GenerateRandomUUID());
 }
 
+//! Client-supplied X-Request-ID: visible ASCII, length-capped (no control chars).
+bool AcceptClientRequestId(const string &s) {
+	if (s.empty() || s.size() > 128) {
+		return false;
+	}
+	for (unsigned char c : s) {
+		if (c < 0x21 || c > 0x7e) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
                                        const string &request_id, double latency_ms) {
 	if (!options.access_log || options.log_level < QuackapiLogLevel::INFO) {
@@ -1339,7 +1352,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		finish();
 		return;
 	}
-	request_id = NextRequestId(*db);
+	// Honor inbound X-Request-ID when safe; else mint uuidv7 (always set header).
+	{
+		auto client_rid = req.get_header_value("X-Request-ID");
+		if (AcceptClientRequestId(client_rid)) {
+			request_id = client_rid;
+		} else {
+			request_id = NextRequestId(*db);
+		}
+	}
 
 	// Built-in health routes (also registered in quackapi_routes() for listing).
 	// Liveness: process accepting HTTP. Readiness: DB handle + version + uptime.
@@ -1641,6 +1662,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			for (auto &kv : stream_match.path_params) {
 				provided[kv.first] = kv.second;
 			}
+			provided["request_id"] = request_id;
 			// Last-Event-ID header → last_id (query ?last_id= wins if both set).
 			if (provided.find("last_id") == provided.end()) {
 				string last_event_id;
@@ -1863,6 +1885,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		for (auto &kv : match.path_params) {
 			provided[kv.first] = {"path", kv.second};
 		}
+		// Server-stamped request id — bindable as $request_id in handler SQL
+		// (and libpq path). Wins over any client query/path of the same name.
+		provided["request_id"] = {"server", request_id};
 
 		// ---- HEADER / COOKIE PARAMS (FastAPI Header / Cookie) ----
 		// Declared via PARAM <name> HEADER [wire] | COOKIE [wire]. Wire defaults:
