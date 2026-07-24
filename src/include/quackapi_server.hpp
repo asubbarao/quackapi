@@ -111,6 +111,12 @@ struct QuackapiServeOptions {
 	bool compression = true;
 	//! Bodies smaller than this many bytes are left uncompressed (default 256).
 	idx_t compression_min_bytes = 256;
+
+	// --- Native Postgres (optional; same shape as FastAPI+psycopg) ---
+	//! When non-empty, simple routes execute via libpq (thread-local conn +
+	//! PQexecParams) instead of DuckDB ATTACH. Empty = DuckDB path only.
+	//! Example: postgresql://user:pass@127.0.0.1:5432/db
+	string pg_dsn;
 };
 
 //! Parse log_level named param / setting. Accepts silent|error|warn|info|debug

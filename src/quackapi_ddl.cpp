@@ -714,8 +714,17 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			Connection con(*context.db);
 			auto prepared = con.Prepare(bind_data.route.handler_sql);
 			if (prepared->HasError()) {
-				throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name,
-				                            prepared->GetError());
+				// INSERT … RETURNING on ATTACH'd Postgres is not supported by DuckDB
+				// but is valid for the native libpq path (pg_dsn). Allow CREATE;
+				// request time uses libpq when configured, else 500.
+				auto err = prepared->GetError();
+				auto el = StringUtil::Lower(err);
+				bool pg_returning =
+				    StringUtil::Contains(el, "returning clause not yet supported") &&
+				    StringUtil::Contains(el, "postgres");
+				if (!pg_returning) {
+					throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name, err);
+				}
 			}
 		}
 		state.AddRoute(bind_data.route, bind_data.or_replace);

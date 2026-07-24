@@ -28,6 +28,7 @@ set(EXTENSION_SOURCES
     src/quackapi_stream.cpp
     src/quackapi_from_x.cpp
     src/quackapi_util.cpp
+    src/quackapi_pg.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -67,6 +68,25 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
 # matching httpfs (links both) rather than only the loadable (parquet).
 target_link_libraries(${EXTENSION_NAME} duckdb_mbedtls)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mbedtls)
+
+# Optional libpq — pure-HTTP Postgres path (same idea as FastAPI+psycopg).
+# When pg_dsn is set on quackapi_serve, simple routes run via PQexecParams
+# instead of DuckDB ATTACH. Soft: build still succeeds without libpq.
+find_path(QUACKAPI_LIBPQ_INCLUDE libpq-fe.h
+    HINTS /opt/homebrew/opt/libpq/include /usr/local/opt/libpq/include /usr/include/postgresql)
+find_library(QUACKAPI_LIBPQ_LIB pq
+    HINTS /opt/homebrew/opt/libpq/lib /usr/local/opt/libpq/lib)
+if (QUACKAPI_LIBPQ_INCLUDE AND QUACKAPI_LIBPQ_LIB)
+    message(STATUS "quackapi: libpq found — native Postgres path enabled")
+    target_include_directories(${EXTENSION_NAME} PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
+    target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
+    target_link_libraries(${EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
+else()
+    message(STATUS "quackapi: libpq not found — native Postgres path disabled")
+endif()
 
 # Response compression: DuckDB-bundled zstd + miniz (gzip). NO new dependencies.
 # Citations (verified in this tree / upstream):

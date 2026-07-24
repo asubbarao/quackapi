@@ -57,6 +57,8 @@ struct ServeBindData : public TableFunctionData {
 	idx_t compression_min_bytes = 256;
 	//! Outbound HTTP client preference: auto|curl|httplib (default auto).
 	string http_client = "auto";
+	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
+	string pg_dsn;
 	bool finished = false;
 };
 
@@ -171,6 +173,10 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		}
 	}
 	// compression_min_bytes named param wins; else SET (default 256).
+	auto pg_dsn_entry = input.named_parameters.find("pg_dsn");
+	if (pg_dsn_entry != input.named_parameters.end()) {
+		bind_data->pg_dsn = pg_dsn_entry->second.GetValue<string>();
+	}
 	auto min_entry = input.named_parameters.find("compression_min_bytes");
 	if (min_entry != input.named_parameters.end()) {
 		auto v = min_entry->second.GetValue<int64_t>();
@@ -258,6 +264,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.read_timeout_sec = bind_data.read_timeout_sec;
 	opts.write_timeout_sec = bind_data.write_timeout_sec;
 	opts.http_client = bind_data.http_client;
+	opts.pg_dsn = bind_data.pg_dsn;
 
 	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
 	// Also prefers curl_httpfs as the outbound HTTP client (graceful fallback).
@@ -509,6 +516,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["compression"] = LogicalType::BOOLEAN;
 	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
 	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
+	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);
