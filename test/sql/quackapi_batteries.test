@@ -65,11 +65,11 @@ SELECT current_setting('enable_http_metadata_cache');
 ----
 true
 
-# DuckDB built-in logging enabled
+# DuckDB built-in QueryLog OFF by default (throughput; opt in via enable_logging:=true)
 query I
 SELECT current_setting('enable_logging');
 ----
-1
+0
 
 # Health routes auto-registered and listed
 query II
