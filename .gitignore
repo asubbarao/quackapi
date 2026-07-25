@@ -10,6 +10,9 @@ test/python/__pycache__/
 *.log
 vcpkg_installed/
 
+# Local multi-arch extension drops (use GitHub Releases / community CDN)
+dist/
+
 # Generated conformance output
 test/conformance/results/
 
