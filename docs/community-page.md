@@ -36,14 +36,21 @@ Zero external app servers.
 
 ## Install
 
-After community acceptance and signed publish:
+**DuckDB v1.5.4** required (community CDN path is versioned).
 
 ```sql
 INSTALL quackapi FROM community;
 LOAD quackapi;
 ```
 
-Until then, build from source against **DuckDB v1.5.4**:
+| Platform | Community signed |
+|----------|------------------|
+| `linux_amd64`, `linux_arm64` | yes |
+| `osx_amd64`, `osx_arm64` | yes |
+| `windows_*` | not yet (use [GitHub Releases](https://github.com/asubbarao/quackapi/releases) + `-unsigned`) |
+| `wasm_*` | excluded |
+
+From source (any platform, including Windows MSVC):
 
 ```sh
 git clone --recurse-submodules https://github.com/asubbarao/quackapi
