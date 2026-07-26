@@ -276,6 +276,9 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
+| `quackapi_fetch(url[, headers])` | scalar | Pooled outbound GET → `STRUCT(status, reason, body, headers, error, reused_connection)` |
+| `quackapi_post(url, body[, ct[, headers]])` | scalar | Pooled outbound POST, same result shape |
+| `quackapi_http_pool()` | table | Outbound pool per origin: `host, idle, dialed, reused` |
 | `quackapi_http_util_name()` | scalar | Active outbound HTTPUtil name |
 
 Internal apply helpers (`quackapi_apply_route`, `quackapi_apply_auth`, …) exist

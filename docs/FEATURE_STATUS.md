@@ -84,9 +84,10 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 
 ```
 quackapi_ack, quackapi_add_api_key, quackapi_authentication, quackapi_authorization,
-quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_groups, quackapi_http_util_name,
-quackapi_nack, quackapi_policies, quackapi_queues, quackapi_routes, quackapi_serve,
-quackapi_servers, quackapi_stop, quackapi_streams, quackapi_verify_auth
+quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_fetch, quackapi_groups,
+quackapi_http_pool, quackapi_http_util_name, quackapi_nack, quackapi_policies, quackapi_post,
+quackapi_queues, quackapi_routes, quackapi_serve, quackapi_servers, quackapi_stop,
+quackapi_streams, quackapi_verify_auth
 ```
 
 Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.
