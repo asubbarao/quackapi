@@ -1,0 +1,102 @@
+# name: test/sql/quackapi_http_pool.test
+# description: Outbound quackapi_fetch / quackapi_post reuse pooled connections
+# group: [sql]
+
+require quackapi
+
+require json
+
+# Serve a tiny echo API and then call it from the SAME process. No external
+# network: the pool is exercised against quackapi's own server.
+statement ok
+CREATE ROUTE ping GET '/ping' AS SELECT 'pong' AS msg;
+
+statement ok
+CREATE ROUTE echo POST '/echo' AS SELECT $body::VARCHAR AS got;
+
+query I
+SELECT * FROM quackapi_serve(29301, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29301
+
+# --- GET ---------------------------------------------------------------------
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29301/ping')).status;
+----
+200
+
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29301/ping')).body;
+----
+[{"msg":"pong"}]
+
+# Extra headers travel as a MAP argument.
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29301/ping', MAP{'X-Test': 'yes'})).status;
+----
+200
+
+# --- POST --------------------------------------------------------------------
+# Plain http:// needs NO companion extension — the vendored httplib implements
+# POST, unlike DuckDB's built-in HTTPUtil client.
+query I
+SELECT (quackapi_post('http://127.0.0.1:29301/echo', to_json({a: 1})::VARCHAR)).status;
+----
+200
+
+# The body arrives intact — $body binds the raw payload we sent.
+query I
+SELECT (quackapi_post('http://127.0.0.1:29301/echo', to_json({a: 1})::VARCHAR)).body;
+----
+[{"got":"{\"a\":1}"}]
+
+# --- pooling -----------------------------------------------------------------
+# The point of the whole exercise: the second call must NOT dial again.
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29301/ping')).reused_connection;
+----
+true
+
+# One origin, one dial, many reuses.
+query I
+SELECT count(*) FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301';
+----
+1
+
+query I
+SELECT dialed = 1 AND reused >= 4 AND idle >= 1
+FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301';
+----
+true
+
+# --- VOLATILE ----------------------------------------------------------------
+# Without FunctionStability::VOLATILE, DuckDB constant-folds a literal-argument
+# call and range(N) would issue ONE request while reporting N rows. Assert the
+# server actually saw every one of them by watching the reuse counter climb.
+statement ok
+CREATE OR REPLACE TEMP TABLE before AS
+  SELECT reused AS n FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301';
+
+statement ok
+SELECT (quackapi_fetch('http://127.0.0.1:29301/ping')).status AS s FROM range(10) t(i);
+
+query I
+SELECT (SELECT reused FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301')
+       - (SELECT n FROM before) >= 10;
+----
+true
+
+# --- transport errors are values, not exceptions ------------------------------
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29399/nope')).error IS NOT NULL;
+----
+true
+
+# NULL url → NULL struct, no request.
+query I
+SELECT (quackapi_fetch(NULL::VARCHAR)).status IS NULL;
+----
+true
+
+statement ok
+SELECT * FROM quackapi_stop(29301);

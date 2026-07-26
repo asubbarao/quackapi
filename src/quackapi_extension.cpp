@@ -553,6 +553,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
 
+	// Outbound HTTP with a connection pool that survives ACROSS requests:
+	// quackapi_fetch / quackapi_post / quackapi_http_pool. See the header of
+	// quackapi_http_fetch.hpp for why the un-pooled path costs ~27ms a call.
+	RegisterQuackapiHttpFetchFunctions(loader);
+
 	// Durable broker-less job queue (CREATE QUEUE + enqueue/dequeue/ack/nack).
 	// Backing store is the plain quackapi_jobs table; worker = compose cronjob.
 	RegisterQuackapiQueueFunctions(loader);
