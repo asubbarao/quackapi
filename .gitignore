@@ -13,3 +13,7 @@ vcpkg_installed/
 # Generated conformance output
 test/conformance/results/
 
+bench/bench_*.duckdb
+bench/bench_*.duckdb.wal
+bench/__pycache__/
+bench/.tmp/
