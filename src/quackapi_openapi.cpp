@@ -7,52 +7,14 @@
 #include "duckdb/main/prepared_statement.hpp"
 
 #include "quackapi_state.hpp"
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
 namespace {
 
-string JsonEscape(const string &input) {
-	string result;
-	result.reserve(input.size() + 2);
-	for (unsigned char c : input) {
-		switch (c) {
-		case '"':
-			result += "\\\"";
-			break;
-		case '\\':
-			result += "\\\\";
-			break;
-		case '\b':
-			result += "\\b";
-			break;
-		case '\f':
-			result += "\\f";
-			break;
-		case '\n':
-			result += "\\n";
-			break;
-		case '\r':
-			result += "\\r";
-			break;
-		case '\t':
-			result += "\\t";
-			break;
-		default:
-			if (c < 0x20) {
-				char buf[8];
-				snprintf(buf, sizeof(buf), "\\u%04x", c);
-				result += buf;
-			} else {
-				result += static_cast<char>(c);
-			}
-		}
-	}
-	return result;
-}
-
 string JsonString(const string &s) {
-	return "\"" + JsonEscape(s) + "\"";
+	return "\"" + QuackapiJsonEscape(s) + "\"";
 }
 
 vector<string> SplitPath(const string &path) {

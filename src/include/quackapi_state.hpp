@@ -5,6 +5,7 @@
 #include <tuple>
 
 #include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/object_cache.hpp"
@@ -206,12 +207,16 @@ public:
 	//! DROP ROUTE. Returns false if no such route.
 	bool DropRoute(const string &name);
 	vector<QuackapiRoute> SnapshotRoutes();
+	//! Shared immutable view for the HTTP hot path (refcount only — no deep copy).
+	shared_ptr<const vector<QuackapiRoute>> LiveRoutes();
 
 	//! CREATE [OR REPLACE] STREAM. Throws on duplicate name unless or_replace.
 	void AddStream(const QuackapiStream &stream, bool or_replace);
 	//! DROP STREAM. Returns false if no such stream.
 	bool DropStream(const string &name);
 	vector<QuackapiStream> SnapshotStreams();
+	//! Shared immutable view for the HTTP hot path (refcount only — no deep copy).
+	shared_ptr<const vector<QuackapiStream>> LiveStreams();
 
 	//! CREATE [OR REPLACE] GROUP. Throws on duplicate name unless or_replace.
 	void AddGroup(const QuackapiGroup &group, bool or_replace);
@@ -273,11 +278,17 @@ public:
 	vector<QuackapiMaskingBinding> SnapshotMaskingBindings();
 
 private:
+	void PublishRoutes();
+	void PublishStreams();
+
 	std::mutex routes_mutex;
 	vector<QuackapiRoute> routes;
+	//! Published under routes_mutex; readers take a shared_ptr copy and drop the lock.
+	shared_ptr<const vector<QuackapiRoute>> routes_live;
 
 	std::mutex streams_mutex;
 	vector<QuackapiStream> streams;
+	shared_ptr<const vector<QuackapiStream>> streams_live;
 
 	std::mutex groups_mutex;
 	vector<QuackapiGroup> groups;

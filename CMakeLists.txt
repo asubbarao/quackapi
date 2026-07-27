@@ -27,6 +27,8 @@ set(EXTENSION_SOURCES
     src/quackapi_policy.cpp
     src/quackapi_stream.cpp
     src/quackapi_from_x.cpp
+    src/quackapi_util.cpp
+    src/quackapi_pg.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -66,6 +68,42 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
 # matching httpfs (links both) rather than only the loadable (parquet).
 target_link_libraries(${EXTENSION_NAME} duckdb_mbedtls)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mbedtls)
+
+# Optional libpq — pure-HTTP Postgres path (same idea as FastAPI+psycopg).
+# When pg_dsn is set on quackapi_serve, simple routes run via PQexecParams
+# instead of DuckDB ATTACH. Soft: build still succeeds without libpq.
+#
+# Never link a host-only Homebrew dylib into a cross-arch build (CI osx_amd64
+# on arm64 runners finds /opt/homebrew arm64 libpq → link fails).
+set(QUACKAPI_TRY_LIBPQ ON)
+if (APPLE AND CMAKE_OSX_ARCHITECTURES)
+	if (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" AND
+	    NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i386")
+		set(QUACKAPI_TRY_LIBPQ OFF)
+		message(STATUS "quackapi: skip libpq (target x86_64, host ${CMAKE_HOST_SYSTEM_PROCESSOR})")
+	elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" AND
+	        NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+		set(QUACKAPI_TRY_LIBPQ OFF)
+		message(STATUS "quackapi: skip libpq (target arm64, host ${CMAKE_HOST_SYSTEM_PROCESSOR})")
+	endif()
+endif()
+if (QUACKAPI_TRY_LIBPQ)
+	find_path(QUACKAPI_LIBPQ_INCLUDE libpq-fe.h
+	    HINTS /opt/homebrew/opt/libpq/include /usr/local/opt/libpq/include /usr/include/postgresql)
+	find_library(QUACKAPI_LIBPQ_LIB pq
+	    HINTS /opt/homebrew/opt/libpq/lib /usr/local/opt/libpq/lib)
+endif()
+if (QUACKAPI_TRY_LIBPQ AND QUACKAPI_LIBPQ_INCLUDE AND QUACKAPI_LIBPQ_LIB)
+	message(STATUS "quackapi: libpq found — native Postgres path enabled")
+	target_include_directories(${EXTENSION_NAME} PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
+	target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
+	target_link_libraries(${EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
+	target_link_libraries(${LOADABLE_EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
+	target_compile_definitions(${EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
+	target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
+else()
+	message(STATUS "quackapi: libpq not found — native Postgres path disabled")
+endif()
 
 # Response compression: DuckDB-bundled zstd + miniz (gzip). NO new dependencies.
 # Citations (verified in this tree / upstream):

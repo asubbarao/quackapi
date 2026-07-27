@@ -1,0 +1,124 @@
+# name: test/sql/quackapi_jwt_claims.test
+# description: JWT HS256 claims parse/serialize — exp/nbf/alg + control-char JSON escape (LOC pass 1)
+# group: [sql]
+
+require quackapi
+
+require json
+
+# Fixtures under test/sql/fixtures/ minted with SECRET 'jwt-matrix-secret' (HS256).
+# Tokens with exp=4102444800 (2100-01-01) so the suite does not age out soon.
+#
+# Why not community `crypto` for JWT: that extension is hash/HMAC primitives only
+# (crypto_hash / crypto_hmac). JWT needs structure parse, alg reject, exp/nbf,
+# claims_json for $claims_* — owned here with DuckDB-bundled mbedtls + json_*.
+
+query I
+CREATE AUTH jwt_t AS JWT ( SECRET 'jwt-matrix-secret' );
+----
+Auth jwt_t: JWT_HS256
+
+# ── happy multi-claim (sub/role/n/flag) ─────────────────────────────────────
+
+query IIII
+SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok,
+       (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).status,
+       json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.sub'),
+       json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.role')
+FROM read_text('test/sql/fixtures/jwt_happy.txt');
+----
+true	200	alice	admin
+
+# numbers/bools stringified into claims_json (VARCHAR claim map contract)
+
+query II
+SELECT json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.n'),
+       json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.flag')
+FROM read_text('test/sql/fixtures/jwt_happy.txt');
+----
+42	true
+
+# ── control-byte + newline in claims — ClaimsToJson must stay valid JSON ────
+
+query I
+SELECT json_valid((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json)
+FROM read_text('test/sql/fixtures/jwt_ctrl.txt');
+----
+true
+
+query I
+SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
+FROM read_text('test/sql/fixtures/jwt_ctrl.txt');
+----
+true
+
+# sub is a + U+0001 + b after extract (escape round-trip)
+
+query I
+SELECT length(json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.sub')) = 3
+FROM read_text('test/sql/fixtures/jwt_ctrl.txt');
+----
+true
+
+# ── quote / backslash in sub ────────────────────────────────────────────────
+
+query I
+SELECT json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.sub')
+FROM read_text('test/sql/fixtures/jwt_quote.txt');
+----
+a"b\c
+
+# ── exp past ────────────────────────────────────────────────────────────────
+
+query II
+SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok,
+       (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).status
+FROM read_text('test/sql/fixtures/jwt_expired.txt');
+----
+false	401
+
+# ── nbf future ──────────────────────────────────────────────────────────────
+
+query II
+SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok,
+       (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).status
+FROM read_text('test/sql/fixtures/jwt_nbf_future.txt');
+----
+false	401
+
+# ── nbf past (accepted) ─────────────────────────────────────────────────────
+
+query I
+SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
+FROM read_text('test/sql/fixtures/jwt_nbf_past.txt');
+----
+true
+
+# ── alg: none (unsigned) ────────────────────────────────────────────────────
+
+query I
+SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
+FROM read_text('test/sql/fixtures/jwt_alg_none.txt');
+----
+false
+
+# ── alg HS384 (signed, non-HS256) ───────────────────────────────────────────
+
+query I
+SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
+FROM read_text('test/sql/fixtures/jwt_alg_hs384.txt');
+----
+false
+
+# garbage token → not ok, body is valid JSON (DetailJson escape path)
+
+query II
+SELECT (quackapi_verify_auth('jwt_t', 'not.a.jwt')).ok,
+       json_valid((quackapi_verify_auth('jwt_t', 'not.a.jwt')).body);
+----
+false	true
+
+query I
+DROP AUTH jwt_t;
+----
+Dropped auth jwt_t

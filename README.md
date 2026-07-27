@@ -22,17 +22,11 @@ The query already types the response.
 
 ## Five-line quickstart
 
-Build locally (community install is not live until the extension is accepted):
-
-```sh
-git clone --recurse-submodules https://github.com/asubbarao/quackapi
-cd quackapi
-GEN=ninja make release
-./build/release/duckdb -unsigned
-```
+Requires **DuckDB v1.5.4** (community binaries are published per DuckDB version).
 
 ```sql
-LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
+INSTALL quackapi FROM community;
+LOAD quackapi;
 
 CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
 CREATE ROUTE item  GET '/items/:id' AS SELECT $id::INTEGER AS id;
@@ -327,37 +321,49 @@ back to httplib when the community extension is unavailable — see
 
 ## Install & load
 
-### From source (today)
+### Community (preferred — signed)
 
-```sh
-GEN=ninja make release
-./build/release/duckdb -unsigned   # extension available under build/release/extension/quackapi/
-```
-
-```sql
-LOAD '/absolute/path/to/quackapi.duckdb_extension';
-```
-
-### Community (after acceptance)
+Page: [duckdb.org/community_extensions/extensions/quackapi](https://duckdb.org/community_extensions/extensions/quackapi)
 
 ```sql
 INSTALL quackapi FROM community;
 LOAD quackapi;
 ```
 
-**Target DuckDB:** **v1.5.4** (pinned in CI: `.github/workflows`, submodule `duckdb` @ `v1.5.4`).
+| Requirement | Detail |
+|-------------|--------|
+| **DuckDB** | **v1.5.4** (binaries live under `community-extensions.duckdb.org/v1.5.4/…`). v1.5.3 → HTTP 404. |
+| **Linux** | `linux_amd64`, `linux_arm64` — **yes** |
+| **macOS** | `osx_amd64`, `osx_arm64` — **yes** |
+| **Windows** | not in community yet (descriptor still excludes Windows; use a [GitHub Release](https://github.com/asubbarao/quackapi/releases) asset + `-unsigned` until CI re-opts in) |
+| **Wasm** | excluded (no server sockets) |
 
-**Signed-build platforms** (community CI / extension-ci-tools):
+### Direct download (unsigned / offline)
 
-| Platform | Status |
-|----------|--------|
-| `linux_amd64`, `linux_arm64` | built (target) |
-| `osx_amd64`, `osx_arm64` | built (target) |
-| `wasm_*` | **excluded** (no server sockets) |
-| `windows_amd64`, `windows_amd64_mingw`, `windows_amd64_rtools`, `windows_arm64` | **excluded** (unproven in repo CI; re-opt-in after green MSVC build) |
+Release assets: https://github.com/asubbarao/quackapi/releases  
 
-Dependencies: C++17, DuckDB’s **bundled httplib** + **mbedtls** only — no vcpkg,
-no libcurl, no extra toolchains (`requires_toolchains` not needed).
+```sh
+# example: linux amd64
+curl -fsSL -o quackapi.duckdb_extension \
+  "https://github.com/asubbarao/quackapi/releases/download/v0.1.1/quackapi-v1.5.4-linux_amd64.duckdb_extension"
+duckdb -unsigned -c "LOAD '$(pwd)/quackapi.duckdb_extension';"
+```
+
+### From source
+
+```sh
+git clone --recurse-submodules https://github.com/asubbarao/quackapi
+cd quackapi
+GEN=ninja make release
+./build/release/duckdb -unsigned
+```
+
+```sql
+LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
+```
+
+**Target DuckDB:** **v1.5.4** (CI + community pin). Dependencies: C++17, DuckDB’s
+bundled **httplib** + **mbedtls** only — no vcpkg, no libcurl.
 
 ---
 
@@ -396,8 +402,9 @@ no libcurl, no extra toolchains (`requires_toolchains` not needed).
 
 - **Write concurrency / OLTP:** single-writer semantics; not a replacement for
   a connection-pooled app tier under heavy concurrent writes.
-- **Unsigned until community acceptance:** local / CI builds only until the
-  community-extensions PR lands and binaries are signed.
+- **Platform coverage:** community ships **signed** linux/osx for DuckDB
+  **v1.5.4**. Windows is not on the community CDN yet; use a Release asset
+  with `duckdb -unsigned` or build from source.
 - **Serve memory default:** `quackapi_serve` applies a 256MB `memory_limit`
   only when nothing was configured (no `memory_limit` / `quackapi_memory_limit`
   and DuckDB is still at its system default). Prefer
@@ -427,6 +434,7 @@ bash test/conformance/run.sh       # FastAPI parity harness
 | [`docs/community-page.md`](docs/community-page.md) | Community-extensions page copy |
 | [`packaging/description.yml`](packaging/description.yml) / [`description.yml`](description.yml) | Community submission manifest |
 | [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md) | Scorecard vs FastAPI |
+| [`docs/SUPERIORITY_ORDER.md`](docs/SUPERIORITY_ORDER.md) | Equivalence → slaughter → leapfrog (work order) |
 | [`docs/QUEUE.md`](docs/QUEUE.md) | Job queue semantics |
 | [`docs/curl_httpfs.md`](docs/curl_httpfs.md) | Outbound HTTP via curl_httpfs |
 

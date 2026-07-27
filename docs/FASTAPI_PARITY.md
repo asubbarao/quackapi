@@ -70,6 +70,9 @@ bash test/http/run_all.sh
 | `SELECT … AS html` / `AS text` / `AS location` / `AS set_cookie` | Zero-framework custom response via column name |
 | `SELECT` column list as response model | FastAPI `response_model` exclude/include is app-side; SQL projection is native |
 | Strict integer bind (reject `1.5`, `1e2`) | Matches Pydantic v2 int parsing; no silent cast-rounding |
+| **`$request_id` always bindable** + client `X-Request-ID` honor | FastAPI needs middleware + Depends; here it's free on every route |
+| **gzip/zstd response negotiation** built into serve | No middleware install; min-size threshold; tested |
+| **`pg_dsn` libpq path** beats FastAPI+psycopg on same PG | Measured: hello/item/rows/write all win med latency |
 
 ---
 

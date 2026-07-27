@@ -59,10 +59,17 @@ CREATE AUTH jwt_auth AS JWT ( SECRET 'conformance-secret' );
 -- optional: ALGORITHM HS256  (only HS256 is accepted)
 
 CREATE ROUTE jwt_route GET '/jwt' REQUIRE jwt_auth AS
-SELECT 'ok' AS status;
+SELECT $claims_sub AS sub, $claims_role AS role;
 ```
 
-Clients send `Authorization: Bearer <token>`.
+Clients send `Authorization: Bearer <token>`. Verified claims bind as `$claims_*`
+(missing claim → SQL `NULL`).
+
+**Why not community `crypto`?** That extension is hash/HMAC *primitives*
+(`crypto_hash`, `crypto_hmac`) — not a JWT implementation. quackapi needs
+compact-token parse, `alg` allowlist (reject `none` / non-HS256), `exp`/`nbf`,
+and a claims map for `$claims_*`. Verify uses DuckDB-bundled **mbedtls** (same
+as httpfs/parquet) so `INSTALL quackapi` does not require `INSTALL crypto`.
 
 ```sh
 # Missing / bad token → 401

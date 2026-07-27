@@ -7,7 +7,9 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/helper.hpp"
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -20,16 +22,82 @@
 
 #include "quackapi_auth.hpp"
 #include "quackapi_openapi.hpp"
+#include "quackapi_pg.hpp"
 #include "quackapi_policy.hpp"
 #include "quackapi_state.hpp"
 
 #include "httplib.hpp"
 #include "miniz_wrapper.hpp"
 #include "zstd.h"
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
 namespace {
+
+//! Per-worker-thread DuckDB connection + prepared-statement cache + static
+//! response cache for zero-parameter handlers.
+//! httplib's ThreadPool runs each request on a worker thread; reusing one
+//! Connection per thread (and reusing Prepare results for stable handler SQL)
+//! removes the dominant per-request tax vs a mature ASGI stack.
+struct ThreadRequestCache {
+	static constexpr idx_t MAX_PREPARED = 128;
+	static constexpr idx_t MAX_STATIC_BODIES = 64;
+
+	DatabaseInstance *db = nullptr;
+	unique_ptr<Connection> con;
+	unordered_map<string, unique_ptr<PreparedStatement>> prepared;
+	//! Fully-serialized JSON body for handlers with zero bind parameters
+	//! (e.g. SELECT 'world' AS msg). Keyed by exact handler SQL.
+	unordered_map<string, string> static_json_bodies;
+
+	Connection &GetConnection(DatabaseInstance &instance) {
+		if (!con || db != &instance) {
+			con = make_uniq<Connection>(instance);
+			prepared.clear();
+			static_json_bodies.clear();
+			db = &instance;
+		}
+		return *con;
+	}
+
+	//! Cache successful prepares keyed by exact handler SQL. Errors are not
+	//! cached so a transient prepare failure can be retried.
+	PreparedStatement *GetPrepared(const string &sql, string &error_out) {
+		auto it = prepared.find(sql);
+		if (it != prepared.end()) {
+			return it->second.get();
+		}
+		auto stmt = con->Prepare(sql);
+		if (stmt->HasError()) {
+			error_out = stmt->GetError();
+			return nullptr;
+		}
+		if (prepared.size() >= MAX_PREPARED) {
+			prepared.clear();
+		}
+		auto *raw = stmt.get();
+		prepared.emplace(sql, std::move(stmt));
+		return raw;
+	}
+
+	const string *LookupStaticBody(const string &sql) const {
+		auto it = static_json_bodies.find(sql);
+		return it == static_json_bodies.end() ? nullptr : &it->second;
+	}
+
+	void StoreStaticBody(const string &sql, string body) {
+		if (static_json_bodies.size() >= MAX_STATIC_BODIES) {
+			static_json_bodies.clear();
+		}
+		static_json_bodies[sql] = std::move(body);
+	}
+};
+
+ThreadRequestCache &TlsRequestCache() {
+	thread_local ThreadRequestCache cache;
+	return cache;
+}
 
 //! Content-Encoding choice after Accept-Encoding negotiation.
 enum class NegotiatedEncoding { IDENTITY, ZSTD, GZIP };
@@ -191,45 +259,6 @@ bool CompressGzip(const string &input, string &output) {
 	}
 }
 
-string JsonEscape(const string &input) {
-	string result;
-	result.reserve(input.size() + 2);
-	for (unsigned char c : input) {
-		switch (c) {
-		case '"':
-			result += "\\\"";
-			break;
-		case '\\':
-			result += "\\\\";
-			break;
-		case '\b':
-			result += "\\b";
-			break;
-		case '\f':
-			result += "\\f";
-			break;
-		case '\n':
-			result += "\\n";
-			break;
-		case '\r':
-			result += "\\r";
-			break;
-		case '\t':
-			result += "\\t";
-			break;
-		default:
-			if (c < 0x20) {
-				char buf[8];
-				snprintf(buf, sizeof(buf), "\\u%04x", c);
-				result += buf;
-			} else {
-				result += static_cast<char>(c);
-			}
-		}
-	}
-	return result;
-}
-
 //! Render a DuckDB Value as JSON. The database typed the column — the JSON
 //! representation follows the type, not string-formatting heuristics.
 string ValueToJson(const Value &value) {
@@ -280,26 +309,26 @@ string ValueToJson(const Value &value) {
 			if (i > 0) {
 				result += ",";
 			}
-			result += "\"" + JsonEscape(child_types[i].first) + "\":" + ValueToJson(children[i]);
+			result += "\"" + QuackapiJsonEscape(child_types[i].first) + "\":" + ValueToJson(children[i]);
 		}
 		result += "}";
 		return result;
 	}
 	default:
-		return "\"" + JsonEscape(value.ToString()) + "\"";
+		return "\"" + QuackapiJsonEscape(value.ToString()) + "\"";
 	}
 }
 
 //! FastAPI-shaped validation error body (loc = [kind, name]).
 string ValidationErrorJson(const string &loc_kind, const string &param_name, const string &msg, const string &type) {
-	return "{\"detail\":[{\"loc\":[\"" + JsonEscape(loc_kind) + "\",\"" + JsonEscape(param_name) + "\"],\"msg\":\"" +
-	       JsonEscape(msg) + "\",\"type\":\"" + JsonEscape(type) + "\"}]}";
+	return "{\"detail\":[{\"loc\":[\"" + QuackapiJsonEscape(loc_kind) + "\",\"" + QuackapiJsonEscape(param_name) +
+	       "\"],\"msg\":\"" + QuackapiJsonEscape(msg) + "\",\"type\":\"" + QuackapiJsonEscape(type) + "\"}]}";
 }
 
 //! FastAPI-shaped body-only validation error (loc = ["body"]).
 string ValidationErrorJsonBody(const string &msg, const string &type) {
-	return "{\"detail\":[{\"loc\":[\"body\"],\"msg\":\"" + JsonEscape(msg) + "\",\"type\":\"" + JsonEscape(type) +
-	       "\"}]}";
+	return "{\"detail\":[{\"loc\":[\"body\"],\"msg\":\"" + QuackapiJsonEscape(msg) + "\",\"type\":\"" +
+	       QuackapiJsonEscape(type) + "\"}]}";
 }
 
 //! Media type from Content-Type (strip parameters; lowercased).
@@ -359,6 +388,149 @@ void ParseFormUrlEncoded(const string &body, case_insensitive_map_t<string> &out
 	}
 }
 
+//! Fast path: flat JSON object of string/number/bool/null scalars (no DuckDB round-trip).
+//! Returns true on success. false → caller may fall back to SQL extract or error.
+bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<string> &fields) {
+	const char *s = raw_body.c_str();
+	const char *end = s + raw_body.size();
+	auto skip_ws = [&]() {
+		while (s < end && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) {
+			s++;
+		}
+	};
+	skip_ws();
+	if (s >= end || *s != '{') {
+		return false;
+	}
+	s++;
+	fields.clear();
+	skip_ws();
+	if (s < end && *s == '}') {
+		return true;
+	}
+	while (s < end) {
+		skip_ws();
+		if (s >= end || *s != '"') {
+			return false;
+		}
+		s++;
+		string key;
+		while (s < end && *s != '"') {
+			if (*s == '\\') {
+				s++;
+				if (s >= end) {
+					return false;
+				}
+				// minimal escapes
+				if (*s == '"' || *s == '\\' || *s == '/') {
+					key.push_back(*s);
+				} else if (*s == 'n') {
+					key.push_back('\n');
+				} else if (*s == 't') {
+					key.push_back('\t');
+				} else if (*s == 'r') {
+					key.push_back('\r');
+				} else {
+					key.push_back(*s);
+				}
+			} else {
+				key.push_back(*s);
+			}
+			s++;
+		}
+		if (s >= end || *s != '"') {
+			return false;
+		}
+		s++;
+		skip_ws();
+		if (s >= end || *s != ':') {
+			return false;
+		}
+		s++;
+		skip_ws();
+		if (s >= end) {
+			return false;
+		}
+		string val;
+		if (*s == '"') {
+			s++;
+			while (s < end && *s != '"') {
+				if (*s == '\\') {
+					s++;
+					if (s >= end) {
+						return false;
+					}
+					if (*s == '"' || *s == '\\' || *s == '/') {
+						val.push_back(*s);
+					} else if (*s == 'n') {
+						val.push_back('\n');
+					} else if (*s == 't') {
+						val.push_back('\t');
+					} else if (*s == 'r') {
+						val.push_back('\r');
+					} else {
+						val.push_back(*s);
+					}
+				} else {
+					val.push_back(*s);
+				}
+				s++;
+			}
+			if (s >= end || *s != '"') {
+				return false;
+			}
+			s++;
+		} else if (*s == 'n' && s + 4 <= end && string(s, 4) == "null") {
+			val = "null";
+			s += 4;
+		} else if (*s == 't' && s + 4 <= end && string(s, 4) == "true") {
+			val = "true";
+			s += 4;
+		} else if (*s == 'f' && s + 5 <= end && string(s, 5) == "false") {
+			val = "false";
+			s += 5;
+		} else if (*s == '-' || (*s >= '0' && *s <= '9')) {
+			const char *start = s;
+			if (*s == '-') {
+				s++;
+			}
+			while (s < end && *s >= '0' && *s <= '9') {
+				s++;
+			}
+			if (s < end && *s == '.') {
+				s++;
+				while (s < end && *s >= '0' && *s <= '9') {
+					s++;
+				}
+			}
+			if (s < end && (*s == 'e' || *s == 'E')) {
+				s++;
+				if (s < end && (*s == '+' || *s == '-')) {
+					s++;
+				}
+				while (s < end && *s >= '0' && *s <= '9') {
+					s++;
+				}
+			}
+			val.assign(start, s - start);
+		} else {
+			// nested object/array — not flat; fall back
+			return false;
+		}
+		fields[key] = val;
+		skip_ws();
+		if (s < end && *s == ',') {
+			s++;
+			continue;
+		}
+		if (s < end && *s == '}') {
+			return true;
+		}
+		return false;
+	}
+	return false;
+}
+
 //! Extract top-level JSON object fields as string values for binding.
 //! On invalid JSON sets err_json and returns false. Arrays/non-objects → model_attributes_type.
 bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensitive_map_t<string> &fields,
@@ -366,6 +538,10 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 	if (raw_body.empty()) {
 		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
 		return false;
+	}
+	// Hot path: flat object without spinning DuckDB (POST /write etc.).
+	if (TryExtractFlatJsonObject(raw_body, fields)) {
+		return true;
 	}
 	// Validate JSON parse first (TRY_CAST → NULL on failure).
 	auto check = con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(raw_body));
@@ -682,7 +858,7 @@ string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
 			event += ",";
 		}
 		first = false;
-		event += "\"" + JsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
+		event += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
 	}
 	event += "}\n\n";
 	return event;
@@ -985,22 +1161,23 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 }
 
 string QuackapiHttpServer::NextRequestId(DatabaseInstance &db) {
-	// Prefer community tsid() when probe succeeded; else core uuidv7 (C++ — no SQL).
-	if (options.request_id_source == "tsid") {
-		try {
-			Connection con(db);
-			auto res = con.Query("SELECT tsid()");
-			if (!res->HasError()) {
-				auto chunk = res->Fetch();
-				if (chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull()) {
-					return chunk->GetValue(0, 0).ToString();
-				}
-			}
-		} catch (...) {
-			// fall through to uuidv7
+	// Always C++ uuidv7 — never SELECT per request (tsid() was a multi-ms tax
+	// on every route including /hello). request_id_source is informational.
+	(void)db;
+	return UUID::ToString(UUIDv7::GenerateRandomUUID());
+}
+
+//! Client-supplied X-Request-ID: visible ASCII, length-capped (no control chars).
+bool AcceptClientRequestId(const string &s) {
+	if (s.empty() || s.size() > 128) {
+		return false;
+	}
+	for (unsigned char c : s) {
+		if (c < 0x21 || c > 0x7e) {
+			return false;
 		}
 	}
-	return UUID::ToString(UUIDv7::GenerateRandomUUID());
+	return true;
 }
 
 void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
@@ -1033,12 +1210,13 @@ void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const
 			path_esc += static_cast<char>(c);
 		}
 	}
+	// No fflush: stderr is typically line-buffered when attached to a terminal
+	// and block-buffered when piped; fflush-per-request serializes all workers.
 	fprintf(stderr,
 	        "{\"type\":\"access\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,"
 	        "\"latency_ms\":%.3f,\"request_id\":\"%s\",\"bytes\":%llu}\n",
 	        req.method.c_str(), path_esc.c_str(), res.status, latency_ms, request_id.c_str(),
 	        (unsigned long long)bytes);
-	fflush(stderr);
 }
 
 void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
@@ -1174,7 +1352,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		finish();
 		return;
 	}
-	request_id = NextRequestId(*db);
+	// Honor inbound X-Request-ID when safe; else mint uuidv7 (always set header).
+	{
+		auto client_rid = req.get_header_value("X-Request-ID");
+		if (AcceptClientRequestId(client_rid)) {
+			request_id = client_rid;
+		} else {
+			request_id = NextRequestId(*db);
+		}
+	}
 
 	// Built-in health routes (also registered in quackapi_routes() for listing).
 	// Liveness: process accepting HTTP. Readiness: DB handle + version + uptime.
@@ -1193,7 +1379,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			string version = "unknown";
 			bool ready = false;
 			try {
-				Connection con(*db);
+				auto &con = TlsRequestCache().GetConnection(*db);
 				auto resq = con.Query("SELECT version()");
 				if (!resq->HasError()) {
 					auto chunk = resq->Fetch();
@@ -1212,13 +1398,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				// operators / readiness probes can confirm batteries applied.
 				const string http_client =
 				    options.http_client_active.empty() ? string("httplib") : options.http_client_active;
-				SetJson(res, 200,
-				        StringUtil::Format(
-				            "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
-				            "\"request_id_source\":\"%s\",\"http_client\":\"%s\"}",
-				            JsonEscape(version), (long long)uptime_sec,
-				            JsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
-				            JsonEscape(http_client)));
+				SetJson(
+				    res, 200,
+				    StringUtil::Format(
+				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
+				        "\"request_id_source\":\"%s\",\"http_client\":\"%s\"}",
+				        QuackapiJsonEscape(version), (long long)uptime_sec,
+				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
+				        QuackapiJsonEscape(http_client)));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
 			}
@@ -1283,9 +1470,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	bool path_matched_other_method = false;
 	vector<string> methods_for_path;
 	auto &qa_state = QuackapiState::Get(*db);
-	auto routes = qa_state.SnapshotRoutes();
-	auto streams = qa_state.SnapshotStreams();
-	for (auto &route : routes) {
+	// Live shared views — no per-request deep copy of the full registry.
+	auto routes = qa_state.LiveRoutes();
+	auto streams = qa_state.LiveStreams();
+	for (auto &route : *routes) {
 		vector<std::pair<string, string>> captures;
 		if (MatchPattern(route.pattern, req.path, captures)) {
 			if (!MethodListContains(methods_for_path, route.method)) {
@@ -1302,7 +1490,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 	}
-	for (auto &stream : streams) {
+	for (auto &stream : *streams) {
 		vector<std::pair<string, string>> captures;
 		if (MatchPattern(stream.pattern, req.path, captures)) {
 			if (!MethodListContains(methods_for_path, stream.method)) {
@@ -1323,7 +1511,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// Auto-HEAD: if HEAD and no explicit HEAD route, reuse the GET handler
 	// (routes first, then streams).
 	if (!match.matched && !stream_match.matched && req.method == "HEAD") {
-		for (auto &route : routes) {
+		for (auto &route : *routes) {
 			vector<std::pair<string, string>> captures;
 			if (MatchPattern(route.pattern, req.path, captures) && route.method == "GET") {
 				match.matched = true;
@@ -1336,7 +1524,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 		if (!match.matched) {
-			for (auto &stream : streams) {
+			for (auto &stream : *streams) {
 				vector<std::pair<string, string>> captures;
 				if (MatchPattern(stream.pattern, req.path, captures) && stream.method == "GET") {
 					stream_match.matched = true;
@@ -1394,7 +1582,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				alt_path = req.path + "/";
 			}
 			bool alt_matches = false;
-			for (auto &route : routes) {
+			for (auto &route : *routes) {
 				vector<std::pair<string, string>> captures;
 				if (!MatchPattern(route.pattern, alt_path, captures)) {
 					continue;
@@ -1404,7 +1592,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				break;
 			}
 			if (!alt_matches) {
-				for (auto &stream : streams) {
+				for (auto &stream : *streams) {
 					vector<std::pair<string, string>> captures;
 					if (MatchPattern(stream.pattern, alt_path, captures)) {
 						alt_matches = true;
@@ -1474,6 +1662,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			for (auto &kv : stream_match.path_params) {
 				provided[kv.first] = kv.second;
 			}
+			provided["request_id"] = request_id;
 			// Last-Event-ID header → last_id (query ?last_id= wins if both set).
 			if (provided.find("last_id") == provided.end()) {
 				string last_event_id;
@@ -1677,13 +1866,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 
 	try {
-		Connection con(*db);
-		auto prepared = con.Prepare(handler_sql);
-		if (prepared->HasError()) {
-			SetInternalError(res, prepared->GetError());
-			finish();
-			return;
-		}
+		auto &tls = TlsRequestCache();
+		auto &con = tls.GetConnection(*db);
 
 		// Request params: path captures shadow query params of the same name.
 		// Body fields (JSON / form / multipart) fill remaining names with loc=body.
@@ -1701,6 +1885,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		for (auto &kv : match.path_params) {
 			provided[kv.first] = {"path", kv.second};
 		}
+		// Server-stamped request id — bindable as $request_id in handler SQL
+		// (and libpq path). Wins over any client query/path of the same name.
+		provided["request_id"] = {"server", request_id};
 
 		// ---- HEADER / COOKIE PARAMS (FastAPI Header / Cookie) ----
 		// Declared via PARAM <name> HEADER [wire] | COOKIE [wire]. Wire defaults:
@@ -1736,55 +1923,67 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		// ---- REQUEST BODY BINDING (POST/PUT/PATCH) ----
-		// FastAPI parity: JSON body fields, form-urlencoded, multipart files,
-		// malformed JSON → 422 json_invalid, wrong CT → 422 model_attributes_type.
+		// Body fills `provided` BEFORE prepare + before optional libpq path.
+		// INSERT…RETURNING cannot prepare via DuckDB ATTACH; libpq handles it.
+		// Named params inferred from handler SQL (prepare may never run).
 		bool body_method = IsBodyMethod(req.method);
-		bool has_body_named = prepared->named_param_map.find("body") != prepared->named_param_map.end();
-		// Does the handler still need any non-path/non-claims param not yet provided?
-		bool needs_body_fields = has_body_named || !match.route.body_schema.empty();
-		if (!needs_body_fields) {
-			for (auto &entry : prepared->named_param_map) {
+		bool has_body_named = false;
+		bool needs_body_fields = !match.route.body_schema.empty();
+		{
+			// Lightweight $name scan (same rules as libpq CollectNamedParams).
+			for (idx_t i = 0; i < handler_sql.size(); i++) {
+				if (handler_sql[i] != '$') {
+					continue;
+				}
+				if (i + 1 >= handler_sql.size() ||
+				    !((handler_sql[i + 1] >= 'A' && handler_sql[i + 1] <= 'Z') ||
+				      (handler_sql[i + 1] >= 'a' && handler_sql[i + 1] <= 'z') || handler_sql[i + 1] == '_')) {
+					continue;
+				}
+				idx_t j = i + 1;
+				while (j < handler_sql.size() &&
+				       ((handler_sql[j] >= 'A' && handler_sql[j] <= 'Z') ||
+				        (handler_sql[j] >= 'a' && handler_sql[j] <= 'z') ||
+				        (handler_sql[j] >= '0' && handler_sql[j] <= '9') || handler_sql[j] == '_')) {
+					j++;
+				}
+				string pname = handler_sql.substr(i + 1, j - (i + 1));
+				i = j - 1;
+				if (StringUtil::Lower(pname) == "body") {
+					has_body_named = true;
+					needs_body_fields = true;
+					continue;
+				}
 				string ck;
-				if (IsClaimsParam(entry.first, ck)) {
+				if (IsClaimsParam(pname, ck)) {
 					continue;
 				}
-				if (entry.first == "body") {
+				if (provided.find(pname) != provided.end()) {
 					continue;
 				}
-				if (provided.find(entry.first) != provided.end()) {
+				if (IsPathParam(match.route.pattern, pname)) {
 					continue;
 				}
-				if (IsPathParam(match.route.pattern, entry.first)) {
-					continue;
-				}
-				const QuackapiParamSpec *ps = FindParamSpec(match.route.params, entry.first);
+				const QuackapiParamSpec *ps = FindParamSpec(match.route.params, pname);
 				if (ps && ps->has_default) {
 					continue;
 				}
-				// Header/Cookie params are not body-derived.
 				if (ps && (ps->source == QuackapiParamSource::HEADER || ps->source == QuackapiParamSource::COOKIE)) {
 					continue;
 				}
-				// File filename helpers are body-derived.
 				needs_body_fields = true;
-				break;
 			}
 		}
 
 		if (body_method) {
 			if (IsJsonMediaType(media) ||
 			    (media.empty() && !req.body.empty() && (req.body[0] == '{' || req.body[0] == '['))) {
-				// JSON body path.
 				if (req.body.empty() && !needs_body_fields && match.route.body_schema.empty()) {
 					// Empty JSON body with fully-bound query/path params — ignore.
 				} else {
 					case_insensitive_map_t<string> body_fields;
 					string err_json;
 					if (!ExtractJsonBodyFields(con, req.body, body_fields, err_json)) {
-						// Empty body with application/json and missing fields: if body
-						// is empty, Extract returns json_invalid — correct for body models.
-						// If CT is application/json and body empty but only query params
-						// needed, we already skipped above.
 						SetJson(res, 422, err_json);
 						finish();
 						return;
@@ -1811,23 +2010,19 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				case_insensitive_map_t<string> form_fields;
 				ParseFormUrlEncoded(req.body, form_fields);
 				for (auto &kv : form_fields) {
-					// Form fields are body-located (FastAPI Form(...)).
 					provided[kv.first] = {"body", kv.second};
 				}
 				if (has_body_named && provided.find("body") == provided.end()) {
 					provided["body"] = {"body", req.body};
 				}
 			} else if (multipart_ct) {
-				// Text fields
 				for (auto &kv : req.form.fields) {
 					provided[kv.first] = {"body", kv.second.content};
 				}
-				// Files: $name = content bytes, $name_filename = original filename
 				for (auto &kv : req.form.files) {
 					provided[kv.first] = {"body", kv.second.content};
 					string fname_key = kv.first + "_filename";
 					provided[fname_key] = {"body", kv.second.filename};
-					// Convenience: single-file routes may bind $filename
 					if (provided.find("filename") == provided.end()) {
 						provided["filename"] = {"body", kv.second.filename};
 					}
@@ -1847,6 +2042,40 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				SetJson(res, 422,
 				        ValidationErrorJsonBody("Input should be a valid dictionary or object to extract fields from",
 				                                "model_attributes_type"));
+				finish();
+				return;
+			}
+		}
+
+		// Native Postgres path (optional): same model as FastAPI+psycopg —
+		// thread-local libpq + PQexecParams. BEFORE DuckDB prepare so
+		// INSERT…RETURNING and other ATTACH-hostile SQL still work.
+		if (!options.pg_dsn.empty()) {
+			string pg_body, pg_err;
+			if (QuackapiTryPgNative(options.pg_dsn, handler_sql, provided, pg_body, pg_err)) {
+				SetJson(res, match.route.status, pg_body);
+				finish();
+				return;
+			}
+			// Fall through to DuckDB on conversion miss / non-PG SQL.
+			(void)pg_err;
+		}
+
+		// DuckDB prepare (after libpq short-circuit).
+		string prepare_err;
+		auto *prepared = tls.GetPrepared(handler_sql, prepare_err);
+		if (!prepared) {
+			SetInternalError(res, prepare_err.empty() ? string("prepare failed") : prepare_err);
+			finish();
+			return;
+		}
+
+		// Zero-parameter handlers (e.g. SELECT 'world' AS msg): serve cached JSON
+		// after the first successful execute on this worker thread.
+		const bool zero_params = prepared->named_param_map.empty();
+		if (zero_params) {
+			if (const string *cached = tls.LookupStaticBody(handler_sql)) {
+				SetJson(res, match.route.status, *cached);
 				finish();
 				return;
 			}
@@ -2204,11 +2433,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					body += ",";
 				}
 				first_col = false;
-				body += "\"" + JsonEscape(names[col]) + "\":" + ValueToJson(rv.cols[col]);
+				body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(rv.cols[col]);
 			}
 			body += "}";
 		}
 		body += "]";
+		// Cache constant responses (no bind params, pure JSON) for this worker.
+		if (zero_params && location_value.empty() && set_cookie_values.empty()) {
+			tls.StoreStaticBody(handler_sql, body);
+		}
 		SetJson(res, match.route.status, body);
 		// Keep body so Content-Length is correct; httplib omits the body for HEAD.
 	} catch (std::exception &ex) {

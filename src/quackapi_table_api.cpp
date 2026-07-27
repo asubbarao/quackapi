@@ -7,28 +7,17 @@
 
 #include "quackapi_state.hpp"
 #include "quackapi_table_api.hpp"
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
 namespace {
 
-string Trim(const string &input) {
-	idx_t begin = 0;
-	idx_t end = input.size();
-	while (begin < end && StringUtil::CharacterIsSpace(input[begin])) {
-		begin++;
-	}
-	while (end > begin && (StringUtil::CharacterIsSpace(input[end - 1]) || input[end - 1] == ';')) {
-		end--;
-	}
-	return input.substr(begin, end - begin);
-}
-
 //! A quoted '<value>' token starting at rest[0]. Returns the inner value and
 //! advances `rest` past the closing quote. Throws a parse-style error via the
 //! bool return (false) on a missing/unterminated quote.
 bool ParseQuoted(string &rest, string &out) {
-	rest = Trim(rest);
+	rest = QuackapiTrim(rest);
 	if (rest.empty() || rest[0] != '\'') {
 		return false;
 	}
@@ -37,7 +26,7 @@ bool ParseQuoted(string &rest, string &out) {
 		return false;
 	}
 	out = rest.substr(1, close - 1);
-	rest = Trim(rest.substr(close + 1));
+	rest = QuackapiTrim(rest.substr(close + 1));
 	return true;
 }
 
@@ -45,7 +34,7 @@ bool ParseQuoted(string &rest, string &out) {
 //! Bare tokens must not contain '"' (those need proper "quoting") so the
 //! statement splitter / shell never sees an unbalanced double-quote.
 bool ParseIdent(string &rest, string &out) {
-	rest = Trim(rest);
+	rest = QuackapiTrim(rest);
 	if (rest.empty()) {
 		return false;
 	}
@@ -60,7 +49,7 @@ bool ParseIdent(string &rest, string &out) {
 					continue;
 				}
 				out = result;
-				rest = Trim(rest.substr(i + 1));
+				rest = QuackapiTrim(rest.substr(i + 1));
 				return !out.empty();
 			}
 			result += rest[i];
@@ -76,7 +65,7 @@ bool ParseIdent(string &rest, string &out) {
 		return false;
 	}
 	out = tok;
-	rest = space == string::npos ? string() : Trim(rest.substr(space));
+	rest = space == string::npos ? string() : QuackapiTrim(rest.substr(space));
 	return true;
 }
 
@@ -117,7 +106,7 @@ struct TableApiParseData : public ParserExtensionParseData {
 //! Grammar:
 //!   CREATE [OR REPLACE] API FOR TABLE <table> [AT '<base>'] [KEY '<column>']
 ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &query) {
-	auto q = Trim(query);
+	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -132,7 +121,7 @@ ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = Trim(q.substr(pos));
+	auto rest = QuackapiTrim(q.substr(pos));
 	if (rest.empty()) {
 		return ParserExtensionParseResult("CREATE API FOR TABLE expects a table name");
 	}
@@ -192,8 +181,7 @@ unique_ptr<FunctionData> ApplyApiBind(ClientContext &, TableFunctionBindInput &i
 	bind_data->table = input.inputs[1].GetValue<string>();
 	bind_data->base_path = input.inputs[2].GetValue<string>();
 	bind_data->key = input.inputs[3].GetValue<string>();
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
+	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
 
@@ -245,16 +233,15 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	get_route.status = 200;
 	state.AddRoute(get_route, bind_data.or_replace);
 
-	output.SetValue(
-	    0, 0, Value(StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key)));
-	output.SetCardinality(1);
-	bind_data.finished = true;
+	EmitOneShotStatus(output, bind_data.finished,
+	                  StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key));
 }
 
 TableFunction MakeApplyApiFunction() {
-	return TableFunction("quackapi_apply_table_api",
-	                     {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                     ApplyApiExec, ApplyApiBind);
+	return MakeApplyDdlFunction(
+	    "quackapi_apply_table_api",
+	    {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ApplyApiExec,
+	    ApplyApiBind);
 }
 
 ParserExtensionPlanResult TableApiPlan(ParserExtensionInfo *, ClientContext &,
@@ -266,8 +253,7 @@ ParserExtensionPlanResult TableApiPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.table));
 	result.parameters.push_back(Value(data.base_path));
 	result.parameters.push_back(Value(data.key));
-	result.requires_valid_transaction = false;
-	result.return_type = StatementReturnType::QUERY_RESULT;
+	FinishDdlPlan(result);
 	return result;
 }
 

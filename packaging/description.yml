@@ -15,23 +15,21 @@ extension:
     FastAPI-class HTTP framework inside DuckDB — CREATE ROUTE turns SQL into
     typed, validated endpoints; one process is DB + HTTP (+ PDF/renderer via
     companion extensions).
-  version: 0.1.0
+  version: 0.1.1
   language: C++
   build: cmake
   license: MIT
   maintainers:
     - asubbarao
   # HTTP server uses DuckDB's bundled httplib — no server sockets on wasm.
-  # All Windows legs excluded: no successful windows_amd64/MSVC or mingw
-  # CI proof in this repo yet (httplib is portable; re-opt-in after a green
-  # community CI windows_amd64 build). Target signed arches: linux_amd64,
-  # linux_arm64, osx_amd64, osx_arm64.
-  excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
+  # windows_amd64 enabled (MSVC / extension-ci-tools). MinGW/rtools/arm64
+  # still excluded. Target signed arches: linux_*, osx_*, windows_amd64.
+  excluded_platforms: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
 
 repo:
   github: asubbarao/quackapi
   # Pin to the packaging commit SHA (set by release engineer; never a branch).
-  ref: 94eb4506151feeb18db00e90349debdee8b7ff22
+  ref: 9ec792678f610483e150fad0debf824a540905ab
 
 docs:
   hello_world: |
@@ -112,7 +110,9 @@ docs:
 
     - **Auth:** `CREATE AUTH … AS API_KEY | JWT (SECRET … [, ALGORITHM HS256])`,
       `REQUIRE` on routes, `quackapi_add_api_key`, `quackapi_auths`, claims as
-      `$claims_*`.
+      `$claims_*`. JWT verify is self-contained (DuckDB-bundled mbedtls +
+      `json_*` claims) — does not depend on community `crypto` (that extension
+      is hash/HMAC only, not JWT parse/exp/nbf/claims).
     - **Groups:** `CREATE GROUP … WITH (prefix=…, auth=…, tags=…)` — path prefix
       + auth inheritance (`quackapi_groups()`).
     - **Table API:** `CREATE API FOR TABLE t [AT '/path'] [KEY 'id']` → GET list
@@ -129,9 +129,8 @@ docs:
     ## Platforms & build
 
     Targets **DuckDB v1.5.4**. C++17; depends only on DuckDB-bundled **httplib**
-    and **mbedtls** (no vcpkg, no libcurl). CI excludes wasm and all Windows
-    legs until a green windows_amd64 community build exists. Signed community
-    binaries land after this descriptor is accepted.
+    and **mbedtls** (no vcpkg, no libcurl). CI excludes wasm and Windows MinGW/rtools/arm64. Signed community
+    binaries for linux/osx are live; windows_amd64 re-opt-in via this descriptor.
 
     ## Limits (honest)
 
@@ -139,7 +138,8 @@ docs:
     - Serve `memory_limit` default is 256MB only when nothing is configured;
       use `memory_limit := '4GB'` / `SET quackapi_memory_limit` (never clobbers
       an operator `SET memory_limit`).
-    - Request body max 8 MiB; JWT HS256 only; table API is read-only scaffold.
+    - Request body max 8 MiB; JWT **HS256 only** (no RS256/OIDC); table API is
+      read-only scaffold.
     - Route registry is instance-scoped (re-run DDL after reopen); queue jobs
       persist in `quackapi_jobs`.
 

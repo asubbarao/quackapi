@@ -6,6 +6,7 @@
 #include <tuple>
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
@@ -27,6 +28,16 @@ QuackapiState &QuackapiState::Get(DatabaseInstance &db) {
 	return *state;
 }
 
+void QuackapiState::PublishRoutes() {
+	// Caller holds routes_mutex.
+	routes_live = make_shared_ptr<const vector<QuackapiRoute>>(routes);
+}
+
+void QuackapiState::PublishStreams() {
+	// Caller holds streams_mutex.
+	streams_live = make_shared_ptr<const vector<QuackapiStream>>(streams);
+}
+
 void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 	std::lock_guard<std::mutex> lock(routes_mutex);
 	for (auto it = routes.begin(); it != routes.end(); ++it) {
@@ -35,10 +46,12 @@ void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 				throw InvalidInputException("Route \"%s\" already exists — use CREATE OR REPLACE ROUTE", route.name);
 			}
 			*it = route;
+			PublishRoutes();
 			return;
 		}
 	}
 	routes.push_back(route);
+	PublishRoutes();
 }
 
 bool QuackapiState::DropRoute(const string &name) {
@@ -46,6 +59,7 @@ bool QuackapiState::DropRoute(const string &name) {
 	for (auto it = routes.begin(); it != routes.end(); ++it) {
 		if (it->name == name) {
 			routes.erase(it);
+			PublishRoutes();
 			return true;
 		}
 	}
@@ -53,8 +67,16 @@ bool QuackapiState::DropRoute(const string &name) {
 }
 
 vector<QuackapiRoute> QuackapiState::SnapshotRoutes() {
+	auto live = LiveRoutes();
+	return *live;
+}
+
+shared_ptr<const vector<QuackapiRoute>> QuackapiState::LiveRoutes() {
 	std::lock_guard<std::mutex> lock(routes_mutex);
-	return routes;
+	if (!routes_live) {
+		PublishRoutes();
+	}
+	return routes_live;
 }
 
 void QuackapiState::AddStream(const QuackapiStream &stream, bool or_replace) {
@@ -65,10 +87,12 @@ void QuackapiState::AddStream(const QuackapiStream &stream, bool or_replace) {
 				throw InvalidInputException("Stream \"%s\" already exists — use CREATE OR REPLACE STREAM", stream.name);
 			}
 			*it = stream;
+			PublishStreams();
 			return;
 		}
 	}
 	streams.push_back(stream);
+	PublishStreams();
 }
 
 bool QuackapiState::DropStream(const string &name) {
@@ -76,6 +100,7 @@ bool QuackapiState::DropStream(const string &name) {
 	for (auto it = streams.begin(); it != streams.end(); ++it) {
 		if (it->name == name) {
 			streams.erase(it);
+			PublishStreams();
 			return true;
 		}
 	}
@@ -83,8 +108,16 @@ bool QuackapiState::DropStream(const string &name) {
 }
 
 vector<QuackapiStream> QuackapiState::SnapshotStreams() {
+	auto live = LiveStreams();
+	return *live;
+}
+
+shared_ptr<const vector<QuackapiStream>> QuackapiState::LiveStreams() {
 	std::lock_guard<std::mutex> lock(streams_mutex);
-	return streams;
+	if (!streams_live) {
+		PublishStreams();
+	}
+	return streams_live;
 }
 
 void QuackapiState::AddGroup(const QuackapiGroup &group, bool or_replace) {

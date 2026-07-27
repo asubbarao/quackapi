@@ -7,7 +7,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
 source "$DIR/lib.sh"
 
-PORT="${QUACKAPI_TEST_PORT:-18971}"
+PORT="${QUACKAPI_TEST_PORT:-18972}"
 INIT="$(mktemp /tmp/quackapi_compression_XXXXXX.sql)"
 
 # Payload large enough to exceed default min (256) and actually shrink under zstd/gzip.
