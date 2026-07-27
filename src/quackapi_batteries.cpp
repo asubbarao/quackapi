@@ -242,8 +242,8 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			pref = "auto";
 		}
 		if (pref != "auto" && pref != "curl" && pref != "httplib") {
-			throw InvalidInputException(
-			    "quackapi_serve: http_client must be 'auto', 'curl', or 'httplib' (got '%s')", opts.http_client);
+			throw InvalidInputException("quackapi_serve: http_client must be 'auto', 'curl', or 'httplib' (got '%s')",
+			                            opts.http_client);
 		}
 
 		if (pref == "httplib") {
@@ -311,19 +311,18 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 				opts.http_client_active = "curl";
 				opts.http_client_reason.clear();
 				fprintf(stderr, "quackapi.http_client=curl\n");
-				applied.push_back(
-				    "http_client=curl (WHY: curl_httpfs — libcurl pool + HTTP/2 + async IO for "
-				    "outbound https reads from handlers; 100% httpfs-compatible)");
+				applied.push_back("http_client=curl (WHY: curl_httpfs — libcurl pool + HTTP/2 + async IO for "
+				                  "outbound https reads from handlers; 100% httpfs-compatible)");
 			} else {
 				opts.http_client_active = "httplib";
 				opts.http_client_reason = "curl_httpfs_unavailable";
 				// One structured line for ops (and a short applied summary).
 				fprintf(stderr, "quackapi.http_client=httplib reason=curl_httpfs_unavailable\n");
-				applied.push_back(StringUtil::Format(
-				    "http_client=httplib reason=curl_httpfs_unavailable (WHY: graceful fallback — "
-				    "curl_httpfs not installable/loadable on this platform or environment; "
-				    "detail=%s)",
-				    fail_detail.empty() ? "unknown" : StringUtil::Replace(fail_detail, "\n", " ")));
+				applied.push_back(
+				    StringUtil::Format("http_client=httplib reason=curl_httpfs_unavailable (WHY: graceful fallback — "
+				                       "curl_httpfs not installable/loadable on this platform or environment; "
+				                       "detail=%s)",
+				                       fail_detail.empty() ? "unknown" : StringUtil::Replace(fail_detail, "\n", " ")));
 			}
 		}
 	}

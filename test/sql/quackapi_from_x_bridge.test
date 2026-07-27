@@ -1,6 +1,6 @@
 # name: test/sql/quackapi_from_x_bridge.test
 # description: sitting_duck quack_from_x extraction — FastAPI routes + Pydantic models via native table functions
-# group: [quackapi]
+# group: [sql]
 
 require quackapi
 
