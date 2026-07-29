@@ -431,6 +431,8 @@ bash test/conformance/run.sh       # FastAPI parity harness
 
 | Doc | Content |
 |-----|---------|
+| [`docs/index.md`](docs/index.md) | Guided tour (start here) |
+| [`docs/guide/extension-composition.md`](docs/guide/extension-composition.md) | Compose companions: gateway, SSE, `quack_from_x`, mesh, PDF |
 | [`docs/community-page.md`](docs/community-page.md) | Community-extensions page copy |
 | [`packaging/description.yml`](packaging/description.yml) / [`description.yml`](description.yml) | Community submission manifest |
 | [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md) | Scorecard vs FastAPI |
