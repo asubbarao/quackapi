@@ -24,9 +24,10 @@ Route item: GET /items/:id
 
 # ---------------------------------------------------------------------------
 # GET registered route → 200 + JSON array body
+# body is BLOB (safe for parquet/arrow); cast for text asserts.
 # ---------------------------------------------------------------------------
 query III
-SELECT status, body, content_type FROM quackapi_request('GET', '/hello');
+SELECT status, body::VARCHAR, content_type FROM quackapi_request('GET', '/hello');
 ----
 200	[{"msg":"world"}]	application/json
 
@@ -34,7 +35,7 @@ SELECT status, body, content_type FROM quackapi_request('GET', '/hello');
 # Missing path → 404
 # ---------------------------------------------------------------------------
 query II
-SELECT status, body FROM quackapi_request('GET', '/nope');
+SELECT status, body::VARCHAR FROM quackapi_request('GET', '/nope');
 ----
 404	{"detail":"Not Found"}
 
@@ -42,7 +43,7 @@ SELECT status, body FROM quackapi_request('GET', '/nope');
 # Path params
 # ---------------------------------------------------------------------------
 query II
-SELECT status, body FROM quackapi_request('GET', '/items/42');
+SELECT status, body::VARCHAR FROM quackapi_request('GET', '/items/42');
 ----
 200	[{"id":42}]
 
@@ -50,7 +51,7 @@ SELECT status, body FROM quackapi_request('GET', '/items/42');
 # POST with JSON body fields (Content-Type application/json set by TF)
 # ---------------------------------------------------------------------------
 query II
-SELECT status, body FROM quackapi_request('POST', '/add', '{"a":2,"b":3}');
+SELECT status, body::VARCHAR FROM quackapi_request('POST', '/add', '{"a":2,"b":3}');
 ----
 200	[{"sum":5}]
 

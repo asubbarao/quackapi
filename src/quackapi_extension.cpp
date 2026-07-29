@@ -350,8 +350,10 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindIn
 	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
 		bind_data->body = input.inputs[2].ToString();
 	}
+	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
+	// "Invalid unicode" on Value(string). JSON/text clients cast: body::VARCHAR.
 	return_types.emplace_back(LogicalType::INTEGER);
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType::BLOB);
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
 	names.emplace_back("body");
@@ -369,7 +371,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	string content_type;
 	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type);
 	output.SetValue(0, 0, Value::INTEGER(status));
-	output.SetValue(1, 0, Value(body));
+	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
 	output.SetValue(2, 0, Value(content_type));
 	output.SetCardinality(1);
 	bind_data.finished = true;
