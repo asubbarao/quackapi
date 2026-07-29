@@ -22,10 +22,10 @@ The query already types the response.
 
 ## Five-line quickstart
 
-Requires **DuckDB v1.5.4** (community binaries are published per DuckDB version).
+Requires **DuckDB ≥ v1.5.3** (quack floor). CI builds **v1.5.3 / v1.5.4 / v1.5.5** for linux, macOS, and windows_amd64.
 
 ```sql
-INSTALL quackapi FROM community;
+INSTALL quackapi FROM community;  -- tip CDN host only
 LOAD quackapi;
 
 CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
@@ -333,22 +333,35 @@ LOAD quackapi;
 
 | Requirement | Detail |
 |-------------|--------|
-| **DuckDB** | **v1.5.4** (binaries live under `community-extensions.duckdb.org/v1.5.4/…`). v1.5.3 → HTTP 404. |
-| **Linux** | `linux_amd64`, `linux_arm64` — **yes** |
-| **macOS** | `osx_amd64`, `osx_arm64` — **yes** |
-| **Windows** | not in community yet (descriptor still excludes Windows; use a [GitHub Release](https://github.com/asubbarao/quackapi/releases) asset + `-unsigned` until CI re-opts in) |
+| **DuckDB min** | **≥ v1.5.3** (quack). Later 1.5.x supported. |
+| **CI matrix** | `v1.5.3`, `v1.5.4`, `v1.5.5` × linux_amd64/arm64, osx_amd64/arm64, windows_amd64 |
+| **Community CDN** | Tip stable path only (`…/v{exact}/…`). Wrong host patch → HTTP 404. |
+| **Linux** | `linux_amd64`, `linux_arm64` — yes |
+| **macOS** | `osx_amd64`, `osx_arm64` — yes |
+| **Windows** | `windows_amd64` in CI matrix + Release assets; community tip may lag (use Release + `-unsigned` if CDN 404) |
 | **Wasm** | excluded (no server sockets) |
 
-### Direct download (unsigned / offline)
+### Direct download (multi-host / offline / Windows)
 
 Release assets: https://github.com/asubbarao/quackapi/releases  
 
+Tagged builds publish:
+
+```text
+quackapi-duckdb-v1.5.3-linux_amd64.duckdb_extension
+quackapi-duckdb-v1.5.3-windows_amd64.duckdb_extension
+quackapi-duckdb-v1.5.4-osx_arm64.duckdb_extension
+…
+```
+
 ```sh
-# example: linux amd64
+# match SELECT version() + platform
 curl -fsSL -o quackapi.duckdb_extension \
-  "https://github.com/asubbarao/quackapi/releases/download/v0.1.1/quackapi-v1.5.4-linux_amd64.duckdb_extension"
+  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v1.5.3-osx_arm64.duckdb_extension"
 duckdb -unsigned -c "LOAD '$(pwd)/quackapi.duckdb_extension';"
 ```
+
+Full matrix without a tag: **Actions → Run workflow** (`multi_version=true`).
 
 ### From source
 
@@ -363,8 +376,8 @@ GEN=ninja make release
 LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
-**Target DuckDB:** **v1.5.4** (CI + community pin). Dependencies: C++17, DuckDB’s
-bundled **httplib** + **mbedtls** only — no vcpkg, no libcurl.
+**Target DuckDB:** **≥ v1.5.3** (CI matrix v1.5.3–v1.5.5; community tip separate).
+Dependencies: C++17, DuckDB’s bundled **httplib** + **mbedtls** only — no vcpkg, no libcurl.
 
 ---
 
@@ -403,9 +416,9 @@ bundled **httplib** + **mbedtls** only — no vcpkg, no libcurl.
 
 - **Write concurrency / OLTP:** single-writer semantics; not a replacement for
   a connection-pooled app tier under heavy concurrent writes.
-- **Platform coverage:** community ships **signed** linux/osx for DuckDB
-  **v1.5.4**. Windows is not on the community CDN yet; use a Release asset
-  with `duckdb -unsigned` or build from source.
+- **Platform coverage:** CI builds linux/macOS/windows for **v1.5.3–v1.5.5**.
+  Community CDN is tip-only and can lag Windows; use Release assets +
+  `duckdb -unsigned` when the exact host path 404s.
 - **Serve memory default:** `quackapi_serve` applies a 256MB `memory_limit`
   only when nothing was configured (no `memory_limit` / `quackapi_memory_limit`
   and DuckDB is still at its system default). Prefer
