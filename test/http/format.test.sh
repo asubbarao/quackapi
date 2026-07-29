@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HTTP integration: FORMAT ndjson/csv + Accept negotiation.
+# HTTP integration: FORMAT ndjson/csv/parquet + Accept negotiation.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,6 +21,9 @@ CREATE ROUTE items_csv GET '/items_csv' FORMAT csv AS
 
 CREATE ROUTE items_json_fmt GET '/items_json_fmt' FORMAT json AS
   SELECT 1 AS id, 'x' AS name;
+
+CREATE ROUTE items_parquet GET '/items_parquet' FORMAT parquet AS
+  SELECT * FROM (VALUES (1, 'alice'), (2, 'bob,jr')) AS t(id, name);
 SQL
 
 boot_quackapi "$PORT" "$INIT"
@@ -28,6 +31,44 @@ rm -f "$INIT"
 
 header_ct() {
   echo "$_QA_LAST_HEADERS" | tr -d '\r' | grep -i '^Content-Type:' | head -1
+}
+
+# Binary body fetch (bash $(cat) strips NULs — keep bytes on disk).
+# Sets: _QA_LAST_STATUS, _QA_LAST_HEADERS, _QA_LAST_BODY_FILE
+curl_binary() {
+  local method="$1" path="$2"
+  shift 2
+  local url="http://127.0.0.1:${_QA_PORT}${path}"
+  local tmp hdr
+  tmp="$(mktemp)"
+  hdr="$(mktemp)"
+  set +e
+  local err
+  err="$(curl -sS -D "$hdr" -o "$tmp" -X "$method" "$@" "$url" 2>&1)"
+  local rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    _QA_LAST_STATUS="0"
+    _QA_LAST_HEADERS=""
+    _QA_LAST_BODY_FILE=""
+    rm -f "$tmp" "$hdr"
+    echo "curl failed rc=$rc: ${err}" >&2
+    return 0
+  fi
+  _QA_LAST_BODY_FILE="$tmp"
+  _QA_LAST_HEADERS="$(cat "$hdr")"
+  _QA_LAST_STATUS="$(awk 'NR==1 {print $2}' "$hdr")"
+  rm -f "$hdr"
+}
+
+assert_parquet_magic() {
+  local file="$1" label="${2:-parquet_magic}"
+  local magic
+  magic="$(head -c 4 "$file" 2>/dev/null || true)"
+  if [[ "$magic" != "PAR1" ]]; then
+    echo "ASSERT FAIL ($label): expected PAR1 magic, got: $(xxd -l 4 -p "$file" 2>/dev/null || echo missing)" >&2
+    return 1
+  fi
 }
 
 echo "-- 1. default route still JSON array"
@@ -97,6 +138,38 @@ if ! header_ct | grep -qi 'text/csv'; then
   echo "ASSERT FAIL: FORMAT json should honor Accept text/csv: $(header_ct)" >&2
   exit 1
 fi
+
+echo "-- 8. FORMAT parquet route (explicit; Accept ignored; PAR1 magic)"
+curl_binary GET "/items_parquet" -H "Accept: application/json"
+assert_status "$_QA_LAST_STATUS" "200" "fmt_parquet"
+assert_parquet_magic "$_QA_LAST_BODY_FILE" "fmt_parquet"
+if ! header_ct | grep -qi 'application/vnd.apache.parquet'; then
+  echo "ASSERT FAIL: explicit FORMAT parquet Content-Type: $(header_ct)" >&2
+  exit 1
+fi
+# Round-trip: DuckDB can read the HTTP body as parquet
+"$DUCKDB_BIN" -unsigned -c "SELECT id, name FROM read_parquet('${_QA_LAST_BODY_FILE}') ORDER BY id" | grep -q alice
+rm -f "$_QA_LAST_BODY_FILE"
+
+echo "-- 9. Accept: application/vnd.apache.parquet on default FORMAT → Parquet"
+curl_binary GET "/items" -H "Accept: application/vnd.apache.parquet"
+assert_status "$_QA_LAST_STATUS" "200" "items_accept_parquet"
+assert_parquet_magic "$_QA_LAST_BODY_FILE" "items_accept_parquet"
+if ! header_ct | grep -qi 'application/vnd.apache.parquet'; then
+  echo "ASSERT FAIL: Accept parquet Content-Type: $(header_ct)" >&2
+  exit 1
+fi
+rm -f "$_QA_LAST_BODY_FILE"
+
+echo "-- 10. Accept: application/parquet alias → Parquet"
+curl_binary GET "/items" -H "Accept: application/parquet"
+assert_status "$_QA_LAST_STATUS" "200" "items_accept_parquet_alias"
+assert_parquet_magic "$_QA_LAST_BODY_FILE" "items_accept_parquet_alias"
+if ! header_ct | grep -qi 'application/vnd.apache.parquet'; then
+  echo "ASSERT FAIL: Accept application/parquet Content-Type: $(header_ct)" >&2
+  exit 1
+fi
+rm -f "$_QA_LAST_BODY_FILE"
 
 echo "format.test.sh OK"
 stop_quackapi
