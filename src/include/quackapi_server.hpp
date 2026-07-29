@@ -199,10 +199,14 @@ private:
 };
 
 //! In-process HTTP-shape invoke (no TCP). Builds a Request, runs Dispatch, returns
-//! status + body. path may include ?query. Optional body for POST/PUT/PATCH.
-//! Content-Type for body defaults to application/json when body is non-empty.
+//! status + body + response headers. path may include ?query.
+//! Optional body for POST/PUT/PATCH (Content-Type application/json when non-empty).
+//! req_headers: optional request headers (e.g. X-Request-ID, Accept, Authorization).
+//! headers_out: response header map (first value per name; case as httplib stores it).
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
-                              int &status_out, string &body_out, string &content_type_out);
+                              int &status_out, string &body_out, string &content_type_out,
+                              const unordered_map<string, string> *req_headers = nullptr,
+                              unordered_map<string, string> *headers_out = nullptr);
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.

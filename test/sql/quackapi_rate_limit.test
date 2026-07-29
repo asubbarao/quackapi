@@ -1,9 +1,10 @@
 # name: test/sql/quackapi_rate_limit.test
-# description: CREATE ROUTE RATE LIMIT clause parses and registers
+# description: RATE LIMIT DDL + in-process enforcement (no TCP / no .sh)
 # group: [sql]
 
 require quackapi
 
+# --- DDL registration ---
 statement ok
 CREATE ROUTE rl1 GET '/rl1' RATE LIMIT 5 PER 10 AS SELECT 1 AS x;
 
@@ -11,9 +12,10 @@ statement ok
 CREATE ROUTE rl2 GET '/rl2' RATE LIMIT 2 PER 30 BY token AS SELECT 1 AS x;
 
 query I
-SELECT count(*) FROM quackapi_routes() WHERE name IN ('rl1','rl2');
+SELECT name FROM quackapi_routes() WHERE name IN ('rl1','rl2') ORDER BY name;
 ----
-2
+rl1
+rl2
 
 statement error
 CREATE ROUTE bad GET '/bad' RATE LIMIT 0 PER 10 AS SELECT 1;
@@ -24,3 +26,33 @@ statement error
 CREATE ROUTE bad2 GET '/bad2' RATE LIMIT 5 PER 10 BY user AS SELECT 1;
 ----
 ip, token, or key
+
+# --- Enforcement via quackapi_request (process-static limiter, same path as HTTP) ---
+statement ok
+CREATE OR REPLACE ROUTE limited GET '/limited' RATE LIMIT 3 PER 60 BY ip AS SELECT 'ok' AS msg;
+
+query I
+SELECT status FROM quackapi_request('GET', '/limited');
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/limited');
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/limited');
+----
+200
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/limited');
+----
+429	{"detail":"Rate limit exceeded"}
+
+# Retry-After present on 429
+query I
+SELECT headers['Retry-After'] IS NOT NULL FROM quackapi_request('GET', '/limited');
+----
+true

@@ -326,20 +326,23 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 }
 
 //===--------------------------------------------------------------------===//
-// quackapi_request(method, path [, body]) — in-process TestClient (no TCP)
+// quackapi_request(method, path [, body] [, headers := MAP]) — TestClient
+// No TCP. Same handler path as serve. Community SQLLogic style.
 //===--------------------------------------------------------------------===//
 
 struct RequestBindData : public TableFunctionData {
 	string method;
 	string path;
 	string body;
+	unordered_map<string, string> req_headers;
 	bool finished = false;
 };
 
 static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
-		throw InvalidInputException("quackapi_request(method, path [, body]) expects 2 or 3 arguments");
+		throw InvalidInputException("quackapi_request(method, path [, body] [, headers := MAP]) expects 2 or 3 "
+		                            "positional args");
 	}
 	auto bind_data = make_uniq<RequestBindData>();
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
@@ -350,14 +353,26 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindIn
 	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
 		bind_data->body = input.inputs[2].ToString();
 	}
+	auto header_it = input.named_parameters.find("headers");
+	if (header_it != input.named_parameters.end() && !header_it->second.IsNull()) {
+		// MAP is LIST of STRUCT{key, value}
+		for (auto &child : MapValue::GetChildren(header_it->second)) {
+			auto &kv = StructValue::GetChildren(child);
+			if (kv.size() >= 2 && !kv[0].IsNull() && !kv[1].IsNull()) {
+				bind_data->req_headers[kv[0].ToString()] = kv[1].ToString();
+			}
+		}
+	}
 	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
-	// "Invalid unicode" on Value(string). JSON/text clients cast: body::VARCHAR.
+	// "Invalid unicode" on Value(string). JSON/text clients: decode(body).
 	return_types.emplace_back(LogicalType::INTEGER);
 	return_types.emplace_back(LogicalType::BLOB);
 	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
 	names.emplace_back("status");
 	names.emplace_back("body");
 	names.emplace_back("content_type");
+	names.emplace_back("headers");
 	return std::move(bind_data);
 }
 
@@ -369,10 +384,21 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	int status = 0;
 	string body;
 	string content_type;
-	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type);
+	unordered_map<string, string> resp_headers;
+	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
+	                         &bind_data.req_headers, &resp_headers);
 	output.SetValue(0, 0, Value::INTEGER(status));
 	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
 	output.SetValue(2, 0, Value(content_type));
+	vector<Value> hk;
+	vector<Value> hv;
+	hk.reserve(resp_headers.size());
+	hv.reserve(resp_headers.size());
+	for (auto &kv : resp_headers) {
+		hk.emplace_back(kv.first);
+		hv.emplace_back(kv.second);
+	}
+	output.SetValue(3, 0, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, hk, hv));
 	output.SetCardinality(1);
 	bind_data.finished = true;
 }
@@ -591,12 +617,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	stop_set.AddFunction(stop);
 	loader.RegisterFunction(stop_set);
 
-	// quackapi_request(method, path [, body]) — in-process TestClient (no TCP).
+	// quackapi_request — SQLLogic TestClient (no TCP, no .sh).
 	TableFunctionSet request_set("quackapi_request");
 	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
+	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	request_set.AddFunction(request2);
 	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       RequestExec, RequestBind);
+	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	request_set.AddFunction(request3);
 	loader.RegisterFunction(request_set);
 

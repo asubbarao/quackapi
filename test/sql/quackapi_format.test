@@ -1,0 +1,89 @@
+# name: test/sql/quackapi_format.test
+# description: FORMAT json|ndjson|csv|parquet + Accept via quackapi_request
+# group: [sql]
+
+require quackapi
+
+require parquet
+
+statement ok
+CREATE OR REPLACE ROUTE items GET '/items' AS
+  SELECT 1 AS id, 'alice' AS name UNION ALL SELECT 2, 'bob';
+
+statement ok
+CREATE OR REPLACE ROUTE items_ndjson GET '/items_ndjson' FORMAT ndjson AS
+  SELECT 1 AS id, 'alice' AS name UNION ALL SELECT 2, 'bob';
+
+statement ok
+CREATE OR REPLACE ROUTE items_csv GET '/items_csv' FORMAT csv AS
+  SELECT 1 AS id, 'alice' AS name UNION ALL SELECT 2, 'bob,jr';
+
+statement ok
+CREATE OR REPLACE ROUTE items_parquet GET '/items_parquet' FORMAT parquet AS
+  SELECT 1 AS id, 'alice' AS name UNION ALL SELECT 2, 'bob';
+
+query II
+SELECT name, format FROM quackapi_routes()
+WHERE name IN ('items','items_ndjson','items_csv','items_parquet')
+ORDER BY name;
+----
+items	json
+items_csv	csv
+items_ndjson	ndjson
+items_parquet	parquet
+
+query II
+SELECT status, content_type FROM quackapi_request('GET', '/items');
+----
+200	application/json
+
+query I
+SELECT starts_with(decode(body), '[{') FROM quackapi_request('GET', '/items');
+----
+true
+
+query II
+SELECT status, content_type FROM quackapi_request('GET', '/items_ndjson');
+----
+200	application/x-ndjson
+
+query I
+SELECT decode(body) LIKE '%alice%' FROM quackapi_request('GET', '/items_ndjson');
+----
+true
+
+query II
+SELECT status, starts_with(content_type, 'text/csv')
+FROM quackapi_request('GET', '/items_csv');
+----
+200	true
+
+query II
+SELECT status, starts_with(content_type, 'text/csv')
+FROM quackapi_request(
+  'GET', '/items',
+  headers := MAP {'Accept': 'text/csv'}
+);
+----
+200	true
+
+query II
+SELECT status, starts_with(content_type, 'application/x-ndjson')
+FROM quackapi_request(
+  'GET', '/items',
+  headers := MAP {'Accept': 'application/x-ndjson'}
+);
+----
+200	true
+
+query II
+SELECT status, starts_with(content_type, 'application/vnd.apache.parquet')
+FROM quackapi_request('GET', '/items_parquet');
+----
+200	true
+
+# PAR1 magic on parquet body
+query I
+SELECT decode(body[1:4]) FROM quackapi_request('GET', '/items_parquet');
+----
+PAR1

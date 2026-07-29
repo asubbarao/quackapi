@@ -1554,7 +1554,9 @@ void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &par
 }
 
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path_in, const string &body,
-                              int &status_out, string &body_out, string &content_type_out) {
+                              int &status_out, string &body_out, string &content_type_out,
+                              const unordered_map<string, string> *req_headers,
+                              unordered_map<string, string> *headers_out) {
 	// Quiet defaults for SQL tests: no access log, no compression (raw body).
 	QuackapiServeOptions opts;
 	opts.access_log = false;
@@ -1583,9 +1585,16 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 	req.local_addr = "127.0.0.1";
 	req.local_port = 0;
 	ParseQueryStringIntoParams(query, req.params);
+	if (req_headers) {
+		for (auto &kv : *req_headers) {
+			req.set_header(kv.first, kv.second);
+		}
+	}
 	if (!body.empty()) {
 		req.body = body;
-		req.set_header("Content-Type", "application/json");
+		if (!req.has_header("Content-Type")) {
+			req.set_header("Content-Type", "application/json");
+		}
 		req.set_header("Content-Length", std::to_string(body.size()));
 	}
 
@@ -1595,6 +1604,15 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 	status_out = res.status;
 	body_out = res.body;
 	content_type_out = res.get_header_value("Content-Type");
+	if (headers_out) {
+		headers_out->clear();
+		for (auto &h : res.headers) {
+			// First value wins for MAP (SQLLogic asserts one value).
+			if (headers_out->find(h.first) == headers_out->end()) {
+				(*headers_out)[h.first] = h.second;
+			}
+		}
+	}
 }
 
 string QuackapiHttpServer::NextRequestId(DatabaseInstance &db) {
