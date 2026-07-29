@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HTTP integration: FORMAT ndjson/csv/parquet + Accept negotiation.
+# HTTP integration: FORMAT ndjson/csv/parquet/arrow + Accept negotiation.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -23,6 +23,9 @@ CREATE ROUTE items_json_fmt GET '/items_json_fmt' FORMAT json AS
   SELECT 1 AS id, 'x' AS name;
 
 CREATE ROUTE items_parquet GET '/items_parquet' FORMAT parquet AS
+  SELECT * FROM (VALUES (1, 'alice'), (2, 'bob,jr')) AS t(id, name);
+
+CREATE ROUTE items_arrow GET '/items_arrow' FORMAT arrow AS
   SELECT * FROM (VALUES (1, 'alice'), (2, 'bob,jr')) AS t(id, name);
 SQL
 
@@ -167,6 +170,52 @@ assert_status "$_QA_LAST_STATUS" "200" "items_accept_parquet_alias"
 assert_parquet_magic "$_QA_LAST_BODY_FILE" "items_accept_parquet_alias"
 if ! header_ct | grep -qi 'application/vnd.apache.parquet'; then
   echo "ASSERT FAIL: Accept application/parquet Content-Type: $(header_ct)" >&2
+  exit 1
+fi
+rm -f "$_QA_LAST_BODY_FILE"
+
+assert_arrow_stream_magic() {
+  local file="$1" label="${2:-arrow_stream_magic}"
+  # IPC stream continuation marker: first 4 bytes 0xFFFFFFFF
+  local magic
+  magic="$(xxd -l 4 -p "$file" 2>/dev/null || true)"
+  if [[ "$magic" != "ffffffff" ]]; then
+    echo "ASSERT FAIL ($label): expected ffffffff stream magic, got: ${magic:-missing}" >&2
+    return 1
+  fi
+}
+
+echo "-- 11. FORMAT arrow route (explicit; IPC stream magic; nanoarrow)"
+curl_binary GET "/items_arrow" -H "Accept: application/json"
+assert_status "$_QA_LAST_STATUS" "200" "fmt_arrow"
+assert_arrow_stream_magic "$_QA_LAST_BODY_FILE" "fmt_arrow"
+if ! header_ct | grep -qi 'application/vnd.apache.arrow.stream'; then
+  echo "ASSERT FAIL: explicit FORMAT arrow Content-Type: $(header_ct)" >&2
+  exit 1
+fi
+# Round-trip: DuckDB + nanoarrow can read the HTTP body
+"$DUCKDB_BIN" -unsigned -c "
+LOAD nanoarrow;
+SELECT id, name FROM read_arrow('${_QA_LAST_BODY_FILE}') ORDER BY id;
+" | grep -q alice
+rm -f "$_QA_LAST_BODY_FILE"
+
+echo "-- 12. Accept: application/vnd.apache.arrow.stream on default FORMAT → Arrow"
+curl_binary GET "/items" -H "Accept: application/vnd.apache.arrow.stream"
+assert_status "$_QA_LAST_STATUS" "200" "items_accept_arrow"
+assert_arrow_stream_magic "$_QA_LAST_BODY_FILE" "items_accept_arrow"
+if ! header_ct | grep -qi 'application/vnd.apache.arrow.stream'; then
+  echo "ASSERT FAIL: Accept arrow stream Content-Type: $(header_ct)" >&2
+  exit 1
+fi
+rm -f "$_QA_LAST_BODY_FILE"
+
+echo "-- 13. Accept: application/vnd.apache.arrow.file alias → Arrow stream body"
+curl_binary GET "/items" -H "Accept: application/vnd.apache.arrow.file"
+assert_status "$_QA_LAST_STATUS" "200" "items_accept_arrow_file"
+assert_arrow_stream_magic "$_QA_LAST_BODY_FILE" "items_accept_arrow_file"
+if ! header_ct | grep -qi 'application/vnd.apache.arrow.stream'; then
+  echo "ASSERT FAIL: Accept arrow.file Content-Type (we still emit stream): $(header_ct)" >&2
   exit 1
 fi
 rm -f "$_QA_LAST_BODY_FILE"

@@ -222,7 +222,7 @@ string JoinGroupPrefix(const string &prefix, const string &path) {
 
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet]
+//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
 //!     [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
@@ -400,17 +400,21 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			rest = QuackapiTrim(rest.substr(token_end));
 			continue;
 		}
-		// [FORMAT json|ndjson|csv|parquet]
+		// [FORMAT json|ndjson|csv|parquet|arrow]
 		if (StringUtil::StartsWith(rest_upper, "FORMAT") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
 			rest = QuackapiTrim(rest.substr(6));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
-				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, or parquet");
+				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, parquet, or arrow");
 			}
 			auto fmt = StringUtil::Lower(rest.substr(0, token_end));
-			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet") {
-				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, or parquet");
+			// "arrows" is a friendly alias of the nanoarrow COPY format name.
+			if (fmt == "arrows") {
+				fmt = "arrow";
+			}
+			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow") {
+				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, parquet, or arrow");
 			}
 			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));

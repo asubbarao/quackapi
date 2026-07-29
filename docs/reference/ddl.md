@@ -12,7 +12,7 @@ Drop forms exist for each noun unless noted.
 CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
   [STATUS <n>]
   [REQUIRE <auth>]
-  [FORMAT json|ndjson|csv|parquet]
+  [FORMAT json|ndjson|csv|parquet|arrow]
   [GROUP <group> | IN GROUP <group>]
   [BODY SCHEMA '<json-schema>']
   [PARAM <name> [<type>] [HEADER|COOKIE|QUERY [wire-name]]
@@ -28,7 +28,7 @@ DROP ROUTE <name>;
 | **pattern** | Quoted. Must start with `/` unless the route is in a GROUP (relative join allowed). Captures: `:id` or `{id}` → `$id` |
 | **STATUS** | Integer 100–599. Default 200 |
 | **REQUIRE** | Auth scheme name (checked at request time) |
-| **FORMAT** | Response body for row data: `json` (default, array of objects), `ndjson` (`application/x-ndjson`), `csv` (`text/csv`), `parquet` (`application/vnd.apache.parquet` file bytes, magic `PAR1`). Explicit `ndjson`/`csv`/`parquet` win over `Accept`; default/`json` allows Accept negotiation (`application/x-ndjson`, `application/jsonl`, `text/csv`, `application/vnd.apache.parquet`, `application/parquet`). Column modes `html`/`text` still win. |
+| **FORMAT** | Response body for row data: `json` (default, array of objects), `ndjson` (`application/x-ndjson`), `csv` (`text/csv`), `parquet` (`application/vnd.apache.parquet` file bytes, magic `PAR1`), `arrow` (Arrow IPC stream via community `nanoarrow` `FORMAT ARROWS`, `application/vnd.apache.arrow.stream`, magic `0xFFFFFFFF`). Explicit `ndjson`/`csv`/`parquet`/`arrow` win over `Accept`; default/`json` allows Accept negotiation (`application/x-ndjson`, `application/jsonl`, `text/csv`, `application/vnd.apache.parquet`, `application/parquet`, `application/vnd.apache.arrow.stream`, `application/vnd.apache.arrow.file`). Column modes `html`/`text` still win. |
 | **GROUP / IN GROUP** | Join group prefix + inherit auth/tags |
 | **BODY SCHEMA** | Quoted JSON Schema string; may appear before or after PARAM |
 | **PARAM** | Zero or more. Types: INTEGER/INT, BIGINT, VARCHAR/TEXT/STRING, BOOLEAN/BOOL, DOUBLE, FLOAT/REAL, HUGEINT, UBIGINT, UINTEGER |

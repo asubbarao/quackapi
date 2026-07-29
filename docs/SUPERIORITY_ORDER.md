@@ -21,9 +21,9 @@ Same HTTP surface as FastAPI for what people actually ship:
 | Static files / compression / request-id / health | **done** (static prefix polish open) |
 | Background work | **QUEUE** (stronger than BackgroundTasks) |
 | SSE streaming | **done** (WS = intentional SSE+radio, not Upgrade) |
-| TestClient in-process | **open** — `quackapi_request` |
+| TestClient in-process | **done** — `quackapi_request(method, path [, body])` |
 | Sessions / OIDC | **open** — after surpass holds |
-| Response FORMAT (CSV/NDJSON) | **open** — FastAPI `response_class` peer |
+| Response FORMAT (CSV/NDJSON/Parquet/Arrow) | **done** — FORMAT + Accept negotiation |
 
 **Gate:** `test/conformance` 100% + `test/http/run_all.sh` green.  
 Do not invent leapfrog nouns while equivalence cells are red.

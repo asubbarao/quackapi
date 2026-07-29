@@ -1033,7 +1033,7 @@ void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
 
 //! Response mode inferred from the single output column's name — the database
 //! names the payload. `html` -> text/html, `text` -> text/plain; anything else
-//! serializes as row data (json / ndjson / csv / parquet via FORMAT + Accept).
+//! serializes as row data (json / ndjson / csv / parquet / arrow via FORMAT + Accept).
 enum class ResponseMode { JSON, HTML, TEXT };
 
 ResponseMode ResponseModeFor(const vector<string> &names) {
@@ -1051,7 +1051,7 @@ ResponseMode ResponseModeFor(const vector<string> &names) {
 }
 
 //! Wire format for multi-row data responses (not html/text column modes).
-enum class BodyFormat { JSON, NDJSON, CSV, PARQUET };
+enum class BodyFormat { JSON, NDJSON, CSV, PARQUET, ARROW };
 
 BodyFormat ParseBodyFormatToken(const string &token) {
 	auto t = StringUtil::Lower(token);
@@ -1063,6 +1063,9 @@ BodyFormat ParseBodyFormatToken(const string &token) {
 	}
 	if (t == "parquet") {
 		return BodyFormat::PARQUET;
+	}
+	if (t == "arrow" || t == "arrows") {
+		return BodyFormat::ARROW;
 	}
 	return BodyFormat::JSON;
 }
@@ -1082,6 +1085,12 @@ bool MediaTypeToBodyFormat(const string &media, BodyFormat &out) {
 	}
 	if (m == "application/vnd.apache.parquet" || m == "application/parquet") {
 		out = BodyFormat::PARQUET;
+		return true;
+	}
+	// Arrow IPC stream (what nanoarrow FORMAT ARROWS emits) or file.
+	if (m == "application/vnd.apache.arrow.stream" || m == "application/vnd.apache.arrow.file" ||
+	    m == "application/x-apache-arrow-stream" || m == "application/arrow") {
+		out = BodyFormat::ARROW;
 		return true;
 	}
 	if (m == "application/json" || m == "text/json" || m == "*/*") {
@@ -1107,11 +1116,12 @@ double ParseAcceptQ(const string &token) {
 	return 1.0;
 }
 
-//! When route FORMAT is default/json, honor Accept for ndjson/csv/parquet/json.
-//! Explicit route FORMAT (ndjson|csv|parquet) always wins.
+//! When route FORMAT is default/json, honor Accept for ndjson/csv/parquet/arrow/json.
+//! Explicit route FORMAT (ndjson|csv|parquet|arrow) always wins.
 BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::Request &req) {
 	auto route_fmt = StringUtil::Lower(route.response_format.empty() ? "json" : route.response_format);
-	if (route_fmt == "ndjson" || route_fmt == "csv" || route_fmt == "parquet") {
+	if (route_fmt == "ndjson" || route_fmt == "csv" || route_fmt == "parquet" || route_fmt == "arrow" ||
+	    route_fmt == "arrows") {
 		return ParseBodyFormatToken(route_fmt);
 	}
 	// Default / explicit json: negotiate Accept when present.
@@ -1119,7 +1129,7 @@ BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::R
 	if (it == req.headers.end() || it->second.empty()) {
 		return BodyFormat::JSON;
 	}
-	// Pick the highest-q recognized type among json / ndjson / csv / parquet.
+	// Pick the highest-q recognized type among json / ndjson / csv / parquet / arrow.
 	BodyFormat best = BodyFormat::JSON;
 	double best_q = -1.0;
 	bool saw_recognized = false;
@@ -1139,7 +1149,7 @@ BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::R
 		if (!MediaTypeToBodyFormat(media, f)) {
 			continue;
 		}
-		// Prefer more specific non-wildcard when q ties: ndjson/csv/parquet over */* json.
+		// Prefer more specific non-wildcard when q ties: ndjson/csv/parquet/arrow over */* json.
 		bool better = !saw_recognized || q > best_q;
 		if (!better && q == best_q) {
 			// Prefer non-json when client listed it at same q after json — first highest wins
@@ -1265,17 +1275,10 @@ string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_c
 	return body;
 }
 
-//! Serialize result rows as a Parquet file body (magic "PAR1"). Uses a unique
-//! TEMP table + COPY TO (FORMAT PARQUET) + read bytes, then cleans up.
-string SerializeRowsParquet(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
-                            const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
-	if (data_cols.empty()) {
-		throw InvalidInputException("parquet serialize: no data columns");
-	}
-	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
-	string table = "qa_parquet_" + uid;
-	string path = "/tmp/" + table + ".parquet";
-
+//! Shared: TEMP table + Appender fill for binary serdes (parquet / arrow).
+void FillTempTableForSerdes(Connection &con, const string &table, const vector<string> &names,
+                            const vector<LogicalType> &types, const vector<idx_t> &data_cols,
+                            const vector<vector<Value>> &rows, const char *label) {
 	string create_sql = "CREATE TEMP TABLE " + table + " (";
 	for (idx_t i = 0; i < data_cols.size(); i++) {
 		if (i > 0) {
@@ -1289,7 +1292,7 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 	create_sql += ")";
 	auto create_res = con.Query(create_sql);
 	if (create_res->HasError()) {
-		throw InvalidInputException("parquet serialize CREATE: %s", create_res->GetError());
+		throw InvalidInputException("%s serialize CREATE: %s", label, create_res->GetError());
 	}
 
 	if (!rows.empty()) {
@@ -1307,15 +1310,10 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 		}
 		appender.Close();
 	}
+}
 
-	auto copy_res = con.Query("COPY " + table + " TO '" + path + "' (FORMAT PARQUET)");
-	if (copy_res->HasError()) {
-		con.Query("DROP TABLE IF EXISTS " + table);
-		FileSystem::GetFileSystem(*con.context).TryRemoveFile(path);
-		throw InvalidInputException("parquet serialize COPY: %s", copy_res->GetError());
-	}
-	con.Query("DROP TABLE IF EXISTS " + table);
-
+//! Read path bytes then delete the file. On open failure, best-effort remove.
+string ReadAndRemoveFileBytes(Connection &con, const string &path) {
 	auto &fs = FileSystem::GetFileSystem(*con.context);
 	unique_ptr<FileHandle> handle;
 	try {
@@ -1335,6 +1333,72 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 	handle->Close();
 	fs.TryRemoveFile(path);
 	return body;
+}
+
+//! Serialize result rows as a Parquet file body (magic "PAR1"). Uses a unique
+//! TEMP table + COPY TO (FORMAT PARQUET) + read bytes, then cleans up.
+string SerializeRowsParquet(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+                            const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
+	if (data_cols.empty()) {
+		throw InvalidInputException("parquet serialize: no data columns");
+	}
+	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
+	string table = "qa_parquet_" + uid;
+	string path = "/tmp/" + table + ".parquet";
+
+	FillTempTableForSerdes(con, table, names, types, data_cols, rows, "parquet");
+
+	auto copy_res = con.Query("COPY " + table + " TO '" + path + "' (FORMAT PARQUET)");
+	if (copy_res->HasError()) {
+		con.Query("DROP TABLE IF EXISTS " + table);
+		FileSystem::GetFileSystem(*con.context).TryRemoveFile(path);
+		throw InvalidInputException("parquet serialize COPY: %s", copy_res->GetError());
+	}
+	con.Query("DROP TABLE IF EXISTS " + table);
+	return ReadAndRemoveFileBytes(con, path);
+}
+
+//! Ensure community nanoarrow is available (LOAD, else INSTALL FROM community).
+void EnsureNanoarrowLoaded(Connection &con) {
+	auto load = con.Query("LOAD nanoarrow");
+	if (!load->HasError()) {
+		return;
+	}
+	auto inst = con.Query("INSTALL nanoarrow FROM community");
+	if (inst->HasError()) {
+		throw InvalidInputException(
+		    "arrow serialize: nanoarrow not available (%s). INSTALL nanoarrow FROM community and retry.",
+		    inst->GetError());
+	}
+	load = con.Query("LOAD nanoarrow");
+	if (load->HasError()) {
+		throw InvalidInputException("arrow serialize: could not LOAD nanoarrow: %s", load->GetError());
+	}
+}
+
+//! Serialize result rows as Arrow IPC stream bytes (nanoarrow FORMAT ARROWS).
+//! Magic is 0xFFFFFFFF stream continuation (not ARROW1 file). Content-Type:
+//! application/vnd.apache.arrow.stream. Same TEMP+COPY+read pattern as parquet.
+string SerializeRowsArrow(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+                          const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
+	if (data_cols.empty()) {
+		throw InvalidInputException("arrow serialize: no data columns");
+	}
+	EnsureNanoarrowLoaded(con);
+	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
+	string table = "qa_arrow_" + uid;
+	string path = "/tmp/" + table + ".arrows";
+
+	FillTempTableForSerdes(con, table, names, types, data_cols, rows, "arrow");
+
+	auto copy_res = con.Query("COPY " + table + " TO '" + path + "' (FORMAT ARROWS)");
+	if (copy_res->HasError()) {
+		con.Query("DROP TABLE IF EXISTS " + table);
+		FileSystem::GetFileSystem(*con.context).TryRemoveFile(path);
+		throw InvalidInputException("arrow serialize COPY: %s", copy_res->GetError());
+	}
+	con.Query("DROP TABLE IF EXISTS " + table);
+	return ReadAndRemoveFileBytes(con, path);
 }
 
 void SetInternalError(duckdb_httplib::Response &res, const string &server_side_detail) {
@@ -1395,10 +1459,16 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 } // namespace
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
-                                       const QuackapiServeOptions &opts)
+                                       const QuackapiServeOptions &opts, bool bind_and_listen)
     : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins), options(opts),
       started_at(std::chrono::steady_clock::now()), compression(opts.compression),
       compression_min_bytes(opts.compression_min_bytes) {
+	// In-process only (quackapi_request): no TCP server object, no bind.
+	if (!bind_and_listen) {
+		is_running.store(false);
+		return;
+	}
+
 	server = make_uniq<duckdb_httplib::Server>();
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
@@ -1451,6 +1521,80 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		                  host, port);
 	}
 	listen_threads.emplace_back(ListenThread, this);
+}
+
+void QuackapiHttpServer::Dispatch(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+	HandleRequest(req, res);
+}
+
+//! Parse application/x-www-form-urlencoded query into httplib Params.
+void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &params) {
+	if (query.empty()) {
+		return;
+	}
+	idx_t start = 0;
+	while (start < query.size()) {
+		idx_t amp = query.find('&', start);
+		if (amp == string::npos) {
+			amp = query.size();
+		}
+		string pair = query.substr(start, amp - start);
+		start = amp + 1;
+		if (pair.empty()) {
+			continue;
+		}
+		auto eq = pair.find('=');
+		if (eq == string::npos) {
+			params.emplace(duckdb_httplib::decode_query_component(pair, true), string());
+		} else {
+			params.emplace(duckdb_httplib::decode_query_component(pair.substr(0, eq), true),
+			               duckdb_httplib::decode_query_component(pair.substr(eq + 1), true));
+		}
+	}
+}
+
+void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path_in, const string &body,
+                              int &status_out, string &body_out, string &content_type_out) {
+	// Quiet defaults for SQL tests: no access log, no compression (raw body).
+	QuackapiServeOptions opts;
+	opts.access_log = false;
+	opts.compression = false;
+	opts.health_routes = true;
+	// No TCP — Dispatch only.
+	QuackapiHttpServer server(db, "127.0.0.1", 0, opts, /*bind_and_listen=*/false);
+
+	duckdb_httplib::Request req;
+	req.method = StringUtil::Upper(method);
+	string path = path_in;
+	string query;
+	auto qpos = path.find('?');
+	if (qpos != string::npos) {
+		query = path.substr(qpos + 1);
+		path = path.substr(0, qpos);
+	}
+	if (path.empty()) {
+		path = "/";
+	}
+	req.path = path;
+	req.target = path_in;
+	req.version = "HTTP/1.1";
+	req.remote_addr = "127.0.0.1";
+	req.remote_port = 0;
+	req.local_addr = "127.0.0.1";
+	req.local_port = 0;
+	ParseQueryStringIntoParams(query, req.params);
+	if (!body.empty()) {
+		req.body = body;
+		req.set_header("Content-Type", "application/json");
+		req.set_header("Content-Length", std::to_string(body.size()));
+	}
+
+	duckdb_httplib::Response res;
+	server.Dispatch(req, res);
+
+	status_out = res.status;
+	body_out = res.body;
+	content_type_out = res.get_header_value("Content-Type");
 }
 
 string QuackapiHttpServer::NextRequestId(DatabaseInstance &db) {
@@ -2853,7 +2997,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		// Serialize rows: json array | ndjson | csv | parquet (FORMAT + Accept).
+		// Serialize rows: json array | ndjson | csv | parquet | arrow (FORMAT + Accept).
 		string body;
 		const char *content_type = "application/json";
 		if (body_format == BodyFormat::NDJSON) {
@@ -2865,6 +3009,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		} else if (body_format == BodyFormat::PARQUET) {
 			body = SerializeRowsParquet(con, names, result->types, data_cols, rows);
 			content_type = "application/vnd.apache.parquet";
+		} else if (body_format == BodyFormat::ARROW) {
+			body = SerializeRowsArrow(con, names, result->types, data_cols, rows);
+			// nanoarrow FORMAT ARROWS produces IPC *stream* (0xFFFFFFFF magic).
+			content_type = "application/vnd.apache.arrow.stream";
 		} else {
 			body = SerializeRowsJsonArray(names, data_cols, rows);
 			// Cache constant JSON responses (no bind params) for this worker.
@@ -2898,7 +3046,8 @@ void QuackapiHttpServer::ListenThread(QuackapiHttpServer *server) {
 
 void QuackapiHttpServer::StopAccepting() {
 	// load/store: is_running is touched by ctor, listener, and stop threads.
-	if (is_running.exchange(false)) {
+	// In-process (no TCP) servers never set is_running / have no Server object.
+	if (is_running.exchange(false) && server) {
 		server->stop();
 	}
 }

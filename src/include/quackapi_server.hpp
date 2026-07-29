@@ -142,7 +142,10 @@ public:
 	//! opts.static_dir: optional directory of files for unrouted GETs.
 	//! opts.cors_origins: empty (default) = CORS off; "*" or list enables CORS
 	//! headers on responses and automatic OPTIONS preflight.
-	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
+	//! When bind_and_listen is false, no TCP socket is opened — only in-process
+	//! Dispatch (quackapi_request) is supported.
+	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts,
+	                   bool bind_and_listen = true);
 	~QuackapiHttpServer();
 
 	//! Close the listener socket only; safe from a request-handler thread.
@@ -152,6 +155,9 @@ public:
 	//! worker thread (httplib's listen teardown joins all workers).
 	//! Mirrors QuackServer::Close.
 	void Close();
+
+	//! Same handler path as the TCP server — for quackapi_request() tests.
+	void Dispatch(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
 	const string &Host() const {
 		return host;
@@ -191,6 +197,12 @@ private:
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
 };
+
+//! In-process HTTP-shape invoke (no TCP). Builds a Request, runs Dispatch, returns
+//! status + body. path may include ?query. Optional body for POST/PUT/PATCH.
+//! Content-Type for body defaults to application/json when body is non-empty.
+void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
+                              int &status_out, string &body_out, string &content_type_out);
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.

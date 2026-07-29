@@ -133,7 +133,7 @@ SELECT format FROM quackapi_routes() WHERE name = 'fmt_default';
 ----
 json
 
-# FORMAT ndjson / csv store on the route
+# FORMAT ndjson / csv / parquet / arrow store on the route
 query I
 CREATE ROUTE fmt_ndjson GET '/fmt_ndjson' FORMAT ndjson AS SELECT 1 AS id, 'a' AS name;
 ----
@@ -144,18 +144,30 @@ CREATE ROUTE fmt_csv GET '/fmt_csv' FORMAT csv STATUS 200 AS SELECT 1 AS id;
 ----
 Route fmt_csv: GET /fmt_csv
 
+query I
+CREATE ROUTE fmt_parquet GET '/fmt_parquet' FORMAT parquet AS SELECT 1 AS id;
+----
+Route fmt_parquet: GET /fmt_parquet
+
+query I
+CREATE ROUTE fmt_arrow GET '/fmt_arrow' FORMAT arrow AS SELECT 1 AS id;
+----
+Route fmt_arrow: GET /fmt_arrow
+
 query II
 SELECT name, format FROM quackapi_routes() WHERE name LIKE 'fmt_%' ORDER BY name;
 ----
+fmt_arrow	arrow
 fmt_csv	csv
 fmt_default	json
 fmt_ndjson	ndjson
+fmt_parquet	parquet
 
 # Invalid FORMAT rejected
 statement error
-CREATE ROUTE bad_fmt GET '/x' FORMAT parquet AS SELECT 1;
+CREATE ROUTE bad_fmt GET '/x' FORMAT protobuf AS SELECT 1;
 ----
-FORMAT must be json, ndjson, or csv
+FORMAT must be json, ndjson, csv, parquet, or arrow
 
 query I
 DROP ROUTE fmt_default;
@@ -171,6 +183,16 @@ query I
 DROP ROUTE fmt_csv;
 ----
 Dropped route fmt_csv
+
+query I
+DROP ROUTE fmt_parquet;
+----
+Dropped route fmt_parquet
+
+query I
+DROP ROUTE fmt_arrow;
+----
+Dropped route fmt_arrow
 
 # Handler SQL is validated at CREATE time (not deferred to first request)
 statement error
