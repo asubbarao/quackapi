@@ -222,7 +222,8 @@ string JoinGroupPrefix(const string &prefix, const string &path) {
 
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-//!     [STATUS <n>] [REQUIRE <auth>] [GROUP <name> | IN GROUP <name>]
+//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv]
+//!     [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
 //!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
@@ -302,15 +303,16 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return i;
 	};
 
-	// Optional clauses in any order: STATUS / REQUIRE / GROUP|IN GROUP / RATE LIMIT
+	// Optional clauses: STATUS / REQUIRE / GROUP / RATE LIMIT / FORMAT (any order)
 	int status = 200;
 	string require_auth;
 	string group_name;
 	int rate_limit_n = 0;
 	int rate_limit_per_sec = 0;
 	string rate_limit_by; // empty → ip at apply time
+	string response_format = "json";
 	auto rest_upper = StringUtil::Upper(rest);
-	for (int clause_round = 0; clause_round < 10; clause_round++) {
+	for (int clause_round = 0; clause_round < 12; clause_round++) {
 		rest_upper = StringUtil::Upper(rest);
 		// [STATUS <n>]
 		if (StringUtil::StartsWith(rest_upper, "STATUS") &&
@@ -396,6 +398,22 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (require_auth.empty()) {
 				return ParserExtensionParseResult("REQUIRE expects an auth name");
 			}
+			rest = QuackapiTrim(rest.substr(token_end));
+			continue;
+		}
+		// [FORMAT json|ndjson|csv]
+		if (StringUtil::StartsWith(rest_upper, "FORMAT") &&
+		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
+			rest = QuackapiTrim(rest.substr(6));
+			auto token_end = NextTokenEnd(rest);
+			if (token_end == 0) {
+				return ParserExtensionParseResult("FORMAT expects json, ndjson, or csv");
+			}
+			auto fmt = StringUtil::Lower(rest.substr(0, token_end));
+			if (fmt != "json" && fmt != "ndjson" && fmt != "csv") {
+				return ParserExtensionParseResult("FORMAT must be json, ndjson, or csv");
+			}
+			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));
 			continue;
 		}
@@ -707,6 +725,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.rate_limit_n = rate_limit_n;
 	data->route.rate_limit_per_sec = rate_limit_per_sec;
 	data->route.rate_limit_by = rate_limit_by.empty() && rate_limit_n > 0 ? string("ip") : rate_limit_by;
+	data->route.response_format = response_format;
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -748,6 +767,13 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	}
 	if (input.inputs.size() > 13 && !input.inputs[13].IsNull()) {
 		bind_data->route.rate_limit_by = input.inputs[13].GetValue<string>();
+	}
+	if (input.inputs.size() > 14 && !input.inputs[14].IsNull()) {
+		auto fmt = StringUtil::Lower(input.inputs[14].GetValue<string>());
+		if (fmt.empty()) {
+			fmt = "json";
+		}
+		bind_data->route.response_format = fmt;
 	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
@@ -812,11 +838,13 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 }
 
 TableFunction MakeApplyRouteFunction() {
+	// action, or_replace, name, method, pattern, handler, status, require_auth,
+	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format
 	return MakeApplyDdlFunction("quackapi_apply_route",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR},
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
@@ -839,6 +867,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::INTEGER(data.route.rate_limit_n));
 	result.parameters.push_back(Value::INTEGER(data.route.rate_limit_per_sec));
 	result.parameters.push_back(Value(data.route.rate_limit_by));
+	result.parameters.push_back(Value(data.route.response_format.empty() ? "json" : data.route.response_format));
 	FinishDdlPlan(result);
 	return result;
 }
