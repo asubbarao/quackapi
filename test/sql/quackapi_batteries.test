@@ -131,17 +131,17 @@ Stopped quackapi server on port 29203
 
 # ---------------------------------------------------------------------------
 # http_client := 'httplib' forces stock client (always available; no network
-# needed for the force path). Active backend is reported on quackapi_servers().
+# needed for the force path). Active backend + reason on quackapi_servers().
 # ---------------------------------------------------------------------------
 query I
 SELECT * FROM quackapi_serve(29204, host := '127.0.0.1', http_client := 'httplib');
 ----
 http://127.0.0.1:29204
 
-query I
-SELECT http_client FROM quackapi_servers() WHERE port = 29204;
+query II
+SELECT http_client, http_client_reason FROM quackapi_servers() WHERE port = 29204;
 ----
-httplib
+httplib	operator_forced
 
 query I
 SELECT * FROM quackapi_stop(29204);

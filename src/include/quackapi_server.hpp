@@ -91,14 +91,17 @@ struct QuackapiServeOptions {
 	bool enable_http_metadata_cache = true;
 
 	// --- Batteries: outbound HTTP client (curl_httpfs preferred) ---
-	//! Preference: "auto" (default — prefer curl_httpfs, fall back to httplib),
-	//! "curl" (same prefer/fallback), or "httplib" (skip curl_httpfs).
-	//! Named param / SET quackapi_http_client. Does NOT touch the inbound
-	//! httplib SERVER — only the client used by httpfs / read_* over https.
+	//! Preference: "auto" (default — prefer curl_httpfs, fall back to httplib with
+	//! loud reason), "curl" (require curl_httpfs — fail serve if unavailable), or
+	//! "httplib" (skip curl_httpfs). Named param / SET quackapi_http_client.
+	//! Does NOT touch the inbound httplib SERVER — only the client used by
+	//! httpfs / read_* over https.
 	string http_client = "auto";
 	//! Filled at serve after probe: "curl" or "httplib".
 	string http_client_active;
-	//! When active is httplib after prefer-curl path: why (e.g. curl_httpfs_unavailable).
+	//! Why active is what it is. Empty when curl is active after a successful
+	//! probe. "operator_forced" when operator chose httplib.
+	//! "curl_httpfs_unavailable" when auto fell back (never silent).
 	string http_client_reason;
 
 	//! Request-id source for X-Request-ID. Always **uuidv7** (C++ core, no SQL)
@@ -139,7 +142,10 @@ public:
 	//! opts.static_dir: optional directory of files for unrouted GETs.
 	//! opts.cors_origins: empty (default) = CORS off; "*" or list enables CORS
 	//! headers on responses and automatic OPTIONS preflight.
-	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
+	//! When bind_and_listen is false, no TCP socket is opened — only in-process
+	//! Dispatch (quackapi_request) is supported.
+	QuackapiHttpServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts,
+	                   bool bind_and_listen = true);
 	~QuackapiHttpServer();
 
 	//! Close the listener socket only; safe from a request-handler thread.
@@ -149,6 +155,9 @@ public:
 	//! worker thread (httplib's listen teardown joins all workers).
 	//! Mirrors QuackServer::Close.
 	void Close();
+
+	//! Same handler path as the TCP server — for quackapi_request() tests.
+	void Dispatch(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
 	const string &Host() const {
 		return host;
@@ -188,6 +197,16 @@ private:
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
 };
+
+//! In-process HTTP-shape invoke (no TCP). Builds a Request, runs Dispatch, returns
+//! status + body + response headers. path may include ?query.
+//! Optional body for POST/PUT/PATCH (Content-Type application/json when non-empty).
+//! req_headers: optional request headers (e.g. X-Request-ID, Accept, Authorization).
+//! headers_out: response header map (first value per name; case as httplib stores it).
+void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
+                              int &status_out, string &body_out, string &content_type_out,
+                              const unordered_map<string, string> *req_headers = nullptr,
+                              unordered_map<string, string> *headers_out = nullptr);
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.

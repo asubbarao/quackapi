@@ -200,11 +200,11 @@ the “PDF service” is a function call in the same address space — not an RP
 |---------|------------------|---------|
 | `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', …)` | `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
-| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags` |
-| `quackapi_servers` | `()` | `host, port, listen_url, http_client` |
+| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format` |
+| `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
-| Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | prefer curl_httpfs outbound client |
+| Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | auto=prefer+loud fallback; curl=require; httplib=force stock |
 
 Built-in OpenAPI (not listed in `quackapi_routes()`):
 
@@ -313,9 +313,10 @@ SELECT * FROM quackapi_policies();
 | `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
 
 Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
-`quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async) and fall
-back to httplib when the community extension is unavailable — see
-[`docs/curl_httpfs.md`](docs/curl_httpfs.md).
+`quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async).
+`http_client := 'auto'` falls back to httplib with a loud `http_client_reason` on
+`/healthz` / `quackapi_servers()`; `http_client := 'curl'` **fails serve** if
+curl_httpfs cannot INSTALL/LOAD — see [`docs/curl_httpfs.md`](docs/curl_httpfs.md).
 
 ---
 
@@ -431,6 +432,8 @@ bash test/conformance/run.sh       # FastAPI parity harness
 
 | Doc | Content |
 |-----|---------|
+| [`docs/index.md`](docs/index.md) | Guided tour (start here) |
+| [`docs/guide/extension-composition.md`](docs/guide/extension-composition.md) | Compose companions: gateway, SSE, `quack_from_x`, mesh, PDF |
 | [`docs/community-page.md`](docs/community-page.md) | Community-extensions page copy |
 | [`packaging/description.yml`](packaging/description.yml) / [`description.yml`](description.yml) | Community submission manifest |
 | [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md) | Scorecard vs FastAPI |

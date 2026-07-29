@@ -267,7 +267,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.pg_dsn = bind_data.pg_dsn;
 
 	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
-	// Also prefers curl_httpfs as the outbound HTTP client (graceful fallback).
+	// Outbound client: auto prefers curl_httpfs (loud fallback); curl requires it.
 	ApplyQuackapiServerDefaults(context, opts);
 	// Compose request_id source: community tsid if LOADable, else core uuidv7.
 	ProbeQuackapiRequestIdSource(*context.db, opts);
@@ -326,6 +326,84 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 }
 
 //===--------------------------------------------------------------------===//
+// quackapi_request(method, path [, body] [, headers := MAP]) — TestClient
+// No TCP. Same handler path as serve. Community SQLLogic style.
+//===--------------------------------------------------------------------===//
+
+struct RequestBindData : public TableFunctionData {
+	string method;
+	string path;
+	string body;
+	unordered_map<string, string> req_headers;
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
+		throw InvalidInputException("quackapi_request(method, path [, body] [, headers := MAP]) expects 2 or 3 "
+		                            "positional args");
+	}
+	auto bind_data = make_uniq<RequestBindData>();
+	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+		throw InvalidInputException("quackapi_request: method and path must be non-NULL");
+	}
+	bind_data->method = input.inputs[0].ToString();
+	bind_data->path = input.inputs[1].ToString();
+	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+		bind_data->body = input.inputs[2].ToString();
+	}
+	auto header_it = input.named_parameters.find("headers");
+	if (header_it != input.named_parameters.end() && !header_it->second.IsNull()) {
+		// MAP is LIST of STRUCT{key, value}
+		for (auto &child : MapValue::GetChildren(header_it->second)) {
+			auto &kv = StructValue::GetChildren(child);
+			if (kv.size() >= 2 && !kv[0].IsNull() && !kv[1].IsNull()) {
+				bind_data->req_headers[kv[0].ToString()] = kv[1].ToString();
+			}
+		}
+	}
+	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
+	// "Invalid unicode" on Value(string). JSON/text clients: decode(body).
+	return_types.emplace_back(LogicalType::INTEGER);
+	return_types.emplace_back(LogicalType::BLOB);
+	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
+	names.emplace_back("status");
+	names.emplace_back("body");
+	names.emplace_back("content_type");
+	names.emplace_back("headers");
+	return std::move(bind_data);
+}
+
+static void RequestExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->CastNoConst<RequestBindData>();
+	if (bind_data.finished) {
+		return;
+	}
+	int status = 0;
+	string body;
+	string content_type;
+	unordered_map<string, string> resp_headers;
+	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
+	                         &bind_data.req_headers, &resp_headers);
+	output.SetValue(0, 0, Value::INTEGER(status));
+	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
+	output.SetValue(2, 0, Value(content_type));
+	vector<Value> hk;
+	vector<Value> hv;
+	hk.reserve(resp_headers.size());
+	hv.reserve(resp_headers.size());
+	for (auto &kv : resp_headers) {
+		hk.emplace_back(kv.first);
+		hv.emplace_back(kv.second);
+	}
+	output.SetValue(3, 0, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, hk, hv));
+	output.SetCardinality(1);
+	bind_data.finished = true;
+}
+
+//===--------------------------------------------------------------------===//
 // quackapi_routes() — inspect the route registry
 //===--------------------------------------------------------------------===//
 
@@ -354,6 +432,8 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("group_name");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("tags");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("format");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -376,6 +456,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(5, row, Value(route.require_auth));
 		output.SetValue(6, row, Value(route.group_name));
 		output.SetValue(7, row, Value(route.tags));
+		output.SetValue(8, row, Value(route.response_format.empty() ? "json" : route.response_format));
 		row++;
 		state.offset++;
 	}
@@ -389,7 +470,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 struct ServersBindData : public TableFunctionData {};
 
 struct ServersGlobalState : public GlobalTableFunctionState {
-	vector<std::tuple<string, int, string>> servers;
+	vector<std::tuple<string, int, string, string>> servers;
 	idx_t offset = 0;
 };
 
@@ -403,6 +484,8 @@ static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindIn
 	names.emplace_back("listen_url");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("http_client");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("http_client_reason");
 	return make_uniq<ServersBindData>();
 }
 
@@ -420,10 +503,12 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 		const auto &host = std::get<0>(server);
 		const auto port = std::get<1>(server);
 		const auto &http_client = std::get<2>(server);
+		const auto &http_client_reason = std::get<3>(server);
 		output.SetValue(0, row, Value(host));
 		output.SetValue(1, row, Value::INTEGER(port));
 		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", host, port)));
 		output.SetValue(3, row, Value(http_client));
+		output.SetValue(4, row, Value(http_client_reason));
 		row++;
 		state.offset++;
 	}
@@ -482,14 +567,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Default 256. Overridden by compression_min_bytes named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
 	// SET quackapi_http_client = 'auto' | 'curl' | 'httplib'
-	// Default auto: INSTALL+LOAD curl_httpfs and SET httpfs_client_implementation='curl';
-	// fall back to httplib if the community extension is unavailable (Windows/WASM/offline).
-	// Serve-time http_client := '…' wins. Inbound server remains httplib regardless.
+	// Default auto: INSTALL+LOAD curl_httpfs; fall back to httplib with loud reason.
+	// curl: REQUIRE curl_httpfs — fail serve if INSTALL/LOAD fails (no silent fallback).
+	// httplib: force stock client. Serve-time http_client := '…' wins.
+	// Inbound server remains httplib regardless.
 	config.AddExtensionOption("quackapi_http_client",
 	                          "Outbound HTTP client for httpfs/route fetches: auto|curl|httplib. "
-	                          "Default auto prefers curl_httpfs (connection pool, HTTP/2, async IO) "
-	                          "and falls back to httplib when unavailable. Overridden by http_client "
-	                          "named parameter. Does not change the inbound HTTP server.",
+	                          "Default auto prefers curl_httpfs (pool, HTTP/2, async) and falls back "
+	                          "to httplib with http_client_reason on /healthz when unavailable. "
+	                          "curl fails serve if curl_httpfs cannot INSTALL/LOAD. Overridden by "
+	                          "http_client named parameter. Does not change the inbound HTTP server.",
 	                          LogicalType::VARCHAR, Value("auto"));
 
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
@@ -529,6 +616,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	stop.arguments.clear();
 	stop_set.AddFunction(stop);
 	loader.RegisterFunction(stop_set);
+
+	// quackapi_request — SQLLogic TestClient (no TCP, no .sh).
+	TableFunctionSet request_set("quackapi_request");
+	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
+	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request_set.AddFunction(request2);
+	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                       RequestExec, RequestBind);
+	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request_set.AddFunction(request3);
+	loader.RegisterFunction(request_set);
 
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));
 	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind, ServersInit));

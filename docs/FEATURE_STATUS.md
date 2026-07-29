@@ -168,15 +168,18 @@ These are **not** counted against the 100% harness score; they are product/roadm
 
 | Gap | Notes | Cite |
 |-----|-------|------|
-| **WebSocket Upgrade** | Bundled cpp-httplib has no WS; `CREATE STREAM … WS` rejected | `src/quackapi_stream.cpp` error string; `/tmp/quackapi_spec_websocket_sse/SPEC.md` SKIP-BLOAT |
-| **OIDC / OAuth2 SSO** browser code flow | JWT/API_KEY only today | `/tmp/quackapi_spec_oidc/SPEC.md` |
+| **WebSocket Upgrade** | Bundled cpp-httplib has no WS; use SSE + compose `radio` bus | stream reject string; catalog `radio` |
+| **OIDC / OAuth2 SSO** browser code flow | JWT/API_KEY only; compose `quack_oauth` / `jwt` for resource-server patterns | `/tmp/quackapi_spec_oidc/SPEC.md` |
 | **Signed cookie sessions + CSRF** | not built | `/tmp/quackapi_spec_sessions/SPEC.md` |
-| **Middleware BEFORE/AFTER SQL** | not built | `/tmp/quackapi_spec_middleware/SPEC.md` |
-| **Response gzip** | not wired (miniz available) | `/tmp/quackapi_spec_gzip/SPEC.md` |
-| **FORMAT / Accept** (CSV/NDJSON/Arrow IPC) | JSON/html/text only | `/tmp/quackapi_spec_serdes/SPEC.md`, `/tmp/quackapi_arrow.md` |
-| **In-process TestClient** `quackapi_request` | network tests only | `/tmp/quackapi_spec_test_client/SPEC.md` |
-| **Rate limit / ETag-304** | designed, not built | SPECs rate_limit, cache_etag |
-| **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor, SQL bind, stderr access log | `batteries.test.sh`; SPECs request_id mostly closed |
+| **Middleware BEFORE/AFTER SQL** | not built (use shared views/SQL preamble) | `/tmp/quackapi_spec_middleware/SPEC.md` |
+| **Response gzip/zstd** | **shipped** — Accept-Encoding negotiate; `compression` serve knobs | `quackapi_server.cpp` MaybeCompress |
+| **FORMAT / Accept** | **shipped** json/ndjson/csv/**parquet**/**arrow** (IPC stream via community nanoarrow) | format tests; Accept stream/file |
+| **GraphQL thin v0** | **shipped** — POST `/graphql`, GET `/graphql/schema` (catalog tables only) | `quackapi_graphql.cpp`, `graphql-v0.md` |
+| **In-process TestClient** `quackapi_request` | **shipped** — `quackapi_request(method, path [, body])` → status/body/content_type (no TCP) | `test/sql/quackapi_request.test` |
+| **Rate limit (HTTP)** | **shipped** — `RATE LIMIT n PER s [BY ip\|token]` → 429 | `rate_limit.test.sh` |
+| **ETag-304 / CACHE TTL** | not built (outbound `cache_httpfs` is separate) | SPEC cache_etag |
+| **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor, SQL bind, stderr access log | `request_id.test.sh` |
+| **curl_httpfs guarantee** | **shipped** — `http_client:='curl'` fails serve if missing; auto loud fallback | batteries + `curl_httpfs_client.test.sh` |
 | **RFC 9457 problem+json** | FastAPI-shaped 422 only | `/tmp/quackapi_spec_problem_details/SPEC.md` |
 | **Envelope** always JSON **array of rows** | intentional SQL semantics (harness still MATCH on fields) | `docs/FASTAPI_PARITY.md` |
 | **Pydantic binder fidelity** ~19% needs C++ | field-level body `loc`, optional/null body, multi-error | `/tmp/quackapi_pydantic_bridge.md` |

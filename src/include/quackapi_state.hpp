@@ -122,6 +122,14 @@ struct QuackapiRoute {
 	string group_name;
 	//! OpenAPI tags CSV (from group inheritance or future per-route tags).
 	string tags;
+	//! RATE LIMIT <n> PER <seconds> [BY ip|token|key]. n==0 disables.
+	int rate_limit_n = 0;
+	int rate_limit_per_sec = 0;
+	//! "ip" (default), "token" (Authorization / X-API-Key header raw), "key" alias of token.
+	string rate_limit_by;
+	//! Default response body format: "json" (default), "ndjson", "csv", "parquet", or "arrow".
+	//! Explicit non-json wins over Accept negotiation; json allows Accept override.
+	string response_format = "json";
 };
 
 //! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).
@@ -254,8 +262,8 @@ public:
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).
 	void StopAllServers();
-	//! (host, port, http_client_active) for each running server.
-	vector<std::tuple<string, int, string>> ListServers();
+	//! (host, port, http_client_active, http_client_reason) for each running server.
+	vector<std::tuple<string, int, string, string>> ListServers();
 
 	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
 	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);

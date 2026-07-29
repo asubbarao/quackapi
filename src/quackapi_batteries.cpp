@@ -257,8 +257,13 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	// per-request httplib client. curl_httpfs is a drop-in httpfs client layer.
 	// CLIENT only — does not replace the inbound httplib SERVER.
 	// Platform matrix (community description.yml excluded_platforms): unavailable on
-	// wasm_* and windows_*; available on linux_* and osx_*. INSTALL/LOAD may still
-	// fail (offline, old catalog) — never fail serve; fall back to httplib.
+	// wasm_* and windows_*; available on linux_* and osx_*.
+	//
+	// Preference semantics:
+	//   auto    — prefer curl_httpfs; fall back to httplib with LOUD reason on
+	//             healthz / quackapi_servers() / stderr (never silent)
+	//   curl    — REQUIRE curl_httpfs; fail serve if INSTALL/LOAD fails
+	//   httplib — operator forced stock client (no curl_httpfs install)
 	{
 		string pref = StringUtil::Lower(opts.http_client);
 		StringUtil::Trim(pref);
@@ -287,7 +292,7 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			applied.push_back("http_client=httplib (WHY: operator forced stock httplib client; "
 			                  "no curl_httpfs install)");
 		} else {
-			// auto | curl — prefer curl_httpfs; graceful fallback on any failure.
+			// auto | curl — probe curl_httpfs. auto falls back; curl fails hard.
 			string fail_detail;
 			bool loaded = false;
 
@@ -337,16 +342,33 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 				fprintf(stderr, "quackapi.http_client=curl\n");
 				applied.push_back("http_client=curl (WHY: curl_httpfs — libcurl pool + HTTP/2 + async IO for "
 				                  "outbound https reads from handlers; 100% httpfs-compatible)");
+			} else if (pref == "curl") {
+				// Production guarantee: no silent httplib when operator required curl.
+				const string detail =
+				    fail_detail.empty() ? string("unknown") : StringUtil::Replace(fail_detail, "\n", " ");
+				fprintf(stderr, "quackapi.http_client=curl FAILED reason=curl_httpfs_unavailable detail=%s\n",
+				        detail.c_str());
+				throw InvalidInputException(
+				    "quackapi_serve: http_client='curl' requires curl_httpfs but INSTALL/LOAD failed "
+				    "(platform excluded, offline catalog, or load error). "
+				    "Use http_client:='auto' for graceful fallback, or install curl_httpfs. detail=%s",
+				    detail);
 			} else {
+				// auto — graceful but LOUD fallback (healthz + servers + stderr carry reason).
 				opts.http_client_active = "httplib";
 				opts.http_client_reason = "curl_httpfs_unavailable";
-				// One structured line for ops (and a short applied summary).
-				fprintf(stderr, "quackapi.http_client=httplib reason=curl_httpfs_unavailable\n");
-				applied.push_back(
-				    StringUtil::Format("http_client=httplib reason=curl_httpfs_unavailable (WHY: graceful fallback — "
-				                       "curl_httpfs not installable/loadable on this platform or environment; "
-				                       "detail=%s)",
-				                       fail_detail.empty() ? "unknown" : StringUtil::Replace(fail_detail, "\n", " ")));
+				const string detail =
+				    fail_detail.empty() ? string("unknown") : StringUtil::Replace(fail_detail, "\n", " ");
+				fprintf(stderr,
+				        "quackapi.http_client=httplib reason=curl_httpfs_unavailable "
+				        "WARN=auto_fallback production_should_force_curl_or_ensure_curl_httpfs "
+				        "detail=%s\n",
+				        detail.c_str());
+				applied.push_back(StringUtil::Format(
+				    "http_client=httplib reason=curl_httpfs_unavailable (WHY: auto fallback — "
+				    "curl_httpfs not installable/loadable; /healthz + quackapi_servers report reason; "
+				    "production: http_client:='curl' or ensure curl_httpfs; detail=%s)",
+				    detail));
 			}
 		}
 	}

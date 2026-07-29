@@ -1,0 +1,50 @@
+# name: test/sql/quackapi_request_id.test
+# description: X-Request-ID mint + client honor + $request_id bind (SQLLogic)
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE OR REPLACE ROUTE echo_rid GET '/echo-rid' AS
+  SELECT $request_id::VARCHAR AS id;
+
+# Server mints: header non-empty and appears in body
+query I
+SELECT length(headers['X-Request-ID']) > 10 FROM quackapi_request('GET', '/echo-rid');
+----
+true
+
+query I
+SELECT decode(body) LIKE '%' || headers['X-Request-ID'] || '%'
+FROM quackapi_request('GET', '/echo-rid');
+----
+true
+
+# Client-supplied id honored (body bind)
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/echo-rid',
+  headers := MAP {'X-Request-ID': 'client-rid-deadbeef'}
+);
+----
+200	[{"id":"client-rid-deadbeef"}]
+
+query I
+SELECT headers['X-Request-ID']
+FROM quackapi_request(
+  'GET', '/echo-rid',
+  headers := MAP {'X-Request-ID': 'client-rid-deadbeef'}
+);
+----
+client-rid-deadbeef
+
+# Case-insensitive request header
+query I
+SELECT decode(body)
+FROM quackapi_request(
+  'GET', '/echo-rid',
+  headers := MAP {'X-Request-Id': 'mixed-case-id-99'}
+);
+----
+[{"id":"mixed-case-id-99"}]

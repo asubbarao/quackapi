@@ -31,7 +31,7 @@ A web-framework server that fetches remote data needs a production-grade pooled
 client; without it, throughput collapses under concurrency on DuckDB’s default
 per-request httplib client.
 
-### Platform coverage + graceful fallback
+### Platform coverage
 
 Community `description.yml` for curl_httpfs excludes:
 
@@ -40,49 +40,72 @@ Community `description.yml` for curl_httpfs excludes:
 | `wasm_mvp`, `wasm_eh`, `wasm_threads` | `linux_amd64`, `linux_arm64`, … |
 | `windows_amd64`, `windows_amd64_mingw`, `windows_amd64_rtools` | `osx_amd64`, `osx_arm64` |
 
-If `INSTALL`/`LOAD` fails for any reason (unsupported platform, offline
-catalog, older DuckDB), **serve does not fail**. Batteries stay on the stock
-httplib client and log:
-
-```text
-quackapi.http_client=httplib reason=curl_httpfs_unavailable
-```
-
-`/healthz` then reports `"http_client":"httplib"`.
-
-### Override knob
+### Preference semantics (`http_client`)
 
 | Surface | Values | Default |
 |---|---|---|
 | `quackapi_serve(…, http_client := '…')` | `auto` \| `curl` \| `httplib` | `auto` |
 | `SET quackapi_http_client = '…'` | same | `auto` |
 
-- **`auto` / `curl`** — prefer curl_httpfs; fall back to httplib if unavailable
-- **`httplib`** — skip curl_httpfs install; force stock client  
-  logs `quackapi.http_client=httplib reason=operator_forced`
-
 Named param wins over the SET.
 
+| Value | Behavior |
+|---|---|
+| **`auto`** | Prefer curl_httpfs. If INSTALL/LOAD fails, **fall back to httplib** and report **loudly**: stderr line, `/healthz` `http_client` + `http_client_reason`, `quackapi_servers()`. |
+| **`curl`** | **Require** curl_httpfs. If INSTALL/LOAD fails, **serve fails** (no silent fallback). Production guarantee. |
+| **`httplib`** | Skip curl_httpfs install; force stock client. Logs `reason=operator_forced`. |
+
 ```sql
--- Default (prefer curl_httpfs)
+-- Default (prefer curl_httpfs; loud fallback if unavailable)
 SELECT * FROM quackapi_serve(8000);
 
--- Force stock httplib client
+-- Production: require curl_httpfs or refuse to serve
+SELECT * FROM quackapi_serve(8000, http_client := 'curl');
+
+-- Explicit stock client (dev / unsupported platform)
 SELECT * FROM quackapi_serve(8000, http_client := 'httplib');
 
 SET quackapi_http_client = 'curl';
 SELECT * FROM quackapi_serve(8001);
 ```
 
+### auto fallback (loud, never silent)
+
+When `http_client` is `auto` and curl_httpfs cannot install/load:
+
+```text
+quackapi.http_client=httplib reason=curl_httpfs_unavailable WARN=auto_fallback …
+```
+
+`/healthz` then reports:
+
+```json
+{"status":"ok", …, "http_client":"httplib", "http_client_reason":"curl_httpfs_unavailable"}
+```
+
+`quackapi_servers()` has the same `http_client` / `http_client_reason` columns.
+
+### Production recommendation
+
+On **linux** and **osx** (platforms where community curl_httpfs ships), production
+should either:
+
+1. **`http_client := 'curl'`** (or `SET quackapi_http_client = 'curl'`) so serve
+   fails closed if the pooled client is missing, **or**
+2. Keep `auto` but **alert on** `/healthz` when
+   `http_client_reason == "curl_httpfs_unavailable"`.
+
+Do not ship concurrent outbound https under silent httplib fallback.
+
 ### Confirm the active client
 
 ```sql
 -- After serve
-SELECT * FROM quackapi_servers();
--- host | port | listen_url | http_client
+SELECT host, port, listen_url, http_client, http_client_reason
+FROM quackapi_servers();
 
--- Readiness JSON includes the same field
--- GET /healthz → {"status":"ok", …, "http_client":"curl"}
+-- Readiness JSON includes the same fields
+-- GET /healthz → {"status":"ok", …, "http_client":"curl", "http_client_reason":""}
 
 -- Active HTTPUtil name (MultiCurl / HTTPFS-Curl after curl_httpfs, Built-In otherwise)
 SELECT quackapi_http_util_name();
@@ -126,7 +149,7 @@ the built-in util is active, POST fails fast with a message to load curl_httpfs.
 | Hard-link libcurl / curl_httpfs into quackapi | Separate extension; composition is `SetHTTPUtil` |
 | `system("curl ...")` / subprocess | No secrets integration, no pool, unsafe |
 | Replace the **inbound** httplib server with curl_httpfs | curl_httpfs is the **client** layer only |
-| Fail serve when curl_httpfs is missing | Batteries must boot on every platform in `excluded_platforms` for quackapi |
+| Rely on silent httplib when you need production pool/HTTP2 | Use `http_client := 'curl'` or alert on `http_client_reason` |
 
 ## Load order
 

@@ -75,6 +75,7 @@ That is the whole product idea:
 | Column redaction | `CREATE MASKING POLICY` | claims-keyed masks |
 | Static files | `static_dir := '…'` on serve | unrouted GETs |
 | OpenAPI | open the browser | `/openapi.json`, `/docs`, `/redoc` |
+| Thin GraphQL (v0) | `POST /graphql` catalog tables | [graphql-v0.md](guide/graphql-v0.md) |
 
 Start the server with:
 
@@ -148,9 +149,11 @@ Handler SQL is validated at `CREATE` time. Broken SQL fails at create — not on
 6. [CREATE GROUP (prefix + shared auth = versioning)](guide/groups.md)  
 7. [CREATE QUEUE (background jobs + worker)](guide/queue.md)  
 8. [CREATE STREAM (SSE)](guide/stream.md)  
-9. [Row access & masking policies](guide/policies.md)  
-10. [Static files (`static_dir`)](guide/static-files.md)  
-11. [OpenAPI, Swagger UI, ReDoc](guide/openapi.md)
+9. [Extension composition (fetch, SSE, from_x, mesh, PDF)](guide/extension-composition.md)  
+10. [Row access & masking policies](guide/policies.md)  
+11. [Static files (`static_dir`)](guide/static-files.md)  
+12. [OpenAPI, Swagger UI, ReDoc](guide/openapi.md)  
+13. [Thin GraphQL v0 (catalog tables)](guide/graphql-v0.md)
 
 ### Reference
 
