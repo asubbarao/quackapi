@@ -193,7 +193,7 @@ INSTALL quackapi FROM community;
 LOAD quackapi;
 ```
 
-**Target DuckDB:** v1.5.4. Platforms: Linux/macOS amd64+arm64. wasm and Windows are excluded until CI is green.
+**Target DuckDB:** v1.5.5. Platforms: Linux/macOS amd64+arm64. wasm and Windows are excluded until CI is green.
 
 ---
 
