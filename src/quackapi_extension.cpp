@@ -326,6 +326,58 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 }
 
 //===--------------------------------------------------------------------===//
+// quackapi_request(method, path [, body]) — in-process TestClient (no TCP)
+//===--------------------------------------------------------------------===//
+
+struct RequestBindData : public TableFunctionData {
+	string method;
+	string path;
+	string body;
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
+		throw InvalidInputException("quackapi_request(method, path [, body]) expects 2 or 3 arguments");
+	}
+	auto bind_data = make_uniq<RequestBindData>();
+	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+		throw InvalidInputException("quackapi_request: method and path must be non-NULL");
+	}
+	bind_data->method = input.inputs[0].ToString();
+	bind_data->path = input.inputs[1].ToString();
+	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+		bind_data->body = input.inputs[2].ToString();
+	}
+	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
+	// "Invalid unicode" on Value(string). JSON/text clients cast: body::VARCHAR.
+	return_types.emplace_back(LogicalType::INTEGER);
+	return_types.emplace_back(LogicalType::BLOB);
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("status");
+	names.emplace_back("body");
+	names.emplace_back("content_type");
+	return std::move(bind_data);
+}
+
+static void RequestExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->CastNoConst<RequestBindData>();
+	if (bind_data.finished) {
+		return;
+	}
+	int status = 0;
+	string body;
+	string content_type;
+	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type);
+	output.SetValue(0, 0, Value::INTEGER(status));
+	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
+	output.SetValue(2, 0, Value(content_type));
+	output.SetCardinality(1);
+	bind_data.finished = true;
+}
+
+//===--------------------------------------------------------------------===//
 // quackapi_routes() — inspect the route registry
 //===--------------------------------------------------------------------===//
 
@@ -538,6 +590,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	stop.arguments.clear();
 	stop_set.AddFunction(stop);
 	loader.RegisterFunction(stop_set);
+
+	// quackapi_request(method, path [, body]) — in-process TestClient (no TCP).
+	TableFunctionSet request_set("quackapi_request");
+	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
+	request_set.AddFunction(request2);
+	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                       RequestExec, RequestBind);
+	request_set.AddFunction(request3);
+	loader.RegisterFunction(request_set);
 
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));
 	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind, ServersInit));

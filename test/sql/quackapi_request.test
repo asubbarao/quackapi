@@ -1,0 +1,72 @@
+# name: test/sql/quackapi_request.test
+# description: In-process TestClient — quackapi_request(method, path [, body]) without TCP
+# group: [sql]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# CREATE routes (registry only — no quackapi_serve / no port)
+# ---------------------------------------------------------------------------
+query I
+CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
+----
+Route hello: GET /hello
+
+query I
+CREATE ROUTE add POST '/add' AS SELECT ($a::INT + $b::INT) AS sum;
+----
+Route add: POST /add
+
+query I
+CREATE ROUTE item GET '/items/:id' AS SELECT $id::INTEGER AS id;
+----
+Route item: GET /items/:id
+
+# ---------------------------------------------------------------------------
+# GET registered route → 200 + JSON array body
+# body is BLOB (safe for parquet/arrow); cast for text asserts.
+# ---------------------------------------------------------------------------
+query III
+SELECT status, body::VARCHAR, content_type FROM quackapi_request('GET', '/hello');
+----
+200	[{"msg":"world"}]	application/json
+
+# ---------------------------------------------------------------------------
+# Missing path → 404
+# ---------------------------------------------------------------------------
+query II
+SELECT status, body::VARCHAR FROM quackapi_request('GET', '/nope');
+----
+404	{"detail":"Not Found"}
+
+# ---------------------------------------------------------------------------
+# Path params
+# ---------------------------------------------------------------------------
+query II
+SELECT status, body::VARCHAR FROM quackapi_request('GET', '/items/42');
+----
+200	[{"id":42}]
+
+# ---------------------------------------------------------------------------
+# POST with JSON body fields (Content-Type application/json set by TF)
+# ---------------------------------------------------------------------------
+query II
+SELECT status, body::VARCHAR FROM quackapi_request('POST', '/add', '{"a":2,"b":3}');
+----
+200	[{"sum":5}]
+
+# ---------------------------------------------------------------------------
+# Built-in health (no serve needed)
+# ---------------------------------------------------------------------------
+query I
+SELECT status FROM quackapi_request('GET', '/health');
+----
+200
+
+# ---------------------------------------------------------------------------
+# Method mismatch → 405
+# ---------------------------------------------------------------------------
+query I
+SELECT status FROM quackapi_request('DELETE', '/hello');
+----
+405

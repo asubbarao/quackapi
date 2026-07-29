@@ -127,7 +127,7 @@ struct QuackapiRoute {
 	int rate_limit_per_sec = 0;
 	//! "ip" (default), "token" (Authorization / X-API-Key header raw), "key" alias of token.
 	string rate_limit_by;
-	//! Default response body format: "json" (default), "ndjson", "csv", or "parquet".
+	//! Default response body format: "json" (default), "ndjson", "csv", "parquet", or "arrow".
 	//! Explicit non-json wins over Accept negotiation; json allows Accept override.
 	string response_format = "json";
 };
