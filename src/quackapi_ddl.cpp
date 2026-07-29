@@ -222,7 +222,7 @@ string JoinGroupPrefix(const string &prefix, const string &path) {
 
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv]
+//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet]
 //!     [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
@@ -401,17 +401,17 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			rest = QuackapiTrim(rest.substr(token_end));
 			continue;
 		}
-		// [FORMAT json|ndjson|csv]
+		// [FORMAT json|ndjson|csv|parquet]
 		if (StringUtil::StartsWith(rest_upper, "FORMAT") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
 			rest = QuackapiTrim(rest.substr(6));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
-				return ParserExtensionParseResult("FORMAT expects json, ndjson, or csv");
+				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, or parquet");
 			}
 			auto fmt = StringUtil::Lower(rest.substr(0, token_end));
-			if (fmt != "json" && fmt != "ndjson" && fmt != "csv") {
-				return ParserExtensionParseResult("FORMAT must be json, ndjson, or csv");
+			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet") {
+				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, or parquet");
 			}
 			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));

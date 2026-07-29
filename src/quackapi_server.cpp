@@ -8,6 +8,8 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
@@ -15,11 +17,13 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 
 #include "quackapi_auth.hpp"
 #include "quackapi_openapi.hpp"
@@ -1028,7 +1032,7 @@ void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
 
 //! Response mode inferred from the single output column's name — the database
 //! names the payload. `html` -> text/html, `text` -> text/plain; anything else
-//! serializes as row data (json / ndjson / csv via FORMAT + Accept).
+//! serializes as row data (json / ndjson / csv / parquet via FORMAT + Accept).
 enum class ResponseMode { JSON, HTML, TEXT };
 
 ResponseMode ResponseModeFor(const vector<string> &names) {
@@ -1046,7 +1050,7 @@ ResponseMode ResponseModeFor(const vector<string> &names) {
 }
 
 //! Wire format for multi-row data responses (not html/text column modes).
-enum class BodyFormat { JSON, NDJSON, CSV };
+enum class BodyFormat { JSON, NDJSON, CSV, PARQUET };
 
 BodyFormat ParseBodyFormatToken(const string &token) {
 	auto t = StringUtil::Lower(token);
@@ -1055,6 +1059,9 @@ BodyFormat ParseBodyFormatToken(const string &token) {
 	}
 	if (t == "csv") {
 		return BodyFormat::CSV;
+	}
+	if (t == "parquet") {
+		return BodyFormat::PARQUET;
 	}
 	return BodyFormat::JSON;
 }
@@ -1070,6 +1077,10 @@ bool MediaTypeToBodyFormat(const string &media, BodyFormat &out) {
 	}
 	if (m == "text/csv" || m == "application/csv") {
 		out = BodyFormat::CSV;
+		return true;
+	}
+	if (m == "application/vnd.apache.parquet" || m == "application/parquet") {
+		out = BodyFormat::PARQUET;
 		return true;
 	}
 	if (m == "application/json" || m == "text/json" || m == "*/*") {
@@ -1095,11 +1106,11 @@ double ParseAcceptQ(const string &token) {
 	return 1.0;
 }
 
-//! When route FORMAT is default/json, honor Accept for ndjson/csv/json.
-//! Explicit route FORMAT (ndjson|csv) always wins.
+//! When route FORMAT is default/json, honor Accept for ndjson/csv/parquet/json.
+//! Explicit route FORMAT (ndjson|csv|parquet) always wins.
 BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::Request &req) {
 	auto route_fmt = StringUtil::Lower(route.response_format.empty() ? "json" : route.response_format);
-	if (route_fmt == "ndjson" || route_fmt == "csv") {
+	if (route_fmt == "ndjson" || route_fmt == "csv" || route_fmt == "parquet") {
 		return ParseBodyFormatToken(route_fmt);
 	}
 	// Default / explicit json: negotiate Accept when present.
@@ -1107,7 +1118,7 @@ BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::R
 	if (it == req.headers.end() || it->second.empty()) {
 		return BodyFormat::JSON;
 	}
-	// Pick the highest-q recognized type among json / ndjson / csv.
+	// Pick the highest-q recognized type among json / ndjson / csv / parquet.
 	BodyFormat best = BodyFormat::JSON;
 	double best_q = -1.0;
 	bool saw_recognized = false;
@@ -1127,7 +1138,7 @@ BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::R
 		if (!MediaTypeToBodyFormat(media, f)) {
 			continue;
 		}
-		// Prefer more specific non-wildcard when q ties: ndjson/csv over */* json.
+		// Prefer more specific non-wildcard when q ties: ndjson/csv/parquet over */* json.
 		bool better = !saw_recognized || q > best_q;
 		if (!better && q == best_q) {
 			// Prefer non-json when client listed it at same q after json — first highest wins
@@ -1250,6 +1261,76 @@ string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_c
 		}
 		body += "\n";
 	}
+	return body;
+}
+
+//! Serialize result rows as a Parquet file body (magic "PAR1"). Uses a unique
+//! TEMP table + COPY TO (FORMAT PARQUET) + read bytes, then cleans up.
+string SerializeRowsParquet(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+                            const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
+	if (data_cols.empty()) {
+		throw InvalidInputException("parquet serialize: no data columns");
+	}
+	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
+	string table = "qa_parquet_" + uid;
+	string path = "/tmp/" + table + ".parquet";
+
+	string create_sql = "CREATE TEMP TABLE " + table + " (";
+	for (idx_t i = 0; i < data_cols.size(); i++) {
+		if (i > 0) {
+			create_sql += ", ";
+		}
+		auto c = data_cols[i];
+		create_sql += KeywordHelper::WriteOptionallyQuoted(names[c]);
+		create_sql += " ";
+		create_sql += types[c].ToString();
+	}
+	create_sql += ")";
+	auto create_res = con.Query(create_sql);
+	if (create_res->HasError()) {
+		throw InvalidInputException("parquet serialize CREATE: %s", create_res->GetError());
+	}
+
+	if (!rows.empty()) {
+		Appender appender(con, table);
+		for (auto &cols : rows) {
+			appender.BeginRow();
+			for (auto c : data_cols) {
+				if (c < cols.size()) {
+					appender.Append(cols[c]);
+				} else {
+					appender.Append(Value());
+				}
+			}
+			appender.EndRow();
+		}
+		appender.Close();
+	}
+
+	auto copy_res = con.Query("COPY " + table + " TO '" + path + "' (FORMAT PARQUET)");
+	if (copy_res->HasError()) {
+		con.Query("DROP TABLE IF EXISTS " + table);
+		FileSystem::GetFileSystem(*con.context).TryRemoveFile(path);
+		throw InvalidInputException("parquet serialize COPY: %s", copy_res->GetError());
+	}
+	con.Query("DROP TABLE IF EXISTS " + table);
+
+	auto &fs = FileSystem::GetFileSystem(*con.context);
+	unique_ptr<FileHandle> handle;
+	try {
+		handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	} catch (...) {
+		fs.TryRemoveFile(path);
+		throw;
+	}
+	idx_t file_size = handle->GetFileSize();
+	string body;
+	body.resize(file_size);
+	if (file_size > 0) {
+		handle->Read(data_ptr_cast(body.data()), file_size);
+	}
+	handle->Close();
+	fs.TryRemoveFile(path);
 	return body;
 }
 
@@ -2367,7 +2448,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		// Zero-parameter handlers (e.g. SELECT 'world' AS msg): serve cached JSON
 		// after the first successful execute on this worker thread. Only for the
-		// JSON body format — Accept/FORMAT may request ndjson/csv on the same SQL.
+		// JSON body format — Accept/FORMAT may request ndjson/csv/parquet on the same SQL.
 		const bool zero_params = prepared->named_param_map.empty();
 		const BodyFormat body_format = ResolveBodyFormat(match.route, req);
 		if (zero_params && body_format == BodyFormat::JSON) {
@@ -2713,7 +2794,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		// Serialize rows: json array | ndjson | csv (FORMAT + Accept).
+		// Serialize rows: json array | ndjson | csv | parquet (FORMAT + Accept).
 		string body;
 		const char *content_type = "application/json";
 		if (body_format == BodyFormat::NDJSON) {
@@ -2722,6 +2803,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		} else if (body_format == BodyFormat::CSV) {
 			body = SerializeRowsCsv(names, data_cols, rows);
 			content_type = "text/csv; charset=utf-8";
+		} else if (body_format == BodyFormat::PARQUET) {
+			body = SerializeRowsParquet(con, names, result->types, data_cols, rows);
+			content_type = "application/vnd.apache.parquet";
 		} else {
 			body = SerializeRowsJsonArray(names, data_cols, rows);
 			// Cache constant JSON responses (no bind params) for this worker.
