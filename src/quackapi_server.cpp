@@ -1027,7 +1027,7 @@ void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
 
 //! Response mode inferred from the single output column's name — the database
 //! names the payload. `html` -> text/html, `text` -> text/plain; anything else
-//! serializes as the JSON array of row objects.
+//! serializes as row data (json / ndjson / csv via FORMAT + Accept).
 enum class ResponseMode { JSON, HTML, TEXT };
 
 ResponseMode ResponseModeFor(const vector<string> &names) {
@@ -1042,6 +1042,214 @@ ResponseMode ResponseModeFor(const vector<string> &names) {
 		return ResponseMode::TEXT;
 	}
 	return ResponseMode::JSON;
+}
+
+//! Wire format for multi-row data responses (not html/text column modes).
+enum class BodyFormat { JSON, NDJSON, CSV };
+
+BodyFormat ParseBodyFormatToken(const string &token) {
+	auto t = StringUtil::Lower(token);
+	if (t == "ndjson") {
+		return BodyFormat::NDJSON;
+	}
+	if (t == "csv") {
+		return BodyFormat::CSV;
+	}
+	return BodyFormat::JSON;
+}
+
+//! Map Accept media-type (no parameters) to BodyFormat. Returns false if unknown.
+bool MediaTypeToBodyFormat(const string &media, BodyFormat &out) {
+	auto m = StringUtil::Lower(media);
+	// strip parameters already; still trim
+	m = QuackapiTrim(m);
+	if (m == "application/x-ndjson" || m == "application/jsonl" || m == "application/ndjson") {
+		out = BodyFormat::NDJSON;
+		return true;
+	}
+	if (m == "text/csv" || m == "application/csv") {
+		out = BodyFormat::CSV;
+		return true;
+	}
+	if (m == "application/json" || m == "text/json" || m == "*/*") {
+		out = BodyFormat::JSON;
+		return true;
+	}
+	return false;
+}
+
+//! Parse one Accept token's q-value (default 1.0).
+double ParseAcceptQ(const string &token) {
+	auto parts = StringUtil::Split(token, ';');
+	if (parts.size() < 2) {
+		return 1.0;
+	}
+	for (idx_t i = 1; i < parts.size(); i++) {
+		auto p = QuackapiTrim(parts[i]);
+		auto pl = StringUtil::Lower(p);
+		if (StringUtil::StartsWith(pl, "q=")) {
+			return atof(p.c_str() + 2);
+		}
+	}
+	return 1.0;
+}
+
+//! When route FORMAT is default/json, honor Accept for ndjson/csv/json.
+//! Explicit route FORMAT (ndjson|csv) always wins.
+BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::Request &req) {
+	auto route_fmt = StringUtil::Lower(route.response_format.empty() ? "json" : route.response_format);
+	if (route_fmt == "ndjson" || route_fmt == "csv") {
+		return ParseBodyFormatToken(route_fmt);
+	}
+	// Default / explicit json: negotiate Accept when present.
+	auto it = req.headers.find("Accept");
+	if (it == req.headers.end() || it->second.empty()) {
+		return BodyFormat::JSON;
+	}
+	// Pick the highest-q recognized type among json / ndjson / csv.
+	BodyFormat best = BodyFormat::JSON;
+	double best_q = -1.0;
+	bool saw_recognized = false;
+	auto tokens = StringUtil::Split(it->second, ',');
+	for (auto &tok : tokens) {
+		auto t = QuackapiTrim(tok);
+		if (t.empty()) {
+			continue;
+		}
+		double q = ParseAcceptQ(t);
+		if (q <= 0.0) {
+			continue;
+		}
+		auto semi = t.find(';');
+		string media = semi == string::npos ? t : QuackapiTrim(t.substr(0, semi));
+		BodyFormat f;
+		if (!MediaTypeToBodyFormat(media, f)) {
+			continue;
+		}
+		// Prefer more specific non-wildcard when q ties: ndjson/csv over */* json.
+		bool better = !saw_recognized || q > best_q;
+		if (!better && q == best_q) {
+			// Prefer non-json when client listed it at same q after json — first highest wins
+			// unless current best is from */* and this is concrete.
+			if (best == BodyFormat::JSON && f != BodyFormat::JSON) {
+				better = true;
+			}
+		}
+		if (better) {
+			best = f;
+			best_q = q;
+			saw_recognized = true;
+		}
+	}
+	return saw_recognized ? best : BodyFormat::JSON;
+}
+
+//! RFC 4180-style CSV field escape (quote when needed).
+string CsvEscapeField(const string &input) {
+	bool need_quote = false;
+	for (unsigned char c : input) {
+		if (c == '"' || c == ',' || c == '\n' || c == '\r') {
+			need_quote = true;
+			break;
+		}
+	}
+	if (!need_quote) {
+		return input;
+	}
+	string out;
+	out.reserve(input.size() + 2);
+	out += '"';
+	for (unsigned char c : input) {
+		if (c == '"') {
+			out += "\"\"";
+		} else {
+			out += static_cast<char>(c);
+		}
+	}
+	out += '"';
+	return out;
+}
+
+//! Cell text for CSV: null → empty; scalars ToString; nested → JSON text.
+string ValueToCsvCell(const Value &value) {
+	if (value.IsNull()) {
+		return "";
+	}
+	auto id = value.type().id();
+	if (id == LogicalTypeId::LIST || id == LogicalTypeId::STRUCT || id == LogicalTypeId::MAP) {
+		return ValueToJson(value);
+	}
+	return value.ToString();
+}
+
+string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &data_cols,
+                              const vector<vector<Value>> &rows) {
+	string body = "[";
+	bool first_row = true;
+	for (auto &cols : rows) {
+		if (!first_row) {
+			body += ",";
+		}
+		first_row = false;
+		body += "{";
+		bool first_col = true;
+		for (auto col : data_cols) {
+			if (!first_col) {
+				body += ",";
+			}
+			first_col = false;
+			body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
+		}
+		body += "}";
+	}
+	body += "]";
+	return body;
+}
+
+string SerializeRowsNdjson(const vector<string> &names, const vector<idx_t> &data_cols,
+                           const vector<vector<Value>> &rows) {
+	string body;
+	for (auto &cols : rows) {
+		body += "{";
+		bool first_col = true;
+		for (auto col : data_cols) {
+			if (!first_col) {
+				body += ",";
+			}
+			first_col = false;
+			body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
+		}
+		body += "}\n";
+	}
+	return body;
+}
+
+string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_cols,
+                        const vector<vector<Value>> &rows) {
+	string body;
+	// header
+	for (idx_t i = 0; i < data_cols.size(); i++) {
+		if (i > 0) {
+			body += ",";
+		}
+		body += CsvEscapeField(names[data_cols[i]]);
+	}
+	body += "\n";
+	for (auto &cols : rows) {
+		for (idx_t i = 0; i < data_cols.size(); i++) {
+			if (i > 0) {
+				body += ",";
+			}
+			auto col = data_cols[i];
+			string cell;
+			if (col < cols.size()) {
+				cell = ValueToCsvCell(cols[col]);
+			}
+			body += CsvEscapeField(cell);
+		}
+		body += "\n";
+	}
+	return body;
 }
 
 void SetInternalError(duckdb_httplib::Response &res, const string &server_side_detail) {
@@ -2071,9 +2279,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		// Zero-parameter handlers (e.g. SELECT 'world' AS msg): serve cached JSON
-		// after the first successful execute on this worker thread.
+		// after the first successful execute on this worker thread. Only for the
+		// JSON body format — Accept/FORMAT may request ndjson/csv on the same SQL.
 		const bool zero_params = prepared->named_param_map.empty();
-		if (zero_params) {
+		const BodyFormat body_format = ResolveBodyFormat(match.route, req);
+		if (zero_params && body_format == BodyFormat::JSON) {
 			if (const string *cached = tls.LookupStaticBody(handler_sql)) {
 				SetJson(res, match.route.status, *cached);
 				finish();
@@ -2345,34 +2555,31 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		// Materialize rows once so we can apply headers then serialize body.
-		struct RowVals {
-			vector<Value> cols;
-		};
-		vector<RowVals> rows;
+		vector<vector<Value>> rows;
 		while (true) {
 			auto chunk = result->Fetch();
 			if (!chunk || chunk->size() == 0) {
 				break;
 			}
 			for (idx_t row = 0; row < chunk->size(); row++) {
-				RowVals rv;
-				rv.cols.resize(chunk->ColumnCount());
+				vector<Value> cols;
+				cols.resize(chunk->ColumnCount());
 				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-					rv.cols[col] = chunk->GetValue(col, row);
+					cols[col] = chunk->GetValue(col, row);
 				}
-				rows.push_back(std::move(rv));
+				rows.push_back(std::move(cols));
 			}
 		}
 
 		// Apply Location / Set-Cookie from first (or each) row.
 		string location_value;
 		vector<string> set_cookie_values;
-		for (auto &rv : rows) {
-			if (location_col < rv.cols.size() && !rv.cols[location_col].IsNull() && location_value.empty()) {
-				location_value = rv.cols[location_col].ToString();
+		for (auto &cols : rows) {
+			if (location_col < cols.size() && !cols[location_col].IsNull() && location_value.empty()) {
+				location_value = cols[location_col].ToString();
 			}
-			if (set_cookie_col < rv.cols.size() && !rv.cols[set_cookie_col].IsNull()) {
-				set_cookie_values.push_back(rv.cols[set_cookie_col].ToString());
+			if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
+				set_cookie_values.push_back(cols[set_cookie_col].ToString());
 			}
 		}
 		if (!location_value.empty()) {
@@ -2402,12 +2609,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// HTML/TEXT mode: a single data column named `html`/`text` serves its raw
 		// string value (e.g. SELECT tera_render(...) AS html). Multiple rows are
 		// concatenated in order, so a query returning fragments streams a page.
+		// Column-name modes win over FORMAT / Accept.
 		if (mode != ResponseMode::JSON) {
 			string body;
 			idx_t col = data_cols[0];
-			for (auto &rv : rows) {
-				if (col < rv.cols.size() && !rv.cols[col].IsNull()) {
-					body += rv.cols[col].ToString();
+			for (auto &cols : rows) {
+				if (col < cols.size() && !cols[col].IsNull()) {
+					body += cols[col].ToString();
 				}
 			}
 			res.status = match.route.status;
@@ -2418,31 +2626,27 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		// Serialize: JSON array of row objects, typed by the query's data columns.
-		string body = "[";
-		bool first_row = true;
-		for (auto &rv : rows) {
-			if (!first_row) {
-				body += ",";
+		// Serialize rows: json array | ndjson | csv (FORMAT + Accept).
+		string body;
+		const char *content_type = "application/json";
+		if (body_format == BodyFormat::NDJSON) {
+			body = SerializeRowsNdjson(names, data_cols, rows);
+			content_type = "application/x-ndjson";
+		} else if (body_format == BodyFormat::CSV) {
+			body = SerializeRowsCsv(names, data_cols, rows);
+			content_type = "text/csv; charset=utf-8";
+		} else {
+			body = SerializeRowsJsonArray(names, data_cols, rows);
+			// Cache constant JSON responses (no bind params) for this worker.
+			if (zero_params && location_value.empty() && set_cookie_values.empty()) {
+				tls.StoreStaticBody(handler_sql, body);
 			}
-			first_row = false;
-			body += "{";
-			bool first_col = true;
-			for (auto col : data_cols) {
-				if (!first_col) {
-					body += ",";
-				}
-				first_col = false;
-				body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(rv.cols[col]);
-			}
-			body += "}";
+			SetJson(res, match.route.status, body);
+			finish();
+			return;
 		}
-		body += "]";
-		// Cache constant responses (no bind params, pure JSON) for this worker.
-		if (zero_params && location_value.empty() && set_cookie_values.empty()) {
-			tls.StoreStaticBody(handler_sql, body);
-		}
-		SetJson(res, match.route.status, body);
+		res.status = match.route.status;
+		res.set_content(body, content_type);
 		// Keep body so Content-Length is correct; httplib omits the body for HEAD.
 	} catch (std::exception &ex) {
 		SetInternalError(res, ex.what());

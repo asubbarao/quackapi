@@ -354,6 +354,8 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("group_name");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("tags");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("format");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -376,6 +378,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(5, row, Value(route.require_auth));
 		output.SetValue(6, row, Value(route.group_name));
 		output.SetValue(7, row, Value(route.tags));
+		output.SetValue(8, row, Value(route.response_format.empty() ? "json" : route.response_format));
 		row++;
 		state.offset++;
 	}

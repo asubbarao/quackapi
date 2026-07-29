@@ -122,6 +122,9 @@ struct QuackapiRoute {
 	string group_name;
 	//! OpenAPI tags CSV (from group inheritance or future per-route tags).
 	string tags;
+	//! Default response body format: "json" (default), "ndjson", or "csv".
+	//! Explicit non-json wins over Accept negotiation; json allows Accept override.
+	string response_format = "json";
 };
 
 //! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).

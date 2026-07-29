@@ -122,6 +122,56 @@ DROP ROUTE spaced;
 ----
 Dropped route spaced
 
+# Default format is json
+query I
+CREATE ROUTE fmt_default GET '/fmt_default' AS SELECT 1 AS id;
+----
+Route fmt_default: GET /fmt_default
+
+query I
+SELECT format FROM quackapi_routes() WHERE name = 'fmt_default';
+----
+json
+
+# FORMAT ndjson / csv store on the route
+query I
+CREATE ROUTE fmt_ndjson GET '/fmt_ndjson' FORMAT ndjson AS SELECT 1 AS id, 'a' AS name;
+----
+Route fmt_ndjson: GET /fmt_ndjson
+
+query I
+CREATE ROUTE fmt_csv GET '/fmt_csv' FORMAT csv STATUS 200 AS SELECT 1 AS id;
+----
+Route fmt_csv: GET /fmt_csv
+
+query II
+SELECT name, format FROM quackapi_routes() WHERE name LIKE 'fmt_%' ORDER BY name;
+----
+fmt_csv	csv
+fmt_default	json
+fmt_ndjson	ndjson
+
+# Invalid FORMAT rejected
+statement error
+CREATE ROUTE bad_fmt GET '/x' FORMAT parquet AS SELECT 1;
+----
+FORMAT must be json, ndjson, or csv
+
+query I
+DROP ROUTE fmt_default;
+----
+Dropped route fmt_default
+
+query I
+DROP ROUTE fmt_ndjson;
+----
+Dropped route fmt_ndjson
+
+query I
+DROP ROUTE fmt_csv;
+----
+Dropped route fmt_csv
+
 # Handler SQL is validated at CREATE time (not deferred to first request)
 statement error
 CREATE ROUTE bad GET '/x' AS SELECT * FROM no_such_table;
