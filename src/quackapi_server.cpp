@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 
@@ -1312,6 +1313,28 @@ void FillTempTableForSerdes(Connection &con, const string &table, const vector<s
 	}
 }
 
+//! OS temp dir + basename for parquet/arrow scratch files. Never hardcode /tmp
+//! (Windows CI has no /tmp). Paths use forward slashes for SQL COPY literals.
+string SerdesTempFilePath(FileSystem &fs, const string &filename) {
+	string dir;
+#if defined(_WIN32) || defined(WIN32)
+	const char *t = std::getenv("TEMP");
+	if (!t || !t[0]) {
+		t = std::getenv("TMP");
+	}
+	dir = (t && t[0]) ? string(t) : string(".");
+#else
+	const char *t = std::getenv("TMPDIR");
+	dir = (t && t[0]) ? string(t) : string("/tmp");
+#endif
+	string path = fs.JoinPath(dir, filename);
+	return StringUtil::Replace(path, "\\", "/");
+}
+
+string SqlQuotePath(const string &path) {
+	return StringUtil::Replace(path, "'", "''");
+}
+
 //! Read path bytes then delete the file. On open failure, best-effort remove.
 string ReadAndRemoveFileBytes(Connection &con, const string &path) {
 	auto &fs = FileSystem::GetFileSystem(*con.context);
@@ -1342,16 +1365,17 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 	if (data_cols.empty()) {
 		throw InvalidInputException("parquet serialize: no data columns");
 	}
+	auto &fs = FileSystem::GetFileSystem(*con.context);
 	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
 	string table = "qa_parquet_" + uid;
-	string path = "/tmp/" + table + ".parquet";
+	string path = SerdesTempFilePath(fs, table + ".parquet");
 
 	FillTempTableForSerdes(con, table, names, types, data_cols, rows, "parquet");
 
-	auto copy_res = con.Query("COPY " + table + " TO '" + path + "' (FORMAT PARQUET)");
+	auto copy_res = con.Query("COPY " + table + " TO '" + SqlQuotePath(path) + "' (FORMAT PARQUET)");
 	if (copy_res->HasError()) {
 		con.Query("DROP TABLE IF EXISTS " + table);
-		FileSystem::GetFileSystem(*con.context).TryRemoveFile(path);
+		fs.TryRemoveFile(path);
 		throw InvalidInputException("parquet serialize COPY: %s", copy_res->GetError());
 	}
 	con.Query("DROP TABLE IF EXISTS " + table);
@@ -1385,16 +1409,17 @@ string SerializeRowsArrow(Connection &con, const vector<string> &names, const ve
 		throw InvalidInputException("arrow serialize: no data columns");
 	}
 	EnsureNanoarrowLoaded(con);
+	auto &fs = FileSystem::GetFileSystem(*con.context);
 	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
 	string table = "qa_arrow_" + uid;
-	string path = "/tmp/" + table + ".arrows";
+	string path = SerdesTempFilePath(fs, table + ".arrows");
 
 	FillTempTableForSerdes(con, table, names, types, data_cols, rows, "arrow");
 
-	auto copy_res = con.Query("COPY " + table + " TO '" + path + "' (FORMAT ARROWS)");
+	auto copy_res = con.Query("COPY " + table + " TO '" + SqlQuotePath(path) + "' (FORMAT ARROWS)");
 	if (copy_res->HasError()) {
 		con.Query("DROP TABLE IF EXISTS " + table);
-		FileSystem::GetFileSystem(*con.context).TryRemoveFile(path);
+		fs.TryRemoveFile(path);
 		throw InvalidInputException("arrow serialize COPY: %s", copy_res->GetError());
 	}
 	con.Query("DROP TABLE IF EXISTS " + table);
