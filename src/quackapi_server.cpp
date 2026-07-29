@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <mutex>
 #include <thread>
 
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -1324,6 +1325,72 @@ void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &re
 	res.set_header("Vary", "Accept-Encoding");
 }
 
+// In-process sliding fixed-window rate limiter (no Redis). Keyed by
+// route name + client key + floor(now / window). thread-safe.
+struct RouteRateLimiter {
+	struct Entry {
+		int count = 0;
+		int64_t window_id = 0;
+	};
+	std::mutex lock;
+	unordered_map<string, Entry> entries;
+
+	// Returns true if allowed. On false, retry_after_sec is seconds until window end.
+	bool Allow(const string &bucket_key, int limit, int per_sec, int &retry_after_sec) {
+		retry_after_sec = per_sec;
+		if (limit <= 0 || per_sec <= 0) {
+			return true;
+		}
+		const auto now = std::chrono::system_clock::now().time_since_epoch();
+		const int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+		const int64_t window_id = now_sec / per_sec;
+		const int64_t window_end = (window_id + 1) * per_sec;
+		retry_after_sec = (int)std::max<int64_t>(1, window_end - now_sec);
+
+		std::lock_guard<std::mutex> guard(lock);
+		auto &e = entries[bucket_key];
+		if (e.window_id != window_id) {
+			e.window_id = window_id;
+			e.count = 0;
+		}
+		if (e.count >= limit) {
+			return false;
+		}
+		e.count++;
+		// Opportunistic prune when map grows large (unbounded routes × clients).
+		if (entries.size() > 100000) {
+			for (auto it = entries.begin(); it != entries.end();) {
+				if (it->second.window_id < window_id - 1) {
+					it = entries.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		return true;
+	}
+};
+
+static RouteRateLimiter &GetRouteRateLimiter() {
+	static RouteRateLimiter lim;
+	return lim;
+}
+
+static string RateLimitClientKey(const duckdb_httplib::Request &req, const string &by) {
+	if (by == "token" || by == "key") {
+		string auth = req.get_header_value("Authorization");
+		if (auth.empty()) {
+			auth = req.get_header_value("X-API-Key");
+		}
+		if (!auth.empty()) {
+			return "tok:" + auth;
+		}
+		// Fall back to IP when no credential presented.
+	}
+	string ip = req.remote_addr.empty() ? string("unknown") : req.remote_addr;
+	return "ip:" + ip;
+}
+
 void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 	// Always attach CORS headers when configured (including error responses).
 	// Stamp X-Request-ID + emit structured access log on every exit path.
@@ -1629,6 +1696,22 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		finish();
 		return;
+	}
+
+	// ---- RATE LIMIT (before auth/handler work) ----
+	// CREATE ROUTE … RATE LIMIT <n> PER <seconds> [BY ip|token|key]
+	if (match.matched && match.route.rate_limit_n > 0 && match.route.rate_limit_per_sec > 0) {
+		string by = match.route.rate_limit_by.empty() ? string("ip") : match.route.rate_limit_by;
+		string client = RateLimitClientKey(req, by);
+		string bucket = match.route.name + "|" + client;
+		int retry_after = match.route.rate_limit_per_sec;
+		if (!GetRouteRateLimiter().Allow(bucket, match.route.rate_limit_n, match.route.rate_limit_per_sec,
+		                                 retry_after)) {
+			res.set_header("Retry-After", std::to_string(retry_after));
+			SetJson(res, 429, "{\"detail\":\"Rate limit exceeded\"}");
+			finish();
+			return;
+		}
 	}
 
 	// ---- CREATE STREAM (SSE) path — no auth schemes on streams in v1 ----

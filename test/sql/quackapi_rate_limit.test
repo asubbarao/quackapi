@@ -1,0 +1,26 @@
+# name: test/sql/quackapi_rate_limit.test
+# description: CREATE ROUTE RATE LIMIT clause parses and registers
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE rl1 GET '/rl1' RATE LIMIT 5 PER 10 AS SELECT 1 AS x;
+
+statement ok
+CREATE ROUTE rl2 GET '/rl2' RATE LIMIT 2 PER 30 BY token AS SELECT 1 AS x;
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name IN ('rl1','rl2');
+----
+2
+
+statement error
+CREATE ROUTE bad GET '/bad' RATE LIMIT 0 PER 10 AS SELECT 1;
+----
+positive
+
+statement error
+CREATE ROUTE bad2 GET '/bad2' RATE LIMIT 5 PER 10 BY user AS SELECT 1;
+----
+ip, token, or key

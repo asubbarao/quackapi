@@ -122,6 +122,11 @@ struct QuackapiRoute {
 	string group_name;
 	//! OpenAPI tags CSV (from group inheritance or future per-route tags).
 	string tags;
+	//! RATE LIMIT <n> PER <seconds> [BY ip|token|key]. n==0 disables.
+	int rate_limit_n = 0;
+	int rate_limit_per_sec = 0;
+	//! "ip" (default), "token" (Authorization / X-API-Key header raw), "key" alias of token.
+	string rate_limit_by;
 };
 
 //! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).

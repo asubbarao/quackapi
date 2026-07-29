@@ -302,12 +302,15 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return i;
 	};
 
-	// Optional clauses in any order: STATUS / REQUIRE / GROUP|IN GROUP
+	// Optional clauses in any order: STATUS / REQUIRE / GROUP|IN GROUP / RATE LIMIT
 	int status = 200;
 	string require_auth;
 	string group_name;
+	int rate_limit_n = 0;
+	int rate_limit_per_sec = 0;
+	string rate_limit_by; // empty → ip at apply time
 	auto rest_upper = StringUtil::Upper(rest);
-	for (int clause_round = 0; clause_round < 6; clause_round++) {
+	for (int clause_round = 0; clause_round < 10; clause_round++) {
 		rest_upper = StringUtil::Upper(rest);
 		// [STATUS <n>]
 		if (StringUtil::StartsWith(rest_upper, "STATUS") &&
@@ -322,6 +325,63 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				return ParserExtensionParseResult("STATUS must be a valid HTTP status code");
 			}
 			rest = QuackapiTrim(rest.substr(token_end));
+			continue;
+		}
+		// [RATE LIMIT <n> PER <seconds> [BY ip|token|key]]
+		if (StringUtil::StartsWith(rest_upper, "RATE") && rest.size() > 4 &&
+		    StringUtil::CharacterIsSpace(rest[4])) {
+			string after_rate = QuackapiTrim(rest.substr(4));
+			auto after_rate_u = StringUtil::Upper(after_rate);
+			if (!(StringUtil::StartsWith(after_rate_u, "LIMIT") &&
+			      (after_rate.size() == 5 || StringUtil::CharacterIsSpace(after_rate[5])))) {
+				return ParserExtensionParseResult("Expected RATE LIMIT <n> PER <seconds>");
+			}
+			after_rate = QuackapiTrim(after_rate.substr(5));
+			auto n_end = NextTokenEnd(after_rate);
+			if (n_end == 0) {
+				return ParserExtensionParseResult("RATE LIMIT expects a positive integer count");
+			}
+			rate_limit_n = atoi(after_rate.substr(0, n_end).c_str());
+			if (rate_limit_n <= 0) {
+				return ParserExtensionParseResult("RATE LIMIT count must be a positive integer");
+			}
+			after_rate = QuackapiTrim(after_rate.substr(n_end));
+			auto after_n_u = StringUtil::Upper(after_rate);
+			if (!(StringUtil::StartsWith(after_n_u, "PER") &&
+			      (after_rate.size() == 3 || StringUtil::CharacterIsSpace(after_rate[3])))) {
+				return ParserExtensionParseResult("Expected PER <seconds> after RATE LIMIT <n>");
+			}
+			after_rate = QuackapiTrim(after_rate.substr(3));
+			auto per_end = NextTokenEnd(after_rate);
+			if (per_end == 0) {
+				return ParserExtensionParseResult("RATE LIMIT PER expects a positive seconds window");
+			}
+			rate_limit_per_sec = atoi(after_rate.substr(0, per_end).c_str());
+			if (rate_limit_per_sec <= 0) {
+				return ParserExtensionParseResult("RATE LIMIT window (PER seconds) must be positive");
+			}
+			after_rate = QuackapiTrim(after_rate.substr(per_end));
+			// optional BY ip|token|key
+			auto by_u = StringUtil::Upper(after_rate);
+			if (StringUtil::StartsWith(by_u, "BY") &&
+			    (after_rate.size() == 2 || StringUtil::CharacterIsSpace(after_rate[2]))) {
+				after_rate = QuackapiTrim(after_rate.substr(2));
+				auto by_end = NextTokenEnd(after_rate);
+				if (by_end == 0) {
+					return ParserExtensionParseResult("RATE LIMIT BY expects ip, token, or key");
+				}
+				rate_limit_by = StringUtil::Lower(after_rate.substr(0, by_end));
+				if (rate_limit_by != "ip" && rate_limit_by != "token" && rate_limit_by != "key") {
+					return ParserExtensionParseResult("RATE LIMIT BY must be ip, token, or key");
+				}
+				if (rate_limit_by == "key") {
+					rate_limit_by = "token";
+				}
+				after_rate = QuackapiTrim(after_rate.substr(by_end));
+			} else {
+				rate_limit_by = "ip";
+			}
+			rest = after_rate;
 			continue;
 		}
 		// [REQUIRE <auth-name>]
@@ -644,6 +704,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.params = std::move(params);
 	data->route.body_schema = std::move(body_schema);
 	data->route.group_name = group_name;
+	data->route.rate_limit_n = rate_limit_n;
+	data->route.rate_limit_per_sec = rate_limit_per_sec;
+	data->route.rate_limit_by = rate_limit_by.empty() && rate_limit_n > 0 ? string("ip") : rate_limit_by;
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -676,6 +739,15 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	}
 	if (input.inputs.size() > 10 && !input.inputs[10].IsNull()) {
 		bind_data->route.group_name = input.inputs[10].GetValue<string>();
+	}
+	if (input.inputs.size() > 11 && !input.inputs[11].IsNull()) {
+		bind_data->route.rate_limit_n = input.inputs[11].GetValue<int32_t>();
+	}
+	if (input.inputs.size() > 12 && !input.inputs[12].IsNull()) {
+		bind_data->route.rate_limit_per_sec = input.inputs[12].GetValue<int32_t>();
+	}
+	if (input.inputs.size() > 13 && !input.inputs[13].IsNull()) {
+		bind_data->route.rate_limit_by = input.inputs[13].GetValue<string>();
 	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
@@ -743,7 +815,8 @@ TableFunction MakeApplyRouteFunction() {
 	return MakeApplyDdlFunction("quackapi_apply_route",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                             LogicalType::INTEGER, LogicalType::VARCHAR},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
@@ -763,6 +836,9 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(SerializeParamSpecs(data.route.params)));
 	result.parameters.push_back(Value(data.route.body_schema));
 	result.parameters.push_back(Value(data.route.group_name));
+	result.parameters.push_back(Value::INTEGER(data.route.rate_limit_n));
+	result.parameters.push_back(Value::INTEGER(data.route.rate_limit_per_sec));
+	result.parameters.push_back(Value(data.route.rate_limit_by));
 	FinishDdlPlan(result);
 	return result;
 }
