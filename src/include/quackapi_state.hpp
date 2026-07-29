@@ -262,8 +262,8 @@ public:
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).
 	void StopAllServers();
-	//! (host, port, http_client_active) for each running server.
-	vector<std::tuple<string, int, string>> ListServers();
+	//! (host, port, http_client_active, http_client_reason) for each running server.
+	vector<std::tuple<string, int, string, string>> ListServers();
 
 	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
 	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);

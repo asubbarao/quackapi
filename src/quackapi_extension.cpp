@@ -267,7 +267,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.pg_dsn = bind_data.pg_dsn;
 
 	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
-	// Also prefers curl_httpfs as the outbound HTTP client (graceful fallback).
+	// Outbound client: auto prefers curl_httpfs (loud fallback); curl requires it.
 	ApplyQuackapiServerDefaults(context, opts);
 	// Compose request_id source: community tsid if LOADable, else core uuidv7.
 	ProbeQuackapiRequestIdSource(*context.db, opts);
@@ -392,7 +392,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 struct ServersBindData : public TableFunctionData {};
 
 struct ServersGlobalState : public GlobalTableFunctionState {
-	vector<std::tuple<string, int, string>> servers;
+	vector<std::tuple<string, int, string, string>> servers;
 	idx_t offset = 0;
 };
 
@@ -406,6 +406,8 @@ static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindIn
 	names.emplace_back("listen_url");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("http_client");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("http_client_reason");
 	return make_uniq<ServersBindData>();
 }
 
@@ -423,10 +425,12 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 		const auto &host = std::get<0>(server);
 		const auto port = std::get<1>(server);
 		const auto &http_client = std::get<2>(server);
+		const auto &http_client_reason = std::get<3>(server);
 		output.SetValue(0, row, Value(host));
 		output.SetValue(1, row, Value::INTEGER(port));
 		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", host, port)));
 		output.SetValue(3, row, Value(http_client));
+		output.SetValue(4, row, Value(http_client_reason));
 		row++;
 		state.offset++;
 	}
@@ -485,14 +489,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Default 256. Overridden by compression_min_bytes named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
 	// SET quackapi_http_client = 'auto' | 'curl' | 'httplib'
-	// Default auto: INSTALL+LOAD curl_httpfs and SET httpfs_client_implementation='curl';
-	// fall back to httplib if the community extension is unavailable (Windows/WASM/offline).
-	// Serve-time http_client := '…' wins. Inbound server remains httplib regardless.
+	// Default auto: INSTALL+LOAD curl_httpfs; fall back to httplib with loud reason.
+	// curl: REQUIRE curl_httpfs — fail serve if INSTALL/LOAD fails (no silent fallback).
+	// httplib: force stock client. Serve-time http_client := '…' wins.
+	// Inbound server remains httplib regardless.
 	config.AddExtensionOption("quackapi_http_client",
 	                          "Outbound HTTP client for httpfs/route fetches: auto|curl|httplib. "
-	                          "Default auto prefers curl_httpfs (connection pool, HTTP/2, async IO) "
-	                          "and falls back to httplib when unavailable. Overridden by http_client "
-	                          "named parameter. Does not change the inbound HTTP server.",
+	                          "Default auto prefers curl_httpfs (pool, HTTP/2, async) and falls back "
+	                          "to httplib with http_client_reason on /healthz when unavailable. "
+	                          "curl fails serve if curl_httpfs cannot INSTALL/LOAD. Overridden by "
+	                          "http_client named parameter. Does not change the inbound HTTP server.",
 	                          LogicalType::VARCHAR, Value("auto"));
 
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.

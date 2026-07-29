@@ -365,14 +365,15 @@ void QuackapiState::StopAllServers() {
 	}
 }
 
-vector<std::tuple<string, int, string>> QuackapiState::ListServers() {
+vector<std::tuple<string, int, string, string>> QuackapiState::ListServers() {
 	std::lock_guard<std::mutex> lock(servers_mutex);
-	vector<std::tuple<string, int, string>> result;
+	vector<std::tuple<string, int, string, string>> result;
 	result.reserve(servers.size());
 	for (auto &kv : servers) {
 		const auto &opts = kv.second->Options();
 		string client = opts.http_client_active.empty() ? string("httplib") : opts.http_client_active;
-		result.emplace_back(kv.second->Host(), kv.second->Port(), std::move(client));
+		string reason = opts.http_client_reason;
+		result.emplace_back(kv.second->Host(), kv.second->Port(), std::move(client), std::move(reason));
 	}
 	return result;
 }

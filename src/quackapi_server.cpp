@@ -1673,18 +1673,21 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			auto uptime_sec =
 			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count();
 			if (ready) {
-				// Surface active outbound HTTP client (curl_httpfs vs httplib) so
-				// operators / readiness probes can confirm batteries applied.
+				// Surface active outbound HTTP client + reason so operators /
+				// readiness probes can confirm batteries applied. auto fallback
+				// is never silent: reason=curl_httpfs_unavailable when httplib.
 				const string http_client =
 				    options.http_client_active.empty() ? string("httplib") : options.http_client_active;
-				SetJson(
-				    res, 200,
-				    StringUtil::Format(
-				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
-				        "\"request_id_source\":\"%s\",\"http_client\":\"%s\"}",
-				        QuackapiJsonEscape(version), (long long)uptime_sec,
-				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
-				        QuackapiJsonEscape(http_client)));
+				SetJson(res, 200,
+				        StringUtil::Format("{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
+				                           "\"request_id_source\":\"%s\",\"http_client\":\"%s\","
+				                           "\"http_client_reason\":\"%s\"}",
+				                           QuackapiJsonEscape(version), (long long)uptime_sec,
+				                           QuackapiJsonEscape(options.request_id_source.empty()
+				                                                  ? "uuidv7"
+				                                                  : options.request_id_source),
+				                           QuackapiJsonEscape(http_client),
+				                           QuackapiJsonEscape(options.http_client_reason)));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
 			}
