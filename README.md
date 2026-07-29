@@ -22,10 +22,10 @@ The query already types the response.
 
 ## Five-line quickstart
 
-Requires **DuckDB ≥ v1.5.3** (quack floor). CI builds **v1.5.3 / v1.5.4 / v1.5.5** for linux, macOS, and windows_amd64.
+Requires **DuckDB v1.5.5** (linux, macOS, windows_amd64).
 
 ```sql
-INSTALL quackapi FROM community;  -- tip CDN host only
+INSTALL quackapi FROM community;
 LOAD quackapi;
 
 CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
