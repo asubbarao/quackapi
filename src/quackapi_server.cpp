@@ -22,6 +22,7 @@
 #include "duckdb/main/query_result.hpp"
 
 #include "quackapi_auth.hpp"
+#include "quackapi_graphql.hpp"
 #include "quackapi_openapi.hpp"
 #include "quackapi_pg.hpp"
 #include "quackapi_policy.hpp"
@@ -1694,6 +1695,60 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			finish();
 			return;
 		}
+	}
+
+	// Built-in thin GraphQL v0 (catalog-only table selection; not full GraphQL).
+	// POST /graphql  — JSON body {"query":"query { table { col } }"}
+	// GET  /graphql/schema — main-schema tables → column names
+	// Public in v0 (no auth). Not listed in quackapi_routes().
+	if (req.path == "/graphql" || req.path == "/graphql/") {
+		if (req.method == "POST") {
+			string gql_query;
+			string gql_err;
+			if (!GraphqlExtractQuery(*db, req.body, gql_query, gql_err)) {
+				SetJson(res, 400, gql_err);
+				finish();
+				return;
+			}
+			try {
+				SetJson(res, 200, ExecuteGraphqlQuery(*db, gql_query));
+			} catch (std::exception &ex) {
+				SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
+			} catch (...) {
+				SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql execution failed\"}]}");
+			}
+			finish();
+			return;
+		}
+		if (req.method == "OPTIONS") {
+			if (cors_origins.empty()) {
+				res.set_header("Allow", "POST");
+				SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
+			} else {
+				res.status = 204;
+				res.set_header("Allow", "POST, OPTIONS");
+				res.body.clear();
+			}
+			finish();
+			return;
+		}
+		// GET /graphql without schema path → 405 with Allow: POST
+		res.set_header("Allow", "POST");
+		SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
+		finish();
+		return;
+	}
+	if ((req.method == "GET" || req.method == "HEAD") &&
+	    (req.path == "/graphql/schema" || req.path == "/graphql/schema/")) {
+		try {
+			SetJson(res, 200, BuildGraphqlSchema(*db));
+		} catch (std::exception &ex) {
+			SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
+		} catch (...) {
+			SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql schema failed\"}]}");
+		}
+		finish();
+		return;
 	}
 
 	// Built-in docs routes (always present while serving; not in quackapi_routes()).
