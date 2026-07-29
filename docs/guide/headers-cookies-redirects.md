@@ -4,6 +4,39 @@ All examples run against `build/release/duckdb -unsigned` with `LOAD quackapi;`.
 
 ---
 
+## X-Request-ID and `$request_id`
+
+Every response gets an `X-Request-ID` header. Handlers can read it as `$request_id`
+(no `PARAM` declaration needed — the server always binds it).
+
+| Inbound | Behavior |
+|---------|----------|
+| `X-Request-ID` / `X-Request-Id` (printable ASCII) | Echoed on the response; bound as `$request_id` |
+| Missing, empty, or control-only | Server mints a uuidv7 |
+| Longer than 128 chars | Truncated to 128 printable ASCII (controls stripped) |
+
+```sql
+CREATE ROUTE echo_rid GET '/echo-rid' AS
+  SELECT $request_id::VARCHAR AS id;
+```
+
+```sh
+curl -i http://127.0.0.1:8000/echo-rid
+# HTTP 200
+# X-Request-ID: <uuidv7>
+# [{"id":"<same uuidv7>"}]
+
+curl -i http://127.0.0.1:8000/echo-rid -H 'X-Request-ID: client-rid-deadbeef'
+# HTTP 200
+# X-Request-ID: client-rid-deadbeef
+# [{"id":"client-rid-deadbeef"}]
+```
+
+Structured access log lines (when `access_log:=true`, the default) include
+`request_id` on stderr as JSON (`"type":"access",…`).
+
+---
+
 ## Header parameters
 
 Declare a header with `PARAM … HEADER`. Underscores in the SQL name become hyphens on the wire (`x_token` → `X-Token`). Lookup is case-insensitive.
