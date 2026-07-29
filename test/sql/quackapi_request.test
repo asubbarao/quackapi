@@ -24,12 +24,11 @@ Route item: GET /items/:id
 
 # ---------------------------------------------------------------------------
 # GET registered route → 200 + JSON array body
-# body is BLOB (binary-safe for parquet/arrow). Text: convert_from(…,'utf8')
+# body is BLOB (binary-safe for parquet/arrow). Text via decode(body)
 # — CAST(blob AS VARCHAR) hex-escapes quotes (\x22), not usable for JSON.
 # ---------------------------------------------------------------------------
 query III
-SELECT status, convert_from(body, 'utf8'), content_type
-FROM quackapi_request('GET', '/hello');
+SELECT status, decode(body), content_type FROM quackapi_request('GET', '/hello');
 ----
 200	[{"msg":"world"}]	application/json
 
@@ -37,7 +36,7 @@ FROM quackapi_request('GET', '/hello');
 # Missing path → 404
 # ---------------------------------------------------------------------------
 query II
-SELECT status, convert_from(body, 'utf8') FROM quackapi_request('GET', '/nope');
+SELECT status, decode(body) FROM quackapi_request('GET', '/nope');
 ----
 404	{"detail":"Not Found"}
 
@@ -45,7 +44,7 @@ SELECT status, convert_from(body, 'utf8') FROM quackapi_request('GET', '/nope');
 # Path params
 # ---------------------------------------------------------------------------
 query II
-SELECT status, convert_from(body, 'utf8') FROM quackapi_request('GET', '/items/42');
+SELECT status, decode(body) FROM quackapi_request('GET', '/items/42');
 ----
 200	[{"id":42}]
 
@@ -53,8 +52,7 @@ SELECT status, convert_from(body, 'utf8') FROM quackapi_request('GET', '/items/4
 # POST with JSON body fields (Content-Type application/json set by TF)
 # ---------------------------------------------------------------------------
 query II
-SELECT status, convert_from(body, 'utf8')
-FROM quackapi_request('POST', '/add', '{"a":2,"b":3}');
+SELECT status, decode(body) FROM quackapi_request('POST', '/add', '{"a":2,"b":3}');
 ----
 200	[{"sum":5}]
 
