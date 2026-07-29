@@ -1326,9 +1326,11 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 	}
 	idx_t file_size = handle->GetFileSize();
 	string body;
-	body.resize(file_size);
 	if (file_size > 0) {
-		handle->Read(data_ptr_cast(body.data()), file_size);
+		// mutable buffer — data_ptr_cast rejects const char* from string::data()
+		vector<data_t> buf(file_size);
+		handle->Read(buf.data(), file_size);
+		body.assign(reinterpret_cast<const char *>(buf.data()), file_size);
 	}
 	handle->Close();
 	fs.TryRemoveFile(path);
