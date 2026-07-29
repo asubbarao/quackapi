@@ -1167,17 +1167,20 @@ string QuackapiHttpServer::NextRequestId(DatabaseInstance &db) {
 	return UUID::ToString(UUIDv7::GenerateRandomUUID());
 }
 
-//! Client-supplied X-Request-ID: visible ASCII, length-capped (no control chars).
-bool AcceptClientRequestId(const string &s) {
-	if (s.empty() || s.size() > 128) {
-		return false;
-	}
+//! Client-supplied X-Request-ID: strip controls / non-printable, cap at 128 chars.
+//! Empty result → caller mints uuidv7.
+string SanitizeClientRequestId(const string &s) {
+	string out;
+	out.reserve(std::min<size_t>(s.size(), 128));
 	for (unsigned char c : s) {
-		if (c < 0x21 || c > 0x7e) {
-			return false;
+		if (c >= 0x21 && c <= 0x7e) {
+			out.push_back(static_cast<char>(c));
+			if (out.size() >= 128) {
+				break;
+			}
 		}
 	}
-	return true;
+	return out;
 }
 
 void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
@@ -1352,11 +1355,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		finish();
 		return;
 	}
-	// Honor inbound X-Request-ID when safe; else mint uuidv7 (always set header).
+	// Honor inbound X-Request-ID when usable; else mint uuidv7 (always set header).
+	// Lookup is case-insensitive (httplib Headers). Strip controls + cap 128.
 	{
-		auto client_rid = req.get_header_value("X-Request-ID");
-		if (AcceptClientRequestId(client_rid)) {
-			request_id = client_rid;
+		auto client_rid = SanitizeClientRequestId(req.get_header_value("X-Request-ID"));
+		if (!client_rid.empty()) {
+			request_id = std::move(client_rid);
 		} else {
 			request_id = NextRequestId(*db);
 		}

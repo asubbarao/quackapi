@@ -176,7 +176,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **FORMAT / Accept** (CSV/NDJSON/Arrow IPC) | JSON/html/text only | `/tmp/quackapi_spec_serdes/SPEC.md`, `/tmp/quackapi_arrow.md` |
 | **In-process TestClient** `quackapi_request` | network tests only | `/tmp/quackapi_spec_test_client/SPEC.md` |
 | **Rate limit / ETag-304** | designed, not built | SPECs rate_limit, cache_etag |
-| **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor, SQL bind, stderr access log | `batteries.test.sh`; SPECs request_id mostly closed |
+| **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor (truncate/strip), SQL bind, stderr access log | `request_id.test.sh`, `batteries.test.sh` |
 | **RFC 9457 problem+json** | FastAPI-shaped 422 only | `/tmp/quackapi_spec_problem_details/SPEC.md` |
 | **Envelope** always JSON **array of rows** | intentional SQL semantics (harness still MATCH on fields) | `docs/FASTAPI_PARITY.md` |
 | **Pydantic binder fidelity** ~19% needs C++ | field-level body `loc`, optional/null body, multi-error | `/tmp/quackapi_pydantic_bridge.md` |

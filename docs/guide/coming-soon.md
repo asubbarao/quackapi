@@ -4,7 +4,7 @@ These features are **not** documented as done. They are actively designed or bui
 
 | Feature | Intent | Status |
 |---------|--------|--------|
-| **Access logging / request-id batteries** | `X-Request-ID`, structured access log table | Designed / building |
+| **Access logging / request-id batteries** | `X-Request-ID` + `$request_id` + stderr access log | **Shipped** — see [headers-cookies-redirects.md](headers-cookies-redirects.md). Table form deferred |
 | **Response compression (gzip / zstd)** | Honor `Accept-Encoding` | Designed / building (miniz available; not wired) |
 | **WebSocket routes** | Browser RFC6455 duplex | **Blocked** on transport (HTTP library has no Upgrade API). Use [CREATE STREAM (SSE)](stream.md) instead |
 | **OIDC / OAuth2 browser SSO** | `CREATE AUTH … OIDC` | Designed — JWT/API_KEY only today |
