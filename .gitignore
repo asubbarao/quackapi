@@ -16,3 +16,6 @@ dist/
 # Generated conformance output
 test/conformance/results/
 
+
+# concurrent agent proposals (hive partitions)
+agent_signature/
