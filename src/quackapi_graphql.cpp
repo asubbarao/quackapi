@@ -226,8 +226,7 @@ bool ColumnExists(Connection &con, const string &table, const string &column) {
 }
 
 //! SELECT cols… FROM table LIMIT n → JSON array of row objects via DuckDB JSON.
-string SelectTableJson(Connection &con, const string &table, const vector<string> &columns, idx_t limit,
-                       string &err) {
+string SelectTableJson(Connection &con, const string &table, const vector<string> &columns, idx_t limit, string &err) {
 	string select_list;
 	for (idx_t c = 0; c < columns.size(); c++) {
 		if (c > 0) {
@@ -245,7 +244,8 @@ string SelectTableJson(Connection &con, const string &table, const vector<string
 	}
 	json_obj += ")";
 
-	string sql = "SELECT coalesce(json_group_array(" + json_obj + "), '[]'::JSON)::VARCHAR FROM ("
+	string sql = "SELECT coalesce(json_group_array(" + json_obj +
+	             "), '[]'::JSON)::VARCHAR FROM ("
 	             "SELECT " +
 	             select_list + " FROM " + QuoteIdent(table) + " LIMIT " + std::to_string(limit) + ") _gql";
 
@@ -269,13 +269,12 @@ bool GraphqlExtractQuery(DatabaseInstance &db, const string &raw_body, string &q
 		return false;
 	}
 	Connection con(db);
-	auto res = con.Query(
-	    "SELECT CASE"
-	    "  WHEN TRY_CAST(? AS JSON) IS NULL THEN NULL"
-	    "  WHEN json_type(?::JSON) != 'OBJECT' THEN NULL"
-	    "  ELSE json_extract_string(?::JSON, '$.query')"
-	    " END",
-	    Value(raw_body), Value(raw_body), Value(raw_body));
+	auto res = con.Query("SELECT CASE"
+	                     "  WHEN TRY_CAST(? AS JSON) IS NULL THEN NULL"
+	                     "  WHEN json_type(?::JSON) != 'OBJECT' THEN NULL"
+	                     "  ELSE json_extract_string(?::JSON, '$.query')"
+	                     " END",
+	                     Value(raw_body), Value(raw_body), Value(raw_body));
 	if (res->HasError()) {
 		error_json = GraphqlError("invalid JSON body");
 		return false;
@@ -332,15 +331,14 @@ string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, idx_t limi
 string BuildGraphqlSchema(DatabaseInstance &db) {
 	Connection con(db);
 	// Group columns per table in main schema. Views included (duckdb_tables covers both).
-	auto res = con.Query(
-	    "SELECT t.table_name, "
-	    "coalesce(list(c.column_name ORDER BY c.column_index), []) AS cols "
-	    "FROM duckdb_tables() t "
-	    "LEFT JOIN duckdb_columns() c "
-	    "  ON c.schema_name = t.schema_name AND c.table_name = t.table_name AND NOT c.internal "
-	    "WHERE t.schema_name = 'main' AND NOT t.internal "
-	    "GROUP BY ALL "
-	    "ORDER BY t.table_name");
+	auto res = con.Query("SELECT t.table_name, "
+	                     "coalesce(list(c.column_name ORDER BY c.column_index), []) AS cols "
+	                     "FROM duckdb_tables() t "
+	                     "LEFT JOIN duckdb_columns() c "
+	                     "  ON c.schema_name = t.schema_name AND c.table_name = t.table_name AND NOT c.internal "
+	                     "WHERE t.schema_name = 'main' AND NOT t.internal "
+	                     "GROUP BY ALL "
+	                     "ORDER BY t.table_name");
 	if (res->HasError()) {
 		return GraphqlError("schema catalog query failed: " + res->GetError());
 	}

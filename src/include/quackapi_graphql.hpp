@@ -24,8 +24,7 @@ static constexpr idx_t QUACKAPI_GRAPHQL_DEFAULT_LIMIT = 100;
 //! No mutations, nested joins, fragments, arguments, aliases, or full grammar.
 //! Schema source is the DuckDB catalog only. Future work may feed types from
 //! sitting_duck / parser_tools over external code; v0 does not.
-string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query,
-                           idx_t limit = QUACKAPI_GRAPHQL_DEFAULT_LIMIT);
+string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, idx_t limit = QUACKAPI_GRAPHQL_DEFAULT_LIMIT);
 
 //! Extract the "query" string from a GraphQL-over-HTTP JSON body.
 //! Returns false with a GraphQL-ish error JSON when body is unusable.

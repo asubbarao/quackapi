@@ -330,8 +330,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			continue;
 		}
 		// [RATE LIMIT <n> PER <seconds> [BY ip|token|key]]
-		if (StringUtil::StartsWith(rest_upper, "RATE") && rest.size() > 4 &&
-		    StringUtil::CharacterIsSpace(rest[4])) {
+		if (StringUtil::StartsWith(rest_upper, "RATE") && rest.size() > 4 && StringUtil::CharacterIsSpace(rest[4])) {
 			string after_rate = QuackapiTrim(rest.substr(4));
 			auto after_rate_u = StringUtil::Upper(after_rate);
 			if (!(StringUtil::StartsWith(after_rate_u, "LIMIT") &&

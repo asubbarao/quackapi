@@ -346,8 +346,7 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 				// Production guarantee: no silent httplib when operator required curl.
 				const string detail =
 				    fail_detail.empty() ? string("unknown") : StringUtil::Replace(fail_detail, "\n", " ");
-				fprintf(stderr,
-				        "quackapi.http_client=curl FAILED reason=curl_httpfs_unavailable detail=%s\n",
+				fprintf(stderr, "quackapi.http_client=curl FAILED reason=curl_httpfs_unavailable detail=%s\n",
 				        detail.c_str());
 				throw InvalidInputException(
 				    "quackapi_serve: http_client='curl' requires curl_httpfs but INSTALL/LOAD failed "
