@@ -17,7 +17,10 @@ namespace duckdb {
 namespace {
 
 constexpr idx_t MAX_IDLE_PER_HOST = 64;
-constexpr time_t OUTBOUND_TIMEOUT_SECONDS = 600; // LLM upstreams are slow; the caller cancels.
+// Read/write: LLM upstreams are slow; the caller cancels. Connect stays short so
+// a dead peer (or CI loopback after stop) fails fast instead of parking a worker.
+constexpr time_t OUTBOUND_TIMEOUT_SECONDS = 600;
+constexpr time_t OUTBOUND_CONNECT_TIMEOUT_SECONDS = 5;
 
 void InsertExtraHeaders(HTTPHeaders &headers, const unordered_map<string, string> &extra) {
 	for (auto &kv : extra) {
@@ -97,7 +100,7 @@ unique_ptr<duckdb_httplib::Client> DialPlain(const string &origin) {
 	client->set_decompress(true);
 	client->set_read_timeout(OUTBOUND_TIMEOUT_SECONDS, 0);
 	client->set_write_timeout(OUTBOUND_TIMEOUT_SECONDS, 0);
-	client->set_connection_timeout(30, 0);
+	client->set_connection_timeout(OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0);
 	return client;
 }
 
@@ -298,8 +301,23 @@ vector<QuackapiHttpPoolStats> QuackapiHttpFetch::PoolStats() {
 }
 
 void QuackapiHttpFetch::ResetPool() {
+	// Drop idle keep-alive sockets *before* httplib Server join. Stop paths
+	// detach ~QuackapiHttpServer; if pooled clients still hold the peer open,
+	// worker join can block until read timeout (600s) and CI process exit hangs
+	// with no log upload (Windows runner "lost communication").
 	auto &pool = ConnectionPool::Get();
 	std::lock_guard<std::mutex> guard(pool.lock);
+	for (auto &entry : pool.hosts) {
+		for (auto &plain : entry.second.plain_idle) {
+			if (plain.client) {
+				plain.client->stop();
+			}
+		}
+		// HTTPUtil clients: unique_ptr reset is enough (no keep-alive join path
+		// into our inbound Server).
+		entry.second.plain_idle.clear();
+		entry.second.util_idle.clear();
+	}
 	pool.hosts.clear();
 }
 

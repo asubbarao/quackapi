@@ -98,5 +98,7 @@ SELECT (quackapi_fetch(NULL::VARCHAR)).status IS NULL;
 ----
 true
 
+# stop closes the listener and (via StopServer) drains the free-list so idle
+# keep-alive clients cannot pin httplib workers across process teardown.
 statement ok
 SELECT * FROM quackapi_stop(29301);

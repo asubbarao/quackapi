@@ -12,6 +12,7 @@
 #include "duckdb/main/database.hpp"
 
 #include "quackapi_auth.hpp"
+#include "quackapi_http_fetch.hpp"
 #include "quackapi_server.hpp"
 
 namespace duckdb {
@@ -333,6 +334,9 @@ bool QuackapiState::StopServer(int port) {
 	if (!to_destroy) {
 		return false;
 	}
+	// Close pooled outbound keep-alives first so Server worker join is not
+	// blocked by idle clients still holding the listen-side connection open.
+	QuackapiHttpFetch::ResetPool();
 	to_destroy->StopAccepting();
 	// Brief delay so a self-stop from inside a route can finish its response
 	// before ~Server joins the thread pool.
@@ -352,6 +356,8 @@ void QuackapiState::StopAllServers() {
 		}
 		servers.clear();
 	}
+	// Same as StopServer: drain free-list before joining httplib workers.
+	QuackapiHttpFetch::ResetPool();
 	for (auto &srv : to_destroy) {
 		if (srv) {
 			srv->StopAccepting();
