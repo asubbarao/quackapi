@@ -16,6 +16,7 @@
 #include "quackapi_auth.hpp"
 #include "quackapi_ddl.hpp"
 #include "quackapi_from_x.hpp"
+#include "quackapi_graphql.hpp"
 #include "quackapi_http_fetch.hpp"
 #include "quackapi_queue.hpp"
 #include "quackapi_policy.hpp"
@@ -659,8 +660,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// that turn a real web-app source tree into route/model IR rows.
 	RegisterQuackapiFromXFunctions(loader);
 
-	// CREATE ROUTE / GROUP / AUTH / QUEUE / POLICY / STREAM / API FOR TABLE —
-	// all first-class nouns registered.
+	// Thin GraphQL allowlist + named route inspection (CREATE GRAPHQL … DDL).
+	RegisterQuackapiGraphqlFunctions(loader);
+
+	// CREATE ROUTE / GROUP / AUTH / QUEUE / POLICY / STREAM / API FOR TABLE /
+	// GRAPHQL FOR TABLE / GRAPHQL ROUTE — all first-class nouns registered.
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(GroupDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
@@ -670,6 +674,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ExtensionCallbackManager::Get(db).Register(PolicyDdlParserExtension());
 	// CREATE STREAM (SSE)
 	ExtensionCallbackManager::Get(db).Register(StreamDdlParserExtension());
+	// CREATE / DROP GRAPHQL FOR TABLE (+ DROP GRAPHQL ALL) + GRAPHQL ROUTE
+	ExtensionCallbackManager::Get(db).Register(GraphqlDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

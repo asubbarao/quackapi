@@ -103,6 +103,22 @@ struct QuackapiGroup {
 	string policy;
 };
 
+//! Named GraphQL-over-HTTP mount (CREATE GRAPHQL ROUTE). Independent of the
+//! built-in POST /graphql global allowlist.
+struct QuackapiGraphqlRoute {
+	string name;
+	//! Upper-case HTTP method; v0 only POST for the query mount.
+	string method = "POST";
+	//! Absolute path, trailing slash stripped (except "/"). Schema is GET path+"/schema".
+	string path;
+	//! Per-route table allowlist (required, ≥1). Does not mutate global graphql_tables.
+	vector<string> tables;
+	//! Empty = public. Non-empty = CREATE AUTH scheme name.
+	string require_auth;
+	//! Row cap for each root field SELECT; 0 means default at execute time.
+	idx_t limit = 100;
+};
+
 //! One registered route. Immutable once snapshotted; the registry replaces
 //! entries wholesale on CREATE OR REPLACE ROUTE.
 struct QuackapiRoute {
@@ -285,6 +301,31 @@ public:
 	bool UnbindMaskingPolicy(const string &table_name, const string &column_name);
 	vector<QuackapiMaskingBinding> SnapshotMaskingBindings();
 
+	// --- Thin GraphQL v0 table allowlist (built-in POST /graphql) ---
+	// Empty allowlist = open mode (all main-schema tables, v0 default).
+	// Non-empty = only registered tables appear in /graphql and /graphql/schema.
+	//! Register a main-schema table/view for GraphQL. Throws on duplicate unless or_replace.
+	void AddGraphqlTable(const string &table_name, bool or_replace);
+	//! Remove one table from the allowlist. Returns false if not registered.
+	bool DropGraphqlTable(const string &table_name);
+	//! Clear allowlist → open catalog mode.
+	void ClearGraphqlTables();
+	//! True when at least one table is registered (allowlist mode).
+	bool GraphqlAllowlistActive();
+	//! True when open mode OR table is on the allowlist.
+	bool IsGraphqlTableAllowed(const string &table_name);
+	//! Sorted snapshot of registered table names (empty in open mode).
+	vector<string> SnapshotGraphqlTables();
+
+	// --- Named GraphQL mounts (CREATE GRAPHQL ROUTE) ---
+	void AddGraphqlRoute(const QuackapiGraphqlRoute &route, bool or_replace);
+	bool DropGraphqlRoute(const string &name);
+	//! Exact path match (normalized). method upper-case.
+	bool GetGraphqlRouteByPath(const string &path, const string &method, QuackapiGraphqlRoute &out);
+	//! True when path is a registered route's schema URL (GET path+"/schema").
+	bool GetGraphqlRouteBySchemaPath(const string &path, QuackapiGraphqlRoute &out);
+	vector<QuackapiGraphqlRoute> SnapshotGraphqlRoutes();
+
 private:
 	void PublishRoutes();
 	void PublishStreams();
@@ -313,6 +354,12 @@ private:
 	vector<QuackapiMaskingPolicy> masking_policies;
 	vector<QuackapiRowAccessBinding> row_access_bindings;
 	vector<QuackapiMaskingBinding> masking_bindings;
+
+	//! GraphQL allowlist (case-sensitive catalog names, like duckdb_tables).
+	std::mutex graphql_mutex;
+	vector<string> graphql_tables;
+	//! Named GraphQL path mounts (independent of graphql_tables).
+	vector<QuackapiGraphqlRoute> graphql_routes;
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;
