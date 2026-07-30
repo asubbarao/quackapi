@@ -410,10 +410,8 @@ bool ParseTableListUntilKeywords(string &rest, vector<string> &tables, string &e
 		}
 		auto upper = StringUtil::Upper(rest);
 		// Stop before optional clauses.
-		if ((StringUtil::StartsWith(upper, "REQUIRE") &&
-		     (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) ||
-		    (StringUtil::StartsWith(upper, "LIMIT") &&
-		     (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5])))) {
+		if ((StringUtil::StartsWith(upper, "REQUIRE") && (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) ||
+		    (StringUtil::StartsWith(upper, "LIMIT") && (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5])))) {
 			if (tables.empty()) {
 				err = "expected at least one table name before " + rest.substr(0, 6);
 				return false;
@@ -444,10 +442,8 @@ bool ParseTableListUntilKeywords(string &rest, vector<string> &tables, string &e
 		}
 		// Next token may be REQUIRE/LIMIT — loop will stop.
 		upper = StringUtil::Upper(rest);
-		if ((StringUtil::StartsWith(upper, "REQUIRE") &&
-		     (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) ||
-		    (StringUtil::StartsWith(upper, "LIMIT") &&
-		     (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5])))) {
+		if ((StringUtil::StartsWith(upper, "REQUIRE") && (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) ||
+		    (StringUtil::StartsWith(upper, "LIMIT") && (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5])))) {
 			return true;
 		}
 		err = "unexpected trailing content after table list";
@@ -504,8 +500,7 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		// <name>
 		auto sp = rest.find(' ');
 		if (sp == string::npos) {
-			return ParserExtensionParseResult(
-			    "CREATE GRAPHQL ROUTE <name> POST '<path>' FROM <table> [, …]");
+			return ParserExtensionParseResult("CREATE GRAPHQL ROUTE <name> POST '<path>' FROM <table> [, …]");
 		}
 		auto name = rest.substr(0, sp);
 		rest = QuackapiTrim(rest.substr(sp));
@@ -516,8 +511,7 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		}
 		auto method = StringUtil::Upper(rest.substr(0, sp));
 		if (method != "POST") {
-			return ParserExtensionParseResult(
-			    "CREATE GRAPHQL ROUTE only supports POST in v0 (got " + method + ")");
+			return ParserExtensionParseResult("CREATE GRAPHQL ROUTE only supports POST in v0 (got " + method + ")");
 		}
 		rest = QuackapiTrim(rest.substr(sp));
 		// '<path>'
@@ -535,8 +529,7 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		rest = QuackapiTrim(rest.substr(path_end + 1));
 		// FROM
 		auto rest_u = StringUtil::Upper(rest);
-		if (!StringUtil::StartsWith(rest_u, "FROM") ||
-		    !(rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]))) {
+		if (!StringUtil::StartsWith(rest_u, "FROM") || !(rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]))) {
 			return ParserExtensionParseResult("Expected FROM <table> [, …] after path");
 		}
 		rest = QuackapiTrim(rest.substr(4));
@@ -625,9 +618,8 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 
 	auto rest = QuackapiTrim(q.substr(pos));
 	if (rest.empty()) {
-		return ParserExtensionParseResult(
-		    is_drop ? "DROP GRAPHQL FOR TABLE expects at least one table name"
-		            : "CREATE GRAPHQL FOR TABLE expects at least one table name");
+		return ParserExtensionParseResult(is_drop ? "DROP GRAPHQL FOR TABLE expects at least one table name"
+		                                          : "CREATE GRAPHQL FOR TABLE expects at least one table name");
 	}
 
 	vector<string> tables;
@@ -704,8 +696,8 @@ void ApplyGraphqlExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	if (bind_data.action == "CREATE_ROUTE") {
 		for (auto &table : bind_data.tables) {
 			if (!TableExists(con, table)) {
-				throw InvalidInputException(
-				    "CREATE GRAPHQL ROUTE: table or view \"%s\" not found in schema main", table);
+				throw InvalidInputException("CREATE GRAPHQL ROUTE: table or view \"%s\" not found in schema main",
+				                            table);
 			}
 		}
 		if (!bind_data.require_auth.empty()) {
@@ -750,8 +742,8 @@ void ApplyGraphqlExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	if (bind_data.action == "CREATE") {
 		for (auto &table : bind_data.tables) {
 			if (!TableExists(con, table)) {
-				throw InvalidInputException(
-				    "CREATE GRAPHQL FOR TABLE: table or view \"%s\" not found in schema main", table);
+				throw InvalidInputException("CREATE GRAPHQL FOR TABLE: table or view \"%s\" not found in schema main",
+				                            table);
 			}
 			state.AddGraphqlTable(table, bind_data.or_replace);
 		}
@@ -807,11 +799,11 @@ void ApplyGraphqlExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 }
 
 TableFunction MakeApplyGraphqlFunction() {
-	return MakeApplyDdlFunction(
-	    "quackapi_apply_graphql",
-	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR,
-	     LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
-	    ApplyGraphqlExec, ApplyGraphqlBind);
+	return MakeApplyDdlFunction("quackapi_apply_graphql",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::LIST(LogicalType::VARCHAR),
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::BIGINT},
+	                            ApplyGraphqlExec, ApplyGraphqlBind);
 }
 
 ParserExtensionPlanResult GraphqlDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -952,8 +944,8 @@ string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, const Grap
 				                    "' is not on this GraphQL route — CREATE GRAPHQL ROUTE … FROM " + field.name);
 			}
 		} else if (global_allowlist && !state.IsGraphqlTableAllowed(field.name)) {
-			return GraphqlError("table '" + field.name +
-			                    "' is not registered for GraphQL — CREATE GRAPHQL FOR TABLE " + field.name);
+			return GraphqlError("table '" + field.name + "' is not registered for GraphQL — CREATE GRAPHQL FOR TABLE " +
+			                    field.name);
 		}
 		if (!TableExists(con, field.name)) {
 			return GraphqlError("unknown table '" + field.name + "' (main schema catalog only)");

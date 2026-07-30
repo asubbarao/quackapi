@@ -675,8 +675,8 @@ void QuackapiState::AddGraphqlRoute(const QuackapiGraphqlRoute &route_in, bool o
 		throw InvalidInputException("CREATE GRAPHQL ROUTE only supports POST in v0 (got %s)", route.method);
 	}
 	if (IsReservedGraphqlPath(route.path)) {
-		throw InvalidInputException(
-		    "CREATE GRAPHQL ROUTE path \"%s\" is reserved for the built-in GraphQL endpoint", route.path);
+		throw InvalidInputException("CREATE GRAPHQL ROUTE path \"%s\" is reserved for the built-in GraphQL endpoint",
+		                            route.path);
 	}
 	// Schema sibling must not collide with another mount or reserved paths.
 	string schema_path = route.path + "/schema";
@@ -690,19 +690,19 @@ void QuackapiState::AddGraphqlRoute(const QuackapiGraphqlRoute &route_in, bool o
 			continue; // handled below by name match
 		}
 		if (existing.path == route.path) {
-			throw InvalidInputException(
-			    "GraphQL route path \"%s\" already used by route \"%s\"", route.path, existing.name);
+			throw InvalidInputException("GraphQL route path \"%s\" already used by route \"%s\"", route.path,
+			                            existing.name);
 		}
 		if (existing.path + "/schema" == route.path || existing.path == schema_path) {
-			throw InvalidInputException(
-			    "GraphQL route path \"%s\" collides with schema URL of route \"%s\"", route.path, existing.name);
+			throw InvalidInputException("GraphQL route path \"%s\" collides with schema URL of route \"%s\"",
+			                            route.path, existing.name);
 		}
 	}
 	for (auto it = graphql_routes.begin(); it != graphql_routes.end(); ++it) {
 		if (it->name == route.name) {
 			if (!or_replace) {
-				throw InvalidInputException(
-				    "GraphQL route \"%s\" already exists — use CREATE OR REPLACE GRAPHQL ROUTE", route.name);
+				throw InvalidInputException("GraphQL route \"%s\" already exists — use CREATE OR REPLACE GRAPHQL ROUTE",
+				                            route.name);
 			}
 			*it = route;
 			return;
