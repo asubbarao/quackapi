@@ -4,6 +4,47 @@ Owner-driven, **not** months of PostGraphile. Built-in while `quackapi_serve` is
 
 **Not DuckGQL.** [DuckGQL](https://duckgql.com/) is ISO GQL (graph analytics: `MATCH`, CSR, …). This surface is **GraphQL-over-HTTP** for tabular reads.
 
+## Dual surface: GraphQL and HTTP at once
+
+The database does not care which wire the client used. **Both resolve to SQL** in the same DuckDB session:
+
+```text
+  Client (GraphQL document)          Client (REST path/body)
+           │                                  │
+           ▼                                  ▼
+  POST /graphql | GRAPHQL ROUTE      CREATE ROUTE / API FOR TABLE
+           │                                  │
+           ▼                                  ▼
+   parse → table/cols                  bind $params
+           │                                  │
+           └──────────►  SQL  ◄───────────────┘
+                          │
+                     same catalog, same auth primitives,
+                     same LOAD companions (tera, sitting_duck, …)
+```
+
+| Wire | You declare | Engine does |
+|------|-------------|-------------|
+| **HTTP** | `CREATE ROUTE … AS SELECT …` | Run that handler SQL |
+| **GraphQL** | tables allowed (`FOR TABLE` / `GRAPHQL ROUTE … FROM`) | Map `{ users { id } }` → `SELECT "id" FROM "users" LIMIT n` |
+
+Same tables can expose **both** in one serve — that is intentional, not a conflict:
+
+```sql
+CREATE TABLE users AS SELECT 1 AS id, 'ada' AS name;
+
+CREATE ROUTE list_users GET '/users' AS
+  SELECT id, name FROM users;
+
+CREATE GRAPHQL ROUTE app POST '/gql' FROM users;
+
+-- GET /users
+-- POST /gql  {"query":"{ users { id name } }"}
+```
+
+Demo: [`examples/dual_surface.sql`](../../examples/dual_surface.sql).  
+Optional AST→SQL recipe (sitting_duck, not the serve hot path): [`examples/graphql_ast_parse.sql`](../../examples/graphql_ast_parse.sql).
+
 ## What ships
 
 | Surface | Behavior |
@@ -11,7 +52,8 @@ Owner-driven, **not** months of PostGraphile. Built-in while `quackapi_serve` is
 | **`POST /graphql`** | JSON body `{"query":"…"}` → GraphQL-ish result |
 | **`GET /graphql/schema`** | Main-schema tables → column names (not full `__schema`) |
 | **`CREATE GRAPHQL FOR TABLE`** | Optional **allowlist** for which tables the built-in endpoint exposes |
-| Auth | **Public** in v0 (require later) |
+| **`CREATE GRAPHQL ROUTE`** | Named path mounts with per-route tables, optional auth + LIMIT |
+| Auth | Built-in `/graphql` is **public**; named routes may `REQUIRE` a `CREATE AUTH` scheme |
 | Schema source | **DuckDB catalog only** (`duckdb_tables` / `duckdb_columns`) |
 
 ## Minimal query language
@@ -147,27 +189,40 @@ Does **not** mount a new path — still the global built-in `POST /graphql`. Tab
 | Catalog | whole main schema | allowlist only |
 | REST | — | still use `CREATE ROUTE` / `CREATE API FOR TABLE` for REST |
 
-## Design: `CREATE GRAPHQL ROUTE` (not shipped)
+## Named mounts: `CREATE GRAPHQL ROUTE`
 
-First-class **named** GraphQL mounts (like `CREATE ROUTE`), for apps that want a private path, auth, or a subset of tables without switching the global endpoint:
+First-class **named** GraphQL mounts (like `CREATE ROUTE`) for a private path, auth, or a subset of tables **without** switching the global endpoint:
 
 ```sql
--- Proposed (not implemented):
 CREATE GRAPHQL ROUTE public_api POST '/api/gql'
   FROM users, posts
-  [REQUIRE site]
-  [LIMIT 50];
+  REQUIRE site
+  LIMIT 50;
+
+SELECT * FROM quackapi_graphql_routes();
+-- name, method, path, tables, require_auth, limit
+
+-- Query:
+--   POST /api/gql          body {"query":"{ users { id } }"}
+--   GET  /api/gql/schema   tables = FROM list only (mode=route)
 
 DROP GRAPHQL ROUTE public_api;
 ```
 
-| Piece | Intent |
+| Piece | Rules |
 |-------|--------|
-| **name** | Registry id (like routes); inspect later via a TF |
-| **METHOD + path** | Mount only that path (global `/graphql` stays independent) |
-| **FROM tables** | Per-route allowlist (does not force global allowlist) |
-| **REQUIRE** | Reuse CREATE AUTH (global `/graphql` stays public in v0) |
-| **LIMIT** | Optional per-route row cap |
+| **name** | Registry id; unique; `OR REPLACE` overwrites |
+| **METHOD** | **POST only** (v0) |
+| **path** | Absolute `/…`; not `/graphql` or `/graphql/schema`; unique among GraphQL routes |
+| **FROM tables** | Required ≥1; must exist in `main` at CREATE; **per-route only** (does not flip global allowlist) |
+| **REQUIRE** | Optional `CREATE AUTH` scheme (auth scheme must exist at CREATE) |
+| **LIMIT** | Optional row cap (default 100; range 1..100000) |
+
+Independence:
+
+- Built-in `POST /graphql` stays always-on; global allowlist via `CREATE GRAPHQL FOR TABLE` is separate.
+- A GraphQL route never mutates `quackapi_graphql_tables()`.
+- Unregistered path → normal 404.
 
 **What stays v0** on any GraphQL surface until product need forces growth:
 
@@ -176,15 +231,16 @@ DROP GRAPHQL ROUTE public_api;
 - No arguments, aliases, fragments, variables  
 - No full GraphQL grammar / `__schema` introspection  
 
-**vs built-in `POST /graphql`:** the built-in is always-on convenience; `CREATE GRAPHQL ROUTE` would be opt-in mounts with path/auth isolation. Alternative spelling considered and rejected for v0 work: `CREATE ROUTE x POST '/gql' AS GRAPHQL FROM …` (overloads ROUTE AS beyond SELECT). Prefer a dedicated noun next to `CREATE API FOR TABLE`.
+Alternative spelling rejected: `CREATE ROUTE x POST '/gql' AS GRAPHQL FROM …` (overloads ROUTE AS beyond SELECT). Dedicated noun matches `CREATE API FOR TABLE`.
 
 ## Future schema feeds
 
-v0 discovers tables/columns from the **live DuckDB catalog**. Later, **sitting_duck** / **parser_tools** can feed types from external application code (models, ORMs) into a richer schema surface without changing the thin query path. That is intentional debt — not a blocker for catalog-backed read APIs.
+v0 discovers tables/columns from the **live DuckDB catalog**. **sitting_duck** already parses GraphQL (and app languages) as AST tables — use that offline to invent allowlists or richer types from source trees; wire into the thin execute path only when product needs it. **parser_tools** stays for SQL hygiene on generated SELECTs. Intentional debt: not a blocker for catalog-backed read APIs.
 
 ## Design stance
 
-- Prefer `CREATE ROUTE` / `CREATE API FOR TABLE` for typed REST.  
-- GraphQL v0 is a **read convenience** over the same tables.  
-- **Allowlist** is the first step toward first-class GraphQL DDL without closing the open default.  
-- Grow only when a real product need forces grammar (filters, nested, auth) or named routes.
+- **Dual surface:** REST and thin GraphQL side by side; both chew into queries.  
+- Prefer `CREATE ROUTE` / `CREATE API FOR TABLE` when you own the SQL shape.  
+- GraphQL v0 is a **read convenience** (column pick + multi-root) over the same tables.  
+- **Allowlist** + **named routes** lock down exposure without closing open `/graphql` by default.  
+- Grow grammar only when a concrete client needs args/filters — still as “→ one SELECT,” not Hasura-in-C++.

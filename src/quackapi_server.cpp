@@ -1966,6 +1966,78 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 	}
 
+	// Named GraphQL mounts (CREATE GRAPHQL ROUTE) — before built-in /graphql.
+	// POST <path> + GET <path>/schema; optional REQUIRE auth; per-route tables.
+	{
+		auto &gql_state = QuackapiState::Get(*db);
+		QuackapiGraphqlRoute gql_route;
+		if (req.method == "POST" && gql_state.GetGraphqlRouteByPath(req.path, req.method, gql_route)) {
+			if (!gql_route.require_auth.empty()) {
+				QuackapiRoute auth_probe;
+				auth_probe.require_auth = gql_route.require_auth;
+				auto headers = CollectHeaders(req);
+				auto auth_result = CheckAuth(*db, auth_probe, headers);
+				if (!auth_result.ok) {
+					if (!auth_result.www_authenticate.empty()) {
+						res.set_header("WWW-Authenticate", auth_result.www_authenticate);
+					}
+					SetJson(res, auth_result.status, auth_result.body);
+					finish();
+					return;
+				}
+			}
+			string gql_query;
+			string gql_err;
+			if (!GraphqlExtractQuery(*db, req.body, gql_query, gql_err)) {
+				SetJson(res, 400, gql_err);
+				finish();
+				return;
+			}
+			try {
+				GraphqlExecOptions opts;
+				opts.allowed_tables = &gql_route.tables;
+				opts.limit = gql_route.limit == 0 ? QUACKAPI_GRAPHQL_DEFAULT_LIMIT : gql_route.limit;
+				SetJson(res, 200, ExecuteGraphqlQuery(*db, gql_query, opts));
+			} catch (std::exception &ex) {
+				SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
+			} catch (...) {
+				SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql execution failed\"}]}");
+			}
+			finish();
+			return;
+		}
+		if ((req.method == "GET" || req.method == "HEAD") &&
+		    gql_state.GetGraphqlRouteBySchemaPath(req.path, gql_route)) {
+			if (!gql_route.require_auth.empty()) {
+				QuackapiRoute auth_probe;
+				auth_probe.require_auth = gql_route.require_auth;
+				auto headers = CollectHeaders(req);
+				auto auth_result = CheckAuth(*db, auth_probe, headers);
+				if (!auth_result.ok) {
+					if (!auth_result.www_authenticate.empty()) {
+						res.set_header("WWW-Authenticate", auth_result.www_authenticate);
+					}
+					SetJson(res, auth_result.status, auth_result.body);
+					finish();
+					return;
+				}
+			}
+			try {
+				GraphqlExecOptions opts;
+				opts.allowed_tables = &gql_route.tables;
+				opts.mode = "route";
+				opts.route_name = gql_route.name;
+				SetJson(res, 200, BuildGraphqlSchema(*db, opts));
+			} catch (std::exception &ex) {
+				SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
+			} catch (...) {
+				SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql schema failed\"}]}");
+			}
+			finish();
+			return;
+		}
+	}
+
 	// Built-in thin GraphQL v0 (catalog-only table selection; not full GraphQL).
 	// POST /graphql  — JSON body {"query":"query { table { col } }"}
 	// GET  /graphql/schema — main-schema tables → column names

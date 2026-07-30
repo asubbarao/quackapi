@@ -660,11 +660,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// that turn a real web-app source tree into route/model IR rows.
 	RegisterQuackapiFromXFunctions(loader);
 
-	// Thin GraphQL allowlist inspection (CREATE GRAPHQL FOR TABLE is the DDL).
+	// Thin GraphQL allowlist + named route inspection (CREATE GRAPHQL … DDL).
 	RegisterQuackapiGraphqlFunctions(loader);
 
 	// CREATE ROUTE / GROUP / AUTH / QUEUE / POLICY / STREAM / API FOR TABLE /
-	// GRAPHQL FOR TABLE — all first-class nouns registered.
+	// GRAPHQL FOR TABLE / GRAPHQL ROUTE — all first-class nouns registered.
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(GroupDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
@@ -674,7 +674,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ExtensionCallbackManager::Get(db).Register(PolicyDdlParserExtension());
 	// CREATE STREAM (SSE)
 	ExtensionCallbackManager::Get(db).Register(StreamDdlParserExtension());
-	// CREATE / DROP GRAPHQL FOR TABLE (+ DROP GRAPHQL ALL)
+	// CREATE / DROP GRAPHQL FOR TABLE (+ DROP GRAPHQL ALL) + GRAPHQL ROUTE
 	ExtensionCallbackManager::Get(db).Register(GraphqlDdlParserExtension());
 }
 

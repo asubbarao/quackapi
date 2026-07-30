@@ -174,7 +174,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **Middleware BEFORE/AFTER SQL** | not built (use shared views/SQL preamble) | `/tmp/quackapi_spec_middleware/SPEC.md` |
 | **Response gzip/zstd** | **shipped** — Accept-Encoding negotiate; `compression` serve knobs | `quackapi_server.cpp` MaybeCompress |
 | **FORMAT / Accept** | **shipped** json/ndjson/csv/**parquet**/**arrow** (IPC stream via community nanoarrow) | format tests; Accept stream/file |
-| **GraphQL thin v0** | **shipped** — POST `/graphql`, GET `/graphql/schema`; **`CREATE GRAPHQL FOR TABLE` allowlist** (open default); named `CREATE GRAPHQL ROUTE` design-only | `quackapi_graphql.cpp`, `graphql-v0.md` |
+| **GraphQL thin v0** | **shipped** — dual surface (REST + GQL → SQL); allowlist + **`CREATE GRAPHQL ROUTE`** | `quackapi_graphql.cpp`, `graphql-v0.md` |
 | **In-process TestClient** `quackapi_request` | **shipped** — `quackapi_request(method, path [, body])` → status/body/content_type (no TCP) | `test/sql/quackapi_request.test` |
 | **Rate limit (HTTP)** | **shipped** — `RATE LIMIT n PER s [BY ip\|token]` → 429 | `rate_limit.test.sh` |
 | **ETag-304 / CACHE TTL** | not built (outbound `cache_httpfs` is separate) | SPEC cache_etag |

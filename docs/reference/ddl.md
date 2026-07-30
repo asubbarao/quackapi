@@ -165,7 +165,35 @@ SELECT * FROM quackapi_graphql_tables();
 CREATE GRAPHQL FOR TABLE users, posts;
 ```
 
-**Not yet:** `CREATE GRAPHQL ROUTE name POST '/gql' FROM …` (named path + auth) — design only in the guide.
+### CREATE GRAPHQL ROUTE
+
+Named path mounts independent of the built-in `/graphql` allowlist. See [graphql-v0.md](../guide/graphql-v0.md).
+
+```sql
+CREATE [OR REPLACE] GRAPHQL ROUTE <name>
+  POST '<path>'
+  FROM <table> [, <table> ...]
+  [REQUIRE <auth>]
+  [LIMIT <n>];
+
+DROP GRAPHQL ROUTE <name>;
+```
+
+| Piece | Rules |
+|-------|--------|
+| **path** | Absolute; not reserved (`/graphql`, `/graphql/schema`); unique among GraphQL routes |
+| **FROM** | Required; tables must exist in `main` |
+| **REQUIRE** | Optional; auth scheme must already exist |
+| **LIMIT** | Optional 1..100000 (default 100) |
+
+Inspect:
+
+```sql
+SELECT * FROM quackapi_graphql_routes();
+-- name, method, path, tables, require_auth, limit
+```
+
+HTTP: `POST <path>` (query body) and `GET <path>/schema`.
 
 ---
 
