@@ -231,19 +231,17 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const strin
 		string origin, path;
 		SplitURL(url, origin, path);
 		auto headers = ToHttplibHeaders(extra_headers);
-		return WithPlainClient(origin,
-		                       [&](duckdb_httplib::Client &client) { return client.Get(path, headers); });
+		return WithPlainClient(origin, [&](duckdb_httplib::Client &client) { return client.Get(path, headers); });
 	}
 
-	return WithUtilClient(db, url,
-	                      [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
-		                      HTTPHeaders headers(db);
-		                      InsertExtraHeaders(headers, extra_headers);
-		                      GetRequestInfo request(url, headers, params, /*response_handler=*/nullptr,
-		                                             /*content_handler=*/nullptr);
-		                      request.try_request = true;
-		                      return FromResponse(http_util.Request(request, client));
-	                      });
+	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+		HTTPHeaders headers(db);
+		InsertExtraHeaders(headers, extra_headers);
+		GetRequestInfo request(url, headers, params, /*response_handler=*/nullptr,
+		                       /*content_handler=*/nullptr);
+		request.try_request = true;
+		return FromResponse(http_util.Request(request, client));
+	});
 }
 
 QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const string &url, const string &body,
@@ -256,8 +254,8 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 		SplitURL(url, origin, path);
 		auto headers = ToHttplibHeaders(extra_headers);
 		const auto &ct = content_type.empty() ? string("application/octet-stream") : content_type;
-		return WithPlainClient(
-		    origin, [&](duckdb_httplib::Client &client) { return client.Post(path, headers, body, ct); });
+		return WithPlainClient(origin,
+		                       [&](duckdb_httplib::Client &client) { return client.Post(path, headers, body, ct); });
 	}
 
 	// Built-In HTTPLibClient does not implement POST (http_util.cpp). Surface a
@@ -272,18 +270,16 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 		    util_name);
 	}
 
-	return WithUtilClient(db, url,
-	                      [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
-		                      HTTPHeaders headers(db);
-		                      if (!content_type.empty()) {
-			                      headers.Insert("Content-Type", content_type);
-		                      }
-		                      InsertExtraHeaders(headers, extra_headers);
-		                      PostRequestInfo request(url, headers, params, const_data_ptr_cast(body.data()),
-		                                              body.size());
-		                      request.try_request = true;
-		                      return FromResponse(http_util.Request(request, client));
-	                      });
+	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+		HTTPHeaders headers(db);
+		if (!content_type.empty()) {
+			headers.Insert("Content-Type", content_type);
+		}
+		InsertExtraHeaders(headers, extra_headers);
+		PostRequestInfo request(url, headers, params, const_data_ptr_cast(body.data()), body.size());
+		request.try_request = true;
+		return FromResponse(http_util.Request(request, client));
+	});
 }
 
 vector<QuackapiHttpPoolStats> QuackapiHttpFetch::PoolStats() {
@@ -337,8 +333,8 @@ Value ToValue(const QuackapiHttpFetchResult &result) {
 	children.emplace_back("body", Value(result.body));
 	children.emplace_back("headers", Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(header_keys),
 	                                            std::move(header_values)));
-	children.emplace_back("error", result.request_error.empty() ? Value(LogicalType::VARCHAR)
-	                                                            : Value(result.request_error));
+	children.emplace_back("error",
+	                      result.request_error.empty() ? Value(LogicalType::VARCHAR) : Value(result.request_error));
 	children.emplace_back("reused_connection", Value::BOOLEAN(result.reused_connection));
 	return Value::STRUCT(std::move(children));
 }
@@ -370,8 +366,8 @@ void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 			result.SetValue(i, Value(FetchResultType()));
 			continue;
 		}
-		auto headers = args.ColumnCount() > 1 ? HeadersFromValue(args.data[1].GetValue(i))
-		                                      : unordered_map<string, string>();
+		auto headers =
+		    args.ColumnCount() > 1 ? HeadersFromValue(args.data[1].GetValue(i)) : unordered_map<string, string>();
 		result.SetValue(i, ToValue(QuackapiHttpFetch::Get(db, url.ToString(), headers)));
 	}
 }
@@ -394,11 +390,10 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 				content_type = ct.ToString();
 			}
 		}
-		auto headers = args.ColumnCount() > 3 ? HeadersFromValue(args.data[3].GetValue(i))
-		                                      : unordered_map<string, string>();
-		result.SetValue(i, ToValue(QuackapiHttpFetch::Post(db, url.ToString(),
-		                                                   body.IsNull() ? string() : body.ToString(), content_type,
-		                                                   headers)));
+		auto headers =
+		    args.ColumnCount() > 3 ? HeadersFromValue(args.data[3].GetValue(i)) : unordered_map<string, string>();
+		result.SetValue(i, ToValue(QuackapiHttpFetch::Post(
+		                       db, url.ToString(), body.IsNull() ? string() : body.ToString(), content_type, headers)));
 	}
 }
 
