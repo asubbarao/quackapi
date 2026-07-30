@@ -584,4 +584,62 @@ vector<QuackapiMaskingBinding> QuackapiState::SnapshotMaskingBindings() {
 	return masking_bindings;
 }
 
+void QuackapiState::AddGraphqlTable(const string &table_name, bool or_replace) {
+	if (table_name.empty()) {
+		throw InvalidInputException("CREATE GRAPHQL FOR TABLE expects a non-empty table name");
+	}
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto &t : graphql_tables) {
+		if (t == table_name) {
+			if (!or_replace) {
+				throw InvalidInputException(
+				    "GraphQL table \"%s\" already registered — use CREATE OR REPLACE GRAPHQL FOR TABLE", table_name);
+			}
+			return;
+		}
+	}
+	graphql_tables.push_back(table_name);
+}
+
+bool QuackapiState::DropGraphqlTable(const string &table_name) {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto it = graphql_tables.begin(); it != graphql_tables.end(); ++it) {
+		if (*it == table_name) {
+			graphql_tables.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+void QuackapiState::ClearGraphqlTables() {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	graphql_tables.clear();
+}
+
+bool QuackapiState::GraphqlAllowlistActive() {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	return !graphql_tables.empty();
+}
+
+bool QuackapiState::IsGraphqlTableAllowed(const string &table_name) {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	if (graphql_tables.empty()) {
+		return true; // open mode
+	}
+	for (auto &t : graphql_tables) {
+		if (t == table_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<string> QuackapiState::SnapshotGraphqlTables() {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	auto out = graphql_tables;
+	std::sort(out.begin(), out.end());
+	return out;
+}
+
 } // namespace duckdb

@@ -75,7 +75,7 @@ That is the whole product idea:
 | Column redaction | `CREATE MASKING POLICY` | claims-keyed masks |
 | Static files | `static_dir := '…'` on serve | unrouted GETs |
 | OpenAPI | open the browser | `/openapi.json`, `/docs`, `/redoc` |
-| Thin GraphQL (v0) | `POST /graphql` catalog tables | [graphql-v0.md](guide/graphql-v0.md) |
+| Thin GraphQL (v0) | `POST /graphql` + `CREATE GRAPHQL FOR TABLE` allowlist | [graphql-v0.md](guide/graphql-v0.md) |
 
 Start the server with:
 

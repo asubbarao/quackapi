@@ -285,6 +285,22 @@ public:
 	bool UnbindMaskingPolicy(const string &table_name, const string &column_name);
 	vector<QuackapiMaskingBinding> SnapshotMaskingBindings();
 
+	// --- Thin GraphQL v0 table allowlist (built-in POST /graphql) ---
+	// Empty allowlist = open mode (all main-schema tables, v0 default).
+	// Non-empty = only registered tables appear in /graphql and /graphql/schema.
+	//! Register a main-schema table/view for GraphQL. Throws on duplicate unless or_replace.
+	void AddGraphqlTable(const string &table_name, bool or_replace);
+	//! Remove one table from the allowlist. Returns false if not registered.
+	bool DropGraphqlTable(const string &table_name);
+	//! Clear allowlist → open catalog mode.
+	void ClearGraphqlTables();
+	//! True when at least one table is registered (allowlist mode).
+	bool GraphqlAllowlistActive();
+	//! True when open mode OR table is on the allowlist.
+	bool IsGraphqlTableAllowed(const string &table_name);
+	//! Sorted snapshot of registered table names (empty in open mode).
+	vector<string> SnapshotGraphqlTables();
+
 private:
 	void PublishRoutes();
 	void PublishStreams();
@@ -313,6 +329,10 @@ private:
 	vector<QuackapiMaskingPolicy> masking_policies;
 	vector<QuackapiRowAccessBinding> row_access_bindings;
 	vector<QuackapiMaskingBinding> masking_bindings;
+
+	//! GraphQL allowlist (case-sensitive catalog names, like duckdb_tables).
+	std::mutex graphql_mutex;
+	vector<string> graphql_tables;
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;
