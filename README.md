@@ -306,6 +306,40 @@ ALTER TABLE … ADD ROW ACCESS POLICY …;
 SELECT * FROM quackapi_policies();
 ```
 
+### Outbound HTTP
+
+A handler that calls an upstream API — an LLM, a payment gateway, a webhook —
+gets a **pooled** connection. The pool lives for the process, so the second
+request to a host does not re-dial.
+
+```sql
+CREATE ROUTE ask POST '/ask' AS
+  SELECT (quackapi_post(
+    'http://127.0.0.1:11434/api/generate',
+    to_json({model: $model::VARCHAR, prompt: $prompt::VARCHAR, stream: false})::VARCHAR
+  )).body AS answer;
+```
+
+| Function | Role |
+|----------|------|
+| `quackapi_fetch(url[, headers])` | GET → `STRUCT(status, reason, body, headers, error, reused_connection)` |
+| `quackapi_post(url, body[, content_type[, headers]])` | POST, same result shape (`content_type` defaults to `application/json`) |
+| `quackapi_http_pool()` | per-origin `host, idle, dialed, reused` |
+
+Why this exists: `HTTPUtil::Request(request)` — and the community `http_client`
+extension — build a fresh client per call and drop it, so connections are only
+reused *within* one query execution. A route handler is exactly one execution,
+so every request paid a full dial. Against an ollama endpoint whose floor is
+12.7ms/call that cost **39.1ms p50**; through the pool the same route measures
+**13.2ms p50 / 13.8ms p90**.
+
+`http://` uses the vendored httplib client, which implements POST — no companion
+extension needed. `https://` goes through `HTTPUtil`, pooled the same way, so
+`LOAD curl_httpfs` (or `httpfs`) supplies TLS.
+
+Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
+`FROM range(1000)` would issue one request while reporting 1000 rows.
+
 ### Diagnostics
 
 | Function | Role |
