@@ -69,9 +69,9 @@ struct QuackapiHttplibServer : duckdb_httplib::Server {
 			    // Restore accept-time SO_* after handler+write (per-route TIMEOUT may
 			    // have raised them). Next keep-alive SocketStream still uses serve defaults.
 			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, read_timeout_sec_,
-			                                               read_timeout_usec_);
+			                                                read_timeout_usec_);
 			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, write_timeout_sec_,
-			                                               write_timeout_usec_);
+			                                                write_timeout_usec_);
 			    quackapi_tls_stream = nullptr;
 			    quackapi_tls_sock = INVALID_SOCKET;
 			    return ok;

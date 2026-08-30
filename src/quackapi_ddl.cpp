@@ -807,8 +807,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 
 	// Optional late TIMEOUT (after PARAM / BODY SCHEMA)
 	rest_upper = StringUtil::Upper(rest);
-	if (StringUtil::StartsWith(rest_upper, "TIMEOUT") &&
-	    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+	if (StringUtil::StartsWith(rest_upper, "TIMEOUT") && (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
 		rest = QuackapiTrim(rest.substr(7));
 		if (rest.empty()) {
 			return ParserExtensionParseResult("TIMEOUT expects a duration (e.g. 180, '3m', '30s')");
@@ -868,14 +867,13 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					sep_len = 1;
 				}
 				if (eq == string::npos) {
-					return ParserExtensionParseResult(
-					    "WITH option must be timeout_sec [=|:=] <n> — got \"" + part + "\"");
+					return ParserExtensionParseResult("WITH option must be timeout_sec [=|:=] <n> — got \"" + part +
+					                                  "\"");
 				}
 				auto key = StringUtil::Lower(QuackapiTrim(part.substr(0, eq)));
 				auto val = QuackapiTrim(part.substr(eq + sep_len));
 				if (key != "timeout_sec" && key != "timeout") {
-					return ParserExtensionParseResult(
-					    "Unknown WITH option \"" + key + "\" — expected timeout_sec");
+					return ParserExtensionParseResult("Unknown WITH option \"" + key + "\" — expected timeout_sec");
 				}
 				string terr;
 				int32_t sec = 0;
@@ -1043,7 +1041,8 @@ TableFunction MakeApplyRouteFunction() {
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::INTEGER},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
