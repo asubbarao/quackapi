@@ -590,4 +590,175 @@ vector<QuackapiMaskingBinding> QuackapiState::SnapshotMaskingBindings() {
 	return masking_bindings;
 }
 
+void QuackapiState::AddGraphqlTable(const string &table_name, bool or_replace) {
+	if (table_name.empty()) {
+		throw InvalidInputException("CREATE GRAPHQL FOR TABLE expects a non-empty table name");
+	}
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto &t : graphql_tables) {
+		if (t == table_name) {
+			if (!or_replace) {
+				throw InvalidInputException(
+				    "GraphQL table \"%s\" already registered — use CREATE OR REPLACE GRAPHQL FOR TABLE", table_name);
+			}
+			return;
+		}
+	}
+	graphql_tables.push_back(table_name);
+}
+
+bool QuackapiState::DropGraphqlTable(const string &table_name) {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto it = graphql_tables.begin(); it != graphql_tables.end(); ++it) {
+		if (*it == table_name) {
+			graphql_tables.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+void QuackapiState::ClearGraphqlTables() {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	graphql_tables.clear();
+}
+
+bool QuackapiState::GraphqlAllowlistActive() {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	return !graphql_tables.empty();
+}
+
+bool QuackapiState::IsGraphqlTableAllowed(const string &table_name) {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	if (graphql_tables.empty()) {
+		return true; // open mode
+	}
+	for (auto &t : graphql_tables) {
+		if (t == table_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<string> QuackapiState::SnapshotGraphqlTables() {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	auto out = graphql_tables;
+	std::sort(out.begin(), out.end());
+	return out;
+}
+
+namespace {
+
+string NormalizeGraphqlMountPath(const string &path) {
+	string p = path;
+	while (p.size() > 1 && p.back() == '/') {
+		p.pop_back();
+	}
+	return p;
+}
+
+bool IsReservedGraphqlPath(const string &path) {
+	return path == "/graphql" || path == "/graphql/schema";
+}
+
+} // namespace
+
+void QuackapiState::AddGraphqlRoute(const QuackapiGraphqlRoute &route_in, bool or_replace) {
+	if (route_in.name.empty()) {
+		throw InvalidInputException("CREATE GRAPHQL ROUTE expects a non-empty name");
+	}
+	if (route_in.path.empty() || route_in.path[0] != '/') {
+		throw InvalidInputException("CREATE GRAPHQL ROUTE path must be absolute (start with '/')");
+	}
+	if (route_in.tables.empty()) {
+		throw InvalidInputException("CREATE GRAPHQL ROUTE requires FROM <table> [, …]");
+	}
+	QuackapiGraphqlRoute route = route_in;
+	route.path = NormalizeGraphqlMountPath(route.path);
+	route.method = StringUtil::Upper(route.method);
+	if (route.method != "POST") {
+		throw InvalidInputException("CREATE GRAPHQL ROUTE only supports POST in v0 (got %s)", route.method);
+	}
+	if (IsReservedGraphqlPath(route.path)) {
+		throw InvalidInputException("CREATE GRAPHQL ROUTE path \"%s\" is reserved for the built-in GraphQL endpoint",
+		                            route.path);
+	}
+	// Schema sibling must not collide with another mount or reserved paths.
+	string schema_path = route.path + "/schema";
+	if (IsReservedGraphqlPath(schema_path)) {
+		throw InvalidInputException("CREATE GRAPHQL ROUTE path \"%s\" collides with built-in schema URL", route.path);
+	}
+
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto &existing : graphql_routes) {
+		if (existing.name == route.name) {
+			continue; // handled below by name match
+		}
+		if (existing.path == route.path) {
+			throw InvalidInputException("GraphQL route path \"%s\" already used by route \"%s\"", route.path,
+			                            existing.name);
+		}
+		if (existing.path + "/schema" == route.path || existing.path == schema_path) {
+			throw InvalidInputException("GraphQL route path \"%s\" collides with schema URL of route \"%s\"",
+			                            route.path, existing.name);
+		}
+	}
+	for (auto it = graphql_routes.begin(); it != graphql_routes.end(); ++it) {
+		if (it->name == route.name) {
+			if (!or_replace) {
+				throw InvalidInputException("GraphQL route \"%s\" already exists — use CREATE OR REPLACE GRAPHQL ROUTE",
+				                            route.name);
+			}
+			*it = route;
+			return;
+		}
+	}
+	graphql_routes.push_back(route);
+}
+
+bool QuackapiState::DropGraphqlRoute(const string &name) {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto it = graphql_routes.begin(); it != graphql_routes.end(); ++it) {
+		if (it->name == name) {
+			graphql_routes.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool QuackapiState::GetGraphqlRouteByPath(const string &path, const string &method, QuackapiGraphqlRoute &out) {
+	string norm = NormalizeGraphqlMountPath(path);
+	string meth = StringUtil::Upper(method);
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto &r : graphql_routes) {
+		if (r.path == norm && r.method == meth) {
+			out = r;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool QuackapiState::GetGraphqlRouteBySchemaPath(const string &path, QuackapiGraphqlRoute &out) {
+	string norm = NormalizeGraphqlMountPath(path);
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	for (auto &r : graphql_routes) {
+		if (norm == r.path + "/schema") {
+			out = r;
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<QuackapiGraphqlRoute> QuackapiState::SnapshotGraphqlRoutes() {
+	std::lock_guard<std::mutex> lock(graphql_mutex);
+	auto out = graphql_routes;
+	std::sort(out.begin(), out.end(),
+	          [](const QuackapiGraphqlRoute &a, const QuackapiGraphqlRoute &b) { return a.name < b.name; });
+	return out;
+}
+
 } // namespace duckdb

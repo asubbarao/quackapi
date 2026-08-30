@@ -133,7 +133,71 @@ CREATE API FOR TABLE documents AT '/api/documents' KEY 'doc_id';
 
 ---
 
-## 5. CREATE QUEUE
+## 5. CREATE GRAPHQL FOR TABLE
+
+Optional allowlist for the built-in thin GraphQL endpoint (`POST /graphql`, `GET /graphql/schema`). Empty allowlist = **open** mode (all main-schema tables). See [graphql-v0.md](../guide/graphql-v0.md).
+
+```sql
+CREATE [OR REPLACE] GRAPHQL FOR TABLE <table> [, <table> ...];
+
+DROP GRAPHQL FOR TABLE <table> [, <table> ...];
+
+DROP GRAPHQL ALL;   -- clear allowlist → open mode
+```
+
+| Piece | Rules |
+|-------|--------|
+| **table** | Bare id or `"quoted""ident"`; must exist in schema `main` at CREATE |
+| **OR REPLACE** | Idempotent re-register (no error if already listed) |
+| **DROP … ALL** | Clears entire allowlist |
+
+Inspect:
+
+```sql
+SELECT * FROM quackapi_graphql_tables();
+-- open mode: one row mode='open', table_name NULL
+-- allowlist: mode='allowlist', one row per table_name
+```
+
+**Example:**
+
+```sql
+CREATE GRAPHQL FOR TABLE users, posts;
+```
+
+### CREATE GRAPHQL ROUTE
+
+Named path mounts independent of the built-in `/graphql` allowlist. See [graphql-v0.md](../guide/graphql-v0.md).
+
+```sql
+CREATE [OR REPLACE] GRAPHQL ROUTE <name>
+  POST '<path>'
+  FROM <table> [, <table> ...]
+  [REQUIRE <auth>]
+  [LIMIT <n>];
+
+DROP GRAPHQL ROUTE <name>;
+```
+
+| Piece | Rules |
+|-------|--------|
+| **path** | Absolute; not reserved (`/graphql`, `/graphql/schema`); unique among GraphQL routes |
+| **FROM** | Required; tables must exist in `main` |
+| **REQUIRE** | Optional; auth scheme must already exist |
+| **LIMIT** | Optional 1..100000 (default 100) |
+
+Inspect:
+
+```sql
+SELECT * FROM quackapi_graphql_routes();
+-- name, method, path, tables, require_auth, limit
+```
+
+HTTP: `POST <path>` (query body) and `GET <path>/schema`.
+
+---
+
+## 6. CREATE QUEUE
 
 ```sql
 CREATE [OR REPLACE] QUEUE <name>
@@ -158,7 +222,7 @@ CREATE QUEUE emails WITH (max_attempts=5, visibility_timeout='30s');
 
 ---
 
-## 6. CREATE STREAM
+## 7. CREATE STREAM
 
 ```sql
 CREATE [OR REPLACE] STREAM <name> GET '<path>'
@@ -184,7 +248,7 @@ SELECT i AS id, 'tick' AS msg FROM range(3) t(i);
 
 ---
 
-## 7. CREATE ROW ACCESS POLICY
+## 8. CREATE ROW ACCESS POLICY
 
 ```sql
 CREATE [OR REPLACE] ROW ACCESS POLICY <name>

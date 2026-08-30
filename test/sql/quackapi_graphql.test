@@ -1,0 +1,292 @@
+# name: test/sql/quackapi_graphql.test
+# description: Thin GraphQL v0 + CREATE GRAPHQL FOR TABLE + CREATE GRAPHQL ROUTE
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE TABLE users AS SELECT 1 AS id, 'ada' AS name;
+
+statement ok
+CREATE TABLE posts AS SELECT 10 AS id, 'hello' AS title;
+
+statement ok
+CREATE TABLE secrets AS SELECT 99 AS id, 'hidden' AS payload;
+
+# ---------------------------------------------------------------------------
+# Open mode (default): all main tables via built-in POST /graphql
+# ---------------------------------------------------------------------------
+query I
+SELECT mode FROM quackapi_graphql_tables();
+----
+open
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/graphql',
+  '{"query":"{ users { id name } posts { id title } }"}'
+);
+----
+200	{"data":{"users":[{"id":1,"name":"ada"}],"posts":[{"id":10,"title":"hello"}]}}
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/graphql/schema');
+----
+200	{"mode":"open","tables":{"posts":["id","title"],"secrets":["id","payload"],"users":["id","name"]},"note":"GraphQL v0 catalog-only schema. Full __schema introspection not implemented. CREATE GRAPHQL FOR TABLE registers an allowlist for POST /graphql; empty = open. CREATE GRAPHQL ROUTE mounts named paths with per-route tables."}
+
+# ---------------------------------------------------------------------------
+# Allowlist mode: only registered tables
+# ---------------------------------------------------------------------------
+query I
+CREATE GRAPHQL FOR TABLE users, posts;
+----
+GraphQL registered: users, posts (allowlist mode on POST /graphql)
+
+query TT
+SELECT mode, table_name FROM quackapi_graphql_tables() ORDER BY table_name;
+----
+allowlist	posts
+allowlist	users
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/graphql',
+  '{"query":"{ users { id name } }"}'
+);
+----
+200	{"data":{"users":[{"id":1,"name":"ada"}]}}
+
+# secrets is not on the allowlist
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/graphql',
+  '{"query":"{ secrets { id payload } }"}'
+);
+----
+200	{"errors":[{"message":"table 'secrets' is not registered for GraphQL — CREATE GRAPHQL FOR TABLE secrets"}]}
+
+# schema only lists allowlisted tables that exist
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/graphql/schema');
+----
+200	{"mode":"allowlist","tables":{"posts":["id","title"],"users":["id","name"]},"note":"GraphQL v0 catalog-only schema. Full __schema introspection not implemented. CREATE GRAPHQL FOR TABLE registers an allowlist for POST /graphql; empty = open. CREATE GRAPHQL ROUTE mounts named paths with per-route tables."}
+
+# Duplicate without OR REPLACE fails
+statement error
+CREATE GRAPHQL FOR TABLE users;
+----
+already registered
+
+# OR REPLACE is idempotent
+query I
+CREATE OR REPLACE GRAPHQL FOR TABLE users;
+----
+GraphQL registered: users (allowlist mode on POST /graphql)
+
+# Unknown catalog table rejected at CREATE
+statement error
+CREATE GRAPHQL FOR TABLE no_such_table;
+----
+not found in schema main
+
+# DROP one table; allowlist still active while non-empty
+query I
+DROP GRAPHQL FOR TABLE posts;
+----
+GraphQL unregistered: posts
+
+query TT
+SELECT mode, table_name FROM quackapi_graphql_tables();
+----
+allowlist	users
+
+# DROP last table → open mode again
+query I
+DROP GRAPHQL FOR TABLE users;
+----
+GraphQL unregistered: users (allowlist empty → open catalog mode)
+
+query I
+SELECT mode FROM quackapi_graphql_tables();
+----
+open
+
+# secrets is queryable again in open mode
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/graphql',
+  '{"query":"{ secrets { id } }"}'
+);
+----
+200	{"data":{"secrets":[{"id":99}]}}
+
+# DROP GRAPHQL ALL clears even a multi-table allowlist
+query I
+CREATE GRAPHQL FOR TABLE users, posts, secrets;
+----
+GraphQL registered: users, posts, secrets (allowlist mode on POST /graphql)
+
+query I
+DROP GRAPHQL ALL;
+----
+GraphQL allowlist cleared (open catalog mode)
+
+query I
+SELECT mode FROM quackapi_graphql_tables();
+----
+open
+
+# DROP missing registration fails when none match
+statement error
+DROP GRAPHQL FOR TABLE users;
+----
+no matching registered tables
+
+# ---------------------------------------------------------------------------
+# CREATE GRAPHQL ROUTE — named mounts, independent of global allowlist
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE multi AS SELECT * FROM (VALUES (1),(2),(3)) t(id);
+
+query I
+CREATE GRAPHQL ROUTE public_api POST '/api/gql' FROM users, posts LIMIT 2;
+----
+GraphQL route public_api: POST /api/gql FROM users, posts LIMIT 2
+
+query IIIII
+SELECT name, method, path, require_auth, "limit" FROM quackapi_graphql_routes();
+----
+public_api	POST	/api/gql	NULL	2
+
+# Route serves only FROM tables
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/api/gql',
+  '{"query":"{ users { id name } }"}'
+);
+----
+200	{"data":{"users":[{"id":1,"name":"ada"}]}}
+
+# secrets not on route (global is still open — secrets works on /graphql)
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/api/gql',
+  '{"query":"{ secrets { id } }"}'
+);
+----
+200	{"errors":[{"message":"table 'secrets' is not on this GraphQL route — CREATE GRAPHQL ROUTE … FROM secrets"}]}
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/graphql',
+  '{"query":"{ secrets { id } }"}'
+);
+----
+200	{"data":{"secrets":[{"id":99}]}}
+
+# Global allowlist does not shrink the route's FROM set
+query I
+CREATE GRAPHQL FOR TABLE users;
+----
+GraphQL registered: users (allowlist mode on POST /graphql)
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/api/gql',
+  '{"query":"{ posts { id title } }"}'
+);
+----
+200	{"data":{"posts":[{"id":10,"title":"hello"}]}}
+
+query I
+DROP GRAPHQL ALL;
+----
+GraphQL allowlist cleared (open catalog mode)
+
+# Schema for the route
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/api/gql/schema');
+----
+200	{"mode":"route","route":"public_api","tables":{"posts":["id","title"],"users":["id","name"]},"note":"GraphQL v0 catalog-only schema. Full __schema introspection not implemented. CREATE GRAPHQL FOR TABLE registers an allowlist for POST /graphql; empty = open. CREATE GRAPHQL ROUTE mounts named paths with per-route tables."}
+
+# LIMIT honored on multi-row table (route with LIMIT 1)
+query I
+CREATE OR REPLACE GRAPHQL ROUTE public_api POST '/api/gql' FROM multi LIMIT 1;
+----
+GraphQL route public_api: POST /api/gql FROM multi LIMIT 1
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/api/gql',
+  '{"query":"{ multi { id } }"}'
+);
+----
+200	{"data":{"multi":[{"id":1}]}}
+
+# Reserved path rejected
+statement error
+CREATE GRAPHQL ROUTE bad POST '/graphql' FROM users;
+----
+reserved
+
+# REQUIRE auth
+query I
+CREATE AUTH gql_site AS API_KEY;
+----
+Auth gql_site: API_KEY
+
+query I
+SELECT * FROM quackapi_add_api_key('gql_site', 'gql-secret-key', 'bob');
+----
+bob
+
+query I
+CREATE OR REPLACE GRAPHQL ROUTE public_api POST '/api/gql' FROM users REQUIRE gql_site;
+----
+GraphQL route public_api: POST /api/gql FROM users REQUIRE gql_site LIMIT 100
+
+query I
+SELECT status FROM quackapi_request(
+  'POST', '/api/gql',
+  '{"query":"{ users { id } }"}'
+);
+----
+401
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/api/gql',
+  '{"query":"{ users { id } }"}',
+  headers := MAP {'X-API-Key': 'gql-secret-key'}
+);
+----
+200	{"data":{"users":[{"id":1}]}}
+
+# DROP route → 404 on path; built-in still works
+query I
+DROP GRAPHQL ROUTE public_api;
+----
+Dropped GraphQL route public_api
+
+query I
+SELECT status FROM quackapi_request(
+  'POST', '/api/gql',
+  '{"query":"{ users { id } }"}'
+);
+----
+404
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/graphql',
+  '{"query":"{ users { id } }"}'
+);
+----
+200	{"data":{"users":[{"id":1}]}}
+
+query I
+SELECT count(*) FROM quackapi_graphql_routes();
+----
+0

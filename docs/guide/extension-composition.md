@@ -7,15 +7,19 @@ No C++ rewrite per companion. No second process for “the PDF service.” Same 
 same address space, same type system.
 
 ```text
-browser  ──►  quackapi (SQL handlers)
+browser  ──►  quackapi (SQL handlers + thin GraphQL)
                     │
                     ├── local tables / views
+                    ├── CREATE ROUTE / API FOR TABLE   (REST → your SQL)
+                    ├── POST /graphql | GRAPHQL ROUTE  (GQL → SELECT …)
                     ├── curl_httpfs / httpfs  (read_text, read_json, …)
                     ├── http_client           (http_get, http_post, …)
-                    ├── sitting_duck          (via quack_from_*)
+                    ├── sitting_duck          (AST / quack_from_*; optional GQL parse recipe)
                     ├── quack                 (quack_query / ATTACH)
                     └── pdf / tera / …        (community companions)
 ```
+
+**Dual surface:** GraphQL + ordinary HTTP on the same session — both resolve to SQL ([graphql-v0.md](graphql-v0.md)). Companions run *inside* handlers; they are not a second API product.
 
 Full DDL and function tables stay in the [README](../../README.md) and
 [function reference](../reference/functions.md). This page is **recipes only**.
