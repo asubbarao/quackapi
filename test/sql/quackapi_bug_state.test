@@ -1,15 +1,15 @@
 # name: test/sql/quackapi_bug_state.test
-# description: Demonstrate concurrency / shared-mutable-state bugs (audit/bug-state)
+# description: Regression — shared-mutable-state fixes (static body, rate limit, TLS TEMP)
 # group: [sql]
+
 #
-# These queries assert the *current buggy observables* so the suite documents
-# each defect. When a bug is fixed, flip the expected rows to the correct
-# behaviour and keep the scenario as a regression test.
+# Scenarios that previously documented buggy observables. Expected rows are the
+# correct post-fix behaviour.
 #
 # Bugs covered (see commit message / audit reply for file:line):
-#   1) TLS static_json_bodies — zero-param JSON responses never re-execute
-#   2) Process-static RouteRateLimiter — counters survive CREATE OR REPLACE
-#   3) TLS Connection session leak — TEMP from request A visible on request B
+#   1) TLS static_json_bodies — zero-param JSON must re-execute after writes / time
+#   2) Process-static RouteRateLimiter — CREATE OR REPLACE resets counters
+#   3) TLS Connection session leak — TEMP from request A must not reach request B
 #
 # Dequeue CAS under parallel workers: not expressible in single-threaded
 # SQLLogic — see test/sql/fixtures/dequeue_conflict_repro.md
@@ -18,7 +18,7 @@ require quackapi
 
 # ---------------------------------------------------------------------------
 # 1) Thread-local static JSON body cache (ThreadRequestCache::static_json_bodies)
-#    Zero-param handlers cache the first serialized body forever on that worker.
+#    Zero-param handlers must not freeze the first serialized body forever.
 #    quackapi_request shares the calling thread's TLS cache (same path as HTTP
 #    workers under keep-alive / thread affinity).
 # ---------------------------------------------------------------------------
@@ -49,20 +49,20 @@ SELECT sleep_ms(50);
 statement ok
 INSERT INTO bugstate_items VALUES (2);
 
-# BUG: count stays 1 after INSERT (table has 2 rows). Correct would be [{"c":2}].
+# After INSERT the table has 2 rows — handler must re-execute.
 query I
 SELECT decode(body) FROM quackapi_request('GET', '/bugstate/cnt');
 ----
-[{"c":1}]
+[{"c":2}]
 
 statement ok
 CREATE TABLE bugstate_tick_snap2 AS SELECT decode(body) AS body FROM quackapi_request('GET', '/bugstate/tick');
 
-# BUG: tick body identical after 50ms sleep (now() never re-runs). Correct: unequal epochs.
+# now() must re-run — epochs differ after 50ms sleep.
 query I
 SELECT s1.body = s2.body FROM bugstate_tick_snap s1 JOIN bugstate_tick_snap2 s2 ON true;
 ----
-true
+false
 
 query I
 SELECT count(*) FROM bugstate_items;
@@ -71,7 +71,7 @@ SELECT count(*) FROM bugstate_items;
 
 # ---------------------------------------------------------------------------
 # 2) Process-global rate limiter (static RouteRateLimiter)
-#    Bucket key is route.name|client only — OR REPLACE does not reset counters.
+#    Bucket key is route.name|client — OR REPLACE must reset counters.
 # ---------------------------------------------------------------------------
 statement ok
 CREATE OR REPLACE ROUTE bugstate_rl GET '/bugstate/rl' RATE LIMIT 2 PER 3600 BY ip AS SELECT 'ok' AS msg;
@@ -91,20 +91,19 @@ SELECT status FROM quackapi_request('GET', '/bugstate/rl');
 ----
 429
 
-# Recreate the route with the same name and budget — should be a fresh window
-# if limits were per-registry generation. BUG: still 429 from sticky process state.
+# Recreate the route with the same name and budget — fresh window.
 statement ok
 CREATE OR REPLACE ROUTE bugstate_rl GET '/bugstate/rl' RATE LIMIT 2 PER 3600 BY ip AS SELECT 'ok' AS msg;
 
 query I
 SELECT status FROM quackapi_request('GET', '/bugstate/rl');
 ----
-429
+200
 
 # ---------------------------------------------------------------------------
-# 3) TLS DuckDB Connection session leak (no reset between requests)
-#    CREATE TEMP on the worker connection remains for the next request on that
-#    thread. Dummy $probe param avoids static body cache masking the result.
+# 3) TLS DuckDB Connection session leak (reset between requests)
+#    CREATE TEMP on the worker connection must not remain for the next request.
+#    Dummy $probe param avoids any residual static-body masking.
 # ---------------------------------------------------------------------------
 statement ok
 CREATE OR REPLACE ROUTE bugstate_leak GET '/bugstate/leak' AS
@@ -124,9 +123,8 @@ SELECT status FROM quackapi_request('GET', '/bugstate/leak');
 ----
 200
 
-# BUG: TEMP from /leak is visible on the next request's connection. Correct: n=0
-# (fresh connection / RESET) or catalog isolation per request.
+# TEMP from /leak must not be visible on the next request's connection.
 query I
 SELECT decode(body) FROM quackapi_request('GET', '/bugstate/readleak?probe=1');
 ----
-[{"n":1}]
+[{"n":0}]

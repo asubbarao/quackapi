@@ -208,6 +208,10 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
                               const unordered_map<string, string> *req_headers = nullptr,
                               unordered_map<string, string> *headers_out = nullptr);
 
+//! Drop in-process rate-limit buckets for a route name (all client keys).
+//! Called on CREATE OR REPLACE / DROP ROUTE so a new registration starts fresh.
+void QuackapiClearRouteRateLimit(const string &route_name);
+
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.
 //! Returns a human-readable summary of what was applied (for docs / debugging).

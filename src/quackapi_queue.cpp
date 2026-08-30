@@ -531,8 +531,10 @@ unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFu
 	auto q = RequireQueue(*context.db, bind.queue_name);
 	EnsureQuackapiJobsTable(*context.db);
 
-	// Atomic claim under DuckDB single-writer: one UPDATE…RETURNING per job.
-	// Ready set: pending OR running-with-expired-lease (visibility timeout).
+	// Atomic claim: UPDATE…RETURNING with outer status/visible_at CAS so two
+	// concurrent dequeue workers cannot both claim the same row. Without the
+	// outer predicates DuckDB raises write-write Conflict; with them the loser
+	// matches zero rows (or retries after a transient Conflict).
 	Connection con(*context.db);
 	for (int32_t i = 0; i < bind.n; i++) {
 		string sql =
@@ -549,10 +551,28 @@ unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFu
 		                       "    AND visible_at <= now()::TIMESTAMP "
 		                       "  ORDER BY id LIMIT 1"
 		                       ") "
+		                       "AND status IN ('pending', 'running') "
+		                       "AND visible_at <= now()::TIMESTAMP "
 		                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error",
 		                       q.visibility_timeout_sec, SqlQuote(bind.queue_name));
-		auto res = con.Query(sql);
-		CheckQuery(res, "dequeue");
+		unique_ptr<MaterializedQueryResult> res;
+		bool claimed = false;
+		for (int attempt = 0; attempt < 8; attempt++) {
+			res = con.Query(sql);
+			if (!res->HasError()) {
+				claimed = true;
+				break;
+			}
+			const string &err = res->GetError();
+			// Concurrent claim on the same tuple — retry; do not surface 422 Conflict.
+			if (StringUtil::Contains(err, "Conflict")) {
+				continue;
+			}
+			CheckQuery(res, "dequeue");
+		}
+		if (!claimed) {
+			CheckQuery(res, "dequeue");
+		}
 		if (res->RowCount() == 0) {
 			break;
 		}

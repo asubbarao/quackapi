@@ -42,62 +42,33 @@ namespace duckdb {
 
 namespace {
 
-//! Per-worker-thread DuckDB connection + prepared-statement cache + static
-//! response cache for zero-parameter handlers.
-//! httplib's ThreadPool runs each request on a worker thread; reusing one
-//! Connection per thread (and reusing Prepare results for stable handler SQL)
-//! removes the dominant per-request tax vs a mature ASGI stack.
+//! Per-worker-thread DuckDB connection.
+//! httplib's ThreadPool runs each request on a worker thread. Connection
+//! construction is avoided only within a single request; each new request
+//! gets a fresh Connection so TEMP tables / SET / session state cannot leak
+//! across keep-alive or in-process calls on the same worker.
+//!
+//! Do NOT cache serialized JSON bodies by SQL alone: zero-parameter handlers
+//! still read tables and call volatile functions (uuid/random/now) — a SQL-only
+//! key freezes the first response forever on that worker.
+//! Do NOT cache PreparedStatement by SQL alone across requests: session reset
+//! drops the connection, and VIEW/MACRO identity is not part of the SQL text.
 struct ThreadRequestCache {
-	static constexpr idx_t MAX_PREPARED = 128;
-	static constexpr idx_t MAX_STATIC_BODIES = 64;
-
 	DatabaseInstance *db = nullptr;
 	unique_ptr<Connection> con;
-	unordered_map<string, unique_ptr<PreparedStatement>> prepared;
-	//! Fully-serialized JSON body for handlers with zero bind parameters
-	//! (e.g. SELECT 'world' AS msg). Keyed by exact handler SQL.
-	unordered_map<string, string> static_json_bodies;
 
-	Connection &GetConnection(DatabaseInstance &instance) {
-		if (!con || db != &instance) {
-			con = make_uniq<Connection>(instance);
-			prepared.clear();
-			static_json_bodies.clear();
-			db = &instance;
-		}
+	//! Start of a request: always a new Connection (clears TEMP/SET).
+	Connection &BeginRequest(DatabaseInstance &instance) {
+		con = make_uniq<Connection>(instance);
+		db = &instance;
 		return *con;
 	}
 
-	//! Cache successful prepares keyed by exact handler SQL. Errors are not
-	//! cached so a transient prepare failure can be retried.
-	PreparedStatement *GetPrepared(const string &sql, string &error_out) {
-		auto it = prepared.find(sql);
-		if (it != prepared.end()) {
-			return it->second.get();
+	Connection &GetConnection(DatabaseInstance &instance) {
+		if (!con || db != &instance) {
+			return BeginRequest(instance);
 		}
-		auto stmt = con->Prepare(sql);
-		if (stmt->HasError()) {
-			error_out = stmt->GetError();
-			return nullptr;
-		}
-		if (prepared.size() >= MAX_PREPARED) {
-			prepared.clear();
-		}
-		auto *raw = stmt.get();
-		prepared.emplace(sql, std::move(stmt));
-		return raw;
-	}
-
-	const string *LookupStaticBody(const string &sql) const {
-		auto it = static_json_bodies.find(sql);
-		return it == static_json_bodies.end() ? nullptr : &it->second;
-	}
-
-	void StoreStaticBody(const string &sql, string body) {
-		if (static_json_bodies.size() >= MAX_STATIC_BODIES) {
-			static_json_bodies.clear();
-		}
-		static_json_bodies[sql] = std::move(body);
+		return *con;
 	}
 };
 
@@ -1809,6 +1780,8 @@ void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &re
 
 // In-process sliding fixed-window rate limiter (no Redis). Keyed by
 // route name + client key + floor(now / window). thread-safe.
+// CREATE OR REPLACE / DROP of a route clears that route's buckets so a new
+// registration does not inherit a spent window from the prior definition.
 struct RouteRateLimiter {
 	struct Entry {
 		int count = 0;
@@ -1851,11 +1824,27 @@ struct RouteRateLimiter {
 		}
 		return true;
 	}
+
+	void ClearRoute(const string &route_name) {
+		const string prefix = route_name + "|";
+		std::lock_guard<std::mutex> guard(lock);
+		for (auto it = entries.begin(); it != entries.end();) {
+			if (StringUtil::StartsWith(it->first, prefix)) {
+				it = entries.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
 };
 
 static RouteRateLimiter &GetRouteRateLimiter() {
 	static RouteRateLimiter lim;
 	return lim;
+}
+
+void QuackapiClearRouteRateLimit(const string &route_name) {
+	GetRouteRateLimiter().ClearRoute(route_name);
 }
 
 static string RateLimitClientKey(const duckdb_httplib::Request &req, const string &by) {
@@ -2561,7 +2550,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	try {
 		auto &tls = TlsRequestCache();
-		auto &con = tls.GetConnection(*db);
+		// Fresh Connection per request — TEMP/SET must not survive to the next call.
+		auto &con = tls.BeginRequest(*db);
 
 		// Request params: path captures shadow query params of the same name.
 		// Body fields (JSON / form / multipart) fill remaining names with loc=body.
@@ -2755,27 +2745,17 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			(void)pg_err;
 		}
 
-		// DuckDB prepare (after libpq short-circuit).
-		string prepare_err;
-		auto *prepared = tls.GetPrepared(handler_sql, prepare_err);
-		if (!prepared) {
-			SetInternalError(res, prepare_err.empty() ? string("prepare failed") : prepare_err);
+		// DuckDB prepare (after libpq short-circuit). Fresh prepare every request:
+		// no SQL-keyed body/plan cache — mutable tables and volatile functions
+		// (now/uuid) must re-execute.
+		auto prepared_owned = con.Prepare(handler_sql);
+		if (prepared_owned->HasError()) {
+			SetInternalError(res, prepared_owned->GetError());
 			finish();
 			return;
 		}
-
-		// Zero-parameter handlers (e.g. SELECT 'world' AS msg): serve cached JSON
-		// after the first successful execute on this worker thread. Only for the
-		// JSON body format — Accept/FORMAT may request ndjson/csv/parquet on the same SQL.
-		const bool zero_params = prepared->named_param_map.empty();
+		PreparedStatement *prepared = prepared_owned.get();
 		const BodyFormat body_format = ResolveBodyFormat(match.route, req);
-		if (zero_params && body_format == BodyFormat::JSON) {
-			if (const string *cached = tls.LookupStaticBody(handler_sql)) {
-				SetJson(res, match.route.status, *cached);
-				finish();
-				return;
-			}
-		}
 
 		// The database types the columns: cast each provided param to the type
 		// the prepared statement expects. Cast failure -> 422, FastAPI-shaped.
@@ -3130,10 +3110,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			content_type = "application/vnd.apache.arrow.stream";
 		} else {
 			body = SerializeRowsJsonArray(names, data_cols, rows);
-			// Cache constant JSON responses (no bind params) for this worker.
-			if (zero_params && location_value.empty() && set_cookie_values.empty()) {
-				tls.StoreStaticBody(handler_sql, body);
-			}
 			SetJson(res, match.route.status, body);
 			finish();
 			return;
