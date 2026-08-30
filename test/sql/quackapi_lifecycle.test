@@ -1,0 +1,212 @@
+# name: test/sql/quackapi_lifecycle.test
+# description: DDL lifecycle correctness — REPLACE/DROP/re-serve bugs with observable wrong survival
+# group: [sql]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# Bug: CREATE OR REPLACE AUTH API_KEY → JWT leaves hashed keys that resurrect
+# when replaced back to API_KEY (DropAuth clears keys; AddAuth did not).
+# ---------------------------------------------------------------------------
+statement ok
+CREATE AUTH site AS API_KEY;
+
+statement ok
+SELECT * FROM quackapi_add_api_key('site', 'super-secret-key', 'alice');
+
+# Avoid $claims_* here — sqllogictest treats $name as a test variable.
+statement ok
+CREATE ROUTE secure GET '/secure' REQUIRE site AS SELECT 'ok' AS msg;
+
+query I
+SELECT status FROM quackapi_request(
+  'GET', '/secure',
+  headers := MAP {'X-API-Key': 'super-secret-key'}
+);
+----
+200
+
+statement ok
+CREATE OR REPLACE AUTH site AS JWT ( SECRET 'new-secret' );
+
+statement ok
+CREATE OR REPLACE AUTH site AS API_KEY;
+
+# Old key must NOT authenticate after the kind cycle (keys cleared on leave API_KEY).
+query I
+SELECT status FROM quackapi_request(
+  'GET', '/secure',
+  headers := MAP {'X-API-Key': 'super-secret-key'}
+);
+----
+401
+
+statement ok
+DROP ROUTE secure;
+
+statement ok
+DROP AUTH site;
+
+# ---------------------------------------------------------------------------
+# Bug: DROP AUTH was case-sensitive while REQUIRE / GetAuth are CIEquals —
+# DROP AUTH site failed for CREATE AUTH Site and the scheme kept working.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE AUTH Site AS API_KEY;
+
+statement ok
+SELECT * FROM quackapi_add_api_key('Site', 'k-case', 'bob');
+
+statement ok
+CREATE ROUTE secure_case GET '/secure-case' REQUIRE site AS SELECT 'ok' AS msg;
+
+query I
+SELECT status FROM quackapi_request(
+  'GET', '/secure-case',
+  headers := MAP {'X-API-Key': 'k-case'}
+);
+----
+200
+
+statement ok
+DROP AUTH site;
+
+query I
+SELECT count(*) FROM quackapi_auths();
+----
+0
+
+query I
+SELECT status FROM quackapi_request(
+  'GET', '/secure-case',
+  headers := MAP {'X-API-Key': 'k-case'}
+);
+----
+401
+
+statement ok
+DROP ROUTE secure_case;
+
+# ---------------------------------------------------------------------------
+# Bug: OR REPLACE ROUTE onto another route's METHOD+pattern left both entries
+# (last registry match won; OpenAPI could emit duplicate method keys).
+# ---------------------------------------------------------------------------
+statement ok
+CREATE ROUTE keeper GET '/x' AS SELECT 'keeper' AS msg;
+
+statement ok
+CREATE ROUTE mover GET '/y' AS SELECT 'mover' AS msg;
+
+statement error
+CREATE OR REPLACE ROUTE mover GET '/x' AS SELECT 'hijack' AS msg;
+----
+already used by route
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE method = 'GET' AND pattern = '/x';
+----
+1
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/x');
+----
+[{"msg":"keeper"}]
+
+statement ok
+DROP ROUTE keeper;
+
+statement ok
+DROP ROUTE mover;
+
+# ---------------------------------------------------------------------------
+# Bug: CREATE GRAPHQL FOR TABLE a, b half-applied when a later name failed
+# (missing table or duplicate) — earlier tables stayed on the allowlist.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE users AS SELECT 1 AS id;
+
+statement ok
+CREATE TABLE posts AS SELECT 1 AS id;
+
+statement error
+CREATE GRAPHQL FOR TABLE users, no_such_table;
+----
+not found
+
+query I
+SELECT count(*) FROM quackapi_graphql_tables() WHERE table_name = 'users';
+----
+0
+
+statement ok
+CREATE GRAPHQL FOR TABLE users;
+
+statement error
+CREATE GRAPHQL FOR TABLE posts, users;
+----
+already registered
+
+query I
+SELECT count(*) FROM quackapi_graphql_tables() WHERE table_name = 'posts';
+----
+0
+
+statement ok
+DROP GRAPHQL FOR TABLE users;
+
+# ---------------------------------------------------------------------------
+# Bug: CREATE API FOR TABLE skipped handler validation — missing table still
+# registered list/get routes that 500'd on first request.
+# ---------------------------------------------------------------------------
+statement error
+CREATE API FOR TABLE no_such_table;
+----
+Invalid handler SQL
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name IN ('no_such_table_list', 'no_such_table_get');
+----
+0
+
+# ---------------------------------------------------------------------------
+# Bug: serve(health_routes=true) → stop → serve(health_routes=false) left
+# __quackapi_health* in the registry (RegisterQuackapiHealthRoutes no-op).
+# ---------------------------------------------------------------------------
+statement ok
+SELECT * FROM quackapi_serve(29451, host := '127.0.0.1');
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE starts_with(name, '__quackapi_health');
+----
+2
+
+statement ok
+SELECT * FROM quackapi_stop(29451);
+
+statement ok
+SELECT * FROM quackapi_serve(29451, host := '127.0.0.1', health_routes := false);
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE starts_with(name, '__quackapi_health');
+----
+0
+
+statement ok
+SELECT * FROM quackapi_stop(29451);
+
+# OpenAPI after DROP ROUTE: path must vanish (live snapshot — regression lock).
+statement ok
+CREATE ROUTE oa GET '/oa' AS SELECT 1 AS n;
+
+query I
+SELECT contains(decode(body), '"/oa"') FROM quackapi_request('GET', '/openapi.json');
+----
+true
+
+statement ok
+DROP ROUTE oa;
+
+query I
+SELECT contains(decode(body), '"/oa"') FROM quackapi_request('GET', '/openapi.json');
+----
+false

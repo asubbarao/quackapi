@@ -214,7 +214,8 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions &opts);
 
 //! Auto-register GET /health + GET /healthz into the route registry (OR REPLACE
-//! reserved names). No-op when opts.health_routes is false.
+//! reserved names). When opts.health_routes is false, drops those reserved
+//! routes so a prior serve(true) → stop → serve(false) does not leave them.
 void RegisterQuackapiHealthRoutes(DatabaseInstance &db, const QuackapiServeOptions &opts);
 
 //! Probe community tsid extension once; set opts.request_id_source to "tsid" or
