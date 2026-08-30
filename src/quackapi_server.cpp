@@ -1237,8 +1237,7 @@ string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &
 }
 
 //! Single-row JSON object (ENVELOPE object). Caller guarantees rows.size() == 1.
-string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &data_cols,
-                              const vector<Value> &cols) {
+string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &data_cols, const vector<Value> &cols) {
 	string body = "{";
 	bool first_col = true;
 	for (auto col : data_cols) {
@@ -3171,8 +3170,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		} else if (object_envelope) {
 			if (rows.size() > 1) {
 				SetJson(res, 500,
-				        "{\"detail\":\"ENVELOPE object requires exactly one row, got " +
-				            std::to_string(rows.size()) + "\"}");
+				        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(rows.size()) +
+				            "\"}");
 				finish();
 				return;
 			}

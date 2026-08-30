@@ -466,8 +466,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				string after_body = QuackapiTrim(after_empty.substr(4));
 				auto after_body_u = StringUtil::Upper(after_body);
 				if (StringUtil::StartsWith(after_body_u, "SCHEMA")) {
-					return ParserExtensionParseResult(
-					    "EMPTY STATUS BODY expects a quoted string, not BODY SCHEMA");
+					return ParserExtensionParseResult("EMPTY STATUS BODY expects a quoted string, not BODY SCHEMA");
 				}
 				if (after_body.empty() || after_body[0] != '\'') {
 					return ParserExtensionParseResult("EMPTY STATUS BODY expects a quoted string");

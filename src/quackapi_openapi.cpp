@@ -363,7 +363,8 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			             "\"description\":" +
 			             JsonString(empty_desc) +
 			             ","
-			             "\"content\":{\"application/json\":{\"schema\":" + empty_schema + "}}}";
+			             "\"content\":{\"application/json\":{\"schema\":" +
+			             empty_schema + "}}}";
 		}
 		responses += "}";
 
