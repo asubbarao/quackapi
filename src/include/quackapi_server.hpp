@@ -171,6 +171,10 @@ public:
 	const QuackapiServeOptions &Options() const {
 		return options;
 	}
+	//! True while the TCP listener thread is alive (false after StopAccepting).
+	bool IsRunning() const {
+		return is_running.load();
+	}
 	//! Monotonic serve start (for /healthz uptime_sec).
 	std::chrono::steady_clock::time_point StartedAt() const {
 		return started_at;
@@ -220,5 +224,9 @@ void RegisterQuackapiHealthRoutes(DatabaseInstance &db, const QuackapiServeOptio
 //! Probe community tsid extension once; set opts.request_id_source to "tsid" or
 //! "uuidv7". Compose-only (LOAD); never fails serve.
 void ProbeQuackapiRequestIdSource(DatabaseInstance &db, QuackapiServeOptions &opts);
+
+//! TCP connect probe: true when host:port accepts a connection (any HTTP
+//! response, including 404). Used by quackapi_wait for readiness.
+bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_ms = 200);
 
 } // namespace duckdb

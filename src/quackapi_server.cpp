@@ -3183,4 +3183,29 @@ QuackapiHttpServer::~QuackapiHttpServer() {
 	}
 }
 
+bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_ms) {
+	if (port < 1 || port > 65535 || host.empty()) {
+		return false;
+	}
+	if (connect_timeout_ms < 0) {
+		connect_timeout_ms = 0;
+	}
+	const time_t sec = static_cast<time_t>(connect_timeout_ms / 1000);
+	const time_t usec = static_cast<time_t>((connect_timeout_ms % 1000) * 1000);
+	try {
+		duckdb_httplib::Client cli(host, port);
+		cli.set_connection_timeout(sec, usec);
+		cli.set_read_timeout(1, 0);
+		cli.set_write_timeout(1, 0);
+		cli.set_tcp_nodelay(true);
+		// Any completed HTTP exchange (including 404) means the listener accepts.
+		auto res = cli.Get("/");
+		auto err = res.error();
+		return err == duckdb_httplib::Error::Success || err == duckdb_httplib::Error::Read ||
+		       err == duckdb_httplib::Error::Write;
+	} catch (...) {
+		return false;
+	}
+}
+
 } // namespace duckdb

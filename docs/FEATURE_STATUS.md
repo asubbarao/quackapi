@@ -67,7 +67,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 
 | Feature | DDL / function | Versioned test | FastAPI equivalent |
 |---------|----------------|----------------|--------------------|
-| Serve / stop / inspect | `quackapi_serve([port], host, static_dir, cors_origins, memory_limit)`, `quackapi_stop`, `quackapi_servers` | `fiveliner.test.sh`, `memory_limit` SQL test | `uvicorn` / `app` process |
+| Serve / stop / inspect | `quackapi_serve([port], host, static_dir, cors_origins, memory_limit, block)`, `quackapi_wait`, `quackapi_stop`, `quackapi_servers` | `quackapi_serve_block.test`, `memory_limit` SQL test | `uvicorn` / `app` process |
 | **CORS** | `cors_origins` arg / `SET quackapi_cors_origins` | `test/sql/quackapi_cors.test`, `test/http/cors.test.sh` | `CORSMiddleware` |
 | **static_dir** unrouted GETs | `quackapi_serve(…, static_dir := …)` | description.yml / README | `StaticFiles` (mount; prefix sugar still SPEC) |
 | **OpenAPI 3.1** | built-in `GET /openapi.json` (`quackapi_openapi.cpp`) | `test/sql/quackapi_openapi.test`, case `openapi_json` | auto OpenAPI |
@@ -87,7 +87,7 @@ quackapi_ack, quackapi_add_api_key, quackapi_authentication, quackapi_authorizat
 quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_fetch, quackapi_groups,
 quackapi_http_pool, quackapi_http_util_name, quackapi_nack, quackapi_policies, quackapi_post,
 quackapi_queues, quackapi_routes, quackapi_serve, quackapi_servers, quackapi_stop,
-quackapi_streams, quackapi_verify_auth
+quackapi_streams, quackapi_verify_auth, quackapi_wait
 ```
 
 Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.

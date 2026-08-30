@@ -278,6 +278,10 @@ public:
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).
 	void StopAllServers();
+	//! True when a quackapi server is registered on this port (any host).
+	bool HasServerOnPort(int port);
+	//! Host for the server on port, if any. Returns false if none.
+	bool GetServerHost(int port, string &host_out);
 	//! (host, port, http_client_active, http_client_reason) for each running server.
 	vector<std::tuple<string, int, string, string>> ListServers();
 
