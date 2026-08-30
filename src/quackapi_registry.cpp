@@ -130,8 +130,8 @@ void QuackapiState::AddStream(const QuackapiStream &stream, bool or_replace) {
 		}
 	}
 	if (auto *hit = collides(stream, string())) {
-		throw InvalidInputException("Stream path \"%s %s\" already used by stream \"%s\"", stream.method, stream.pattern,
-		                            hit->name);
+		throw InvalidInputException("Stream path \"%s %s\" already used by stream \"%s\"", stream.method,
+		                            stream.pattern, hit->name);
 	}
 	streams.push_back(stream);
 	PublishStreams();
