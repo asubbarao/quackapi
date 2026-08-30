@@ -154,6 +154,11 @@ struct QuackapiRoute {
 	int empty_status = 0;
 	//! Body for EMPTY STATUS responses. Empty string → `{"detail":"Not Found"}`.
 	string empty_body;
+	//! Per-request httplib socket read/write timeout in seconds. 0 = use serve
+	//! defaults (QUACKAPI_DEFAULT_IO_TIMEOUT_SEC / quackapi_serve read/write_timeout_sec).
+	//! When set, HandleRequest extends SO_RCVTIMEO/SO_SNDTIMEO and the active
+	//! SocketStream select deadlines for this connection only.
+	int32_t timeout_sec = 0;
 };
 
 //! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).

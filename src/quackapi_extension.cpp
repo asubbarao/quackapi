@@ -610,6 +610,8 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("envelope");
 	return_types.emplace_back(LogicalType::INTEGER);
 	names.emplace_back("empty_status");
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("timeout_sec");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -635,6 +637,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(8, row, Value(route.response_format.empty() ? "json" : route.response_format));
 		output.SetValue(9, row, Value(route.response_envelope.empty() ? "array" : route.response_envelope));
 		output.SetValue(10, row, Value::INTEGER(route.empty_status));
+		output.SetValue(11, row, Value::INTEGER(route.timeout_sec));
 		row++;
 		state.offset++;
 	}

@@ -220,14 +220,74 @@ string JoinGroupPrefix(const string &prefix, const string &path) {
 	return p + r;
 }
 
+//! Parse route IO timeout seconds: 30 | '30' | '30s' | '5m' | '1h'. Max 24h.
+bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
+	auto s = QuackapiTrim(raw);
+	if (s.empty()) {
+		err = "empty timeout";
+		return false;
+	}
+	if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
+		s = s.substr(1, s.size() - 2);
+	}
+	if (s.empty()) {
+		err = "empty timeout";
+		return false;
+	}
+	idx_t i = 0;
+	if (s[i] == '-') {
+		err = "timeout must be positive";
+		return false;
+	}
+	if (i >= s.size() || !StringUtil::CharacterIsDigit(s[i])) {
+		err = "timeout must start with a number";
+		return false;
+	}
+	int64_t num = 0;
+	while (i < s.size() && StringUtil::CharacterIsDigit(s[i])) {
+		num = num * 10 + (s[i] - '0');
+		if (num > 86400LL) {
+			err = "timeout too large";
+			return false;
+		}
+		i++;
+	}
+	int64_t mult = 1;
+	if (i < s.size()) {
+		auto unit = StringUtil::Lower(s.substr(i));
+		if (unit == "s" || unit == "sec" || unit == "secs" || unit == "second" || unit == "seconds") {
+			mult = 1;
+		} else if (unit == "m" || unit == "min" || unit == "mins" || unit == "minute" || unit == "minutes") {
+			mult = 60;
+		} else if (unit == "h" || unit == "hr" || unit == "hrs" || unit == "hour" || unit == "hours") {
+			mult = 3600;
+		} else {
+			err = "unknown timeout unit \"" + unit + "\" — use s, m, or h";
+			return false;
+		}
+	}
+	int64_t sec = num * mult;
+	if (sec <= 0) {
+		err = "timeout must be a positive number of seconds";
+		return false;
+	}
+	if (sec > 86400LL) {
+		err = "timeout max is 24 hours";
+		return false;
+	}
+	out_sec = static_cast<int32_t>(sec);
+	return true;
+}
+
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
 //!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
 //!     [ENVELOPE array|object] [EMPTY STATUS <n> [BODY '<json>']]
-//!     [GROUP <name> | IN GROUP <name>]
+//!     [TIMEOUT <n>|'30s'|'5m'] [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
 //!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
+//!     [WITH (timeout_sec [=|:=] <n>|'30s')]
 //!     AS <select>
 //!   DROP ROUTE <name>
 //!
@@ -236,6 +296,8 @@ string JoinGroupPrefix(const string &prefix, const string &path) {
 //! COOKIE binds from the Cookie header (FastAPI Cookie); default wire name is
 //! the param name as-is.
 //! GROUP expands prefix+auth at CREATE (APIRouter-style); pattern may be relative.
+//! TIMEOUT / WITH (timeout_sec) extends httplib read/write socket deadlines for
+//! that request only; 0 (omit) keeps quackapi_serve defaults (30s).
 ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
@@ -304,7 +366,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return i;
 	};
 
-	// Optional clauses: STATUS / REQUIRE / GROUP / RATE LIMIT / FORMAT / ENVELOPE / EMPTY (any order)
+	// Optional clauses: STATUS / REQUIRE / GROUP / RATE LIMIT / FORMAT / ENVELOPE / EMPTY / TIMEOUT (any order)
 	int status = 200;
 	string require_auth;
 	string group_name;
@@ -315,8 +377,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	string response_envelope = "array";
 	int empty_status = 0;
 	string empty_body;
+	int32_t timeout_sec = 0;
 	auto rest_upper = StringUtil::Upper(rest);
-	for (int clause_round = 0; clause_round < 16; clause_round++) {
+	for (int clause_round = 0; clause_round < 18; clause_round++) {
 		rest_upper = StringUtil::Upper(rest);
 		// [STATUS <n>]
 		if (StringUtil::StartsWith(rest_upper, "STATUS") &&
@@ -492,6 +555,37 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				after_empty = QuackapiTrim(after_body.substr(bi + 1));
 			}
 			rest = after_empty;
+			continue;
+		}
+		// [TIMEOUT <n>|'30s'|'5m']
+		if (StringUtil::StartsWith(rest_upper, "TIMEOUT") &&
+		    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+			rest = QuackapiTrim(rest.substr(7));
+			if (rest.empty()) {
+				return ParserExtensionParseResult("TIMEOUT expects a duration (e.g. 180, '3m', '30s')");
+			}
+			string tok;
+			if (rest[0] == '\'') {
+				auto endq = rest.find('\'', 1);
+				if (endq == string::npos) {
+					return ParserExtensionParseResult("Unterminated TIMEOUT string");
+				}
+				tok = rest.substr(0, endq + 1);
+				rest = QuackapiTrim(rest.substr(endq + 1));
+			} else {
+				auto token_end = NextTokenEnd(rest);
+				tok = rest.substr(0, token_end);
+				rest = QuackapiTrim(rest.substr(token_end));
+			}
+			string terr;
+			int32_t sec = 0;
+			if (!ParseRouteTimeoutSec(tok, sec, terr)) {
+				return ParserExtensionParseResult("TIMEOUT: " + terr);
+			}
+			if (timeout_sec > 0) {
+				return ParserExtensionParseResult("TIMEOUT specified more than once");
+			}
+			timeout_sec = sec;
 			continue;
 		}
 		// [IN GROUP <name>] or [GROUP <name>]
@@ -698,6 +792,14 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2])) {
 				break;
 			}
+			if (StringUtil::StartsWith(rest_upper, "WITH") &&
+			    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '(')) {
+				break;
+			}
+			if (StringUtil::StartsWith(rest_upper, "TIMEOUT") &&
+			    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+				break;
+			}
 			// HEADER / COOKIE may appear after DEFAULT/constraints too.
 			if (TryConsumeSource()) {
 				continue;
@@ -782,6 +884,94 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 	}
 
+	// Optional late TIMEOUT (after PARAM / BODY SCHEMA)
+	rest_upper = StringUtil::Upper(rest);
+	if (StringUtil::StartsWith(rest_upper, "TIMEOUT") && (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+		rest = QuackapiTrim(rest.substr(7));
+		if (rest.empty()) {
+			return ParserExtensionParseResult("TIMEOUT expects a duration (e.g. 180, '3m', '30s')");
+		}
+		string tok;
+		if (rest[0] == '\'') {
+			auto endq = rest.find('\'', 1);
+			if (endq == string::npos) {
+				return ParserExtensionParseResult("Unterminated TIMEOUT string");
+			}
+			tok = rest.substr(0, endq + 1);
+			rest = QuackapiTrim(rest.substr(endq + 1));
+		} else {
+			auto token_end = NextTokenEnd(rest);
+			tok = rest.substr(0, token_end);
+			rest = QuackapiTrim(rest.substr(token_end));
+		}
+		string terr;
+		int32_t sec = 0;
+		if (!ParseRouteTimeoutSec(tok, sec, terr)) {
+			return ParserExtensionParseResult("TIMEOUT: " + terr);
+		}
+		if (timeout_sec > 0) {
+			return ParserExtensionParseResult("TIMEOUT specified more than once");
+		}
+		timeout_sec = sec;
+		rest_upper = StringUtil::Upper(rest);
+	}
+
+	// [WITH (timeout_sec [=|:=] <n>|'30s')] — may appear immediately before AS
+	if (StringUtil::StartsWith(rest_upper, "WITH") &&
+	    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '(')) {
+		rest = QuackapiTrim(rest.substr(4));
+		if (rest.empty() || rest[0] != '(') {
+			return ParserExtensionParseResult("Expected WITH (timeout_sec := <n>)");
+		}
+		auto close = rest.find(')');
+		if (close == string::npos) {
+			return ParserExtensionParseResult("Unterminated WITH (...) options");
+		}
+		auto inner = QuackapiTrim(rest.substr(1, close - 1));
+		rest = QuackapiTrim(rest.substr(close + 1));
+		if (inner.empty()) {
+			return ParserExtensionParseResult("WITH (...) is empty — expected timeout_sec");
+		}
+		// Split on commas for future options; only timeout_sec today.
+		idx_t part_start = 0;
+		while (part_start <= inner.size()) {
+			idx_t comma = inner.find(',', part_start);
+			auto part = QuackapiTrim(comma == string::npos ? inner.substr(part_start)
+			                                               : inner.substr(part_start, comma - part_start));
+			if (!part.empty()) {
+				auto eq = part.find(":=");
+				idx_t sep_len = 2;
+				if (eq == string::npos) {
+					eq = part.find('=');
+					sep_len = 1;
+				}
+				if (eq == string::npos) {
+					return ParserExtensionParseResult("WITH option must be timeout_sec [=|:=] <n> — got \"" + part +
+					                                  "\"");
+				}
+				auto key = StringUtil::Lower(QuackapiTrim(part.substr(0, eq)));
+				auto val = QuackapiTrim(part.substr(eq + sep_len));
+				if (key != "timeout_sec" && key != "timeout") {
+					return ParserExtensionParseResult("Unknown WITH option \"" + key + "\" — expected timeout_sec");
+				}
+				string terr;
+				int32_t sec = 0;
+				if (!ParseRouteTimeoutSec(val, sec, terr)) {
+					return ParserExtensionParseResult("timeout_sec: " + terr);
+				}
+				if (timeout_sec > 0) {
+					return ParserExtensionParseResult("TIMEOUT / timeout_sec specified more than once");
+				}
+				timeout_sec = sec;
+			}
+			if (comma == string::npos) {
+				break;
+			}
+			part_start = comma + 1;
+		}
+		rest_upper = StringUtil::Upper(rest);
+	}
+
 	// AS <select> — any whitespace (spaces/tabs/newlines) after AS is accepted.
 	// "AS SELECT …" and "AS\nSELECT …" are both valid; bare "AS" is not.
 	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2]))) {
@@ -811,6 +1001,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.response_envelope = response_envelope;
 	data->route.empty_status = empty_status;
 	data->route.empty_body = empty_body;
+	data->route.timeout_sec = timeout_sec;
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -872,6 +1063,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	}
 	if (input.inputs.size() > 17 && !input.inputs[17].IsNull()) {
 		bind_data->route.empty_body = input.inputs[17].GetValue<string>();
+	}
+	if (input.inputs.size() > 18 && !input.inputs[18].IsNull()) {
+		bind_data->route.timeout_sec = input.inputs[18].GetValue<int32_t>();
 	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
@@ -938,13 +1132,13 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyRouteFunction() {
 	// action, or_replace, name, method, pattern, handler, status, require_auth,
 	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format,
-	// envelope, empty_status, empty_body
+	// envelope, empty_status, empty_body, timeout_sec
 	return MakeApplyDdlFunction("quackapi_apply_route",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR},
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
@@ -971,6 +1165,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.route.response_envelope.empty() ? "array" : data.route.response_envelope));
 	result.parameters.push_back(Value::INTEGER(data.route.empty_status));
 	result.parameters.push_back(Value(data.route.empty_body));
+	result.parameters.push_back(Value::INTEGER(data.route.timeout_sec));
 	FinishDdlPlan(result);
 	return result;
 }

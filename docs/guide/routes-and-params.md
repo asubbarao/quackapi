@@ -29,6 +29,19 @@ curl http://127.0.0.1:8000/hello
 
 Methods: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 
+### Long-running handlers (`TIMEOUT` / `timeout_sec`)
+
+Serve defaults keep httplib socket read/write timeouts at **30s**. Handlers that block longer (browser automation, heavy SQL) need an explicit per-route deadline:
+
+```sql
+CREATE ROUTE slow GET '/slow'
+  WITH (timeout_sec := 180)
+  AS SELECT sleep(60), 'ok' AS msg;
+-- or: CREATE ROUTE slow GET '/slow' TIMEOUT '3m' AS …
+```
+
+That request extends the connection’s httplib `SocketStream` select timeouts and `SO_RCVTIMEO`/`SO_SNDTIMEO` for the handler and response write. Other routes keep the serve default. Inspect with `SELECT name, timeout_sec FROM quackapi_routes();` (`0` = serve default).
+
 ---
 
 ## Path parameters
