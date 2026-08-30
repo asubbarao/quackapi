@@ -174,9 +174,15 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		}
 	}
 	// compression_min_bytes named param wins; else SET (default 256).
+	// pg_dsn named param wins; else SET quackapi_pg_dsn.
 	auto pg_dsn_entry = input.named_parameters.find("pg_dsn");
 	if (pg_dsn_entry != input.named_parameters.end()) {
 		bind_data->pg_dsn = pg_dsn_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_pg_dsn", setting) && !setting.IsNull()) {
+			bind_data->pg_dsn = setting.GetValue<string>();
+		}
 	}
 	auto min_entry = input.named_parameters.find("compression_min_bytes");
 	if (min_entry != input.named_parameters.end()) {
@@ -336,14 +342,17 @@ struct RequestBindData : public TableFunctionData {
 	string path;
 	string body;
 	unordered_map<string, string> req_headers;
+	//! Optional libpq DSN for this request (named param wins over SET quackapi_pg_dsn).
+	string pg_dsn;
 	bool finished = false;
 };
 
-static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
-		throw InvalidInputException("quackapi_request(method, path [, body] [, headers := MAP]) expects 2 or 3 "
-		                            "positional args");
+		throw InvalidInputException(
+		    "quackapi_request(method, path [, body] [, headers := MAP] [, pg_dsn := VARCHAR]) expects 2 or 3 "
+		    "positional args");
 	}
 	auto bind_data = make_uniq<RequestBindData>();
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
@@ -362,6 +371,16 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindIn
 			if (kv.size() >= 2 && !kv[0].IsNull() && !kv[1].IsNull()) {
 				bind_data->req_headers[kv[0].ToString()] = kv[1].ToString();
 			}
+		}
+	}
+	// pg_dsn named param wins; else SET quackapi_pg_dsn (empty = DuckDB path).
+	auto pg_dsn_it = input.named_parameters.find("pg_dsn");
+	if (pg_dsn_it != input.named_parameters.end() && !pg_dsn_it->second.IsNull()) {
+		bind_data->pg_dsn = pg_dsn_it->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_pg_dsn", setting) && !setting.IsNull()) {
+			bind_data->pg_dsn = setting.GetValue<string>();
 		}
 	}
 	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
@@ -387,7 +406,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	string content_type;
 	unordered_map<string, string> resp_headers;
 	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
-	                         &bind_data.req_headers, &resp_headers);
+	                         &bind_data.req_headers, &resp_headers, bind_data.pg_dsn);
 	output.SetValue(0, 0, Value::INTEGER(status));
 	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
 	output.SetValue(2, 0, Value(content_type));
@@ -579,6 +598,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "curl fails serve if curl_httpfs cannot INSTALL/LOAD. Overridden by "
 	                          "http_client named parameter. Does not change the inbound HTTP server.",
 	                          LogicalType::VARCHAR, Value("auto"));
+	// SET quackapi_pg_dsn = 'postgresql://…' — native libpq path for serve + request.
+	// Empty (default) = DuckDB handler path only. Overridden by pg_dsn named parameter.
+	config.AddExtensionOption("quackapi_pg_dsn",
+	                          "Postgres DSN for the native libpq handler path (thread-local PGconn). "
+	                          "Empty (default) keeps DuckDB-only execution. Overridden by pg_dsn named "
+	                          "parameter on quackapi_serve / quackapi_request.",
+	                          LogicalType::VARCHAR, Value(""));
 
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
@@ -622,10 +648,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunctionSet request_set("quackapi_request");
 	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
 	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request_set.AddFunction(request2);
 	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       RequestExec, RequestBind);
 	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request_set.AddFunction(request3);
 	loader.RegisterFunction(request_set);
 

@@ -1545,12 +1545,13 @@ void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &par
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path_in, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers,
-                              unordered_map<string, string> *headers_out) {
+                              unordered_map<string, string> *headers_out, const string &pg_dsn) {
 	// Quiet defaults for SQL tests: no access log, no compression (raw body).
 	QuackapiServeOptions opts;
 	opts.access_log = false;
 	opts.compression = false;
 	opts.health_routes = true;
+	opts.pg_dsn = pg_dsn;
 	// No TCP — Dispatch only.
 	QuackapiHttpServer server(db, "127.0.0.1", 0, opts, /*bind_and_listen=*/false);
 
@@ -2706,8 +2707,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		// Native Postgres path (optional): same model as FastAPI+psycopg —
-		// thread-local libpq + PQexecParams. BEFORE DuckDB prepare so
-		// INSERT…RETURNING and other ATTACH-hostile SQL still work.
+		// thread-local libpq, fresh PQexecParams per request. BEFORE DuckDB
+		// prepare so INSERT…RETURNING and other ATTACH-hostile SQL still work.
 		if (!options.pg_dsn.empty()) {
 			string pg_body, pg_err;
 			if (QuackapiTryPgNative(options.pg_dsn, handler_sql, provided, pg_body, pg_err)) {

@@ -81,10 +81,9 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	// NEVER disables safety (no allow_unsigned_extensions, no disabled checks).
 	vector<string> applied;
 	// Build stamp so operators/agents can confirm the loaded extension matches the tree.
-	applied.push_back(
-	    StringUtil::Format("quackapi_request_path=perf (enable_logging=%s access_log=%s) "
-	                       "(WHY: thread-local Connection + uuidv7 ids)",
-	                       opts.enable_logging ? "true" : "false", opts.access_log ? "true" : "false"));
+	applied.push_back(StringUtil::Format("quackapi_request_path=perf (enable_logging=%s access_log=%s) "
+	                                     "(WHY: thread-local Connection + uuidv7 ids)",
+	                                     opts.enable_logging ? "true" : "false", opts.access_log ? "true" : "false"));
 	Connection con(*context.db);
 	string err;
 

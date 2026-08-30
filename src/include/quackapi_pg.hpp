@@ -9,8 +9,9 @@
 namespace duckdb {
 
 //! Thin libpq path for pure-HTTP routes that hit Postgres — same shape as
-//! FastAPI+psycopg: bind params, PQexecParams, JSON rows. Bypasses DuckDB
-//! ATTACH/scanner for that request (optional; only when pg_dsn is set at serve).
+//! FastAPI+psycopg: bind params, fresh PQexecParams, JSON rows. Bypasses DuckDB
+//! ATTACH/scanner for that request (optional; when pg_dsn is set on serve or
+//! quackapi_request / SET quackapi_pg_dsn).
 //!
 //! Returns true and fills json_body on success. false → caller uses DuckDB path.
 bool QuackapiTryPgNative(const string &dsn, const string &handler_sql,
