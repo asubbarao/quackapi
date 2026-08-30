@@ -42,6 +42,68 @@ namespace duckdb {
 
 namespace {
 
+//! Active connection for this httplib worker — set around process_request so a
+//! matched CREATE ROUTE … TIMEOUT can extend SocketStream + SO_*TIMEO deadlines.
+thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
+thread_local duckdb_httplib::Stream *quackapi_tls_stream = nullptr;
+
+//! httplib Server subclass: stash the live Stream/socket for per-route IO timeouts.
+struct QuackapiHttplibServer : duckdb_httplib::Server {
+	bool process_and_close_socket(socket_t sock) override {
+		std::string remote_addr;
+		int remote_port = 0;
+		duckdb_httplib::detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
+
+		std::string local_addr;
+		int local_port = 0;
+		duckdb_httplib::detail::get_local_ip_and_port(sock, local_addr, local_port);
+
+		auto ret = duckdb_httplib::detail::process_server_socket(
+		    svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
+		    write_timeout_sec_, write_timeout_usec_,
+		    [&](duckdb_httplib::Stream &strm, bool close_connection, bool &connection_closed) {
+			    quackapi_tls_sock = sock;
+			    quackapi_tls_stream = &strm;
+			    auto ok = process_request(strm, remote_addr, remote_port, local_addr, local_port, close_connection,
+			                              connection_closed, nullptr);
+			    // Restore accept-time SO_* after handler+write (per-route TIMEOUT may
+			    // have raised them). Next keep-alive SocketStream still uses serve defaults.
+			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, read_timeout_sec_,
+			                                               read_timeout_usec_);
+			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, write_timeout_sec_,
+			                                               write_timeout_usec_);
+			    quackapi_tls_stream = nullptr;
+			    quackapi_tls_sock = INVALID_SOCKET;
+			    return ok;
+		    });
+
+		duckdb_httplib::detail::shutdown_socket(sock);
+		duckdb_httplib::detail::close_socket(sock);
+		return ret;
+	}
+};
+
+//! Extend httplib read/write deadlines for the current request.
+//! Sets SocketStream select timeouts (covers the response write after the
+//! handler returns) and SO_RCVTIMEO/SO_SNDTIMEO on the accepted socket.
+//! SO_* is restored to serve defaults in QuackapiHttplibServer after
+//! process_request returns (keep-alive safe). Do not restore in a HandleRequest
+//! destructor — that runs before httplib's write_response.
+void ApplyRouteIoTimeout(time_t timeout_sec) {
+	if (timeout_sec <= 0) {
+		return;
+	}
+	auto *stream = dynamic_cast<duckdb_httplib::detail::SocketStream *>(quackapi_tls_stream);
+	if (stream) {
+		stream->set_read_timeout(timeout_sec, 0);
+		stream->set_write_timeout(timeout_sec, 0);
+	}
+	if (quackapi_tls_sock != INVALID_SOCKET) {
+		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec, 0);
+		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
+	}
+}
+
 //! Per-worker-thread DuckDB connection + prepared-statement cache + static
 //! response cache for zero-parameter handlers.
 //! httplib's ThreadPool runs each request on a worker thread; reusing one
@@ -1494,7 +1556,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		return;
 	}
 
-	server = make_uniq<duckdb_httplib::Server>();
+	server = make_uniq<QuackapiHttplibServer>();
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
 	// requests before route handlers, so API routes always win over files.
@@ -2526,6 +2588,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			finish();
 			return;
 		}
+	}
+
+	// Per-route IO timeout (CREATE ROUTE … TIMEOUT / WITH (timeout_sec := N)).
+	// Extends httplib SocketStream select deadlines + SO_RCVTIMEO/SO_SNDTIMEO for
+	// this connection through handler execute and response write.
+	if (match.route.timeout_sec > 0) {
+		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec));
 	}
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----

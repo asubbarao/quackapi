@@ -3471,6 +3471,18 @@ public:
   socket_t socket() const override;
   time_t duration() const override;
 
+  //! quackapi: per-request IO deadline override (CREATE ROUTE … TIMEOUT / WITH timeout_sec).
+  void set_read_timeout(time_t sec, time_t usec = 0) {
+    read_timeout_sec_ = sec;
+    read_timeout_usec_ = usec;
+  }
+  void set_write_timeout(time_t sec, time_t usec = 0) {
+    write_timeout_sec_ = sec;
+    write_timeout_usec_ = usec;
+  }
+  time_t read_timeout_sec() const { return read_timeout_sec_; }
+  time_t write_timeout_sec() const { return write_timeout_sec_; }
+
 private:
   socket_t sock_;
   time_t read_timeout_sec_;

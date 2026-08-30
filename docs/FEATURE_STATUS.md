@@ -51,6 +51,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 | **Form** `application/x-www-form-urlencoded` | body binder | `form.test.sh`, case `form_submit` | `Form()` |
 | **Multipart** fields + file (`$file`, `$filename`) | body binder | `multipart.test.sh`, case `multipart_upload` | `File()`, `UploadFile` |
 | **STATUS n** | `STATUS 201` etc. | conformance `status_*` | `status_code=` / `Response` |
+| **TIMEOUT / WITH (timeout_sec)** | per-request httplib read/write deadline (default = serve 30s) | `quackapi_route_timeout.test` | no first-class FastAPI equivalent (uvicorn/gunicorn worker timeouts are process-global) |
 | **Redirect** (3xx + `location` column) | `STATUS 307 AS SELECT '…' AS location` | `redirect.test.sh`, case `redirect_307` | `RedirectResponse` |
 | **Set-Cookie** response | `AS set_cookie` column | `redirect.test.sh` / case `set_cookie` | `Response.set_cookie` |
 | **html / text** content types | single column named `html`/`text` | conformance `ct_html`/`ct_text` | `HTMLResponse` / `PlainTextResponse` |

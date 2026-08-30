@@ -435,6 +435,8 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("tags");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("format");
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("timeout_sec");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -458,6 +460,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(6, row, Value(route.group_name));
 		output.SetValue(7, row, Value(route.tags));
 		output.SetValue(8, row, Value(route.response_format.empty() ? "json" : route.response_format));
+		output.SetValue(9, row, Value::INTEGER(route.timeout_sec));
 		row++;
 		state.offset++;
 	}
