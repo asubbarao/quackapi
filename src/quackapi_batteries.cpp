@@ -406,10 +406,14 @@ void ProbeQuackapiRequestIdSource(DatabaseInstance &db, QuackapiServeOptions &op
 }
 
 void RegisterQuackapiHealthRoutes(DatabaseInstance &db, const QuackapiServeOptions &opts) {
+	auto &state = QuackapiState::Get(db);
 	if (!opts.health_routes) {
+		// Re-serve with health_routes:=false must drop prior auto-routes; a no-op
+		// left __quackapi_health* in the registry (and still HTTP-reachable).
+		state.DropRoute("__quackapi_health");
+		state.DropRoute("__quackapi_healthz");
 		return;
 	}
-	auto &state = QuackapiState::Get(db);
 
 	// Liveness: process is up and accepting HTTP. No auth. Listed in routes().
 	QuackapiRoute health;

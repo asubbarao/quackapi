@@ -41,10 +41,28 @@ void QuackapiState::PublishStreams() {
 
 void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 	std::lock_guard<std::mutex> lock(routes_mutex);
+	// Method+pattern must be unique across route names (GraphQL mounts already
+	// enforce path uniqueness). Otherwise OR REPLACE onto another route's path
+	// leaves two handlers and last-match / duplicate OpenAPI keys.
+	auto collides = [&](const QuackapiRoute &candidate, const string &ignore_name) -> const QuackapiRoute * {
+		for (auto &other : routes) {
+			if (other.name == ignore_name) {
+				continue;
+			}
+			if (other.method == candidate.method && other.pattern == candidate.pattern) {
+				return &other;
+			}
+		}
+		return nullptr;
+	};
 	for (auto it = routes.begin(); it != routes.end(); ++it) {
 		if (it->name == route.name) {
 			if (!or_replace) {
 				throw InvalidInputException("Route \"%s\" already exists — use CREATE OR REPLACE ROUTE", route.name);
+			}
+			if (auto *hit = collides(route, route.name)) {
+				throw InvalidInputException("Route path \"%s %s\" already used by route \"%s\"", route.method,
+				                            route.pattern, hit->name);
 			}
 			*it = route;
 			PublishRoutes();
@@ -52,6 +70,10 @@ void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 			QuackapiClearRouteRateLimit(route.name);
 			return;
 		}
+	}
+	if (auto *hit = collides(route, string())) {
+		throw InvalidInputException("Route path \"%s %s\" already used by route \"%s\"", route.method, route.pattern,
+		                            hit->name);
 	}
 	routes.push_back(route);
 	PublishRoutes();
@@ -86,15 +108,34 @@ shared_ptr<const vector<QuackapiRoute>> QuackapiState::LiveRoutes() {
 
 void QuackapiState::AddStream(const QuackapiStream &stream, bool or_replace) {
 	std::lock_guard<std::mutex> lock(streams_mutex);
+	auto collides = [&](const QuackapiStream &candidate, const string &ignore_name) -> const QuackapiStream * {
+		for (auto &other : streams) {
+			if (other.name == ignore_name) {
+				continue;
+			}
+			if (other.method == candidate.method && other.pattern == candidate.pattern) {
+				return &other;
+			}
+		}
+		return nullptr;
+	};
 	for (auto it = streams.begin(); it != streams.end(); ++it) {
 		if (it->name == stream.name) {
 			if (!or_replace) {
 				throw InvalidInputException("Stream \"%s\" already exists — use CREATE OR REPLACE STREAM", stream.name);
 			}
+			if (auto *hit = collides(stream, stream.name)) {
+				throw InvalidInputException("Stream path \"%s %s\" already used by stream \"%s\"", stream.method,
+				                            stream.pattern, hit->name);
+			}
 			*it = stream;
 			PublishStreams();
 			return;
 		}
+	}
+	if (auto *hit = collides(stream, string())) {
+		throw InvalidInputException("Stream path \"%s %s\" already used by stream \"%s\"", stream.method,
+		                            stream.pattern, hit->name);
 	}
 	streams.push_back(stream);
 	PublishStreams();
@@ -168,10 +209,29 @@ vector<QuackapiGroup> QuackapiState::SnapshotGroups() {
 
 void QuackapiState::AddAuth(const QuackapiAuth &auth, bool or_replace) {
 	std::lock_guard<std::mutex> lock(auths_mutex);
+	// Match REQUIRE / GetAuth: scheme names are case-insensitive.
 	for (auto it = auths.begin(); it != auths.end(); ++it) {
-		if (it->name == auth.name) {
+		if (StringUtil::CIEquals(it->name, auth.name)) {
 			if (!or_replace) {
 				throw InvalidInputException("Auth \"%s\" already exists — use CREATE OR REPLACE AUTH", auth.name);
+			}
+			const string old_name = it->name;
+			const auto old_kind = it->kind;
+			// Hashed API keys must not outlive an API_KEY scheme (OR REPLACE to JWT
+			// used to leave keys that resurrected after OR REPLACE back to API_KEY).
+			if (old_kind == QuackapiAuthKind::API_KEY && auth.kind != QuackapiAuthKind::API_KEY) {
+				api_keys.erase(std::remove_if(api_keys.begin(), api_keys.end(),
+				                              [&](const QuackapiApiKeyEntry &e) {
+					                              return StringUtil::CIEquals(e.auth_name, old_name);
+				                              }),
+				               api_keys.end());
+			} else if (old_name != auth.name) {
+				// Preserve keys across casing-only renames of the same API_KEY scheme.
+				for (auto &entry : api_keys) {
+					if (StringUtil::CIEquals(entry.auth_name, old_name)) {
+						entry.auth_name = auth.name;
+					}
+				}
 			}
 			*it = auth;
 			return;
@@ -183,8 +243,10 @@ void QuackapiState::AddAuth(const QuackapiAuth &auth, bool or_replace) {
 bool QuackapiState::DropAuth(const string &name) {
 	std::lock_guard<std::mutex> lock(auths_mutex);
 	bool found = false;
+	string dropped_name;
 	for (auto it = auths.begin(); it != auths.end(); ++it) {
-		if (it->name == name) {
+		if (StringUtil::CIEquals(it->name, name)) {
+			dropped_name = it->name;
 			auths.erase(it);
 			found = true;
 			break;
@@ -192,8 +254,11 @@ bool QuackapiState::DropAuth(const string &name) {
 	}
 	if (found) {
 		// Drop associated API keys so hashes cannot outlive their scheme.
+		// Case-insensitive: DROP AUTH site must clear keys for CREATE AUTH Site.
 		api_keys.erase(std::remove_if(api_keys.begin(), api_keys.end(),
-		                              [&](const QuackapiApiKeyEntry &e) { return e.auth_name == name; }),
+		                              [&](const QuackapiApiKeyEntry &e) {
+			                              return StringUtil::CIEquals(e.auth_name, dropped_name);
+		                              }),
 		               api_keys.end());
 	}
 	return found;
@@ -229,7 +294,7 @@ string QuackapiState::AddApiKey(const string &auth_name, const string &raw_key, 
 	std::lock_guard<std::mutex> lock(auths_mutex);
 	const QuackapiAuth *auth_ptr = nullptr;
 	for (auto &auth : auths) {
-		if (auth.name == auth_name) {
+		if (StringUtil::CIEquals(auth.name, auth_name)) {
 			auth_ptr = &auth;
 			break;
 		}
@@ -241,13 +306,16 @@ string QuackapiState::AddApiKey(const string &auth_name, const string &raw_key, 
 		throw InvalidInputException("Auth \"%s\" is not an API_KEY scheme", auth_name);
 	}
 	QuackapiApiKeyEntry entry;
-	entry.auth_name = auth_name;
+	// Store the canonical scheme name from the registry (not the caller's casing).
+	entry.auth_name = auth_ptr->name;
 	entry.key_hash = QuackapiSha256(raw_key);
 	entry.subject = subject;
 	// Replace existing key with the same hash (same raw key re-added).
 	for (auto &existing : api_keys) {
-		if (existing.auth_name == auth_name && QuackapiConstantTimeEquals(existing.key_hash, entry.key_hash)) {
+		if (StringUtil::CIEquals(existing.auth_name, entry.auth_name) &&
+		    QuackapiConstantTimeEquals(existing.key_hash, entry.key_hash)) {
 			existing.subject = subject;
+			existing.auth_name = entry.auth_name;
 			return subject;
 		}
 	}
@@ -259,7 +327,7 @@ vector<QuackapiApiKeyEntry> QuackapiState::SnapshotApiKeys(const string &auth_na
 	std::lock_guard<std::mutex> lock(auths_mutex);
 	vector<QuackapiApiKeyEntry> result;
 	for (auto &entry : api_keys) {
-		if (entry.auth_name == auth_name) {
+		if (StringUtil::CIEquals(entry.auth_name, auth_name)) {
 			result.push_back(entry);
 		}
 	}

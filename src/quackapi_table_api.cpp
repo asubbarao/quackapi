@@ -2,6 +2,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
@@ -222,7 +223,6 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	list_route.pattern = base;
 	list_route.handler_sql = "SELECT * FROM " + quoted_table;
 	list_route.status = 200;
-	state.AddRoute(list_route, bind_data.or_replace);
 
 	// GET <base>/:<key>  -> by key
 	QuackapiRoute get_route;
@@ -231,6 +231,24 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	get_route.pattern = base + "/:" + bind_data.key;
 	get_route.handler_sql = "SELECT * FROM " + quoted_table + " WHERE " + quoted_key + " = $" + bind_data.key;
 	get_route.status = 200;
+
+	// Validate handlers before mutating the registry (CREATE ROUTE parity) so a
+	// missing table cannot leave list/get routes that 500 on first request.
+	{
+		Connection con(*context.db);
+		auto prepared_list = con.Prepare(list_route.handler_sql);
+		if (prepared_list->HasError()) {
+			throw InvalidInputException("Invalid handler SQL for API table \"%s\": %s", bind_data.table,
+			                            prepared_list->GetError());
+		}
+		auto prepared_get = con.Prepare(get_route.handler_sql);
+		if (prepared_get->HasError()) {
+			throw InvalidInputException("Invalid handler SQL for API table \"%s\": %s", bind_data.table,
+			                            prepared_get->GetError());
+		}
+	}
+
+	state.AddRoute(list_route, bind_data.or_replace);
 	state.AddRoute(get_route, bind_data.or_replace);
 
 	EmitOneShotStatus(output, bind_data.finished,
