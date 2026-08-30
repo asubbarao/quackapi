@@ -411,8 +411,10 @@ LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 
 ## Behavior notes
 
-- **Response envelope:** always a JSON array of row objects for multi-column /
-  non-`html`/`text` handlers (SQL result-set semantics — not a bare object).
+- **Response envelope:** default is a JSON **array** of row objects for
+  multi-column / non-`html`/`text` handlers. Opt in with `ENVELOPE object`
+  for a bare JSON object (exactly one row) and `EMPTY STATUS 404` for 0-row
+  → HTTP 404 instead of `[]` / `null`.
 - **CORS:** off by default; enable with `cors_origins` / `SET quackapi_cors_origins`.
 - **Registry lifecycle:** routes, auth schemes, groups, queues, streams live on
   the **database instance** (not the catalog). Re-run DDL after reopen.
