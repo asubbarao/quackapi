@@ -42,8 +42,7 @@ static void (*quackapi_prev_sigterm)(int) = SIG_DFL;
 
 static void QuackapiSignalHandler(int sig) {
 	quackapi_signal_stop.store(true);
-	if (sig == SIGINT && quackapi_prev_sigint && quackapi_prev_sigint != SIG_DFL &&
-	    quackapi_prev_sigint != SIG_IGN) {
+	if (sig == SIGINT && quackapi_prev_sigint && quackapi_prev_sigint != SIG_DFL && quackapi_prev_sigint != SIG_IGN) {
 		quackapi_prev_sigint(sig);
 	} else if (sig == SIGTERM && quackapi_prev_sigterm && quackapi_prev_sigterm != SIG_DFL &&
 	           quackapi_prev_sigterm != SIG_IGN) {
@@ -462,15 +461,13 @@ static void WaitExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	// Prefer the in-process host when this DB already started the server.
 	string host = bind_data.host;
 	string registered_host;
-	if (QuackapiState::Get(*context.db).GetServerHost(bind_data.port, registered_host) &&
-	    !registered_host.empty()) {
+	if (QuackapiState::Get(*context.db).GetServerHost(bind_data.port, registered_host) && !registered_host.empty()) {
 		host = registered_host;
 	}
 
 	const auto deadline = bind_data.timeout_ms < 0
 	                          ? std::chrono::steady_clock::time_point::max()
-	                          : std::chrono::steady_clock::now() +
-	                                std::chrono::milliseconds(bind_data.timeout_ms);
+	                          : std::chrono::steady_clock::now() + std::chrono::milliseconds(bind_data.timeout_ms);
 	bool ready = false;
 	while (true) {
 		if (QuackapiStopRequested(context)) {
