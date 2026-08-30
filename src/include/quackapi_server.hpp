@@ -116,9 +116,9 @@ struct QuackapiServeOptions {
 	idx_t compression_min_bytes = 256;
 
 	// --- Native Postgres (optional; same shape as FastAPI+psycopg) ---
-	//! When non-empty, simple routes execute via libpq (thread-local conn +
-	//! PQexecParams) instead of DuckDB ATTACH. Empty = DuckDB path only.
-	//! Example: postgresql://user:pass@127.0.0.1:5432/db
+	//! When non-empty, simple routes execute via libpq (thread-local conn,
+	//! fresh PQexecParams per request) instead of DuckDB ATTACH.
+	//! Empty = DuckDB path only. Example: postgresql://user:pass@127.0.0.1:5432/db
 	string pg_dsn;
 };
 
@@ -203,10 +203,12 @@ private:
 //! Optional body for POST/PUT/PATCH (Content-Type application/json when non-empty).
 //! req_headers: optional request headers (e.g. X-Request-ID, Accept, Authorization).
 //! headers_out: response header map (first value per name; case as httplib stores it).
+//! Optional pg_dsn: when non-empty, in-process dispatch uses the native libpq
+//! path (same as quackapi_serve(..., pg_dsn := ...)). Empty keeps DuckDB-only.
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers = nullptr,
-                              unordered_map<string, string> *headers_out = nullptr);
+                              unordered_map<string, string> *headers_out = nullptr, const string &pg_dsn = string());
 
 //! Drop in-process rate-limit buckets for a route name (all client keys).
 //! Called on CREATE OR REPLACE / DROP ROUTE so a new registration starts fresh.

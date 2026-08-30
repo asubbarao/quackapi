@@ -1,0 +1,63 @@
+# name: test/sql/quackapi_pg_prepare_cache.test
+# description: PG PQprepare cache must not key on SQL alone (catalog/definition identity)
+# group: [sql]
+
+#
+# Requires a live Postgres reachable at QUACKAPI_TEST_PG_DSN (libpq DSN).
+# Throwaway setup used in development:
+#   postgresql://quackapi_pg_cache:qa_pg_cache_test@/quackapi_pg_cache_test?host=/tmp
+
+require quackapi
+
+require-env QUACKAPI_TEST_PG_DSN
+
+# Keep quackapi_request on one worker thread so TLS PGconn + prepare map are shared.
+statement ok
+SET threads = 1;
+
+statement ok
+SET quackapi_pg_dsn = 'postgresql://quackapi_pg_cache:qa_pg_cache_test@/quackapi_pg_cache_test?host=/tmp';
+
+# ---------------------------------------------------------------------------
+# PQprepare was keyed only by pg_sql. Missing: catalog type OID identity.
+# Prepare SELECT …::qa_dpos, DROP+CREATE the domain (new OID, same name), then
+# reuse the cached statement name → sticky "cache lookup failed for type".
+# Fresh exec (no SQL-only prepare cache) returns the post-redefinition row.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE ROUTE qa_pg_redef POST '/qa_pg_redef' AS
+DO $$
+BEGIN
+  DROP DOMAIN IF EXISTS qa_dpos CASCADE;
+  CREATE DOMAIN qa_dpos AS integer CHECK (VALUE > 0);
+END
+$$;
+
+statement ok
+CREATE OR REPLACE ROUTE qa_pg_cast GET '/qa_pg_cast/:id' AS
+  SELECT ($id::INTEGER)::qa_dpos AS v, $id::INTEGER AS id;
+
+# Boot domain on the TLS libpq connection.
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/qa_pg_redef');
+----
+200	[]
+
+# First cast prepares with the live domain OID.
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/qa_pg_cast/5');
+----
+200	[{"v":5,"id":5}]
+
+# Redefine domain (new OID, same SQL text for the cast route).
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/qa_pg_redef');
+----
+200	[]
+
+# Must return the post-redefinition result — not a sticky dead type OID failure.
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/qa_pg_cast/5');
+----
+200	[{"v":5,"id":5}]
