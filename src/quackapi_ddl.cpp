@@ -223,6 +223,7 @@ string JoinGroupPrefix(const string &prefix, const string &path) {
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
 //!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
+//!     [ENVELOPE array|object] [EMPTY STATUS <n> [BODY '<json>']]
 //!     [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
@@ -303,7 +304,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return i;
 	};
 
-	// Optional clauses: STATUS / REQUIRE / GROUP / RATE LIMIT / FORMAT (any order)
+	// Optional clauses: STATUS / REQUIRE / GROUP / RATE LIMIT / FORMAT / ENVELOPE / EMPTY (any order)
 	int status = 200;
 	string require_auth;
 	string group_name;
@@ -311,8 +312,11 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	int rate_limit_per_sec = 0;
 	string rate_limit_by; // empty → ip at apply time
 	string response_format = "json";
+	string response_envelope = "array";
+	int empty_status = 0;
+	string empty_body;
 	auto rest_upper = StringUtil::Upper(rest);
-	for (int clause_round = 0; clause_round < 12; clause_round++) {
+	for (int clause_round = 0; clause_round < 16; clause_round++) {
 		rest_upper = StringUtil::Upper(rest);
 		// [STATUS <n>]
 		if (StringUtil::StartsWith(rest_upper, "STATUS") &&
@@ -420,6 +424,76 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			rest = QuackapiTrim(rest.substr(token_end));
 			continue;
 		}
+		// [ENVELOPE array|object]
+		if (StringUtil::StartsWith(rest_upper, "ENVELOPE") &&
+		    (rest.size() == 8 || StringUtil::CharacterIsSpace(rest[8]))) {
+			rest = QuackapiTrim(rest.substr(8));
+			auto token_end = NextTokenEnd(rest);
+			if (token_end == 0) {
+				return ParserExtensionParseResult("ENVELOPE expects array or object");
+			}
+			auto env = StringUtil::Lower(rest.substr(0, token_end));
+			if (env != "array" && env != "object") {
+				return ParserExtensionParseResult("ENVELOPE must be array or object");
+			}
+			response_envelope = env;
+			rest = QuackapiTrim(rest.substr(token_end));
+			continue;
+		}
+		// [EMPTY STATUS <n> [BODY '<json>']]
+		if (StringUtil::StartsWith(rest_upper, "EMPTY") &&
+		    (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
+			string after_empty = QuackapiTrim(rest.substr(5));
+			auto after_empty_u = StringUtil::Upper(after_empty);
+			if (!(StringUtil::StartsWith(after_empty_u, "STATUS") &&
+			      (after_empty.size() == 6 || StringUtil::CharacterIsSpace(after_empty[6])))) {
+				return ParserExtensionParseResult("Expected EMPTY STATUS <n> [BODY '<json>']");
+			}
+			after_empty = QuackapiTrim(after_empty.substr(6));
+			auto status_end = NextTokenEnd(after_empty);
+			if (status_end == 0) {
+				return ParserExtensionParseResult("EMPTY STATUS expects a valid HTTP status code");
+			}
+			empty_status = atoi(after_empty.substr(0, status_end).c_str());
+			if (empty_status < 100 || empty_status > 599) {
+				return ParserExtensionParseResult("EMPTY STATUS must be a valid HTTP status code");
+			}
+			after_empty = QuackapiTrim(after_empty.substr(status_end));
+			auto after_status_u = StringUtil::Upper(after_empty);
+			// Optional BODY '<…>' — not BODY SCHEMA (that clause is separate).
+			if (StringUtil::StartsWith(after_status_u, "BODY") && after_empty.size() > 4 &&
+			    StringUtil::CharacterIsSpace(after_empty[4])) {
+				string after_body = QuackapiTrim(after_empty.substr(4));
+				auto after_body_u = StringUtil::Upper(after_body);
+				if (StringUtil::StartsWith(after_body_u, "SCHEMA")) {
+					return ParserExtensionParseResult("EMPTY STATUS BODY expects a quoted string, not BODY SCHEMA");
+				}
+				if (after_body.empty() || after_body[0] != '\'') {
+					return ParserExtensionParseResult("EMPTY STATUS BODY expects a quoted string");
+				}
+				string body_lit;
+				idx_t bi = 1;
+				while (bi < after_body.size()) {
+					if (after_body[bi] == '\'') {
+						if (bi + 1 < after_body.size() && after_body[bi + 1] == '\'') {
+							body_lit += '\'';
+							bi += 2;
+							continue;
+						}
+						break;
+					}
+					body_lit += after_body[bi];
+					bi++;
+				}
+				if (bi >= after_body.size() || after_body[bi] != '\'') {
+					return ParserExtensionParseResult("Unterminated EMPTY STATUS BODY string");
+				}
+				empty_body = body_lit;
+				after_empty = QuackapiTrim(after_body.substr(bi + 1));
+			}
+			rest = after_empty;
+			continue;
+		}
 		// [IN GROUP <name>] or [GROUP <name>]
 		if (StringUtil::StartsWith(rest_upper, "IN") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2])) {
 			string after_in = QuackapiTrim(rest.substr(2));
@@ -456,6 +530,11 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		break;
 	}
 	rest_upper = StringUtil::Upper(rest);
+
+	// ENVELOPE object only applies to FORMAT json (default).
+	if (response_envelope == "object" && response_format != "json") {
+		return ParserExtensionParseResult("ENVELOPE object requires FORMAT json (default)");
+	}
 
 	// Ungrouped routes still require an absolute path starting with '/'.
 	if (group_name.empty() && pattern[0] != '/') {
@@ -729,6 +808,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.rate_limit_per_sec = rate_limit_per_sec;
 	data->route.rate_limit_by = rate_limit_by.empty() && rate_limit_n > 0 ? string("ip") : rate_limit_by;
 	data->route.response_format = response_format;
+	data->route.response_envelope = response_envelope;
+	data->route.empty_status = empty_status;
+	data->route.empty_body = empty_body;
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -777,6 +859,19 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 			fmt = "json";
 		}
 		bind_data->route.response_format = fmt;
+	}
+	if (input.inputs.size() > 15 && !input.inputs[15].IsNull()) {
+		auto env = StringUtil::Lower(input.inputs[15].GetValue<string>());
+		if (env.empty()) {
+			env = "array";
+		}
+		bind_data->route.response_envelope = env;
+	}
+	if (input.inputs.size() > 16 && !input.inputs[16].IsNull()) {
+		bind_data->route.empty_status = input.inputs[16].GetValue<int32_t>();
+	}
+	if (input.inputs.size() > 17 && !input.inputs[17].IsNull()) {
+		bind_data->route.empty_body = input.inputs[17].GetValue<string>();
 	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
@@ -842,12 +937,14 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 
 TableFunction MakeApplyRouteFunction() {
 	// action, or_replace, name, method, pattern, handler, status, require_auth,
-	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format
+	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format,
+	// envelope, empty_status, empty_body
 	return MakeApplyDdlFunction("quackapi_apply_route",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::INTEGER, LogicalType::VARCHAR},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
@@ -871,6 +968,9 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::INTEGER(data.route.rate_limit_per_sec));
 	result.parameters.push_back(Value(data.route.rate_limit_by));
 	result.parameters.push_back(Value(data.route.response_format.empty() ? "json" : data.route.response_format));
+	result.parameters.push_back(Value(data.route.response_envelope.empty() ? "array" : data.route.response_envelope));
+	result.parameters.push_back(Value::INTEGER(data.route.empty_status));
+	result.parameters.push_back(Value(data.route.empty_body));
 	FinishDdlPlan(result);
 	return result;
 }

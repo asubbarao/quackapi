@@ -88,18 +88,24 @@ struct ThreadRequestCache {
 		return raw;
 	}
 
-	const string *LookupStaticBody(const string &sql) const {
-		auto it = static_json_bodies.find(sql);
+	const string *LookupStaticBody(const string &key) const {
+		auto it = static_json_bodies.find(key);
 		return it == static_json_bodies.end() ? nullptr : &it->second;
 	}
 
-	void StoreStaticBody(const string &sql, string body) {
+	void StoreStaticBody(const string &key, string body) {
 		if (static_json_bodies.size() >= MAX_STATIC_BODIES) {
 			static_json_bodies.clear();
 		}
-		static_json_bodies[sql] = std::move(body);
+		static_json_bodies[key] = std::move(body);
 	}
 };
+
+//! Static JSON body cache key must include envelope — same SQL can be array or object.
+string StaticJsonCacheKey(const QuackapiRoute &route, const string &handler_sql) {
+	auto env = route.response_envelope.empty() ? string("array") : route.response_envelope;
+	return env + "\x1f" + handler_sql;
+}
 
 ThreadRequestCache &TlsRequestCache() {
 	thread_local ThreadRequestCache cache;
@@ -1228,6 +1234,28 @@ string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &
 	}
 	body += "]";
 	return body;
+}
+
+//! Single-row JSON object (ENVELOPE object). Caller guarantees rows.size() == 1.
+string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &data_cols, const vector<Value> &cols) {
+	string body = "{";
+	bool first_col = true;
+	for (auto col : data_cols) {
+		if (!first_col) {
+			body += ",";
+		}
+		first_col = false;
+		body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
+	}
+	body += "}";
+	return body;
+}
+
+string EmptyResultBody(const QuackapiRoute &route) {
+	if (!route.empty_body.empty()) {
+		return route.empty_body;
+	}
+	return "{\"detail\":\"Not Found\"}";
 }
 
 string SerializeRowsNdjson(const vector<string> &names, const vector<idx_t> &data_cols,
@@ -2770,7 +2798,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		const bool zero_params = prepared->named_param_map.empty();
 		const BodyFormat body_format = ResolveBodyFormat(match.route, req);
 		if (zero_params && body_format == BodyFormat::JSON) {
-			if (const string *cached = tls.LookupStaticBody(handler_sql)) {
+			if (const string *cached = tls.LookupStaticBody(StaticJsonCacheKey(match.route, handler_sql))) {
 				SetJson(res, match.route.status, *cached);
 				finish();
 				return;
@@ -3083,6 +3111,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		auto mode = ResponseModeFor(data_names);
 
+		// 0-row EMPTY STATUS: override success STATUS (any FORMAT / html/text).
+		if (rows.empty() && match.route.empty_status != 0) {
+			SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
+			finish();
+			return;
+		}
+
 		// No data columns: empty body (redirect / cookie-only responses).
 		if (data_cols.empty()) {
 			res.status = match.route.status;
@@ -3112,7 +3147,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		// Serialize rows: json array | ndjson | csv | parquet | arrow (FORMAT + Accept).
+		const bool object_envelope =
+		    StringUtil::Lower(match.route.response_envelope.empty() ? "array" : match.route.response_envelope) ==
+		    "object";
+
+		// Serialize rows: json array | json object | ndjson | csv | parquet | arrow.
 		string body;
 		const char *content_type = "application/json";
 		if (body_format == BodyFormat::NDJSON) {
@@ -3128,11 +3167,31 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			body = SerializeRowsArrow(con, names, result->types, data_cols, rows);
 			// nanoarrow FORMAT ARROWS produces IPC *stream* (0xFFFFFFFF magic).
 			content_type = "application/vnd.apache.arrow.stream";
+		} else if (object_envelope) {
+			if (rows.size() > 1) {
+				SetJson(res, 500,
+				        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(rows.size()) +
+				            "\"}");
+				finish();
+				return;
+			}
+			if (rows.empty()) {
+				// No EMPTY STATUS → JSON null (array default remains []).
+				body = "null";
+			} else {
+				body = SerializeRowJsonObject(names, data_cols, rows[0]);
+			}
+			if (zero_params && location_value.empty() && set_cookie_values.empty() && !rows.empty()) {
+				tls.StoreStaticBody(StaticJsonCacheKey(match.route, handler_sql), body);
+			}
+			SetJson(res, match.route.status, body);
+			finish();
+			return;
 		} else {
 			body = SerializeRowsJsonArray(names, data_cols, rows);
 			// Cache constant JSON responses (no bind params) for this worker.
 			if (zero_params && location_value.empty() && set_cookie_values.empty()) {
-				tls.StoreStaticBody(handler_sql, body);
+				tls.StoreStaticBody(StaticJsonCacheKey(match.route, handler_sql), body);
 			}
 			SetJson(res, match.route.status, body);
 			finish();

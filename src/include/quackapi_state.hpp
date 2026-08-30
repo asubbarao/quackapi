@@ -146,6 +146,14 @@ struct QuackapiRoute {
 	//! Default response body format: "json" (default), "ndjson", "csv", "parquet", or "arrow".
 	//! Explicit non-json wins over Accept negotiation; json allows Accept override.
 	string response_format = "json";
+	//! JSON shape for FORMAT json: "array" (default, `[{…}]`) or "object" (single row → `{…}`).
+	//! Object requires exactly one row; >1 rows → 500. Only valid with FORMAT json.
+	string response_envelope = "array";
+	//! When handler returns 0 rows and this is set (≠0), respond with this status instead of
+	//! the success STATUS + empty array/null. 0 = unset (default empty-result behavior).
+	int empty_status = 0;
+	//! Body for EMPTY STATUS responses. Empty string → `{"detail":"Not Found"}`.
+	string empty_body;
 };
 
 //! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).

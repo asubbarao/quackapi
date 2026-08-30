@@ -182,7 +182,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor, SQL bind, stderr access log | `request_id.test.sh` |
 | **curl_httpfs guarantee** | **shipped** — `http_client:='curl'` fails serve if missing; auto loud fallback | batteries + `curl_httpfs_client.test.sh` |
 | **RFC 9457 problem+json** | FastAPI-shaped 422 only | `/tmp/quackapi_spec_problem_details/SPEC.md` |
-| **Envelope** always JSON **array of rows** | intentional SQL semantics (harness still MATCH on fields) | `docs/FASTAPI_PARITY.md` |
+| **Envelope** default JSON **array of rows**; `ENVELOPE object` + `EMPTY STATUS` shipped | array stays default; object/404 opt-in | `docs/reference/ddl.md`; `quackapi_envelope.test` |
 | **Pydantic binder fidelity** ~19% needs C++ | field-level body `loc`, optional/null body, multi-error | `/tmp/quackapi_pydantic_bridge.md` |
 | **Multi-writer OLTP / wasm / Windows** | single-writer DuckDB; platforms excluded in `description.yml` | packaging descriptor |
 
