@@ -37,6 +37,82 @@ jobs:
       extension_name: quackapi
       format_checks: "format"
 
+  # Own job (not the reusable distribution workflow): needs `services:` for
+  # Postgres so require-env QUACKAPI_TEST_PG_DSN tests actually run. Linux
+  # amd64 only — does not publish artifacts or expand the release matrix.
+  linux-amd64-pg-sqllogic:
+    name: Linux amd64 SQLLogic with Postgres
+    runs-on: ubuntu-24.04
+    env:
+      GEN: ninja
+      DUCKDB_GIT_VERSION: v1.5.5
+      ENABLE_EXTENSION_AUTOLOADING: "1"
+      ENABLE_EXTENSION_AUTOINSTALL: "1"
+      QUACKAPI_TEST_PG_DSN: postgresql://quackapi_pg_cache:qa_pg_cache_test@127.0.0.1:5432/quackapi_pg_cache_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: quackapi_pg_cache
+          POSTGRES_PASSWORD: qa_pg_cache_test
+          POSTGRES_DB: quackapi_pg_cache_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quackapi_pg_cache -d quackapi_pg_cache_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Checkout extension-ci-tools
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/extension-ci-tools
+          ref: v1.5-variegata
+          path: extension-ci-tools
+
+      - name: Checkout DuckDB v1.5.5
+        run: make set_duckdb_version
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache libpq-dev postgresql-client
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@main
+        continue-on-error: true
+        with:
+          key: ccache-quackapi-pg-sqllogic-linux-amd64-v1.5.5
+          restore-keys: ccache-quackapi-pg-sqllogic-linux-amd64-
+
+      - name: Point PG prepare-cache test at service DSN
+        run: |
+          f=test/sql/quackapi_pg_prepare_cache.test
+          test -f "$f"
+          # Local throwaway uses host=/tmp; CI service is TCP. require-env
+          # loads QUACKAPI_TEST_PG_DSN into SQLLogic ${VAR} substitution.
+          sed -i "s|SET quackapi_pg_dsn = '.*';|SET quackapi_pg_dsn = '\${QUACKAPI_TEST_PG_DSN}';|" "$f"
+          grep -n 'require-env\|quackapi_pg_dsn' "$f"
+
+      - name: Wait for Postgres
+        run: |
+          until pg_isready -h 127.0.0.1 -p 5432 -U quackapi_pg_cache -d quackapi_pg_cache_test; do
+            sleep 1
+          done
+
+      - name: Build extension
+        run: make release -j"$(nproc)"
+
+      - name: Run quackapi SQLLogic
+        run: ./build/release/test/unittest "test/sql/quackapi*"
+
   publish-github-release:
     name: Publish GitHub Release assets
     needs: [duckdb-stable-build]
