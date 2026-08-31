@@ -1,46 +1,68 @@
 # name: test/sql/quackapi_table_api.test
-# description: CREATE API FOR TABLE generates read routes into the registry
+# description: CREATE API FOR TABLE generated routes answer over HTTP via quackapi_request
 # group: [sql]
 
 require quackapi
 
 statement ok
-CREATE TABLE cases AS SELECT 1 AS id, '24-000117' AS case_no;
+CREATE TABLE cases AS
+  SELECT 1 AS id, '24-000117' AS case_no
+  UNION ALL
+  SELECT 2, '24-000118';
 
-# Generates a list route and a by-key route at the default base '/<table>'.
+# Generates list + by-key routes; exercise them over the request path.
 statement ok
 CREATE API FOR TABLE cases;
 
-query TTT
-SELECT name, method, pattern FROM quackapi_routes() ORDER BY name;
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/cases');
 ----
-cases_get	GET	/cases/:id
-cases_list	GET	/cases
+200	[{"id":1,"case_no":"24-000117"},{"id":2,"case_no":"24-000118"}]
 
-# Custom base path and key column.
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/cases/1');
+----
+200	[{"id":1,"case_no":"24-000117"}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/cases/999');
+----
+200	[]
+
+# Custom base path and key column — HTTP hit
 statement ok
 CREATE TABLE documents AS SELECT 1 AS doc_id, 'report.pdf' AS filename;
 
 statement ok
 CREATE API FOR TABLE documents AT '/api/documents' KEY 'doc_id';
 
-query TTT
-SELECT method, pattern, handler FROM quackapi_routes() WHERE name = 'documents_get';
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/api/documents/1');
 ----
-GET	/api/documents/:doc_id	SELECT * FROM "documents" WHERE "doc_id" = $doc_id
+200	[{"doc_id":1,"filename":"report.pdf"}]
 
-# The generated routes are ordinary registry rows: DROP ROUTE removes them.
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/api/documents');
+----
+200	[{"doc_id":1,"filename":"report.pdf"}]
+
+# DROP ROUTE removes a generated route (404 after)
 statement ok
 DROP ROUTE cases_list;
 
 query I
-SELECT count(*) FROM quackapi_routes() WHERE name = 'cases_list';
+SELECT status FROM quackapi_request('GET', '/cases');
 ----
-0
+404
 
 # OR REPLACE re-generates without a duplicate error.
 statement ok
 CREATE OR REPLACE API FOR TABLE documents AT '/api/documents' KEY 'doc_id';
+
+query I
+SELECT status FROM quackapi_request('GET', '/api/documents/1');
+----
+200
 
 # Bad grammar: AT requires a leading-slash quoted path.
 statement error
@@ -48,22 +70,21 @@ CREATE API FOR TABLE cases AT 'nope';
 ----
 
 # Quoted table identifier with embedded double-quote — QuoteIdent must not break out.
-# SQL: CREATE TABLE "weird""name" (...); CREATE API FOR TABLE "weird""name" KEY 'id';
 statement ok
 CREATE TABLE "weird""name" AS SELECT 1 AS id, 'v' AS v;
 
 statement ok
 CREATE API FOR TABLE "weird""name" KEY 'id';
 
-query TTT
-SELECT name, pattern, handler FROM quackapi_routes() WHERE name = 'weird"name_list';
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/weird"name');
 ----
-weird"name_list	/weird"name	SELECT * FROM "weird""name"
+200	[{"id":1,"v":"v"}]
 
-query TTT
-SELECT name, pattern, handler FROM quackapi_routes() WHERE name = 'weird"name_get';
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/weird"name/1');
 ----
-weird"name_get	/weird"name/:id	SELECT * FROM "weird""name" WHERE "id" = $id
+200	[{"id":1,"v":"v"}]
 
 # Bare table token with an embedded " is rejected (use "quoted""ident" form).
 statement error
