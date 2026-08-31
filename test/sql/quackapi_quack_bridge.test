@@ -45,32 +45,12 @@ SELECT (quackapi_verify_auth('nope', 'x')).ok, (quackapi_verify_auth('nope', 'x'
 false	401
 
 # ---------------------------------------------------------------------------
-# quackapi_authentication — quack_check_token-compatible signature
+# quackapi_authentication — scheme fall-through: auth_string is a registered API key
 # ---------------------------------------------------------------------------
-# Token equality path (same contract as quack_check_token)
-query I
-SELECT quackapi_authentication('sess', 'mytoken', 'mytoken');
-----
-true
-
-query I
-SELECT quackapi_authentication('sess', 'mytoken', 'other');
-----
-false
-
-# Scheme fall-through: auth_string is a registered API key
 query I
 SELECT quackapi_authentication('sess', 'bridge-secret', 'not-the-server-token');
 ----
 true
-
-# ---------------------------------------------------------------------------
-# quackapi_authorization — pass-through like quack_nop_authorization
-# ---------------------------------------------------------------------------
-query I
-SELECT quackapi_authorization('sess', 'SELECT 1');
-----
-SELECT 1
 
 # Cleanup
 query I

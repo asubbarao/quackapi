@@ -25,12 +25,6 @@ SELECT name, kind, header FROM quackapi_auths() WHERE name = 'site';
 ----
 site	API_KEY	X-API-Key
 
-# Only name/kind/header columns — secrets never projected
-query III
-SELECT name, kind, header FROM quackapi_auths() WHERE name = 'site';
-----
-site	API_KEY	X-API-Key
-
 # ---------------------------------------------------------------------------
 # CREATE AUTH AS API_KEY with custom HEADER
 # ---------------------------------------------------------------------------

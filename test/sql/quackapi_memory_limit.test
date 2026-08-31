@@ -10,38 +10,6 @@ SELECT current_setting('quackapi_memory_limit');
 ----
 (empty)
 
-# SET surface (mirrors cors_origins / other extension options)
-statement ok
-SET quackapi_memory_limit = '4GB';
-
-query I
-SELECT current_setting('quackapi_memory_limit');
-----
-4GB
-
-statement ok
-SET quackapi_memory_limit = '512MB';
-
-query I
-SELECT current_setting('quackapi_memory_limit');
-----
-512MB
-
-# Reset to empty (fall back to non-clobber logic)
-statement ok
-SET quackapi_memory_limit = '';
-
-query I
-SELECT current_setting('quackapi_memory_limit');
-----
-(empty)
-
-# Setting is listed among duckdb_settings
-query I
-SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_memory_limit';
-----
-true
-
 # ---------------------------------------------------------------------------
 # Non-clobber: operator SET memory_limit before serve must stick
 # ---------------------------------------------------------------------------

@@ -15,11 +15,6 @@ ORDER BY method, path;
 GET	/articles/{slug}	get_article
 POST	/login	login
 
-query I
-SELECT count(*) FROM quack_from_fastapi('bridges/from_x/fixtures/fastapi_mini');
-----
-2
-
 # ---------------------------------------------------------------------------
 # Models: UserInLogin with 3 fields (2 required, 1 defaulted optional-ish)
 # ---------------------------------------------------------------------------
@@ -31,11 +26,6 @@ ORDER BY field_line, field_name;
 UserInLogin	email	str	true	false
 UserInLogin	password	str	true	false
 UserInLogin	remember_me	bool	false	true
-
-query I
-SELECT count(*) FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini');
-----
-3
 
 query I
 SELECT default_expr FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini')

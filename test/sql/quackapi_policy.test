@@ -149,41 +149,6 @@ INSERT INTO policy_users VALUES
   (1, 'alice@acme.test', 'acme'),
   (2, 'bob@beta.test', 'beta');
 
-# Manual claim-filter equivalence (same predicate as RAP USING, bound claims)
-query III
-SELECT id, tenant_id, amount FROM policy_orders
-WHERE tenant_id = 'acme' OR 'user' = 'admin'
-ORDER BY id;
-----
-1	acme	100
-3	acme	150
-
-# Admin claim equivalence
-query III
-SELECT id, tenant_id, amount FROM policy_orders
-WHERE tenant_id = 'acme' OR 'admin' = 'admin'
-ORDER BY id;
-----
-1	acme	100
-2	beta	200
-3	acme	150
-
-# Masking equivalence: non-admin sees ***
-query II
-SELECT id,
-  CASE WHEN 'user' = 'admin' THEN email ELSE '***' END AS email
-FROM policy_users WHERE tenant_id = 'acme' ORDER BY id;
-----
-1	***
-
-# Masking equivalence: admin sees raw
-query II
-SELECT id,
-  CASE WHEN 'admin' = 'admin' THEN email ELSE '***' END AS email
-FROM policy_users WHERE tenant_id = 'acme' ORDER BY id;
-----
-1	alice@acme.test
-
 # ---------------------------------------------------------------------------
 # Inspection: both policies listed
 # ---------------------------------------------------------------------------

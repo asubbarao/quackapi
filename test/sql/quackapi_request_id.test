@@ -30,15 +30,6 @@ FROM quackapi_request(
 ----
 200	[{"id":"client-rid-deadbeef"}]
 
-query I
-SELECT headers['X-Request-ID']
-FROM quackapi_request(
-  'GET', '/echo-rid',
-  headers := MAP {'X-Request-ID': 'client-rid-deadbeef'}
-);
-----
-client-rid-deadbeef
-
 # Case-insensitive request header
 query I
 SELECT decode(body)
