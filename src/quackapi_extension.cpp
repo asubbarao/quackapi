@@ -727,6 +727,18 @@ static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &re
 }
 
 //===--------------------------------------------------------------------===//
+// quackapi_last_write_timeout_sec() — effective write deadline of last request
+//===--------------------------------------------------------------------===//
+// Reports what HandleRequest / ApplyRouteIoTimeout actually applied — serve
+// write_timeout_sec when no route override ran, or the route timeout_sec when
+// ApplyRouteIoTimeout extended the socket deadlines. Not a registry lookup.
+
+static void LastWriteTimeoutSecFunction(DataChunk &, ExpressionState &state, Vector &result) {
+	auto &qa = QuackapiState::Get(*state.GetContext().db);
+	result.Reference(Value::INTEGER(qa.GetLastEffectiveWriteTimeoutSec()));
+}
+
+//===--------------------------------------------------------------------===//
 // Load
 //===--------------------------------------------------------------------===//
 
@@ -872,6 +884,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
+
+	// Effective write deadline applied to the most recent route request
+	// (ApplyRouteIoTimeout / serve write_timeout_sec). Test/introspection seam.
+	loader.RegisterFunction(
+	    ScalarFunction("quackapi_last_write_timeout_sec", {}, LogicalType::INTEGER, LastWriteTimeoutSecFunction));
 
 	// Outbound HTTP with a connection pool that survives ACROSS requests:
 	// quackapi_fetch / quackapi_post / quackapi_http_pool. See the header of

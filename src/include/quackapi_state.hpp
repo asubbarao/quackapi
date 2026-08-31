@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <tuple>
@@ -343,9 +344,22 @@ public:
 	bool GetGraphqlRouteBySchemaPath(const string &path, QuackapiGraphqlRoute &out);
 	vector<QuackapiGraphqlRoute> SnapshotGraphqlRoutes();
 
+	//! Effective write deadline (seconds) applied to the most recent route
+	//! request. Seeded with serve write_timeout_sec; ApplyRouteIoTimeout
+	//! overwrites it only when it actually extends the socket deadlines.
+	//! Test/introspection seam — not a registry field.
+	void SetLastEffectiveWriteTimeoutSec(int32_t sec) {
+		last_effective_write_timeout_sec.store(sec, std::memory_order_relaxed);
+	}
+	int32_t GetLastEffectiveWriteTimeoutSec() const {
+		return last_effective_write_timeout_sec.load(std::memory_order_relaxed);
+	}
+
 private:
 	void PublishRoutes();
 	void PublishStreams();
+
+	std::atomic<int32_t> last_effective_write_timeout_sec {0};
 
 	std::mutex routes_mutex;
 	vector<QuackapiRoute> routes;

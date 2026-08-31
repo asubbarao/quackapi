@@ -89,7 +89,9 @@ struct QuackapiHttplibServer : duckdb_httplib::Server {
 //! SO_* is restored to serve defaults in QuackapiHttplibServer after
 //! process_request returns (keep-alive safe). Do not restore in a HandleRequest
 //! destructor — that runs before httplib's write_response.
-void ApplyRouteIoTimeout(time_t timeout_sec) {
+//! Records the applied write deadline on qa_state only after this path runs
+//! (early return leaves the serve-level seed from HandleRequest unchanged).
+void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
 	if (timeout_sec <= 0) {
 		return;
 	}
@@ -102,6 +104,7 @@ void ApplyRouteIoTimeout(time_t timeout_sec) {
 		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec, 0);
 		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
 	}
+	qa_state.SetLastEffectiveWriteTimeoutSec(static_cast<int32_t>(timeout_sec));
 }
 
 //! Per-worker-thread DuckDB connection.
@@ -2605,8 +2608,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// Per-route IO timeout (CREATE ROUTE … TIMEOUT / WITH (timeout_sec := N)).
 	// Extends httplib SocketStream select deadlines + SO_RCVTIMEO/SO_SNDTIMEO for
 	// this connection through handler execute and response write.
+	// Seed introspection with serve write_timeout_sec; ApplyRouteIoTimeout
+	// overwrites only when it actually applies a route override.
+	qa_state.SetLastEffectiveWriteTimeoutSec(options.write_timeout_sec);
 	if (match.route.timeout_sec > 0) {
-		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec));
+		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec), qa_state);
 	}
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----

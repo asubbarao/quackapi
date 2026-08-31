@@ -60,7 +60,56 @@ CREATE ROUTE bad2 GET '/bad2' WITH (timeout_sec := 180, response := 'json') AS S
 ----
 Unknown WITH option
 
-# --- Live HTTP: control/treatment via client stall (not handler sleep) --------
+# --- Effective write deadline (all platforms) --------------------------------
+# Prove ApplyRouteIoTimeout ran (or did not) via quackapi_last_write_timeout_sec,
+# which records what the apply path actually did — not the registry timeout_sec.
+
+statement ok
+CREATE OR REPLACE ROUTE probe_default GET '/probe-default' AS SELECT 1 AS n;
+
+statement ok
+CREATE OR REPLACE ROUTE probe_optin GET '/probe-optin'
+  WITH (timeout_sec := 30)
+  AS SELECT 1 AS n;
+
+query I
+SELECT * FROM quackapi_serve(29350, host := '127.0.0.1', access_log := false,
+                             read_timeout_sec := 2, write_timeout_sec := 2,
+                             compression := false);
+----
+http://127.0.0.1:29350
+
+# No route timeout_sec → serve-level write_timeout_sec remains effective.
+query I
+SELECT status FROM quackapi_fetch('http://127.0.0.1:29350/probe-default');
+----
+200
+
+query I
+SELECT quackapi_last_write_timeout_sec();
+----
+2
+
+# Route WITH timeout_sec := 30 → ApplyRouteIoTimeout applied 30.
+query I
+SELECT status FROM quackapi_fetch('http://127.0.0.1:29350/probe-optin');
+----
+200
+
+query I
+SELECT quackapi_last_write_timeout_sec();
+----
+30
+
+query I
+SELECT * FROM quackapi_stop(29350);
+----
+Stopped quackapi server on port 29350
+
+# --- Live HTTP stall: control/treatment (POSIX only) -------------------------
+# Windows receive-window autotuning absorbs the body, so client stall cannot create write backpressure.
+require notwindows
+
 # ApplyRouteIoTimeout raises httplib socket write deadlines. A compute-bound
 # handler never stalls the socket, so sleep_ms cannot prove the feature.
 # Observable difference: large body + client that sends then waits before
