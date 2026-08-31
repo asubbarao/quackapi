@@ -16,6 +16,7 @@
 #include "quackapi_state.hpp"
 
 #include <cmath>
+#include <mutex>
 #include "quackapi_util.hpp"
 
 namespace duckdb {
@@ -531,12 +532,25 @@ unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFu
 	auto q = RequireQueue(*context.db, bind.queue_name);
 	EnsureQuackapiJobsTable(*context.db);
 
-	// Atomic claim: UPDATE…RETURNING with outer status/visible_at CAS so two
-	// concurrent dequeue workers cannot both claim the same row. Without the
-	// outer predicates DuckDB raises write-write Conflict; with them the loser
-	// matches zero rows (or retries after a transient Conflict).
+	// Serialize claims in-process. DuckDB's UPDATE…RETURNING is not a reliable
+	// exclusive lease under contention: outer status IN ('pending','running')
+	// still matches a row another worker just claimed (only visible_at excludes
+	// it), and now() is transaction-start time, so losers can pass the lease
+	// check or both UPDATEs commit. Mutex + pending-only CAS → one winner.
+	static std::mutex dequeue_claim_mutex;
+	std::lock_guard<std::mutex> claim_lock(dequeue_claim_mutex);
+
 	Connection con(*context.db);
 	for (int32_t i = 0; i < bind.n; i++) {
+		// Expired leases become pending again, then only pending is claimable.
+		string sweep_sql =
+		    StringUtil::Format("UPDATE quackapi_jobs SET status = 'pending', worker_id = NULL, "
+		                       "updated_at = now()::TIMESTAMP "
+		                       "WHERE queue = %s AND status = 'running' AND visible_at <= now()::TIMESTAMP",
+		                       SqlQuote(bind.queue_name));
+		auto sweep = con.Query(sweep_sql);
+		CheckQuery(sweep, "dequeue-sweep");
+
 		string sql =
 		    StringUtil::Format("UPDATE quackapi_jobs SET "
 		                       "status = 'running', "
@@ -547,12 +561,11 @@ unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFu
 		                       "WHERE id = ("
 		                       "  SELECT id FROM quackapi_jobs "
 		                       "  WHERE queue = %s "
-		                       "    AND status IN ('pending', 'running') "
+		                       "    AND status = 'pending' "
 		                       "    AND visible_at <= now()::TIMESTAMP "
 		                       "  ORDER BY id LIMIT 1"
 		                       ") "
-		                       "AND status IN ('pending', 'running') "
-		                       "AND visible_at <= now()::TIMESTAMP "
+		                       "AND status = 'pending' "
 		                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error",
 		                       q.visibility_timeout_sec, SqlQuote(bind.queue_name));
 		unique_ptr<MaterializedQueryResult> res;
