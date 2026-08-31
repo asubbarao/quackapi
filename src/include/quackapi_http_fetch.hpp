@@ -80,7 +80,7 @@ struct QuackapiHttpFetch {
 	static void ResetPool();
 };
 
-//! quackapi_fetch / quackapi_post / quackapi_http_pool.
+//! quackapi_fetch / quackapi_post / quackapi_http_pool / quackapi_parallel_fetch.
 void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader);
 
 } // namespace duckdb
