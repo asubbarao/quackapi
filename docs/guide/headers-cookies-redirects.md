@@ -170,7 +170,7 @@ Valid range for `STATUS` is **100–599**. Default is **200**.
 
 ### JSON (default)
 
-Multi-column (or non-magic single column) → `application/json` array of objects. Types follow DuckDB:
+Multi-column (or non-magic single column) → `application/json` **array** of objects by default (`ENVELOPE object` for a bare object). Types follow DuckDB:
 
 ```sql
 CREATE ROUTE page_json GET '/json' AS

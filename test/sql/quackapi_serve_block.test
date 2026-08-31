@@ -1,0 +1,51 @@
+# name: test/sql/quackapi_serve_block.test
+# description: quackapi_serve(block := …) + quackapi_wait readiness
+# group: [sql]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# Default serve still returns immediately (block defaults false)
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29451, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29451
+
+# Explicit block := false is identical to default
+query I
+SELECT * FROM quackapi_serve(29452, host := '127.0.0.1', access_log := false, block := false);
+----
+http://127.0.0.1:29452
+
+# ---------------------------------------------------------------------------
+# quackapi_wait — ready once the port accepts
+# ---------------------------------------------------------------------------
+query II
+SELECT ready, listen_url FROM quackapi_wait(29451, 2000);
+----
+true	http://127.0.0.1:29451
+
+# Named timeout_ms + host
+query II
+SELECT ready, listen_url FROM quackapi_wait(29452, timeout_ms := 2000, host := '127.0.0.1');
+----
+true	http://127.0.0.1:29452
+
+# Dead port → ready=false within timeout (no hang)
+query II
+SELECT ready, listen_url IS NULL FROM quackapi_wait(29459, 100);
+----
+false	true
+
+statement ok
+SELECT * FROM quackapi_stop(29451);
+
+statement ok
+SELECT * FROM quackapi_stop(29452);
+
+# After stop, wait times out
+query II
+SELECT ready, listen_url IS NULL FROM quackapi_wait(29451, 100);
+----
+false	true

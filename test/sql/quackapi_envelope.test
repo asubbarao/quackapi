@@ -1,0 +1,176 @@
+# name: test/sql/quackapi_envelope.test
+# description: ENVELOPE object + EMPTY STATUS for single-row JSON / 0-row HTTP status
+# group: [sql]
+
+require quackapi
+
+require json
+
+# Default remains array
+statement ok
+CREATE OR REPLACE ROUTE health_arr GET '/health_arr' AS
+  SELECT 'ok' AS status, 'sd-shelf' AS service;
+
+query III
+SELECT format, envelope, empty_status FROM quackapi_routes() WHERE name = 'health_arr';
+----
+json	array	0
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/health_arr');
+----
+200	[{"status":"ok","service":"sd-shelf"}]
+
+# ENVELOPE object → bare JSON object
+statement ok
+CREATE OR REPLACE ROUTE health_obj GET '/health_obj'
+  ENVELOPE object
+  AS SELECT 'ok' AS status, 'sd-shelf' AS service;
+
+query II
+SELECT envelope, empty_status FROM quackapi_routes() WHERE name = 'health_obj';
+----
+object	0
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/health_obj');
+----
+200	{"status":"ok","service":"sd-shelf"}
+
+# Clause order: ENVELOPE after FORMAT / STATUS
+statement ok
+CREATE OR REPLACE ROUTE item_obj GET '/items_obj/:id'
+  STATUS 200
+  FORMAT json
+  ENVELOPE object
+  EMPTY STATUS 404 BODY '{"detail":"item not found"}'
+  AS SELECT $id::INTEGER AS id, 'widget' AS name
+  WHERE $id::INTEGER = 1;
+
+query III
+SELECT envelope, empty_status, format FROM quackapi_routes() WHERE name = 'item_obj';
+----
+object	404	json
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/items_obj/1');
+----
+200	{"id":1,"name":"widget"}
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/items_obj/2');
+----
+404	{"detail":"item not found"}
+
+# EMPTY STATUS without BODY → default Not Found object
+statement ok
+CREATE OR REPLACE ROUTE miss GET '/miss/:id'
+  ENVELOPE object
+  EMPTY STATUS 404
+  AS SELECT $id::INTEGER AS id WHERE $id::INTEGER < 0;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/miss/1');
+----
+404	{"detail":"Not Found"}
+
+# 0 rows + object envelope + no EMPTY STATUS → JSON null (not [])
+statement ok
+CREATE OR REPLACE ROUTE maybe GET '/maybe'
+  ENVELOPE object
+  AS SELECT 1 AS id WHERE false;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/maybe');
+----
+200	null
+
+# >1 row with ENVELOPE object → 500
+statement ok
+CREATE OR REPLACE ROUTE multi GET '/multi'
+  ENVELOPE object
+  AS SELECT 1 AS id UNION ALL SELECT 2;
+
+query II
+SELECT status, json_extract_string(decode(body)::JSON, '$.detail')
+FROM quackapi_request('GET', '/multi');
+----
+500	ENVELOPE object requires exactly one row, got 2
+
+# EMPTY STATUS also works with default array envelope
+statement ok
+CREATE OR REPLACE ROUTE arr_miss GET '/arr_miss'
+  EMPTY STATUS 404 BODY '{"detail":"gone"}'
+  AS SELECT 1 AS id WHERE false;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/arr_miss');
+----
+404	{"detail":"gone"}
+
+# Parse errors
+statement error
+CREATE ROUTE bad GET '/bad' ENVELOPE banana AS SELECT 1;
+----
+ENVELOPE must be array or object
+
+statement error
+CREATE ROUTE bad GET '/bad' FORMAT csv ENVELOPE object AS SELECT 1;
+----
+ENVELOPE object requires FORMAT json
+
+statement error
+CREATE ROUTE bad GET '/bad' EMPTY STATUS 99 AS SELECT 1;
+----
+EMPTY STATUS must be a valid HTTP status code
+
+# Explicit ENVELOPE array is fine
+statement ok
+CREATE OR REPLACE ROUTE explicit_arr GET '/explicit_arr'
+  ENVELOPE array
+  AS SELECT 1 AS n;
+
+query I
+SELECT envelope FROM quackapi_routes() WHERE name = 'explicit_arr';
+----
+array
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/explicit_arr');
+----
+[{"n":1}]
+
+# OpenAPI: object envelope → type object; EMPTY STATUS appears in responses
+query I
+SELECT json_extract_string(
+  decode(body)::JSON,
+  '$.paths."/health_obj".get.responses."200".content."application/json".schema.type'
+) FROM quackapi_request('GET', '/openapi.json');
+----
+object
+
+query I
+SELECT json_extract_string(
+  decode(body)::JSON,
+  '$.paths."/items_obj/{id}".get.responses."200".content."application/json".schema.type'
+) FROM quackapi_request('GET', '/openapi.json');
+----
+object
+
+query I
+SELECT json_extract(
+  decode(body)::JSON,
+  '$.paths."/items_obj/{id}".get.responses."404"'
+) IS NOT NULL
+FROM quackapi_request('GET', '/openapi.json');
+----
+true
+
+# Default array routes still advertise array in OpenAPI
+query I
+SELECT json_extract_string(
+  decode(body)::JSON,
+  '$.paths."/health_arr".get.responses."200".content."application/json".schema.type'
+) FROM quackapi_request('GET', '/openapi.json');
+----
+array

@@ -42,6 +42,68 @@ namespace duckdb {
 
 namespace {
 
+//! Active connection for this httplib worker — set around process_request so a
+//! matched CREATE ROUTE … TIMEOUT can extend SocketStream + SO_*TIMEO deadlines.
+thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
+thread_local duckdb_httplib::Stream *quackapi_tls_stream = nullptr;
+
+//! httplib Server subclass: stash the live Stream/socket for per-route IO timeouts.
+struct QuackapiHttplibServer : duckdb_httplib::Server {
+	bool process_and_close_socket(socket_t sock) override {
+		std::string remote_addr;
+		int remote_port = 0;
+		duckdb_httplib::detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
+
+		std::string local_addr;
+		int local_port = 0;
+		duckdb_httplib::detail::get_local_ip_and_port(sock, local_addr, local_port);
+
+		auto ret = duckdb_httplib::detail::process_server_socket(
+		    svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
+		    write_timeout_sec_, write_timeout_usec_,
+		    [&](duckdb_httplib::Stream &strm, bool close_connection, bool &connection_closed) {
+			    quackapi_tls_sock = sock;
+			    quackapi_tls_stream = &strm;
+			    auto ok = process_request(strm, remote_addr, remote_port, local_addr, local_port, close_connection,
+			                              connection_closed, nullptr);
+			    // Restore accept-time SO_* after handler+write (per-route TIMEOUT may
+			    // have raised them). Next keep-alive SocketStream still uses serve defaults.
+			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, read_timeout_sec_,
+			                                                read_timeout_usec_);
+			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, write_timeout_sec_,
+			                                                write_timeout_usec_);
+			    quackapi_tls_stream = nullptr;
+			    quackapi_tls_sock = INVALID_SOCKET;
+			    return ok;
+		    });
+
+		duckdb_httplib::detail::shutdown_socket(sock);
+		duckdb_httplib::detail::close_socket(sock);
+		return ret;
+	}
+};
+
+//! Extend httplib read/write deadlines for the current request.
+//! Sets SocketStream select timeouts (covers the response write after the
+//! handler returns) and SO_RCVTIMEO/SO_SNDTIMEO on the accepted socket.
+//! SO_* is restored to serve defaults in QuackapiHttplibServer after
+//! process_request returns (keep-alive safe). Do not restore in a HandleRequest
+//! destructor — that runs before httplib's write_response.
+void ApplyRouteIoTimeout(time_t timeout_sec) {
+	if (timeout_sec <= 0) {
+		return;
+	}
+	auto *stream = dynamic_cast<duckdb_httplib::detail::SocketStream *>(quackapi_tls_stream);
+	if (stream) {
+		stream->set_read_timeout(timeout_sec, 0);
+		stream->set_write_timeout(timeout_sec, 0);
+	}
+	if (quackapi_tls_sock != INVALID_SOCKET) {
+		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec, 0);
+		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
+	}
+}
+
 //! Per-worker-thread DuckDB connection.
 //! httplib's ThreadPool runs each request on a worker thread. Connection
 //! construction is avoided only within a single request; each new request
@@ -1201,6 +1263,28 @@ string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &
 	return body;
 }
 
+//! Single-row JSON object (ENVELOPE object). Caller guarantees rows.size() == 1.
+string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &data_cols, const vector<Value> &cols) {
+	string body = "{";
+	bool first_col = true;
+	for (auto col : data_cols) {
+		if (!first_col) {
+			body += ",";
+		}
+		first_col = false;
+		body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
+	}
+	body += "}";
+	return body;
+}
+
+string EmptyResultBody(const QuackapiRoute &route) {
+	if (!route.empty_body.empty()) {
+		return route.empty_body;
+	}
+	return "{\"detail\":\"Not Found\"}";
+}
+
 string SerializeRowsNdjson(const vector<string> &names, const vector<idx_t> &data_cols,
                            const vector<vector<Value>> &rows) {
 	string body;
@@ -1465,7 +1549,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		return;
 	}
 
-	server = make_uniq<duckdb_httplib::Server>();
+	server = make_uniq<QuackapiHttplibServer>();
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
 	// requests before route handlers, so API routes always win over files.
@@ -2518,6 +2602,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 	}
 
+	// Per-route IO timeout (CREATE ROUTE … TIMEOUT / WITH (timeout_sec := N)).
+	// Extends httplib SocketStream select deadlines + SO_RCVTIMEO/SO_SNDTIMEO for
+	// this connection through handler execute and response write.
+	if (match.route.timeout_sec > 0) {
+		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec));
+	}
+
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
 	// Public routes (require_auth empty) pass through unchanged.
 	// Auth is evaluated through the SQL surface (quackapi_verify_auth), the
@@ -3064,6 +3155,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		auto mode = ResponseModeFor(data_names);
 
+		// 0-row EMPTY STATUS: override success STATUS (any FORMAT / html/text).
+		if (rows.empty() && match.route.empty_status != 0) {
+			SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
+			finish();
+			return;
+		}
+
 		// No data columns: empty body (redirect / cookie-only responses).
 		if (data_cols.empty()) {
 			res.status = match.route.status;
@@ -3093,7 +3191,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		// Serialize rows: json array | ndjson | csv | parquet | arrow (FORMAT + Accept).
+		const bool object_envelope =
+		    StringUtil::Lower(match.route.response_envelope.empty() ? "array" : match.route.response_envelope) ==
+		    "object";
+
+		// Serialize rows: json array | json object | ndjson | csv | parquet | arrow.
 		string body;
 		const char *content_type = "application/json";
 		if (body_format == BodyFormat::NDJSON) {
@@ -3109,6 +3211,23 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			body = SerializeRowsArrow(con, names, result->types, data_cols, rows);
 			// nanoarrow FORMAT ARROWS produces IPC *stream* (0xFFFFFFFF magic).
 			content_type = "application/vnd.apache.arrow.stream";
+		} else if (object_envelope) {
+			if (rows.size() > 1) {
+				SetJson(res, 500,
+				        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(rows.size()) +
+				            "\"}");
+				finish();
+				return;
+			}
+			if (rows.empty()) {
+				// No EMPTY STATUS → JSON null (array default remains []).
+				body = "null";
+			} else {
+				body = SerializeRowJsonObject(names, data_cols, rows[0]);
+			}
+			SetJson(res, match.route.status, body);
+			finish();
+			return;
 		} else {
 			body = SerializeRowsJsonArray(names, data_cols, rows);
 			SetJson(res, match.route.status, body);
@@ -3157,6 +3276,31 @@ QuackapiHttpServer::~QuackapiHttpServer() {
 	try {
 		Close();
 	} catch (std::exception &) {
+	}
+}
+
+bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_ms) {
+	if (port < 1 || port > 65535 || host.empty()) {
+		return false;
+	}
+	if (connect_timeout_ms < 0) {
+		connect_timeout_ms = 0;
+	}
+	const time_t sec = static_cast<time_t>(connect_timeout_ms / 1000);
+	const time_t usec = static_cast<time_t>((connect_timeout_ms % 1000) * 1000);
+	try {
+		duckdb_httplib::Client cli(host, port);
+		cli.set_connection_timeout(sec, usec);
+		cli.set_read_timeout(1, 0);
+		cli.set_write_timeout(1, 0);
+		cli.set_tcp_nodelay(true);
+		// Any completed HTTP exchange (including 404) means the listener accepts.
+		auto res = cli.Get("/");
+		auto err = res.error();
+		return err == duckdb_httplib::Error::Success || err == duckdb_httplib::Error::Read ||
+		       err == duckdb_httplib::Error::Write;
+	} catch (...) {
+		return false;
 	}
 }
 

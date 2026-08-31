@@ -81,7 +81,7 @@ classes: MATCH 88, STRONGER 1, BUG 0
 
 | Topic | quackapi | FastAPI | Why |
 |-------|----------|---------|-----|
-| Response envelope | Always JSON **array of rows** for multi-column handlers | Often a bare object for one dict | SQL result-set semantics |
+| Response envelope | Default JSON **array of rows**; `ENVELOPE object` opt-in | Often a bare object for one dict | SQL result-set default; object mode available |
 | CORS default | Off until configured | Off until middleware | Same opt-in spirit |
 | Query vs body `loc` | Missing params use `query` when no body model field path applies | Body models use `body` | SQL `$param` surface; JSON body still uses `loc=["body",…]` when fields come from the body |
 

@@ -443,6 +443,27 @@ void QuackapiState::StopAllServers() {
 	}
 }
 
+bool QuackapiState::HasServerOnPort(int port) {
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	for (auto &kv : servers) {
+		if (kv.second->Port() == port) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool QuackapiState::GetServerHost(int port, string &host_out) {
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	for (auto &kv : servers) {
+		if (kv.second->Port() == port) {
+			host_out = kv.second->Host();
+			return true;
+		}
+	}
+	return false;
+}
+
 vector<std::tuple<string, int, string, string>> QuackapiState::ListServers() {
 	std::lock_guard<std::mutex> lock(servers_mutex);
 	vector<std::tuple<string, int, string, string>> result;

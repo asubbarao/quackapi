@@ -80,7 +80,7 @@ bash test/http/run_all.sh
 
 | Divergence | quackapi | FastAPI | Justification |
 |------------|----------|---------|---------------|
-| **Response envelope** | Always JSON **array of row objects** (`[{"status":"ok"}]`) | Often a bare object for a single dict | SQL result set semantics; scorecard matches on fields + status |
+| **Response envelope** | Default JSON **array of row objects** (`[{"status":"ok"}]`); opt-in `ENVELOPE object` (+ `EMPTY STATUS`) for bare objects / 404 | Often a bare object for a single dict | SQL result-set default; object mode closes FastAPI-shaped singleton routes |
 | **Query vs body loc** | Missing query-bound fields use `loc=["query", name]` when the client did not send a JSON body model | Body models use `loc=["body", name]` | Surface is SQL `$param` binding; JSON body still uses `loc=["body", …]` when fields come from the body |
 | **CORS default** | CORS **off** until `SET quackapi_cors_origins` / serve `cors_origins` | Same — CORS is middleware opt-in | Documented; OPTIONS 405 without CORS matches FastAPI |
 

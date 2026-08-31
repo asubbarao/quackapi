@@ -107,6 +107,8 @@ SELECT * FROM quackapi_stop();
 | Handler shape | Response |
 |---------------|----------|
 | Multiple columns (default) | `application/json` **array of objects** |
+| `ENVELOPE object` (FORMAT json) | bare **JSON object** (exactly one row); 0 rows → `null` unless `EMPTY STATUS` |
+| `EMPTY STATUS <n> [BODY '…']` | 0-row result → that status (default body `{"detail":"Not Found"}`) |
 | Single column named `html` | `text/html; charset=utf-8` raw body |
 | Single column named `text` | `text/plain; charset=utf-8` raw body |
 | Column `location` (+ `STATUS 3xx`) | redirect (`Location` header) |
@@ -122,6 +124,14 @@ SELECT 'world' AS msg, 42 AS n, true AS ok, NULL::INTEGER AS missing;
 ```sh
 curl http://127.0.0.1:8000/json
 # [{"msg":"world","n":42,"ok":true,"missing":null}]
+```
+
+Single-row object (opt-in; array remains the default):
+
+```sql
+CREATE ROUTE health GET '/api/health' ENVELOPE object AS
+SELECT 'ok' AS status;
+-- → {"status":"ok"}
 ```
 
 ### Live registry

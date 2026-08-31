@@ -32,6 +32,10 @@ CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
 CREATE ROUTE item  GET '/items/:id' AS SELECT $id::INTEGER AS id;
 
 SELECT * FROM quackapi_serve(8000);
+-- returns immediately; pass block := true to hold until stop / SIGINT / SIGTERM
+
+-- Readiness (replaces sleep/lsof/curl loops):
+-- SELECT ready, listen_url FROM quackapi_wait(8000, 5000);
 ```
 
 ```sh
@@ -198,7 +202,8 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', …)` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', block := false, …)` | `listen_url` |
+| `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
@@ -411,8 +416,10 @@ LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 
 ## Behavior notes
 
-- **Response envelope:** always a JSON array of row objects for multi-column /
-  non-`html`/`text` handlers (SQL result-set semantics — not a bare object).
+- **Response envelope:** default is a JSON **array** of row objects for
+  multi-column / non-`html`/`text` handlers. Opt in with `ENVELOPE object`
+  for a bare JSON object (exactly one row) and `EMPTY STATUS 404` for 0-row
+  → HTTP 404 instead of `[]` / `null`.
 - **CORS:** off by default; enable with `cors_origins` / `SET quackapi_cors_origins`.
 - **Registry lifecycle:** routes, auth schemes, groups, queues, streams live on
   the **database instance** (not the catalog). Re-run DDL after reopen.

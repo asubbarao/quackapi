@@ -13,10 +13,14 @@ CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
   [STATUS <n>]
   [REQUIRE <auth>]
   [FORMAT json|ndjson|csv|parquet|arrow]
+  [ENVELOPE array|object]
+  [EMPTY STATUS <n> [BODY '<json>']]
+  [TIMEOUT <n>|'30s'|'5m'|'1h']
   [GROUP <group> | IN GROUP <group>]
   [BODY SCHEMA '<json-schema>']
   [PARAM <name> [<type>] [HEADER|COOKIE|QUERY [wire-name]]
          [DEFAULT <lit>] [GE|GT|LE|LT <n>] [MIN_LENGTH|MAX_LENGTH <n>] …]
+  [WITH (timeout_sec [=|:=] <n>|'30s')]
   AS <select-or-dml>;
 
 DROP ROUTE <name>;
@@ -29,6 +33,9 @@ DROP ROUTE <name>;
 | **STATUS** | Integer 100–599. Default 200 |
 | **REQUIRE** | Auth scheme name (checked at request time) |
 | **FORMAT** | Response body for row data: `json` (default, array of objects), `ndjson` (`application/x-ndjson`), `csv` (`text/csv`), `parquet` (`application/vnd.apache.parquet` file bytes, magic `PAR1`), `arrow` (Arrow IPC stream via community `nanoarrow` `FORMAT ARROWS`, `application/vnd.apache.arrow.stream`, magic `0xFFFFFFFF`). Explicit `ndjson`/`csv`/`parquet`/`arrow` win over `Accept`; default/`json` allows Accept negotiation (`application/x-ndjson`, `application/jsonl`, `text/csv`, `application/vnd.apache.parquet`, `application/parquet`, `application/vnd.apache.arrow.stream`, `application/vnd.apache.arrow.file`). Column modes `html`/`text` still win. |
+| **ENVELOPE** | JSON shape for `FORMAT json`: `array` (default, `[{…}]`) or `object` (exactly one row → `{…}`; 0 rows → `null` unless `EMPTY STATUS`; >1 rows → 500). Only valid with `FORMAT json`. OpenAPI advertises `type: object` when set. |
+| **EMPTY STATUS** | When the handler returns **0 rows**, respond with this HTTP status instead of success `STATUS` + `[]`/`null`. Optional `BODY '<json>'` (default `{"detail":"Not Found"}`). Works with array or object envelope. Listed in OpenAPI responses. |
+| **TIMEOUT** / **WITH (timeout_sec)** | Per-request httplib socket read/write deadline in seconds (also `'30s'` / `'5m'` / `'1h'`, max 24h). Default omit/`0` = serve defaults (`quackapi_serve` `read_timeout_sec`/`write_timeout_sec`, usually 30). When set, the matched request extends `SocketStream` select timeouts and `SO_RCVTIMEO`/`SO_SNDTIMEO` on that connection through handler + response write. Synonyms: `TIMEOUT 180` or `WITH (timeout_sec := 180)`. |
 | **GROUP / IN GROUP** | Join group prefix + inherit auth/tags |
 | **BODY SCHEMA** | Quoted JSON Schema string; may appear before or after PARAM |
 | **PARAM** | Zero or more. Types: INTEGER/INT, BIGINT, VARCHAR/TEXT/STRING, BOOLEAN/BOOL, DOUBLE, FLOAT/REAL, HUGEINT, UBIGINT, UINTEGER |
@@ -41,6 +48,31 @@ CREATE ROUTE item GET '/items/:id'
   PARAM pretty BOOLEAN DEFAULT false
   AS
 SELECT $id::INTEGER AS id, $pretty AS pretty;
+```
+
+**Object envelope + empty → 404:**
+
+```sql
+CREATE ROUTE health GET '/api/health'
+  ENVELOPE object
+  AS SELECT 'ok' AS status, 'sd-shelf' AS service;
+-- GET → {"status":"ok","service":"sd-shelf"}
+
+CREATE ROUTE get_doc GET '/documents/:id'
+  ENVELOPE object
+  EMPTY STATUS 404 BODY '{"detail":"Not Found"}'
+  AS SELECT * FROM documents WHERE id = $id::INTEGER;
+-- 1 row → {…}; 0 rows → 404 {"detail":"Not Found"}
+```
+
+**Long-running handler (extends socket IO past the serve default):**
+
+```sql
+CREATE ROUTE chrome_exhaust POST '/chrome/exhaust'
+  PARAM url_prefix VARCHAR
+  WITH (timeout_sec := 180)
+  AS SELECT chrome_exhaust($url_prefix) AS result;
+-- equivalent: … TIMEOUT 180 AS SELECT …
 ```
 
 **Response control columns:** `html`, `text`, `location`, `set_cookie` / `set-cookie` — see [headers guide](../guide/headers-cookies-redirects.md).
