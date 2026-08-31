@@ -60,28 +60,43 @@ CREATE ROUTE bad2 GET '/bad2' WITH (timeout_sec := 180, response := 'json') AS S
 ----
 Unknown WITH option
 
-# --- Live HTTP: handler slower than serve default IO timeout still completes --
-# Serve with 1s read/write deadlines. Route opts into 10s. Handler sleeps 2s.
+# --- Live HTTP: control/treatment via client stall (not handler sleep) --------
+# ApplyRouteIoTimeout raises httplib socket write deadlines. A compute-bound
+# handler never stalls the socket, so sleep_ms cannot prove the feature.
+# Observable difference: large body + client that sends then waits before
+# reading (quackapi_fetch stall_ms). Serve write_timeout_sec short; stall longer.
+# Control (no opt-in) truncates/fails; treatment (timeout_sec) completes.
+
 statement ok
-CREATE OR REPLACE ROUTE slow_ok GET '/slow-ok'
-  WITH (timeout_sec := 10)
-  AS SELECT 'done' AS msg FROM (SELECT sleep_ms(2000)) s;
+CREATE OR REPLACE ROUTE big_default GET '/big-default' AS
+  SELECT repeat('x', 10000000) AS payload;
+
+statement ok
+CREATE OR REPLACE ROUTE big_optin GET '/big-optin'
+  WITH (timeout_sec := 30)
+  AS SELECT repeat('x', 10000000) AS payload;
 
 query I
 SELECT * FROM quackapi_serve(29350, host := '127.0.0.1', access_log := false,
-                             read_timeout_sec := 1, write_timeout_sec := 1);
+                             read_timeout_sec := 2, write_timeout_sec := 2,
+                             compression := false);
 ----
 http://127.0.0.1:29350
 
+# Expected complete JSON body length: [{"payload":"<10M x>"}] = 10_000_014
+# Control: stall 6s > write_timeout 2s → truncated or failed (body shorter).
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29350/slow-ok')).status;
+SELECT length(body) < 10000014 AS truncated_or_short
+FROM quackapi_fetch('http://127.0.0.1:29350/big-default', stall_ms := 6000);
 ----
-200
+true
 
+# Treatment: per-route timeout_sec := 30 covers the stall → full body.
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29350/slow-ok')).body;
+SELECT length(body) >= 10000014 AS complete
+FROM quackapi_fetch('http://127.0.0.1:29350/big-optin', stall_ms := 6000);
 ----
-[{"msg":"done"}]
+true
 
 query I
 SELECT * FROM quackapi_stop(29350);
