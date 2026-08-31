@@ -648,6 +648,80 @@ void PoolExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	output.SetCardinality(row);
 }
 
+//! Concurrent GETs — the seam SQLLogic needs for claim-race / fan-out tests.
+//! `FROM range(n)` around scalar quackapi_fetch constant-folds to one request;
+//! this table function fires n real threads and returns one row per attempt.
+struct ParallelFetchBindData : public TableFunctionData {
+	string url;
+	int32_t n = 1;
+};
+
+struct ParallelFetchRow {
+	int32_t idx = 0;
+	int32_t status = 0;
+	string body;
+	string error;
+};
+
+struct ParallelFetchGlobalState : public GlobalTableFunctionState {
+	vector<ParallelFetchRow> rows;
+	idx_t offset = 0;
+};
+
+unique_ptr<FunctionData> ParallelFetchBind(ClientContext &, TableFunctionBindInput &input,
+                                           vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind = make_uniq<ParallelFetchBindData>();
+	bind->url = input.inputs[0].GetValue<string>();
+	bind->n = input.inputs[1].GetValue<int32_t>();
+	if (bind->n < 1) {
+		throw InvalidInputException("quackapi_parallel_fetch: n must be >= 1");
+	}
+	if (bind->n > 256) {
+		throw InvalidInputException("quackapi_parallel_fetch: n max is 256");
+	}
+	names = {"idx", "status", "body", "error"};
+	return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> ParallelFetchInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<ParallelFetchBindData>();
+	auto state = make_uniq<ParallelFetchGlobalState>();
+	state->rows.resize(NumericCast<idx_t>(bind.n));
+	auto &db = *context.db;
+	vector<std::thread> threads;
+	threads.reserve(NumericCast<idx_t>(bind.n));
+	for (int32_t i = 0; i < bind.n; i++) {
+		threads.emplace_back([&db, &bind, &state, i]() {
+			auto res = QuackapiHttpFetch::Get(db, bind.url);
+			auto &row = state->rows[NumericCast<idx_t>(i)];
+			row.idx = i;
+			row.status = static_cast<int32_t>(res.status);
+			row.body = std::move(res.body);
+			row.error = std::move(res.request_error);
+		});
+	}
+	for (auto &t : threads) {
+		t.join();
+	}
+	return std::move(state);
+}
+
+void ParallelFetchExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+	auto &state = data_p.global_state->Cast<ParallelFetchGlobalState>();
+	idx_t row = 0;
+	while (state.offset < state.rows.size() && row < STANDARD_VECTOR_SIZE) {
+		auto &r = state.rows[state.offset];
+		output.SetValue(0, row, Value::INTEGER(r.idx));
+		output.SetValue(1, row, Value::INTEGER(r.status));
+		output.SetValue(2, row, Value(r.body));
+		output.SetValue(3, row, r.error.empty() ? Value(LogicalType::VARCHAR) : Value(r.error));
+		row++;
+		state.offset++;
+	}
+	output.SetCardinality(row);
+}
+
 } // namespace
 
 void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
@@ -739,6 +813,10 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(post_set);
 
 	loader.RegisterFunction(TableFunction("quackapi_http_pool", {}, PoolExec, PoolBind, PoolInit));
+
+	TableFunction parallel_fetch("quackapi_parallel_fetch", {LogicalType::VARCHAR, LogicalType::INTEGER},
+	                             ParallelFetchExec, ParallelFetchBind, ParallelFetchInit);
+	loader.RegisterFunction(parallel_fetch);
 }
 
 } // namespace duckdb
