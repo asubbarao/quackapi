@@ -9,14 +9,22 @@
 # Tag push (v*) attaches artifacts to the GitHub Release.
 #
 name: Main Extension Distribution Pipeline
+# Feature branches are covered by `pull_request`. Building them again on
+# `push` doubled every run (5 platforms x2) and mailed two failures per
+# mistake, so `push` is limited to main and release tags.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
+# The group deliberately omits `github.sha`: including it made every commit
+# its own group, so nothing ever superseded anything and stale runs raced
+# their own fixups to completion.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   duckdb-stable-build:
