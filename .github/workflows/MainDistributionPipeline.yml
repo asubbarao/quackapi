@@ -9,24 +9,38 @@
 # Tag push (v*) attaches artifacts to the GitHub Release.
 #
 name: Main Extension Distribution Pipeline
+# Feature branches are covered by `pull_request`. Building them again on
+# `push` doubled every run (5 platforms x2) and mailed two failures per
+# mistake, so `push` is limited to main and release tags.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
+# The group deliberately omits `github.sha`: including it made every commit
+# its own group, so nothing ever superseded anything and stale runs raced
+# their own fixups to completion.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    # Pin workflow+ci-tools to a main SHA that exposes the `runners` input
+    # (absent on v1.5-variegata). windows-latest currently resolves to
+    # windows-2025-vs2026; MSVC 14.51 dropped stdext::checked_array_iterator
+    # and breaks DuckDB's vendored fmt (format.h C2653). Keep shipping
+    # windows_amd64 on VS 2022.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@26d4b617b6957ce2283a48294d18c5f9581ac456
     with:
       duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: 26d4b617b6957ce2283a48294d18c5f9581ac456
       extension_name: quackapi
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
+      runners: '{"windows_x64":"windows-2022"}'
 
   code-quality-check:
     name: Code Quality Check
