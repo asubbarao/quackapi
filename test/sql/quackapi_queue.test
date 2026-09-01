@@ -152,9 +152,32 @@ SELECT decode(body) FROM quackapi_request('GET', '/q/stats?t=4');
 
 # ---------------------------------------------------------------------------
 # Concurrent dequeue: one message → exactly one winner across parallel GETs
+#
+# Uses its own queue with a visibility timeout far longer than the storm can
+# take. The `jobs` queue above is deliberately 1s so the tests before this one
+# can exercise lease lapse + redelivery — but redelivery after an expired lease
+# is CORRECT queue behavior, so reusing `jobs` here made this test assert
+# "the 8-request storm finishes within 1s", a wall-clock property CI cannot
+# guarantee. On a loaded runner the lease lapsed mid-storm and a second
+# claimant legitimately won job 3 (attempts 1 then 2 -> winner_ids [3,3]).
+# A long lease isolates the property actually under test: exclusive claim.
 # ---------------------------------------------------------------------------
+query I
+CREATE QUEUE race WITH (max_attempts=3, visibility_timeout='300s', backoff_base_seconds=0);
+----
+Queue race: max_attempts=3 visibility_timeout=300s
+
+statement ok
+CREATE ROUTE q_rclaim GET '/q/rclaim' AS
+  SELECT id, payload, status, attempts FROM quackapi_dequeue('race', 1)
+  WHERE $t::INT >= 0;
+
+statement ok
+CREATE ROUTE q_renq POST '/q/renq' AS
+  SELECT quackapi_enqueue('race', $payload::VARCHAR) AS job_id;
+
 query II
-SELECT status, decode(body) FROM quackapi_request('POST', '/q/enq', '{"payload":"{\"task\":\"race\"}"}');
+SELECT status, decode(body) FROM quackapi_request('POST', '/q/renq', '{"payload":"{\"task\":\"race\"}"}');
 ----
 200	[{"job_id":3}]
 
@@ -169,7 +192,7 @@ SELECT list(json_extract(body::JSON, '$[0].id')::BIGINT)
          FILTER (WHERE status = 200 AND body != '[]') AS winner_ids,
        bool_and(status = 200 AND error IS NULL) AS all_ok,
        len(list(idx) FILTER (WHERE body = '[]')) AS empty_n
-FROM quackapi_parallel_fetch('http://127.0.0.1:29270/q/claim?t=9', 8);
+FROM quackapi_parallel_fetch('http://127.0.0.1:29270/q/rclaim?t=9', 8);
 ----
 [3]	true	7
 
