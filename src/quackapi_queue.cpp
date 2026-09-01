@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -526,65 +527,92 @@ unique_ptr<FunctionData> DequeueBind(ClientContext &, TableFunctionBindInput &in
 	return std::move(bind_data);
 }
 
+bool HasLiveLocalLease(unordered_map<string, unordered_map<int64_t, int64_t>> &leases, const string &queue_name,
+                       int64_t now_micros) {
+	auto it = leases.find(queue_name);
+	if (it == leases.end()) {
+		return false;
+	}
+	for (auto jit = it->second.begin(); jit != it->second.end();) {
+		if (jit->second > now_micros) {
+			++jit;
+		} else {
+			jit = it->second.erase(jit);
+		}
+	}
+	if (it->second.empty()) {
+		leases.erase(it);
+		return false;
+	}
+	return true;
+}
+
+unique_ptr<MaterializedQueryResult> ClaimPendingJob(Connection &con, const string &queue_name,
+                                                    int32_t visibility_timeout_sec) {
+	string sql =
+	    StringUtil::Format("UPDATE quackapi_jobs SET "
+	                       "status = 'running', "
+	                       "attempts = attempts + 1, "
+	                       "visible_at = now()::TIMESTAMP + to_seconds(%d), "
+	                       "updated_at = now()::TIMESTAMP, "
+	                       "worker_id = 'dequeue' "
+	                       "WHERE id = ("
+	                       "  SELECT id FROM quackapi_jobs "
+	                       "  WHERE queue = %s "
+	                       "    AND status = 'pending' "
+	                       "    AND visible_at <= now()::TIMESTAMP "
+	                       "  ORDER BY id LIMIT 1"
+	                       ") "
+	                       "AND status = 'pending' "
+	                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error",
+	                       visibility_timeout_sec, SqlQuote(queue_name));
+	unique_ptr<MaterializedQueryResult> res;
+	for (int attempt = 0; attempt < 8; attempt++) {
+		res = con.Query(sql);
+		if (!res->HasError()) {
+			return res;
+		}
+		const string &err = res->GetError();
+		// Concurrent claim on the same tuple — retry; do not surface 422 Conflict.
+		if (StringUtil::Contains(err, "Conflict")) {
+			continue;
+		}
+		CheckQuery(res, "dequeue");
+	}
+	CheckQuery(res, "dequeue");
+	return res;
+}
+
 unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<DequeueBindData>();
 	auto state = make_uniq<DequeueGlobalState>();
 	auto q = RequireQueue(*context.db, bind.queue_name);
 	EnsureQuackapiJobsTable(*context.db);
 
-	// Serialize claims in-process. DuckDB's UPDATE…RETURNING is not a reliable
-	// exclusive lease under contention: outer status IN ('pending','running')
-	// still matches a row another worker just claimed (only visible_at excludes
-	// it), and now() is transaction-start time, so losers can pass the lease
-	// check or both UPDATEs commit. Mutex + pending-only CAS → one winner.
-	static std::mutex dequeue_claim_mutex;
-	std::lock_guard<std::mutex> claim_lock(dequeue_claim_mutex);
+	// Gate lives on QuackapiState (one per DatabaseInstance) so static and
+	// loadable extension copies share the same mutex + lease map.
+	auto &qa = QuackapiState::Get(*context.db);
+	std::lock_guard<std::mutex> claim_lock(qa.DequeueClaimMutex());
+	auto &leases = qa.DequeueLeases();
 
 	Connection con(*context.db);
 	for (int32_t i = 0; i < bind.n; i++) {
-		// Expired leases become pending again, then only pending is claimable.
-		string sweep_sql =
-		    StringUtil::Format("UPDATE quackapi_jobs SET status = 'pending', worker_id = NULL, "
-		                       "updated_at = now()::TIMESTAMP "
-		                       "WHERE queue = %s AND status = 'running' AND visible_at <= now()::TIMESTAMP",
-		                       SqlQuote(bind.queue_name));
-		auto sweep = con.Query(sweep_sql);
-		CheckQuery(sweep, "dequeue-sweep");
+		const int64_t now_micros = Timestamp::GetCurrentTimestamp().value;
+		const bool live_lease = HasLiveLocalLease(leases, bind.queue_name, now_micros);
 
-		string sql =
-		    StringUtil::Format("UPDATE quackapi_jobs SET "
-		                       "status = 'running', "
-		                       "attempts = attempts + 1, "
-		                       "visible_at = now()::TIMESTAMP + to_seconds(%d), "
-		                       "updated_at = now()::TIMESTAMP, "
-		                       "worker_id = 'dequeue' "
-		                       "WHERE id = ("
-		                       "  SELECT id FROM quackapi_jobs "
-		                       "  WHERE queue = %s "
-		                       "    AND status = 'pending' "
-		                       "    AND visible_at <= now()::TIMESTAMP "
-		                       "  ORDER BY id LIMIT 1"
-		                       ") "
-		                       "AND status = 'pending' "
-		                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error",
-		                       q.visibility_timeout_sec, SqlQuote(bind.queue_name));
-		unique_ptr<MaterializedQueryResult> res;
-		bool claimed = false;
-		for (int attempt = 0; attempt < 8; attempt++) {
-			res = con.Query(sql);
-			if (!res->HasError()) {
-				claimed = true;
-				break;
-			}
-			const string &err = res->GetError();
-			// Concurrent claim on the same tuple — retry; do not surface 422 Conflict.
-			if (StringUtil::Contains(err, "Conflict")) {
-				continue;
-			}
-			CheckQuery(res, "dequeue");
-		}
-		if (!claimed) {
-			CheckQuery(res, "dequeue");
+		// Pending-only claim first. While an in-process lease is live, do NOT
+		// sweep: a visibility-window reclaim mid claim-storm is what produces
+		// winner_ids=[3,3] under the mutex (attempts 1 then 2).
+		auto res = ClaimPendingJob(con, bind.queue_name, q.visibility_timeout_sec);
+		if (res->RowCount() == 0 && !live_lease) {
+			string sweep_sql =
+			    StringUtil::Format("UPDATE quackapi_jobs SET status = 'pending', worker_id = NULL, "
+			                       "updated_at = now()::TIMESTAMP "
+			                       "WHERE queue = %s AND status = 'running' AND visible_at <= now()::TIMESTAMP",
+			                       SqlQuote(bind.queue_name));
+			auto sweep = con.Query(sweep_sql);
+			CheckQuery(sweep, "dequeue-sweep");
+			res = ClaimPendingJob(con, bind.queue_name, q.visibility_timeout_sec);
 		}
 		if (res->RowCount() == 0) {
 			break;
@@ -593,6 +621,9 @@ unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFu
 		for (idx_t c = 0; c < 8; c++) {
 			row.push_back(res->GetValue(c, 0));
 		}
+		const int64_t job_id = row[0].GetValue<int64_t>();
+		leases[bind.queue_name][job_id] =
+		    Timestamp::GetCurrentTimestamp().value + int64_t(q.visibility_timeout_sec) * 1000000LL;
 		state->rows.push_back(std::move(row));
 	}
 	return std::move(state);

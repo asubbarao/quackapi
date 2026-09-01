@@ -285,6 +285,13 @@ public:
 	//! Lookup by name. Returns false if not registered.
 	bool GetQueue(const string &name, QuackapiQueue &out);
 	vector<QuackapiQueue> SnapshotQueues();
+	//! Shared dequeue claim fence (mutex + lease map) for this database.
+	std::mutex &DequeueClaimMutex() {
+		return dequeue_claim_mutex;
+	}
+	unordered_map<string, unordered_map<int64_t, int64_t>> &DequeueLeases() {
+		return dequeue_leases;
+	}
 
 	//! Start serving on host:port. Throws if a server already listens there.
 	void StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
@@ -379,6 +386,12 @@ private:
 
 	std::mutex queues_mutex;
 	vector<QuackapiQueue> queues;
+	//! Serialize dequeue claims for this database. Function-local statics are
+	//! unsafe: static+loadable extension copies each get their own mutex/lease
+	//! map, so concurrent HTTP workers can bypass the fence.
+	std::mutex dequeue_claim_mutex;
+	//! queue -> job_id -> lease deadline (microseconds since epoch).
+	unordered_map<string, unordered_map<int64_t, int64_t>> dequeue_leases;
 
 	std::mutex policies_mutex;
 	vector<QuackapiRowAccessPolicy> row_access_policies;
