@@ -1,11 +1,11 @@
 # name: test/sql/quackapi_from_x_native.test
-# description: Native quack_from_* table functions — FastAPI fixture + embed drift
+# description: Native quack_from_* table functions — fixtures + embed drift
 # group: [sql]
 
 require quackapi
 
 # ---------------------------------------------------------------------------
-# Routes from committed fastapi_mini fixture (2 routes)
+# FastAPI — routes from committed fastapi_mini fixture (2 routes)
 # ---------------------------------------------------------------------------
 query III
 SELECT method, path, handler_name
@@ -16,7 +16,7 @@ GET	/articles/{slug}	get_article
 POST	/login	login
 
 # ---------------------------------------------------------------------------
-# Models: UserInLogin with 3 fields (2 required, 1 defaulted optional-ish)
+# FastAPI — models: UserInLogin with 3 fields (2 required, 1 defaulted)
 # ---------------------------------------------------------------------------
 query IIIII
 SELECT model_name, field_name, field_type, is_required, has_default
@@ -32,6 +32,81 @@ SELECT default_expr FROM quack_from_fastapi_models('bridges/from_x/fixtures/fast
 WHERE field_name = 'remember_me';
 ----
 False
+
+# ---------------------------------------------------------------------------
+# Rails — routes from committed rails_mini fixture (2 routes under /api)
+# ---------------------------------------------------------------------------
+query III
+SELECT method, path, handler_name
+FROM quack_from_rails('bridges/from_x/fixtures/rails_mini')
+ORDER BY method, path;
+----
+GET	/api/articles/:slug	articles#show
+POST	/api/login	sessions#create
+
+# ---------------------------------------------------------------------------
+# Rails — models: User validates (2 presence-required, 1 optional)
+# ---------------------------------------------------------------------------
+query IIIII
+SELECT model_name, field_name, field_type, is_required, has_default
+FROM quack_from_rails_models('bridges/from_x/fixtures/rails_mini')
+ORDER BY field_name;
+----
+User	email	presence	true	false
+User	password	presence	true	false
+User	remember_me	allow_blank,inclusion	false	false
+
+# ---------------------------------------------------------------------------
+# Express — routes from committed express_mini fixture (2 routes)
+# ---------------------------------------------------------------------------
+query III
+SELECT method, path, handler_name
+FROM quack_from_express('bridges/from_x/fixtures/express_mini')
+ORDER BY method, path;
+----
+GET	/articles/:slug	getArticle
+POST	/login	login
+
+# ---------------------------------------------------------------------------
+# Express — models: UserInLogin class (2 required, 1 defaulted)
+# ---------------------------------------------------------------------------
+query IIIII
+SELECT model_name, field_name, field_type, is_required, has_default
+FROM quack_from_express_models('bridges/from_x/fixtures/express_mini')
+ORDER BY field_line, field_name;
+----
+UserInLogin	email	string	true	false
+UserInLogin	password	string	true	false
+UserInLogin	remember_me	boolean	false	true
+
+query I
+SELECT default_expr FROM quack_from_express_models('bridges/from_x/fixtures/express_mini')
+WHERE field_name = 'remember_me';
+----
+false
+
+# ---------------------------------------------------------------------------
+# Gin — routes from committed gin_mini fixture (2 routes under /api)
+# ---------------------------------------------------------------------------
+query III
+SELECT method, path, handler_name
+FROM quack_from_gin('bridges/from_x/fixtures/gin_mini')
+ORDER BY method, path;
+----
+GET	/api/articles/:slug	GetArticle
+POST	/api/login	Login
+
+# ---------------------------------------------------------------------------
+# Gin — models: UserInLogin struct tags (2 required, 1 omitempty optional)
+# ---------------------------------------------------------------------------
+query IIIII
+SELECT model_name, field_name, field_type, is_required, has_default
+FROM quack_from_gin_models('bridges/from_x/fixtures/gin_mini')
+ORDER BY field_line, field_name;
+----
+UserInLogin	Email	string	true	false
+UserInLogin	Password	string	true	false
+UserInLogin	RememberMe	bool	false	false
 
 # ---------------------------------------------------------------------------
 # Embed drift: on-disk src/sql/*.sql must byte-match embedded constants.

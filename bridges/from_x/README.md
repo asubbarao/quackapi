@@ -50,7 +50,11 @@ byte-matches the embedded constants via `quack_from_x_sql(framework, kind)`.
 ```
 bridges/from_x/
 ├── README.md
-├── fixtures/fastapi_mini/app/main.py   committed fixture for tests
+├── fixtures/
+│   ├── fastapi_mini/   committed FastAPI fixture
+│   ├── rails_mini/     committed Rails fixture
+│   ├── express_mini/   committed Express fixture
+│   └── gin_mini/       committed Gin fixture
 └── docs/                               original proof reports
     ├── fromfast.md
     ├── rails_bridge.md
