@@ -1,8 +1,10 @@
 # name: test/sql/quackapi_auth.test
-# description: CREATE AUTH / DROP AUTH, API keys, REQUIRE clause, registry inspection
+# description: CREATE AUTH / DROP AUTH, API keys, REQUIRE enforcement via quackapi_request
 # group: [sql]
 
 require quackapi
+
+require json
 
 # ---------------------------------------------------------------------------
 # Registry starts empty
@@ -20,12 +22,6 @@ CREATE AUTH site AS API_KEY;
 ----
 Auth site: API_KEY
 
-query III
-SELECT name, kind, header FROM quackapi_auths() WHERE name = 'site';
-----
-site	API_KEY	X-API-Key
-
-# Only name/kind/header columns — secrets never projected
 query III
 SELECT name, kind, header FROM quackapi_auths() WHERE name = 'site';
 ----
@@ -90,40 +86,69 @@ SELECT * FROM quackapi_add_api_key('jwt_auth', 'k', 'bob');
 not an API_KEY
 
 # ---------------------------------------------------------------------------
-# CREATE ROUTE ... REQUIRE <auth> surfaces require_auth in quackapi_routes()
+# REQUIRE enforcement via quackapi_request (reject / accept)
 # ---------------------------------------------------------------------------
 query I
 CREATE ROUTE me GET '/me' REQUIRE site AS SELECT $claims_sub AS user;
 ----
 Route me: GET /me
 
+# No credentials → 401
 query II
-SELECT name, require_auth FROM quackapi_routes() WHERE name = 'me';
+SELECT status, decode(body) FROM quackapi_request('GET', '/me');
 ----
-me	site
+401	{"detail":"Not authenticated"}
 
-# Public route still has empty require_auth
+# Wrong key → 401
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/me',
+  headers := MAP {'X-API-Key': 'wrong-key'}
+);
+----
+401	{"detail":"Invalid authentication credentials"}
+
+# Valid key → 200 + subject claim
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/me',
+  headers := MAP {'X-API-Key': 'super-secret-key'}
+);
+----
+200	[{"user":"alice"}]
+
+# Public route still open without credentials
 query I
 CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
 ----
 Route hello: GET /hello
 
-query I
-SELECT CASE WHEN require_auth = '' THEN 'public' ELSE require_auth END
-FROM quackapi_routes() WHERE name = 'hello';
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/hello');
 ----
-public
+200	[{"msg":"world"}]
 
-# REQUIRE + STATUS both allowed
+# REQUIRE + STATUS both allowed; STATUS applies only on auth success
 query I
 CREATE ROUTE me2 GET '/me2' STATUS 201 REQUIRE site AS SELECT $claims_sub AS user;
 ----
 Route me2: GET /me2
 
-query II
-SELECT status, require_auth FROM quackapi_routes() WHERE name = 'me2';
+query I
+SELECT status FROM quackapi_request('GET', '/me2');
 ----
-201	site
+401
+
+query I
+SELECT status
+FROM quackapi_request(
+  'GET', '/me2',
+  headers := MAP {'X-API-Key': 'super-secret-key'}
+);
+----
+201
 
 # ---------------------------------------------------------------------------
 # CREATE OR REPLACE AUTH updates in place

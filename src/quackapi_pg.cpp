@@ -15,7 +15,6 @@ bool QuackapiTryPgNative(const string &, const string &, const case_insensitive_
 
 #include <libpq-fe.h>
 
-#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -23,13 +22,15 @@ namespace duckdb {
 namespace {
 
 // Thread-local connection: one PGconn per HTTP worker thread (psycopg-pool shape).
-// Prepared statements cached per thread (PQprepare once → PQexecPrepared).
+//
+// Do NOT cache PQprepare by SQL alone: the named statement embeds catalog OIDs
+// (domains, types, …). DROP + CREATE of the same name leaves a sticky dead OID
+// ("cache lookup failed for type") while the SQL text is unchanged. Mirror the
+// DuckDB handler path — reuse the connection, execute fresh each request.
 struct TlsPg {
 	string dsn;
 	PGconn *conn = nullptr;
 	string err;
-	unordered_map<string, string> prepared; // pg_sql → stmt name
-	idx_t prep_seq = 0;
 	~TlsPg() {
 		if (conn) {
 			PQfinish(conn);
@@ -41,8 +42,6 @@ struct TlsPg {
 			PQfinish(conn);
 			conn = nullptr;
 		}
-		prepared.clear();
-		prep_seq = 0;
 	}
 	PGconn *Get(const string &want_dsn) {
 		if (conn && dsn == want_dsn && PQstatus(conn) == CONNECTION_OK) {
@@ -58,36 +57,6 @@ struct TlsPg {
 			return nullptr;
 		}
 		return conn;
-	}
-	// Prepare-once execute. nparams must match SQL $1..$n.
-	PGresult *ExecPrepared(const string &pg_sql, int nparams, const char *const *vals) {
-		if (!conn) {
-			return nullptr;
-		}
-		string name;
-		auto it = prepared.find(pg_sql);
-		if (it == prepared.end()) {
-			if (prepared.size() >= 64) {
-				// Drop cache (PG keeps plans on conn; names collide only after Reset).
-				prepared.clear();
-			}
-			name = "qa" + std::to_string(prep_seq++);
-			PGresult *pr = PQprepare(conn, name.c_str(), pg_sql.c_str(), nparams, nullptr);
-			if (!pr || PQresultStatus(pr) != PGRES_COMMAND_OK) {
-				if (pr) {
-					err = PQresultErrorMessage(pr);
-					PQclear(pr);
-				} else {
-					err = "PQprepare null";
-				}
-				return nullptr;
-			}
-			PQclear(pr);
-			prepared.emplace(pg_sql, name);
-		} else {
-			name = it->second;
-		}
-		return PQexecPrepared(conn, name.c_str(), nparams, vals, nullptr, nullptr, 0);
 	}
 };
 
@@ -271,16 +240,17 @@ bool QuackapiTryPgNative(const string &dsn, const string &handler_sql,
 		storage.push_back(it->second.second);
 		vals.push_back(storage.back().c_str());
 	}
-	PGresult *res = tls.ExecPrepared(pg_sql, (int)vals.size(), vals.data());
+	// Fresh parse/bind each request (PQexecParams). A SQL-keyed PQprepare cache
+	// would stick to dropped catalog OIDs after CREATE OR REPLACE / DROP+CREATE.
+	PGresult *res = PQexecParams(conn, pg_sql.c_str(), (int)vals.size(), nullptr, vals.data(), nullptr, nullptr, 0);
 	if (!res) {
-		err_out = tls.err.empty() ? string("PQexecPrepared null") : tls.err;
+		err_out = string("PQexecParams null");
 		return false;
 	}
 	auto status = PQresultStatus(res);
 	if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
 		err_out = PQresultErrorMessage(res);
 		PQclear(res);
-		// drop dead connection + prepared cache
 		if (PQstatus(conn) != CONNECTION_OK) {
 			tls.Reset();
 		}

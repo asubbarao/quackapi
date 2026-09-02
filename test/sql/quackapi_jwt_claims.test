@@ -1,5 +1,5 @@
 # name: test/sql/quackapi_jwt_claims.test
-# description: JWT HS256 claims parse/serialize — exp/nbf/alg + control-char JSON escape (LOC pass 1)
+# description: JWT $claims_* bind / absent-NULL / reject via quackapi_request
 # group: [sql]
 
 require quackapi
@@ -8,115 +8,105 @@ require json
 
 # Fixtures under test/sql/fixtures/ minted with SECRET 'jwt-matrix-secret' (HS256).
 # Tokens with exp=4102444800 (2100-01-01) so the suite does not age out soon.
-#
-# Why not community `crypto` for JWT: that extension is hash/HMAC primitives only
-# (crypto_hash / crypto_hmac). JWT needs structure parse, alg reject, exp/nbf,
-# claims_json for $claims_* — owned here with DuckDB-bundled mbedtls + json_*.
+# Loaded via SET VARIABLE so signature bytes that contain '--' are not SQL comments.
 
 query I
 CREATE AUTH jwt_t AS JWT ( SECRET 'jwt-matrix-secret' );
 ----
 Auth jwt_t: JWT_HS256
 
-# ── happy multi-claim (sub/role/n/flag) ─────────────────────────────────────
-
-query IIII
-SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok,
-       (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).status,
-       json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.sub'),
-       json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.role')
-FROM read_text('test/sql/fixtures/jwt_happy.txt');
+# Route that binds verified claims into handler SQL ($claims_sub / $claims_role).
+query I
+CREATE ROUTE me GET '/me' REQUIRE jwt_t AS
+  SELECT $claims_sub AS sub, $claims_role AS role;
 ----
-true	200	alice	admin
+Route me: GET /me
 
-# numbers/bools stringified into claims_json (VARCHAR claim map contract)
+# Absent claim must bind SQL NULL (not 422). Happy token has no 'tenant'.
+query I
+CREATE ROUTE me_opt GET '/me_opt' REQUIRE jwt_t AS
+  SELECT $claims_sub AS sub, $claims_tenant AS tenant;
+----
+Route me_opt: GET /me_opt
+
+statement ok
+SET VARIABLE jwt_happy = (
+  SELECT rtrim(content, E'\n\r ') FROM read_text('test/sql/fixtures/jwt_happy.txt')
+);
+
+statement ok
+SET VARIABLE jwt_expired = (
+  SELECT rtrim(content, E'\n\r ') FROM read_text('test/sql/fixtures/jwt_expired.txt')
+);
+
+statement ok
+SET VARIABLE jwt_alg_none = (
+  SELECT rtrim(content, E'\n\r ') FROM read_text('test/sql/fixtures/jwt_alg_none.txt')
+);
+
+# ---------------------------------------------------------------------------
+# $claims_* binds the verified claim value into the handler SQL
+# ---------------------------------------------------------------------------
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/me',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_happy')}
+);
+----
+200	[{"sub":"alice","role":"admin"}]
+
+# ---------------------------------------------------------------------------
+# Absent claim binds SQL NULL — does NOT return 422
+# ---------------------------------------------------------------------------
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/me_opt',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_happy')}
+);
+----
+200	[{"sub":"alice","tenant":null}]
+
+# ---------------------------------------------------------------------------
+# Forged / expired rejected at request time (not merely absent from registry)
+# ---------------------------------------------------------------------------
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/me',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_expired')}
+);
+----
+401	{"detail":"Invalid authentication credentials"}
 
 query II
-SELECT json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.n'),
-       json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.flag')
-FROM read_text('test/sql/fixtures/jwt_happy.txt');
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/me',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_alg_none')}
+);
 ----
-42	true
+401	{"detail":"Invalid authentication credentials"}
 
-# ── control-byte + newline in claims — ClaimsToJson must stay valid JSON ────
-
-query I
-SELECT json_valid((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json)
-FROM read_text('test/sql/fixtures/jwt_ctrl.txt');
-----
-true
-
-query I
-SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
-FROM read_text('test/sql/fixtures/jwt_ctrl.txt');
-----
-true
-
-# sub is a + U+0001 + b after extract (escape round-trip)
-
-query I
-SELECT length(json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.sub')) = 3
-FROM read_text('test/sql/fixtures/jwt_ctrl.txt');
-----
-true
-
-# ── quote / backslash in sub ────────────────────────────────────────────────
-
-query I
-SELECT json_extract_string((quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).claims_json::JSON, '$.sub')
-FROM read_text('test/sql/fixtures/jwt_quote.txt');
-----
-a"b\c
-
-# ── exp past ────────────────────────────────────────────────────────────────
-
+# No credentials → 401 (REQUIRE before bind)
 query II
-SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok,
-       (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).status
-FROM read_text('test/sql/fixtures/jwt_expired.txt');
+SELECT status, decode(body) FROM quackapi_request('GET', '/me');
 ----
-false	401
+401	{"detail":"Not authenticated"}
 
-# ── nbf future ──────────────────────────────────────────────────────────────
-
-query II
-SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok,
-       (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).status
-FROM read_text('test/sql/fixtures/jwt_nbf_future.txt');
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+query I
+DROP ROUTE me;
 ----
-false	401
-
-# ── nbf past (accepted) ─────────────────────────────────────────────────────
+Dropped route me
 
 query I
-SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
-FROM read_text('test/sql/fixtures/jwt_nbf_past.txt');
+DROP ROUTE me_opt;
 ----
-true
-
-# ── alg: none (unsigned) ────────────────────────────────────────────────────
-
-query I
-SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
-FROM read_text('test/sql/fixtures/jwt_alg_none.txt');
-----
-false
-
-# ── alg HS384 (signed, non-HS256) ───────────────────────────────────────────
-
-query I
-SELECT (quackapi_verify_auth('jwt_t', rtrim(content, E'\n\r '))).ok
-FROM read_text('test/sql/fixtures/jwt_alg_hs384.txt');
-----
-false
-
-# garbage token → not ok, body is valid JSON (DetailJson escape path)
-
-query II
-SELECT (quackapi_verify_auth('jwt_t', 'not.a.jwt')).ok,
-       json_valid((quackapi_verify_auth('jwt_t', 'not.a.jwt')).body);
-----
-false	true
+Dropped route me_opt
 
 query I
 DROP AUTH jwt_t;

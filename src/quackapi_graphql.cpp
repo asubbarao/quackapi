@@ -740,11 +740,26 @@ void ApplyGraphqlExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	}
 
 	if (bind_data.action == "CREATE") {
+		// Validate the full table list before mutating so a mid-list miss/duplicate
+		// cannot half-apply earlier names (CREATE GRAPHQL ROUTE already does this).
 		for (auto &table : bind_data.tables) {
 			if (!TableExists(con, table)) {
 				throw InvalidInputException("CREATE GRAPHQL FOR TABLE: table or view \"%s\" not found in schema main",
 				                            table);
 			}
+		}
+		if (!bind_data.or_replace) {
+			auto existing = state.SnapshotGraphqlTables();
+			for (auto &table : bind_data.tables) {
+				for (auto &e : existing) {
+					if (e == table) {
+						throw InvalidInputException(
+						    "GraphQL table \"%s\" already registered — use CREATE OR REPLACE GRAPHQL FOR TABLE", table);
+					}
+				}
+			}
+		}
+		for (auto &table : bind_data.tables) {
 			state.AddGraphqlTable(table, bind_data.or_replace);
 		}
 		string msg = "GraphQL registered: ";

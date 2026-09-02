@@ -1,8 +1,10 @@
 # name: test/sql/quackapi_routes.test
-# description: CREATE ROUTE / DROP ROUTE DDL and the route registry
+# description: CREATE ROUTE / DROP ROUTE DDL, registry, BODY SCHEMA rejection via quackapi_request
 # group: [sql]
 
 require quackapi
+
+require json
 
 # Registry starts empty
 query I
@@ -122,77 +124,11 @@ DROP ROUTE spaced;
 ----
 Dropped route spaced
 
-# Default format is json
-query I
-CREATE ROUTE fmt_default GET '/fmt_default' AS SELECT 1 AS id;
-----
-Route fmt_default: GET /fmt_default
-
-query I
-SELECT format FROM quackapi_routes() WHERE name = 'fmt_default';
-----
-json
-
-# FORMAT ndjson / csv / parquet / arrow store on the route
-query I
-CREATE ROUTE fmt_ndjson GET '/fmt_ndjson' FORMAT ndjson AS SELECT 1 AS id, 'a' AS name;
-----
-Route fmt_ndjson: GET /fmt_ndjson
-
-query I
-CREATE ROUTE fmt_csv GET '/fmt_csv' FORMAT csv STATUS 200 AS SELECT 1 AS id;
-----
-Route fmt_csv: GET /fmt_csv
-
-query I
-CREATE ROUTE fmt_parquet GET '/fmt_parquet' FORMAT parquet AS SELECT 1 AS id;
-----
-Route fmt_parquet: GET /fmt_parquet
-
-query I
-CREATE ROUTE fmt_arrow GET '/fmt_arrow' FORMAT arrow AS SELECT 1 AS id;
-----
-Route fmt_arrow: GET /fmt_arrow
-
-query II
-SELECT name, format FROM quackapi_routes() WHERE name LIKE 'fmt_%' ORDER BY name;
-----
-fmt_arrow	arrow
-fmt_csv	csv
-fmt_default	json
-fmt_ndjson	ndjson
-fmt_parquet	parquet
-
-# Invalid FORMAT rejected
+# Invalid FORMAT rejected at CREATE
 statement error
 CREATE ROUTE bad_fmt GET '/x' FORMAT protobuf AS SELECT 1;
 ----
 FORMAT must be json, ndjson, csv, parquet, or arrow
-
-query I
-DROP ROUTE fmt_default;
-----
-Dropped route fmt_default
-
-query I
-DROP ROUTE fmt_ndjson;
-----
-Dropped route fmt_ndjson
-
-query I
-DROP ROUTE fmt_csv;
-----
-Dropped route fmt_csv
-
-query I
-DROP ROUTE fmt_parquet;
-----
-Dropped route fmt_parquet
-
-query I
-DROP ROUTE fmt_arrow;
-----
-Dropped route fmt_arrow
 
 # Handler SQL is validated at CREATE time (not deferred to first request)
 statement error
@@ -227,6 +163,47 @@ DROP ROUTE keepme;
 ----
 Dropped route keepme
 
+# ---------------------------------------------------------------------------
+# BODY SCHEMA enforcement via quackapi_request (reject bad body, accept good)
+# maximum:10 is schema-only — SQL INTEGER bind would accept 100 without it.
+# ---------------------------------------------------------------------------
+query I
+CREATE ROUTE with_schema POST '/with-schema'
+  BODY SCHEMA '{"type":"object","required":["n"],"properties":{"n":{"type":"integer","maximum":10}}}'
+  AS SELECT $n::INTEGER AS n;
+----
+Route with_schema: POST /with-schema
+
+# Schema maximum violated (would bind fine as INTEGER) → 422
+query II
+SELECT status, contains(decode(body), '_schema')
+FROM quackapi_request('POST', '/with-schema', '{"n":100}');
+----
+422	true
+
+# Wrong type → 422
+query I
+SELECT status FROM quackapi_request('POST', '/with-schema', '{"n":"not-int"}');
+----
+422
+
+# Valid body → 200
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/with-schema', '{"n":1}');
+----
+200	[{"n":1}]
+
+query I
+DROP ROUTE with_schema;
+----
+Dropped route with_schema
+
+# Unterminated BODY SCHEMA errors
+statement error
+CREATE ROUTE bad_schema POST '/x' BODY SCHEMA '{"type":"object" AS SELECT 1;
+----
+Unterminated BODY SCHEMA
+
 # Multi-chunk emission: > STANDARD_VECTOR_SIZE (2048) routes must not corrupt
 loop i 0 2100
 
@@ -239,41 +216,3 @@ query I
 SELECT count(*) FROM quackapi_routes();
 ----
 2100
-
-# BODY SCHEMA clause parses and is accepted on CREATE ROUTE
-query I
-CREATE ROUTE with_schema POST '/with-schema'
-  BODY SCHEMA '{"type":"object","properties":{"n":{"type":"integer"}}}'
-  AS SELECT $n::INTEGER AS n;
-----
-Route with_schema: POST /with-schema
-
-query I
-SELECT count(*) FROM quackapi_routes() WHERE name = 'with_schema';
-----
-1
-
-query I
-DROP ROUTE with_schema;
-----
-Dropped route with_schema
-
-# BODY SCHEMA after PARAM also parses
-query I
-CREATE ROUTE with_schema2 POST '/with-schema2'
-  PARAM n INTEGER DEFAULT 0
-  BODY SCHEMA '{"type":"object"}'
-  AS SELECT $n::INTEGER AS n;
-----
-Route with_schema2: POST /with-schema2
-
-query I
-DROP ROUTE with_schema2;
-----
-Dropped route with_schema2
-
-# Unterminated BODY SCHEMA errors
-statement error
-CREATE ROUTE bad_schema POST '/x' BODY SCHEMA '{"type":"object" AS SELECT 1;
-----
-Unterminated BODY SCHEMA

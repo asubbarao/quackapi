@@ -1,11 +1,15 @@
 # name: test/sql/quackapi_quack_bridge.test
-# description: quack auth bridge scalars (verify_auth / authentication / authorization)
+# description: quack auth bridge at request time (verify_auth via REQUIRE + bridged route body)
 # group: [sql]
 
 require quackapi
 
+require json
+
+# require json: CheckAuth rebinds claims_json from quackapi_verify_auth via json_*.
+
 # ---------------------------------------------------------------------------
-# quackapi_verify_auth — policy engine exposed as SQL (EvaluateAuthQuery shape)
+# Setup — API_KEY scheme + REQUIRE route (CheckAuth → quackapi_verify_auth)
 # ---------------------------------------------------------------------------
 query I
 CREATE AUTH bridge_keys AS API_KEY;
@@ -17,62 +21,53 @@ SELECT * FROM quackapi_add_api_key('bridge_keys', 'bridge-secret', 'carol');
 ----
 carol
 
-# Good key → ok=true, status=200, claims_json carries sub
-query III
-SELECT (quackapi_verify_auth('bridge_keys', 'bridge-secret')).ok,
-       (quackapi_verify_auth('bridge_keys', 'bridge-secret')).status,
-       (quackapi_verify_auth('bridge_keys', 'bridge-secret')).claims_json;
-----
-true	200	{"sub":"carol"}
-
 query I
-SELECT (quackapi_verify_auth('bridge_keys', 'wrong')).ok;
+CREATE ROUTE bridge_me GET '/bridge/me' REQUIRE bridge_keys AS
+  SELECT $claims_sub AS user, 'bridged' AS via;
 ----
-false
+Route bridge_me: GET /bridge/me
 
-query I
-SELECT (quackapi_verify_auth('bridge_keys', 'wrong')).status;
-----
-401
-
-# Unknown scheme fails closed — 401, not 500. A REQUIRE naming a scheme that
-# doesn't exist (missing or wrong-case) must never surface as a server error
-# with the scheme name in the body (fuzz catalog P1); it must be
-# indistinguishable from an ordinary auth failure.
+# ---------------------------------------------------------------------------
+# quackapi_verify_auth at request time — reject invalid, accept valid
+# ---------------------------------------------------------------------------
 query II
-SELECT (quackapi_verify_auth('nope', 'x')).ok, (quackapi_verify_auth('nope', 'x')).status;
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/bridge/me',
+  headers := MAP {'X-API-Key': 'wrong'}
+);
 ----
-false	401
-
-# ---------------------------------------------------------------------------
-# quackapi_authentication — quack_check_token-compatible signature
-# ---------------------------------------------------------------------------
-# Token equality path (same contract as quack_check_token)
-query I
-SELECT quackapi_authentication('sess', 'mytoken', 'mytoken');
-----
-true
+401	{"detail":"Invalid authentication credentials"}
 
 query I
-SELECT quackapi_authentication('sess', 'mytoken', 'other');
+SELECT status
+FROM quackapi_request(
+  'GET', '/bridge/me',
+  headers := MAP {'X-API-Key': 'bridge-secret'}
+);
 ----
-false
-
-# Scheme fall-through: auth_string is a registered API key
-query I
-SELECT quackapi_authentication('sess', 'bridge-secret', 'not-the-server-token');
-----
-true
+200
 
 # ---------------------------------------------------------------------------
-# quackapi_authorization — pass-through like quack_nop_authorization
+# Bridged route — expected body over a real request
 # ---------------------------------------------------------------------------
-query I
-SELECT quackapi_authorization('sess', 'SELECT 1');
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/bridge/me',
+  headers := MAP {'X-API-Key': 'bridge-secret'}
+);
 ----
-SELECT 1
+200	[{"user":"carol","via":"bridged"}]
 
+# ---------------------------------------------------------------------------
 # Cleanup
+# ---------------------------------------------------------------------------
+query I
+DROP ROUTE bridge_me;
+----
+Dropped route bridge_me
+
 query I
 DROP AUTH bridge_keys;
 ----

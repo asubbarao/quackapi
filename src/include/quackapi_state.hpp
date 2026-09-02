@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <tuple>
@@ -146,6 +147,19 @@ struct QuackapiRoute {
 	//! Default response body format: "json" (default), "ndjson", "csv", "parquet", or "arrow".
 	//! Explicit non-json wins over Accept negotiation; json allows Accept override.
 	string response_format = "json";
+	//! JSON shape for FORMAT json: "array" (default, `[{…}]`) or "object" (single row → `{…}`).
+	//! Object requires exactly one row; >1 rows → 500. Only valid with FORMAT json.
+	string response_envelope = "array";
+	//! When handler returns 0 rows and this is set (≠0), respond with this status instead of
+	//! the success STATUS + empty array/null. 0 = unset (default empty-result behavior).
+	int empty_status = 0;
+	//! Body for EMPTY STATUS responses. Empty string → `{"detail":"Not Found"}`.
+	string empty_body;
+	//! Per-request httplib socket read/write timeout in seconds. 0 = use serve
+	//! defaults (QUACKAPI_DEFAULT_IO_TIMEOUT_SEC / quackapi_serve read/write_timeout_sec).
+	//! When set, HandleRequest extends SO_RCVTIMEO/SO_SNDTIMEO and the active
+	//! SocketStream select deadlines for this connection only.
+	int32_t timeout_sec = 0;
 };
 
 //! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).
@@ -271,6 +285,13 @@ public:
 	//! Lookup by name. Returns false if not registered.
 	bool GetQueue(const string &name, QuackapiQueue &out);
 	vector<QuackapiQueue> SnapshotQueues();
+	//! Shared dequeue claim fence (mutex + lease map) for this database.
+	std::mutex &DequeueClaimMutex() {
+		return dequeue_claim_mutex;
+	}
+	unordered_map<string, unordered_map<int64_t, int64_t>> &DequeueLeases() {
+		return dequeue_leases;
+	}
 
 	//! Start serving on host:port. Throws if a server already listens there.
 	void StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
@@ -278,6 +299,10 @@ public:
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).
 	void StopAllServers();
+	//! True when a quackapi server is registered on this port (any host).
+	bool HasServerOnPort(int port);
+	//! Host for the server on port, if any. Returns false if none.
+	bool GetServerHost(int port, string &host_out);
 	//! (host, port, http_client_active, http_client_reason) for each running server.
 	vector<std::tuple<string, int, string, string>> ListServers();
 
@@ -326,9 +351,22 @@ public:
 	bool GetGraphqlRouteBySchemaPath(const string &path, QuackapiGraphqlRoute &out);
 	vector<QuackapiGraphqlRoute> SnapshotGraphqlRoutes();
 
+	//! Effective write deadline (seconds) applied to the most recent route
+	//! request. Seeded with serve write_timeout_sec; ApplyRouteIoTimeout
+	//! overwrites it only when it actually extends the socket deadlines.
+	//! Test/introspection seam — not a registry field.
+	void SetLastEffectiveWriteTimeoutSec(int32_t sec) {
+		last_effective_write_timeout_sec.store(sec, std::memory_order_relaxed);
+	}
+	int32_t GetLastEffectiveWriteTimeoutSec() const {
+		return last_effective_write_timeout_sec.load(std::memory_order_relaxed);
+	}
+
 private:
 	void PublishRoutes();
 	void PublishStreams();
+
+	std::atomic<int32_t> last_effective_write_timeout_sec {0};
 
 	std::mutex routes_mutex;
 	vector<QuackapiRoute> routes;
@@ -348,6 +386,12 @@ private:
 
 	std::mutex queues_mutex;
 	vector<QuackapiQueue> queues;
+	//! Serialize dequeue claims for this database. Function-local statics are
+	//! unsafe: static+loadable extension copies each get their own mutex/lease
+	//! map, so concurrent HTTP workers can bypass the fence.
+	std::mutex dequeue_claim_mutex;
+	//! queue -> job_id -> lease deadline (microseconds since epoch).
+	unordered_map<string, unordered_map<int64_t, int64_t>> dequeue_leases;
 
 	std::mutex policies_mutex;
 	vector<QuackapiRowAccessPolicy> row_access_policies;

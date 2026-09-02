@@ -65,8 +65,12 @@ struct QuackapiHttpFetch {
 	static string ActiveHttpUtilName(DatabaseInstance &db);
 
 	//! GET url. headers are optional extra request headers (e.g. Authorization).
+	//! stall_ms > 0 (plain http:// only): after sending the request, wait that
+	//! many milliseconds before reading the response. Test seam for server
+	//! write-timeout / per-route timeout_sec — a compute-bound handler cannot
+	//! trip socket IO deadlines.
 	static QuackapiHttpFetchResult Get(DatabaseInstance &db, const string &url,
-	                                   const unordered_map<string, string> &extra_headers = {});
+	                                   const unordered_map<string, string> &extra_headers = {}, int32_t stall_ms = 0);
 
 	//! POST url with a raw body and Content-Type.
 	//! http:// needs nothing loaded; https:// requires httpfs / curl_httpfs.
@@ -80,7 +84,7 @@ struct QuackapiHttpFetch {
 	static void ResetPool();
 };
 
-//! quackapi_fetch / quackapi_post / quackapi_http_pool.
+//! quackapi_fetch / quackapi_post / quackapi_http_pool / quackapi_parallel_fetch.
 void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader);
 
 } // namespace duckdb

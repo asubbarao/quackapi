@@ -81,10 +81,9 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	// NEVER disables safety (no allow_unsigned_extensions, no disabled checks).
 	vector<string> applied;
 	// Build stamp so operators/agents can confirm the loaded extension matches the tree.
-	applied.push_back(
-	    StringUtil::Format("quackapi_request_path=perf (enable_logging=%s access_log=%s) "
-	                       "(WHY: thread-local Connection + prepare cache + static body cache + uuidv7 ids)",
-	                       opts.enable_logging ? "true" : "false", opts.access_log ? "true" : "false"));
+	applied.push_back(StringUtil::Format("quackapi_request_path=perf (enable_logging=%s access_log=%s) "
+	                                     "(WHY: per-request Connection reset + uuidv7 ids)",
+	                                     opts.enable_logging ? "true" : "false", opts.access_log ? "true" : "false"));
 	Connection con(*context.db);
 	string err;
 
@@ -407,10 +406,14 @@ void ProbeQuackapiRequestIdSource(DatabaseInstance &db, QuackapiServeOptions &op
 }
 
 void RegisterQuackapiHealthRoutes(DatabaseInstance &db, const QuackapiServeOptions &opts) {
+	auto &state = QuackapiState::Get(db);
 	if (!opts.health_routes) {
+		// Re-serve with health_routes:=false must drop prior auto-routes; a no-op
+		// left __quackapi_health* in the registry (and still HTTP-reachable).
+		state.DropRoute("__quackapi_health");
+		state.DropRoute("__quackapi_healthz");
 		return;
 	}
-	auto &state = QuackapiState::Get(db);
 
 	// Liveness: process is up and accepting HTTP. No auth. Listed in routes().
 	QuackapiRoute health;

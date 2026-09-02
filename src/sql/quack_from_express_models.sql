@@ -100,16 +100,21 @@ zod_fields AS (
   QUALIFY row_number() OVER (PARTITION BY pair.node_id, pair.file_path ORDER BY key.sibling_index) = 1
 ),
 models AS (
-  SELECT model_name, field_name, field_type, (NOT is_optional) AS is_required, is_optional,
+  -- Defaults imply not required (Pydantic/FastAPI parity).
+  SELECT model_name, field_name, field_type,
+         (NOT is_optional AND NOT has_default) AS is_required, is_optional,
          has_default, default_expr, file, field_line FROM interface_fields
   UNION ALL BY NAME
-  SELECT model_name, field_name, field_type, (NOT is_optional) AS is_required, is_optional,
+  SELECT model_name, field_name, field_type,
+         (NOT is_optional AND NOT has_default) AS is_required, is_optional,
          has_default, default_expr, file, field_line FROM class_fields
   UNION ALL BY NAME
-  SELECT model_name, field_name, field_type, (NOT is_optional) AS is_required, is_optional,
+  SELECT model_name, field_name, field_type,
+         (NOT is_optional AND NOT has_default) AS is_required, is_optional,
          has_default, default_expr, file, field_line FROM ctor_fields
   UNION ALL BY NAME
-  SELECT model_name, field_name, field_type, (NOT coalesce(is_optional,false)) AS is_required,
+  SELECT model_name, field_name, field_type,
+         (NOT coalesce(is_optional,false) AND NOT coalesce(has_default,false)) AS is_required,
          coalesce(is_optional,false) AS is_optional, coalesce(has_default,false) AS has_default,
          default_expr, file, field_line FROM zod_fields
 )

@@ -109,7 +109,7 @@ file_prefixes AS (
   JOIN bare_mounts bm ON bm.file_path = sm.file_path
   JOIN imports im ON im.from_file = bm.file_path AND im.local_name = bm.mounted_ident
 )
-SELECT lower(rb.name) AS method,
+SELECT upper(rb.name) AS method,
   CASE
     WHEN fp.prefix IS NOT NULL AND rb.path_raw = '/' THEN fp.prefix
     WHEN fp.prefix IS NOT NULL AND starts_with(rb.path_raw, fp.prefix) THEN rb.path_raw

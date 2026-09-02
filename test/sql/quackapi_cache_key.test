@@ -1,0 +1,98 @@
+# name: test/sql/quackapi_cache_key.test
+# description: Cache keys must include every input that changes the response
+# group: [sql]
+
+require quackapi
+
+# Keep quackapi_request on one worker thread so TLS state is shared across calls.
+statement ok
+SET threads = 1;
+
+# ---------------------------------------------------------------------------
+# Static JSON body cache was keyed only by handler SQL. Missing: table state.
+# Two GETs with the same SQL must not freeze the first row snapshot forever.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE cache_t AS SELECT 'a' AS x;
+
+statement ok
+CREATE ROUTE cache_table GET '/cache_table' AS SELECT x FROM cache_t;
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/cache_table');
+----
+[{"x":"a"}]
+
+statement ok
+UPDATE cache_t SET x = 'b';
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/cache_table');
+----
+[{"x":"b"}]
+
+# ---------------------------------------------------------------------------
+# Same SQL-only body cache missed per-call entropy (uuid is volatile).
+# ---------------------------------------------------------------------------
+statement ok
+CREATE ROUTE cache_uuid GET '/cache_uuid' AS SELECT uuid()::VARCHAR AS id;
+
+statement ok
+CREATE TABLE cache_uuid_hits AS
+  SELECT decode(body) AS body FROM quackapi_request('GET', '/cache_uuid');
+
+statement ok
+INSERT INTO cache_uuid_hits
+  SELECT decode(body) FROM quackapi_request('GET', '/cache_uuid');
+
+query I
+SELECT COUNT(DISTINCT body) FROM cache_uuid_hits;
+----
+2
+
+# ---------------------------------------------------------------------------
+# Prepared-statement reuse keyed only by handler SQL. Missing: VIEW definition.
+# Parameterized route so this is prepare-cache, not static-body cache.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE VIEW cache_v AS SELECT 'old' AS x;
+
+statement ok
+CREATE ROUTE cache_view GET '/cache_view/:id' AS
+  SELECT x, $id::INTEGER AS id FROM cache_v;
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/cache_view/1');
+----
+[{"x":"old","id":1}]
+
+statement ok
+CREATE OR REPLACE VIEW cache_v AS SELECT 'new' AS x;
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/cache_view/1');
+----
+[{"x":"new","id":1}]
+
+# ---------------------------------------------------------------------------
+# Prepared reuse keyed only by SQL. Missing: MACRO definition identity.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE MACRO cache_m() AS 'old';
+
+statement ok
+CREATE ROUTE cache_macro GET '/cache_macro/:id' AS
+  SELECT cache_m() AS x, $id::INTEGER AS id;
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/cache_macro/1');
+----
+[{"x":"old","id":1}]
+
+statement ok
+CREATE OR REPLACE MACRO cache_m() AS 'new';
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/cache_macro/1');
+----
+[{"x":"new","id":1}]

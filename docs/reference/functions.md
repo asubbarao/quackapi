@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := …, block := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), plus batteries knobs (`log_level`, `compression`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -27,7 +27,15 @@ SELECT * FROM quackapi_serve(
   memory_limit := '4GB',
   http_client := 'auto'   -- prefer curl_httpfs; fall back to httplib
 );
+
+-- Supervised process (launchd / KeepAlive): hold until quackapi_stop or SIGINT/SIGTERM.
+-- listen_url is still emitted first; the query stays open afterward.
+SELECT * FROM quackapi_serve(8000, block := true);
 ```
+
+**`block`:** default `false` — serve returns immediately after bind (backward compatible).
+With `block := true`, the query emits `listen_url` then waits until `quackapi_stop`
+(or SIGINT/SIGTERM / query interrupt). Prefer this over shell `sleep` / `lsof` keepalive loops.
 
 **Memory limit precedence:** named param → `SET quackapi_memory_limit` → leave non-default DuckDB `memory_limit` alone → else safe default **256MB**.
 
@@ -36,6 +44,30 @@ SELECT * FROM quackapi_serve(
 (Windows/WASM/offline), logs `quackapi.http_client=httplib reason=curl_httpfs_unavailable`
 and continues. Override with `http_client := 'httplib'` or `SET quackapi_http_client`.
 Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
+
+---
+
+### `quackapi_wait(port [, timeout_ms], host := …)`
+
+| | |
+|--|--|
+| **Kind** | Table function |
+| **Args** | `port INTEGER` required; `timeout_ms BIGINT` optional (omit / negative = wait until ready or interrupt) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `timeout_ms BIGINT` |
+| **Returns** | `ready BOOLEAN`, `listen_url VARCHAR` (NULL when not ready) |
+
+TCP readiness probe — returns once `host:port` accepts connections (any HTTP status,
+including 404). Replaces `sleep` / `lsof` / `curl` boot loops.
+
+```sql
+SELECT * FROM quackapi_serve(8000);
+SELECT ready, listen_url FROM quackapi_wait(8000, 5000);
+-- true | http://127.0.0.1:8000
+
+-- Timed miss (dead port)
+SELECT ready, listen_url FROM quackapi_wait(59999, 100);
+-- false | NULL
+```
 
 ---
 

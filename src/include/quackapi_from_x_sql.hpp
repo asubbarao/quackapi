@@ -402,8 +402,9 @@ pfields AS (
   JOIN ast hk ON hk.parent_id = pr.node_id AND hk.file_path = p.file_path AND hk.type = 'hash_key_symbol'
 ),
 from_sp AS (
+  -- permit is a whitelist only; presence/required comes from validates (from_val).
   SELECT upper(substr(rm.model_key,1,1)) || substr(rm.model_key,2) AS model_name,
-         pf.field_name, pf.field_type, true AS is_required,
+         pf.field_name, pf.field_type, false AS is_required,
          false AS has_default, CAST(NULL AS VARCHAR) AS default_expr,
          rm.file_path AS file, rm.start_line AS field_line
   FROM req_model rm
@@ -414,9 +415,14 @@ models AS (
          NOT is_required AS is_optional, has_default, default_expr, file, field_line
   FROM from_val
   UNION ALL
-  SELECT model_name, field_name, field_type, is_required,
-         NOT is_required AS is_optional, has_default, default_expr, file, field_line
-  FROM from_sp
+  -- Keep permit-only fields; drop duplicates already covered by validates.
+  SELECT sp.model_name, sp.field_name, sp.field_type, sp.is_required,
+         NOT sp.is_required AS is_optional, sp.has_default, sp.default_expr, sp.file, sp.field_line
+  FROM from_sp sp
+  WHERE NOT EXISTS (
+    SELECT 1 FROM from_val v
+    WHERE lower(v.model_name) = lower(sp.model_name) AND v.field_name = sp.field_name
+  )
 )
 SELECT model_name, field_name, field_type, is_required, is_optional, has_default,
        default_expr, file, field_line
@@ -537,7 +543,7 @@ file_prefixes AS (
   JOIN bare_mounts bm ON bm.file_path = sm.file_path
   JOIN imports im ON im.from_file = bm.file_path AND im.local_name = bm.mounted_ident
 )
-SELECT lower(rb.name) AS method,
+SELECT upper(rb.name) AS method,
   CASE
     WHEN fp.prefix IS NOT NULL AND rb.path_raw = '/' THEN fp.prefix
     WHEN fp.prefix IS NOT NULL AND starts_with(rb.path_raw, fp.prefix) THEN rb.path_raw
@@ -660,16 +666,21 @@ zod_fields AS (
   QUALIFY row_number() OVER (PARTITION BY pair.node_id, pair.file_path ORDER BY key.sibling_index) = 1
 ),
 models AS (
-  SELECT model_name, field_name, field_type, (NOT is_optional) AS is_required, is_optional,
+  -- Defaults imply not required (Pydantic/FastAPI parity).
+  SELECT model_name, field_name, field_type,
+         (NOT is_optional AND NOT has_default) AS is_required, is_optional,
          has_default, default_expr, file, field_line FROM interface_fields
   UNION ALL BY NAME
-  SELECT model_name, field_name, field_type, (NOT is_optional) AS is_required, is_optional,
+  SELECT model_name, field_name, field_type,
+         (NOT is_optional AND NOT has_default) AS is_required, is_optional,
          has_default, default_expr, file, field_line FROM class_fields
   UNION ALL BY NAME
-  SELECT model_name, field_name, field_type, (NOT is_optional) AS is_required, is_optional,
+  SELECT model_name, field_name, field_type,
+         (NOT is_optional AND NOT has_default) AS is_required, is_optional,
          has_default, default_expr, file, field_line FROM ctor_fields
   UNION ALL BY NAME
-  SELECT model_name, field_name, field_type, (NOT coalesce(is_optional,false)) AS is_required,
+  SELECT model_name, field_name, field_type,
+         (NOT coalesce(is_optional,false) AND NOT coalesce(has_default,false)) AS is_required,
          coalesce(is_optional,false) AS is_optional, coalesce(has_default,false) AS has_default,
          default_expr, file, field_line FROM zod_fields
 )

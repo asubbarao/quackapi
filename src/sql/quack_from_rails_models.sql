@@ -69,8 +69,9 @@ pfields AS (
   JOIN ast hk ON hk.parent_id = pr.node_id AND hk.file_path = p.file_path AND hk.type = 'hash_key_symbol'
 ),
 from_sp AS (
+  -- permit is a whitelist only; presence/required comes from validates (from_val).
   SELECT upper(substr(rm.model_key,1,1)) || substr(rm.model_key,2) AS model_name,
-         pf.field_name, pf.field_type, true AS is_required,
+         pf.field_name, pf.field_type, false AS is_required,
          false AS has_default, CAST(NULL AS VARCHAR) AS default_expr,
          rm.file_path AS file, rm.start_line AS field_line
   FROM req_model rm
@@ -81,9 +82,14 @@ models AS (
          NOT is_required AS is_optional, has_default, default_expr, file, field_line
   FROM from_val
   UNION ALL
-  SELECT model_name, field_name, field_type, is_required,
-         NOT is_required AS is_optional, has_default, default_expr, file, field_line
-  FROM from_sp
+  -- Keep permit-only fields; drop duplicates already covered by validates.
+  SELECT sp.model_name, sp.field_name, sp.field_type, sp.is_required,
+         NOT sp.is_required AS is_optional, sp.has_default, sp.default_expr, sp.file, sp.field_line
+  FROM from_sp sp
+  WHERE NOT EXISTS (
+    SELECT 1 FROM from_val v
+    WHERE lower(v.model_name) = lower(sp.model_name) AND v.field_name = sp.field_name
+  )
 )
 SELECT model_name, field_name, field_type, is_required, is_optional, has_default,
        default_expr, file, field_line

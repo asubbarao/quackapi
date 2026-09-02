@@ -116,9 +116,9 @@ struct QuackapiServeOptions {
 	idx_t compression_min_bytes = 256;
 
 	// --- Native Postgres (optional; same shape as FastAPI+psycopg) ---
-	//! When non-empty, simple routes execute via libpq (thread-local conn +
-	//! PQexecParams) instead of DuckDB ATTACH. Empty = DuckDB path only.
-	//! Example: postgresql://user:pass@127.0.0.1:5432/db
+	//! When non-empty, simple routes execute via libpq (thread-local conn,
+	//! fresh PQexecParams per request) instead of DuckDB ATTACH.
+	//! Empty = DuckDB path only. Example: postgresql://user:pass@127.0.0.1:5432/db
 	string pg_dsn;
 };
 
@@ -171,6 +171,10 @@ public:
 	const QuackapiServeOptions &Options() const {
 		return options;
 	}
+	//! True while the TCP listener thread is alive (false after StopAccepting).
+	bool IsRunning() const {
+		return is_running.load();
+	}
 	//! Monotonic serve start (for /healthz uptime_sec).
 	std::chrono::steady_clock::time_point StartedAt() const {
 		return started_at;
@@ -203,10 +207,16 @@ private:
 //! Optional body for POST/PUT/PATCH (Content-Type application/json when non-empty).
 //! req_headers: optional request headers (e.g. X-Request-ID, Accept, Authorization).
 //! headers_out: response header map (first value per name; case as httplib stores it).
+//! Optional pg_dsn: when non-empty, in-process dispatch uses the native libpq
+//! path (same as quackapi_serve(..., pg_dsn := ...)). Empty keeps DuckDB-only.
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers = nullptr,
-                              unordered_map<string, string> *headers_out = nullptr);
+                              unordered_map<string, string> *headers_out = nullptr, const string &pg_dsn = string());
+
+//! Drop in-process rate-limit buckets for a route name (all client keys).
+//! Called on CREATE OR REPLACE / DROP ROUTE so a new registration starts fresh.
+void QuackapiClearRouteRateLimit(const string &route_name);
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.
@@ -214,11 +224,16 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions &opts);
 
 //! Auto-register GET /health + GET /healthz into the route registry (OR REPLACE
-//! reserved names). No-op when opts.health_routes is false.
+//! reserved names). When opts.health_routes is false, drops those reserved
+//! routes so a prior serve(true) → stop → serve(false) does not leave them.
 void RegisterQuackapiHealthRoutes(DatabaseInstance &db, const QuackapiServeOptions &opts);
 
 //! Probe community tsid extension once; set opts.request_id_source to "tsid" or
 //! "uuidv7". Compose-only (LOAD); never fails serve.
 void ProbeQuackapiRequestIdSource(DatabaseInstance &db, QuackapiServeOptions &opts);
+
+//! TCP connect probe: true when host:port accepts a connection (any HTTP
+//! response, including 404). Used by quackapi_wait for readiness.
+bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_ms = 200);
 
 } // namespace duckdb

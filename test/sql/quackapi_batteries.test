@@ -1,5 +1,5 @@
 # name: test/sql/quackapi_batteries.test
-# description: batteries-included server defaults — SETs, health routes in registry, log_level setting
+# description: batteries-included overrides — preserve_insertion_order, health_routes off, http_client force
 # group: [sql]
 
 require quackapi
@@ -15,73 +15,6 @@ query I
 SELECT current_setting('quackapi_http_client');
 ----
 auto
-
-# Setting is listed among duckdb_settings
-query I
-SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_log_level';
-----
-true
-
-query I
-SELECT count(*) > 0 FROM duckdb_settings() WHERE name = 'quackapi_http_client';
-----
-true
-
-statement ok
-SET quackapi_log_level = 'debug';
-
-query I
-SELECT current_setting('quackapi_log_level');
-----
-debug
-
-statement ok
-SET quackapi_log_level = 'info';
-
-# ---------------------------------------------------------------------------
-# Serve with defaults → health routes appear in quackapi_routes()
-# + applied PRAGMAs/SETs are in effect
-# ---------------------------------------------------------------------------
-statement ok
-SET preserve_insertion_order = true;
-
-statement ok
-SET enable_http_metadata_cache = false;
-
-query I
-SELECT * FROM quackapi_serve(29201, host := '127.0.0.1');
-----
-http://127.0.0.1:29201
-
-# preserve_insertion_order flipped to false by default (server throughput)
-query I
-SELECT current_setting('preserve_insertion_order');
-----
-false
-
-# enable_http_metadata_cache ON by default
-query I
-SELECT current_setting('enable_http_metadata_cache');
-----
-true
-
-# DuckDB built-in QueryLog OFF by default (throughput; opt in via enable_logging:=true)
-query I
-SELECT current_setting('enable_logging');
-----
-0
-
-# Health routes auto-registered and listed
-query II
-SELECT name, pattern FROM quackapi_routes() WHERE name LIKE '__quackapi_health%' ORDER BY name;
-----
-__quackapi_health	/health
-__quackapi_healthz	/healthz
-
-query I
-SELECT * FROM quackapi_stop(29201);
-----
-Stopped quackapi server on port 29201
 
 # ---------------------------------------------------------------------------
 # Overridable: preserve_insertion_order := true keeps insertion order

@@ -2,6 +2,11 @@
 
 #include "quackapi_extension.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <thread>
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -26,6 +31,62 @@
 #include "quackapi_table_api.hpp"
 
 namespace duckdb {
+
+// Process-level stop request from SIGTERM (and SIGINT when we own the handler).
+// DuckDB CLI also sets ClientContext::interrupted on SIGINT — both are honored.
+static std::atomic<bool> quackapi_signal_stop {false};
+#ifndef _WIN32
+static std::atomic<bool> quackapi_signal_handlers_installed {false};
+static void (*quackapi_prev_sigint)(int) = SIG_DFL;
+static void (*quackapi_prev_sigterm)(int) = SIG_DFL;
+
+static void QuackapiSignalHandler(int sig) {
+	quackapi_signal_stop.store(true);
+	if (sig == SIGINT && quackapi_prev_sigint && quackapi_prev_sigint != SIG_DFL && quackapi_prev_sigint != SIG_IGN) {
+		quackapi_prev_sigint(sig);
+	} else if (sig == SIGTERM && quackapi_prev_sigterm && quackapi_prev_sigterm != SIG_DFL &&
+	           quackapi_prev_sigterm != SIG_IGN) {
+		quackapi_prev_sigterm(sig);
+	}
+}
+
+static void QuackapiEnsureSignalHandlers() {
+	bool expected = false;
+	if (!quackapi_signal_handlers_installed.compare_exchange_strong(expected, true)) {
+		return;
+	}
+	quackapi_prev_sigint = std::signal(SIGINT, QuackapiSignalHandler);
+	quackapi_prev_sigterm = std::signal(SIGTERM, QuackapiSignalHandler);
+}
+#endif
+
+static bool QuackapiStopRequested(ClientContext &context) {
+	return context.interrupted || quackapi_signal_stop.load();
+}
+
+//! Hold until the server on port is gone, or SIGINT/SIGTERM / query interrupt.
+//! On signal/interrupt, stop the port (or all servers) so listen threads exit.
+static void QuackapiBlockUntilStopped(ClientContext &context, int32_t port) {
+#ifndef _WIN32
+	QuackapiEnsureSignalHandlers();
+#endif
+	auto &state = QuackapiState::Get(*context.db);
+	while (state.HasServerOnPort(port)) {
+		if (QuackapiStopRequested(context)) {
+			quackapi_signal_stop.store(false);
+			if (port > 0) {
+				state.StopServer(port);
+			} else {
+				state.StopAllServers();
+			}
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+}
 
 //===--------------------------------------------------------------------===//
 // quackapi_serve([port[, host]]) — start serving registered routes
@@ -60,6 +121,11 @@ struct ServeBindData : public TableFunctionData {
 	string http_client = "auto";
 	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
 	string pg_dsn;
+	//! When true, hold the query open after listen_url until stop / SIGINT / SIGTERM.
+	//! Default false — serve still returns immediately (backward compatible).
+	bool block = false;
+	//! First Exec emitted listen_url; second Exec blocks when block=true.
+	bool started = false;
 	bool finished = false;
 };
 
@@ -174,9 +240,15 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		}
 	}
 	// compression_min_bytes named param wins; else SET (default 256).
+	// pg_dsn named param wins; else SET quackapi_pg_dsn.
 	auto pg_dsn_entry = input.named_parameters.find("pg_dsn");
 	if (pg_dsn_entry != input.named_parameters.end()) {
 		bind_data->pg_dsn = pg_dsn_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_pg_dsn", setting) && !setting.IsNull()) {
+			bind_data->pg_dsn = setting.GetValue<string>();
+		}
 	}
 	auto min_entry = input.named_parameters.find("compression_min_bytes");
 	if (min_entry != input.named_parameters.end()) {
@@ -207,6 +279,10 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 				bind_data->http_client = s;
 			}
 		}
+	}
+	auto block_entry = input.named_parameters.find("block");
+	if (block_entry != input.named_parameters.end()) {
+		bind_data->block = block_entry->second.GetValue<bool>();
 	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
@@ -242,6 +318,14 @@ static void ComposeQuackAuthSettings(ClientContext &context) {
 static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->CastNoConst<ServeBindData>();
 	if (bind_data.finished) {
+		return;
+	}
+	// Phase 2: listen_url already emitted; hold until stop / signal.
+	if (bind_data.started) {
+		if (bind_data.block) {
+			QuackapiBlockUntilStopped(context, bind_data.port);
+		}
+		bind_data.finished = true;
 		return;
 	}
 	// Compose with quack's auth settings when present (no-op if quack unloaded).
@@ -283,7 +367,12 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, opts);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
 	output.SetCardinality(1);
-	bind_data.finished = true;
+	bind_data.started = true;
+	// Emit listen_url now; block on the next Exec so the row reaches the client
+	// before we hold the query open (supervised-process / launchd recipe).
+	if (!bind_data.block) {
+		bind_data.finished = true;
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -327,6 +416,94 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 }
 
 //===--------------------------------------------------------------------===//
+// quackapi_wait(port [, timeout_ms], host := …) — block until port accepts
+// Replaces sleep/lsof/curl readiness loops. Returns one row: ready, listen_url.
+//===--------------------------------------------------------------------===//
+
+struct WaitBindData : public TableFunctionData {
+	int32_t port = 0;
+	//! Negative = wait forever (until accepting or interrupt).
+	int64_t timeout_ms = -1;
+	string host = "127.0.0.1";
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> WaitBind(ClientContext &, TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs.empty()) {
+		throw InvalidInputException("quackapi_wait(port [, timeout_ms]) requires a port");
+	}
+	auto bind_data = make_uniq<WaitBindData>();
+	bind_data->port = input.inputs[0].GetValue<int32_t>();
+	if (bind_data->port < 1 || bind_data->port > 65535) {
+		throw InvalidInputException("quackapi_wait: port must be between 1 and 65535");
+	}
+	if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
+		bind_data->timeout_ms = input.inputs[1].GetValue<int64_t>();
+	}
+	auto host_entry = input.named_parameters.find("host");
+	if (host_entry != input.named_parameters.end() && !host_entry->second.IsNull()) {
+		bind_data->host = host_entry->second.GetValue<string>();
+	}
+	auto timeout_entry = input.named_parameters.find("timeout_ms");
+	if (timeout_entry != input.named_parameters.end() && !timeout_entry->second.IsNull()) {
+		bind_data->timeout_ms = timeout_entry->second.GetValue<int64_t>();
+	}
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("ready");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("listen_url");
+	return std::move(bind_data);
+}
+
+static void WaitExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->CastNoConst<WaitBindData>();
+	if (bind_data.finished) {
+		return;
+	}
+#ifndef _WIN32
+	QuackapiEnsureSignalHandlers();
+#endif
+	// Prefer the in-process host when this DB already started the server.
+	string host = bind_data.host;
+	string registered_host;
+	if (QuackapiState::Get(*context.db).GetServerHost(bind_data.port, registered_host) && !registered_host.empty()) {
+		host = registered_host;
+	}
+
+	const auto deadline = bind_data.timeout_ms < 0
+	                          ? std::chrono::steady_clock::time_point::max()
+	                          : std::chrono::steady_clock::now() + std::chrono::milliseconds(bind_data.timeout_ms);
+	bool ready = false;
+	while (true) {
+		if (QuackapiStopRequested(context)) {
+			quackapi_signal_stop.store(false);
+			if (context.interrupted) {
+				throw InterruptException();
+			}
+			break;
+		}
+		if (QuackapiPortIsAccepting(host, bind_data.port)) {
+			ready = true;
+			break;
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	}
+
+	output.SetValue(0, 0, Value::BOOLEAN(ready));
+	if (ready) {
+		output.SetValue(1, 0, Value(StringUtil::Format("http://%s:%d", host, bind_data.port)));
+	} else {
+		output.SetValue(1, 0, Value());
+	}
+	output.SetCardinality(1);
+	bind_data.finished = true;
+}
+
+//===--------------------------------------------------------------------===//
 // quackapi_request(method, path [, body] [, headers := MAP]) — TestClient
 // No TCP. Same handler path as serve. Community SQLLogic style.
 //===--------------------------------------------------------------------===//
@@ -336,14 +513,17 @@ struct RequestBindData : public TableFunctionData {
 	string path;
 	string body;
 	unordered_map<string, string> req_headers;
+	//! Optional libpq DSN for this request (named param wins over SET quackapi_pg_dsn).
+	string pg_dsn;
 	bool finished = false;
 };
 
-static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
-		throw InvalidInputException("quackapi_request(method, path [, body] [, headers := MAP]) expects 2 or 3 "
-		                            "positional args");
+		throw InvalidInputException(
+		    "quackapi_request(method, path [, body] [, headers := MAP] [, pg_dsn := VARCHAR]) expects 2 or 3 "
+		    "positional args");
 	}
 	auto bind_data = make_uniq<RequestBindData>();
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
@@ -362,6 +542,16 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &, TableFunctionBindIn
 			if (kv.size() >= 2 && !kv[0].IsNull() && !kv[1].IsNull()) {
 				bind_data->req_headers[kv[0].ToString()] = kv[1].ToString();
 			}
+		}
+	}
+	// pg_dsn named param wins; else SET quackapi_pg_dsn (empty = DuckDB path).
+	auto pg_dsn_it = input.named_parameters.find("pg_dsn");
+	if (pg_dsn_it != input.named_parameters.end() && !pg_dsn_it->second.IsNull()) {
+		bind_data->pg_dsn = pg_dsn_it->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_pg_dsn", setting) && !setting.IsNull()) {
+			bind_data->pg_dsn = setting.GetValue<string>();
 		}
 	}
 	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
@@ -387,7 +577,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	string content_type;
 	unordered_map<string, string> resp_headers;
 	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
-	                         &bind_data.req_headers, &resp_headers);
+	                         &bind_data.req_headers, &resp_headers, bind_data.pg_dsn);
 	output.SetValue(0, 0, Value::INTEGER(status));
 	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
 	output.SetValue(2, 0, Value(content_type));
@@ -435,6 +625,12 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("tags");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("format");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("envelope");
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("empty_status");
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("timeout_sec");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -458,6 +654,9 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(6, row, Value(route.group_name));
 		output.SetValue(7, row, Value(route.tags));
 		output.SetValue(8, row, Value(route.response_format.empty() ? "json" : route.response_format));
+		output.SetValue(9, row, Value(route.response_envelope.empty() ? "array" : route.response_envelope));
+		output.SetValue(10, row, Value::INTEGER(route.empty_status));
+		output.SetValue(11, row, Value::INTEGER(route.timeout_sec));
 		row++;
 		state.offset++;
 	}
@@ -528,6 +727,18 @@ static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &re
 }
 
 //===--------------------------------------------------------------------===//
+// quackapi_last_write_timeout_sec() — effective write deadline of last request
+//===--------------------------------------------------------------------===//
+// Reports what HandleRequest / ApplyRouteIoTimeout actually applied — serve
+// write_timeout_sec when no route override ran, or the route timeout_sec when
+// ApplyRouteIoTimeout extended the socket deadlines. Not a registry lookup.
+
+static void LastWriteTimeoutSecFunction(DataChunk &, ExpressionState &state, Vector &result) {
+	auto &qa = QuackapiState::Get(*state.GetContext().db);
+	result.Reference(Value::INTEGER(qa.GetLastEffectiveWriteTimeoutSec()));
+}
+
+//===--------------------------------------------------------------------===//
 // Load
 //===--------------------------------------------------------------------===//
 
@@ -579,6 +790,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "curl fails serve if curl_httpfs cannot INSTALL/LOAD. Overridden by "
 	                          "http_client named parameter. Does not change the inbound HTTP server.",
 	                          LogicalType::VARCHAR, Value("auto"));
+	// SET quackapi_pg_dsn = 'postgresql://…' — native libpq path for serve + request.
+	// Empty (default) = DuckDB handler path only. Overridden by pg_dsn named parameter.
+	config.AddExtensionOption("quackapi_pg_dsn",
+	                          "Postgres DSN for the native libpq handler path (thread-local PGconn). "
+	                          "Empty (default) keeps DuckDB-only execution. Overridden by pg_dsn named "
+	                          "parameter on quackapi_serve / quackapi_request.",
+	                          LogicalType::VARCHAR, Value(""));
 
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
@@ -605,6 +823,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
 	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
 	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
+	serve.named_parameters["block"] = LogicalType::BOOLEAN;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);
@@ -618,14 +837,28 @@ static void LoadInternal(ExtensionLoader &loader) {
 	stop_set.AddFunction(stop);
 	loader.RegisterFunction(stop_set);
 
+	// quackapi_wait(port) / quackapi_wait(port, timeout_ms) — readiness probe
+	TableFunctionSet wait_set("quackapi_wait");
+	TableFunction wait1("quackapi_wait", {LogicalType::INTEGER}, WaitExec, WaitBind);
+	wait1.named_parameters["host"] = LogicalType::VARCHAR;
+	wait1.named_parameters["timeout_ms"] = LogicalType::BIGINT;
+	wait_set.AddFunction(wait1);
+	TableFunction wait2("quackapi_wait", {LogicalType::INTEGER, LogicalType::BIGINT}, WaitExec, WaitBind);
+	wait2.named_parameters["host"] = LogicalType::VARCHAR;
+	wait2.named_parameters["timeout_ms"] = LogicalType::BIGINT;
+	wait_set.AddFunction(wait2);
+	loader.RegisterFunction(wait_set);
+
 	// quackapi_request — SQLLogic TestClient (no TCP, no .sh).
 	TableFunctionSet request_set("quackapi_request");
 	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
 	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request_set.AddFunction(request2);
 	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       RequestExec, RequestBind);
 	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request_set.AddFunction(request3);
 	loader.RegisterFunction(request_set);
 
@@ -651,6 +884,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
+
+	// Effective write deadline applied to the most recent route request
+	// (ApplyRouteIoTimeout / serve write_timeout_sec). Test/introspection seam.
+	loader.RegisterFunction(
+	    ScalarFunction("quackapi_last_write_timeout_sec", {}, LogicalType::INTEGER, LastWriteTimeoutSecFunction));
 
 	// Outbound HTTP with a connection pool that survives ACROSS requests:
 	// quackapi_fetch / quackapi_post / quackapi_http_pool. See the header of

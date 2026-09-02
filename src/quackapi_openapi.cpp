@@ -312,7 +312,10 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			response_schema = "{\"type\":\"string\",\"maxLength\":0}";
 		} else {
 			content_type = "application/json";
-			response_desc = "Successful response (JSON array of row objects)";
+			const bool object_envelope =
+			    StringUtil::Lower(route.response_envelope.empty() ? "array" : route.response_envelope) == "object";
+			response_desc = object_envelope ? "Successful response (JSON object — single row)"
+			                                : "Successful response (JSON array of row objects)";
 			string props = "{";
 			bool first_p = true;
 			for (idx_t i = 0; i < col_names.size(); i++) {
@@ -328,7 +331,11 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				props += JsonString(col_names[i]) + ":" + DuckTypeToOas(t);
 			}
 			props += "}";
-			response_schema = "{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":" + props + "}}";
+			if (object_envelope) {
+				response_schema = "{\"type\":\"object\",\"properties\":" + props + "}";
+			} else {
+				response_schema = "{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":" + props + "}}";
+			}
 		}
 
 		string status_key = std::to_string(route.status);
@@ -346,8 +353,20 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		                   "\"content\":{\"application/json\":{\"schema\":{"
 		                   "\"type\":\"object\","
 		                   "\"properties\":{\"detail\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}}"
-		                   "}}}}"
-		                   "}";
+		                   "}}}}";
+		if (route.empty_status != 0) {
+			string empty_key = std::to_string(route.empty_status);
+			string empty_desc = "Empty result set (EMPTY STATUS)";
+			string empty_schema = "{\"type\":\"object\",\"properties\":{\"detail\":{\"type\":\"string\"}}}";
+			responses += "," + JsonString(empty_key) +
+			             ":{"
+			             "\"description\":" +
+			             JsonString(empty_desc) +
+			             ","
+			             "\"content\":{\"application/json\":{\"schema\":" +
+			             empty_schema + "}}}";
+		}
+		responses += "}";
 
 		string security = "[]";
 		if (!route.require_auth.empty()) {

@@ -1,0 +1,130 @@
+# name: test/sql/quackapi_bug_state.test
+# description: Regression — shared-mutable-state fixes (static body, rate limit, TLS TEMP)
+# group: [sql]
+
+#
+# Scenarios that previously documented buggy observables. Expected rows are the
+# correct post-fix behaviour.
+#
+# Bugs covered (see commit message / audit reply for file:line):
+#   1) TLS static_json_bodies — zero-param JSON must re-execute after writes / time
+#   2) Process-static RouteRateLimiter — CREATE OR REPLACE resets counters
+#   3) TLS Connection session leak — TEMP from request A must not reach request B
+#
+# Dequeue CAS under parallel workers: not expressible in single-threaded
+# SQLLogic — see test/sql/fixtures/dequeue_conflict_repro.md
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# 1) Thread-local static JSON body cache (ThreadRequestCache::static_json_bodies)
+#    Zero-param handlers must not freeze the first serialized body forever.
+#    quackapi_request shares the calling thread's TLS cache (same path as HTTP
+#    workers under keep-alive / thread affinity).
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE bugstate_items(id INTEGER);
+
+statement ok
+INSERT INTO bugstate_items VALUES (1);
+
+statement ok
+CREATE ROUTE bugstate_cnt GET '/bugstate/cnt' AS SELECT count(*)::BIGINT AS c FROM bugstate_items;
+
+statement ok
+CREATE ROUTE bugstate_tick GET '/bugstate/tick' AS SELECT epoch_ms(current_timestamp)::BIGINT AS t;
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/bugstate/cnt');
+----
+[{"c":1}]
+
+# tick value is non-deterministic — snap first body, sleep, snap again, compare.
+statement ok
+CREATE TABLE bugstate_tick_snap AS SELECT decode(body) AS body FROM quackapi_request('GET', '/bugstate/tick');
+
+statement ok
+SELECT sleep_ms(50);
+
+statement ok
+INSERT INTO bugstate_items VALUES (2);
+
+# After INSERT the table has 2 rows — handler must re-execute.
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/bugstate/cnt');
+----
+[{"c":2}]
+
+statement ok
+CREATE TABLE bugstate_tick_snap2 AS SELECT decode(body) AS body FROM quackapi_request('GET', '/bugstate/tick');
+
+# now() must re-run — epochs differ after 50ms sleep.
+query I
+SELECT s1.body = s2.body FROM bugstate_tick_snap s1 JOIN bugstate_tick_snap2 s2 ON true;
+----
+false
+
+query I
+SELECT count(*) FROM bugstate_items;
+----
+2
+
+# ---------------------------------------------------------------------------
+# 2) Process-global rate limiter (static RouteRateLimiter)
+#    Bucket key is route.name|client — OR REPLACE must reset counters.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE ROUTE bugstate_rl GET '/bugstate/rl' RATE LIMIT 2 PER 3600 BY ip AS SELECT 'ok' AS msg;
+
+query I
+SELECT status FROM quackapi_request('GET', '/bugstate/rl');
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/bugstate/rl');
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/bugstate/rl');
+----
+429
+
+# Recreate the route with the same name and budget — fresh window.
+statement ok
+CREATE OR REPLACE ROUTE bugstate_rl GET '/bugstate/rl' RATE LIMIT 2 PER 3600 BY ip AS SELECT 'ok' AS msg;
+
+query I
+SELECT status FROM quackapi_request('GET', '/bugstate/rl');
+----
+200
+
+# ---------------------------------------------------------------------------
+# 3) TLS DuckDB Connection session leak (reset between requests)
+#    CREATE TEMP on the worker connection must not remain for the next request.
+#    Dummy $probe param avoids any residual static-body masking.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE ROUTE bugstate_leak GET '/bugstate/leak' AS
+	CREATE TEMP TABLE IF NOT EXISTS bugstate_leak_t AS SELECT 42 AS x;
+
+statement ok
+CREATE OR REPLACE ROUTE bugstate_readleak GET '/bugstate/readleak' AS
+	SELECT count(*)::BIGINT AS n FROM duckdb_tables() WHERE table_name = 'bugstate_leak_t' AND $probe::INT >= 0;
+
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/bugstate/readleak?probe=1');
+----
+[{"n":0}]
+
+query I
+SELECT status FROM quackapi_request('GET', '/bugstate/leak');
+----
+200
+
+# TEMP from /leak must not be visible on the next request's connection.
+query I
+SELECT decode(body) FROM quackapi_request('GET', '/bugstate/readleak?probe=1');
+----
+[{"n":0}]
