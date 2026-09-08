@@ -10,7 +10,11 @@ not “DuckDB vs Postgres,” not local CTAS.
 2. **Surpass** — **slaughter FastAPI** on latency + RPS (this bench)  
 3. **Leapfrog** — features FastAPI doesn’t have (policies, queue DDL, …) *after* 1–2
 
-## Scoreboard (2026-07-24, w1, measure 20s, `pg_dsn` libpq path)
+## Historical scoreboard (2026-07-24; not reproduced by a preserved run)
+
+The table below is retained as context from an earlier run. It is not a current
+performance claim: the raw artifacts for it are absent, and the new runner will
+publish only cells marked `valid=true` in a preserved run directory.
 
 | scenario | VUs | quackapi med | FastAPI med | speedup | quackapi rps | FastAPI rps | rps× |
 |----------|----:|-------------:|------------:|--------:|-------------:|------------:|-----:|
@@ -27,7 +31,8 @@ not “DuckDB vs Postgres,” not local CTAS.
 
 † item@1 rps is k6 1-VU noise (med latency still wins). Under load, item **slaughters**.
 
-**Verdict (w1): zero lose cells. Under concurrency, 3–13× faster med, 2–8× RPS.**
+The old run reported zero lose cells. Treat those numbers as historical until a
+new run passes the correctness gates.
 
 ### w8 (8 processes, SO_REUSEPORT — no proxy tax)
 
@@ -44,8 +49,8 @@ Workers bind the **same port** via kernel `SO_REUSEPORT` (httplib default). The 
 
 | Stack | Process | Port | Data path |
 |-------|---------|------|-----------|
-| **quackapi-w1** | one DuckDB + quackapi | `8000` | **`pg_dsn` libpq** (thread-local + PQprepare); ATTACH kept as fallback |
-| **quackapi-w8** | 8 DuckDB processes + RR proxy | `8000` | same, pool capped per worker |
+| **quackapi-w1** | one DuckDB + quackapi | `8000` | **`pg_dsn` libpq** parameterized execution; ATTACH kept as fallback |
+| **quackapi-w8** | 8 DuckDB processes + `SO_REUSEPORT` | `8000` | same, pool capped per worker |
 | **fastapi-w1** | uvicorn `--workers 1` | `8001` | psycopg3 `ConnectionPool` |
 | **fastapi-w8** | uvicorn `--workers 8` | `8001` | same app, multi-process |
 
@@ -77,13 +82,14 @@ If Postgres is down: `podman start pgedge-n1`.
 
 ### quackapi (port 8000)
 
-- **One process** (w1) or **N processes + RR proxy** (w8): DuckDB CLI +
-  quackapi (`-unsigned`, `-init /dev/null`).
+- **One process** (w1) or **eight DuckDB processes sharing one port via
+  `SO_REUSEPORT`** (w8): DuckDB CLI + quackapi (`-unsigned`, `-init /dev/null`).
 - **32 httplib worker threads** (w1); fewer per process when multi-worker.
 - Handlers are pure SQL via `CREATE ROUTE` (see `routes.sql`).
 - **Scoreboard path:** `quackapi_serve(…, pg_dsn := 'postgresql://…')` —
-  thread-local **libpq** + prepare cache (same model as FastAPI+psycopg).
-- ATTACH is still in `routes.sql` as DuckDB fallback only — not the hot path
+  parameterized **libpq** execution against the same server as FastAPI.
+- The launcher attaches the configured `PG_DSN` as DuckDB fallback before loading
+  `routes.sql`; the attachment is not the hot path.
   when `pg_dsn` is set. See [PG_ATTACH_CONCURRENCY.md](./PG_ATTACH_CONCURRENCY.md)
   for why ATTACH alone collapsed under concurrency (pre-libpq).
 - In-memory DuckDB holds routes only — **not** a copy of `bench_rows`.
@@ -91,9 +97,11 @@ If Postgres is down: `podman start pgedge-n1`.
 ### fastapi (port 8001)
 
 - FastAPI + uvicorn; handlers are plain `def` (Starlette/AnyIO threadpool
-  size **32**, matched to quackapi workers).
+  size **32** at w1 and **4 per process** at w8, for 32 aggregate workers).
 - **psycopg3 `ConnectionPool`** to the same DSN (`min_size=2`,
-  `max_size=32`).
+  `max_size=32` at w1 and **4 per process** at w8). Single-worker stacks
+  use 32 HTTP workers and 32 pool connections; eight-worker stacks use 32
+  HTTP workers and 32 total Postgres pool connections.
 - Measured at **1 and 8 uvicorn workers** (`fastapi-w1`, `fastapi-w8`) so
   multi-process scaling is visible next to single-process quackapi.
 
@@ -117,10 +125,18 @@ single VUs level (default 32).
 - `uv` for the FastAPI venv at `bench/.venv` (`uvicorn` / `fastapi` /
   `psycopg[binary]` / `psycopg_pool` are **not** assumed global)
 
+Create the isolated FastAPI environment once before a run:
+
+```bash
+uv venv bench/.venv
+uv pip install --python bench/.venv/bin/python \
+  fastapi 'uvicorn[standard]' 'psycopg[binary]' psycopg_pool
+```
+
 ## How to run
 
 ```bash
-cd /Users/aloksubbarao/personal/quackapi-bench
+cd /Users/aloksubbarao/personal/quackapi
 
 # Ensure pgEdge is answering
 podman start pgedge-n1
@@ -137,19 +153,25 @@ bash bench/run.sh hello item
 
 `run.sh` (serial stacks by design — never concurrent on shared cores):
 
-1. Clears `bench/results/`
-2. Records machine + versions into `bench/results/env.txt`
+1. Creates a unique `bench/results/<run-id>/` directory and preserves prior runs
+2. Records machine, source/build hashes, effective budgets, and versions into `env.txt`
 3. For each stack: start serve script → poll `/hello` until ready → run k6 →
    kill server → wait for port release
-4. After write runs, writes
-   `<stack>__write__vus<N>__rowcheck.txt` (`pg_rows k6_successful_reqs`)
-5. Prints the comparison table via `bench/report.sql`
+4. After write runs, verifies measurement-phase prefixed commits against
+   measurement-phase acknowledged requests and writes a structured rowcheck
+5. Prints the row-oriented comparison table via `bench/report.sql`
+
+A cell is valid only when k6 exited successfully, the measure window produced
+requests, no measure HTTP request failed, every response contract check passed,
+the raw latency sample count matches successful requests, and write commit/ack
+counts agree. Invalid cells stay in the report with their reason and the runner
+exits nonzero, so a fast failure cannot become a speed claim.
 
 Re-print the table later:
 
 ```bash
-cd /Users/aloksubbarao/personal/quackapi-bench/bench
-/Users/aloksubbarao/personal/quackapi/build/release/duckdb -init /dev/null -c ".read report.sql"
+cd /Users/aloksubbarao/personal/quackapi/bench/results/<run-id>
+/Users/aloksubbarao/personal/quackapi/build/release/duckdb -init /dev/null < ../../report.sql
 ```
 
 ### Env knobs
@@ -158,6 +180,8 @@ cd /Users/aloksubbarao/personal/quackapi-bench/bench
 |----------|---------|---------|
 | `WARMUP_DURATION` | `5s` | Ramp 0 → VUs (excluded from reported metrics) |
 | `MEASURE_DURATION` | `20s` | Steady-state window that populates the report |
+| `WRITE_WARMUP_DRAIN_DURATION` | `2s` | Let write warmup requests finish before measurement VUs begin |
+| `WRITE_MEASURE_GRACEFUL_STOP_DURATION` | `30s` | Let final write requests finish before k6 exits |
 | `DEFAULT_VUS` | `32` | VUs for hello / rows |
 | `ITEM_VUS_LIST` | `1 8 16 32` | Concurrency sweep for item |
 | `WRITE_VUS_LIST` | `1 8 16 32 64` | Concurrency sweep for write |
@@ -166,10 +190,17 @@ cd /Users/aloksubbarao/personal/quackapi-bench/bench
 
 ## Stage durations (warmup excluded from numbers)
 
-Every scenario uses the same two k6 stages:
+Every scenario has a tagged warmup and measurement stage:
 
 1. **warmup** — `ramping-vus`, `0 → VUs` over **5s**, tag `stage=warmup`
 2. **measure** — `constant-vus` at **VUs** for **20s**, tag `stage=measure`
+
+For `write`, measurement starts after a two-second warmup drain by default.
+That prevents warmup and measurement from competing for the same k6 VU pool;
+the commit/ack check uses only the explicitly counted measurement writes.
+At the end of measurement, k6 allows writes up to 30 seconds to finish. This
+prevents a server-side commit after a client-side cancellation from masquerading
+as a lost acknowledgement.
 
 `report.sql` reads only measure-stage submetrics:
 
@@ -189,23 +220,24 @@ Every scenario uses the same two k6 stages:
 Checks assert **response shape**, not byte-equality of timestamps. DuckDB and
 psycopg format timestamps differently (`"2026-01-01 00:00:00"` vs
 `"2026-01-01T00:00:00"`); both are accepted. Shape = 2xx + keys present +
-typed ids where applicable. A fast-but-erroring run shows a high
-`*_check_fail` rate — do not trust RPS when that column is non-zero.
+typed ids where applicable. A fast-but-erroring cell is retained for diagnosis,
+marked `valid=false`, and excluded from comparisons.
 
 ### Results file naming
 
 ```text
-bench/results/<stack>__hello.json
-bench/results/<stack>__rows.json
-bench/results/<stack>__item__vus<N>.json          # N in 1 8 16 32
-bench/results/<stack>__write__vus<N>.json         # N in 1 8 16 32 64
-bench/results/<stack>__write__vus<N>__rowcheck.txt  # "<pg_rows> <k6_ok>"
-bench/results/<stack>__server.log
-bench/results/env.txt
-bench/results/fastapi_versions.txt
+bench/results/<run-id>/<stack>__hello.json
+bench/results/<run-id>/<stack>__rows.json
+bench/results/<run-id>/<stack>__item__vus<N>.json          # N in 1 8 16 32
+bench/results/<run-id>/<stack>__write__vus<N>.json         # N in 1 8 16 32 64
+bench/results/<run-id>/<stack>__write__vus<N>__rowcheck.txt  # scoped commit/ack
+bench/results/<run-id>/<stack>__server.log
+bench/results/<run-id>/env.txt
+bench/results/<run-id>/cells.tsv
+bench/results/<run-id>/rowchecks.tsv
 ```
 
-`<stack>` is exactly one of: `quackapi`, `fastapi-w1`, `fastapi-w8`.
+`<stack>` is exactly one of: `quackapi-w1`, `quackapi-w8`, `fastapi-w1`, or `fastapi-w8`.
 
 ## What the comparison table means
 
@@ -214,10 +246,11 @@ bench/results/fastapi_versions.txt
 
 | Column family | Meaning |
 |---------------|---------|
-| `*_rps` | Measure-stage request rate |
-| `*_p50_ms` / `*_p95_ms` / `*_p99_ms` | Measure-stage `http_req_duration` percentiles (ms) |
-| `*_check_fail` | Fraction of k6 checks that failed (0 = all shape/status checks passed) |
-| `*_pg_rows` / `*_k6_ok` | Write rowcheck only: rows counted in Postgres vs k6 successful requests |
+| `successful_rps` | Measure-stage successful request rate |
+| `p50_ms` / `p95_ms` / `p99_ms` | Measure-stage `http_req_duration` percentiles (ms) |
+| `http_failures` / `check_failures` | Failed measure requests/checks; either makes a cell invalid |
+| `pg_rows` / `k6_ok` | Write rowcheck: measurement-phase committed rows vs measurement-phase acknowledged requests |
+| `valid` / `invalid_reason` | Whether the cell is eligible for comparison and why it was rejected |
 
 ## What this does **not** measure
 
