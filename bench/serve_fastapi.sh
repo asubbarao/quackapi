@@ -36,15 +36,30 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Uvicorn's parent owns one child per worker. Emit the exact PID set so the
-# runner can verify that every requested worker exists before measuring.
+# Uvicorn's parent owns a short-lived spawn helper as well as one child per
+# worker on some versions. Emit only the actual application worker PIDs so the
+# runner can verify the requested worker count without mistaking the helper for
+# a server process.
 worker_pids=""
 for _ in $(seq 1 120); do
   if [[ "$WORKERS" -eq 1 ]]; then
     worker_pids="$UVICORN_PID"
     break
   fi
-  worker_pids="$(pgrep -P "$UVICORN_PID" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
+  worker_pids=""
+  for pid in $(pgrep -P "$UVICORN_PID" 2>/dev/null || true); do
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$command_line" == *"fastapi_app:app"* || "$command_line" == *"multiprocessing-fork"* ]]; then
+      worker_pids+="${pid} "
+    fi
+  done
+  worker_pids="${worker_pids% }"
+  # Older Uvicorn releases do not expose the application target in child
+  # command lines. Their child list still contains the requested workers plus
+  # one spawn helper, so retain that authoritative live set as a fallback.
+  if [[ -z "$worker_pids" ]]; then
+    worker_pids="$(pgrep -P "$UVICORN_PID" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
+  fi
   count=0
   [[ -n "$worker_pids" ]] && count=$(wc -w <<<"$worker_pids" | tr -d ' ')
   if [[ "$count" -ge "$WORKERS" ]]; then

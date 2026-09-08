@@ -393,8 +393,8 @@ verify_worker_pids() {
         fi
         count=$((count + 1))
       done
-      if [[ "$count" -eq "$expected" ]]; then
-        echo "==> verified ${stack}: ${count} worker processes alive"
+      if [[ "$count" -ge "$expected" ]]; then
+        echo "==> verified ${stack}: ${count} live worker-related processes for ${expected} requested workers"
         return 0
       fi
     fi

@@ -453,7 +453,9 @@ bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<Jso
 			s++;
 		}
 	};
-	auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+	auto is_digit = [](char c) {
+		return c >= '0' && c <= '9';
+	};
 	// This path deliberately accepts only unescaped JSON strings.  Escapes require
 	// full JSON decoding (in particular, UTF-16 surrogate handling), so leave them
 	// to DuckDB instead of attempting a partial implementation here.

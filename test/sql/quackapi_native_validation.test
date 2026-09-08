@@ -154,6 +154,18 @@ SELECT status, decode(body) FROM quackapi_request('POST', '/nullable-body', '{"o
 ----
 200	[{"optional":17}]
 
+# Malformed JSON must not take the flat-object fast path. Trailing input and
+# invalid escapes are rejected before handler SQL executes.
+query I
+SELECT status FROM quackapi_request('POST', '/nullable-body', '{"optional":17} trailing');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('POST', '/nullable-body', '{"optional":"\\uZZZZ"}');
+----
+422
+
 query I
 DROP ROUTE nullable_body;
 ----

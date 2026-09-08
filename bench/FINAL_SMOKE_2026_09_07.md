@@ -14,6 +14,9 @@ in each immutable result directory.
   HTTP workers and four pool slots per process.
 - The runner waits for all requested worker PIDs, refuses occupied ports, and
   only stops the process group it created.
+- The FastAPI launcher filters Uvicorn's spawn helper from its worker set and
+  accepts the helper when older Uvicorn versions do not expose worker command
+  lines; every requested worker-related process must still be alive.
 - Report rows correlate raw k6 samples through the runner's `export_name`
   manifest rather than parsing routing fields from a filename. A cell is valid
   only when the measurement request count, successful count, raw latency count,
@@ -52,10 +55,30 @@ that report offered versus achieved rate, queue delay, timeouts, and per-worker
 connection distribution. That work is necessary before treating the current
 reuse-path numbers as production performance parity.
 
-## Final comparison status
+## Final comparison
 
-The final all-stack smoke is pending the consolidated validation build. It will
-run QuackAPI and FastAPI at one and eight workers across `hello`, `item`,
-`rows`, and `write`, with item and write at 1 and 8 VUs, using the same isolated
-PostgreSQL tables. This document will be updated with the preserved result path
-and validity outcome before any comparison is published.
+The consolidated run is preserved at
+`bench/results/20260908T051111Z-81854`. It covered 24 cells (four stacks ×
+`hello`, `item`, `rows`, `write`; `item` and `write` at 1 and 8 VUs). Every
+cell was valid: zero HTTP failures, zero check failures, k6 exit 0, and write
+acknowledgements exactly matched committed rows. The measurement was 1 second
+warmup, 3 seconds, and a 2 second write drain. The source tree was dirty because
+the smoke ran before this documentation update; the exact source SHA, binary
+SHA-256 values, dependency versions, budgets, and trial order are in that run's
+`env.txt`.
+
+Representative 8-VU results (successful requests per second; p50/p99 in ms):
+
+| Stack | hello | item | rows | write |
+|---|---:|---:|---:|---:|
+| quackapi-w1 | 46,305; 0.132/0.660 | 43,083; 0.142/0.791 | 3,346; 1.499/2.127 | 29,687; 0.211/0.931 |
+| quackapi-w8 | 33,131; 0.092/0.620 | 29,676; 0.104/0.753 | 1,808; 1.493/8.593 | 19,686; 0.155/1.104 |
+| fastapi-w1 | 8,624; 0.877/1.438 | 5,436; 1.407/2.254 | 594; 12.405/21.414 | 5,153; 1.474/2.465 |
+| fastapi-w8 | 19,314; 0.388/0.785 | 14,895; 0.477/1.197 | 2,041; 3.238/9.918 | 11,342; 0.630/1.373 |
+
+These short closed-loop numbers are directional evidence, not a production
+parity claim. QuackAPI leads this run on these PostgreSQL-backed routes, but its
+eight-worker write cell has a 10,027.811 ms maximum caused by the documented
+per-connection worker head-of-line behavior. The raw samples and all 1-VU cells
+remain in the preserved result directory; report generation excludes no valid
+cell.
