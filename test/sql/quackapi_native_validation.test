@@ -1,0 +1,198 @@
+# name: test/sql/quackapi_native_validation.test
+# description: Native DuckDB typed request bodies, null/default distinction, and SQL-safe body parameter discovery
+# group: [sql]
+
+require quackapi
+
+# BODY TYPE uses DuckDB json_transform structure syntax. It needs no optional
+# json_schema extension; the declared type is injected for $body at prepare time.
+query I
+CREATE ROUTE typed_cart POST '/typed-cart'
+  BODY TYPE '{"items":[{"sku":"VARCHAR","qty":"INTEGER"}]}'
+  AS SELECT array_length($body.items) AS item_count;
+----
+Route typed_cart: POST /typed-cart
+
+query II
+SELECT status,
+       contains(decode(body), '"items":{"type":"array"') AND
+       contains(decode(body), '"sku":{"type":"string"') AND
+       contains(decode(body), '"qty":{"type":"integer"') AND
+       contains(decode(body), '"x-duckdb-json-transform"')
+FROM quackapi_request('GET', '/openapi.json');
+----
+200	true
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/typed-cart', '{"items":[{"sku":"a", "qty":2},{"sku":"b","qty":3}]}');
+----
+200	[{"item_count":2}]
+
+# json_transform_strict rejects an invalid nested scalar before handler SQL.
+query I
+SELECT status
+FROM quackapi_request('POST', '/typed-cart', '{"items":[{"sku":"a","qty":"nope"}]}');
+----
+422
+
+query I
+DROP ROUTE typed_cart;
+----
+Dropped route typed_cart
+
+# BODY TYPE also accepts a root LIST with no STRUCT wrapper. The handler
+# receives a native DuckDB list from the one declaration.
+query I
+CREATE ROUTE typed_numbers POST '/typed-numbers'
+  BODY TYPE '["INTEGER"]'
+  AS SELECT array_length($body) AS item_count;
+----
+Route typed_numbers: POST /typed-numbers
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/typed-numbers', '[1,2,3]');
+----
+200	[{"item_count":3}]
+
+query I
+SELECT status FROM quackapi_request('POST', '/typed-numbers', '[1,"nope"]');
+----
+422
+
+query I
+DROP ROUTE typed_numbers;
+----
+Dropped route typed_numbers
+
+# Root scalar transforms receive their concrete type too.
+query I
+CREATE ROUTE typed_increment POST '/typed-increment'
+  BODY TYPE '"INTEGER"'
+  AS SELECT $body + 1 AS value;
+----
+Route typed_increment: POST /typed-increment
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/typed-increment', '41');
+----
+200	[{"value":42}]
+
+query I
+DROP ROUTE typed_increment;
+----
+Dropped route typed_increment
+
+# JSON Pointer numeric segments use the actual payload container: object keys
+# remain JSON strings, including a leading-zero key, while array indexes are numbers.
+query I
+CREATE ROUTE numeric_object_key POST '/numeric-object-key'
+  BODY SCHEMA '{"type":"object","properties":{"01":{"type":"integer","maximum":1}}}'
+  AS SELECT 1 AS ok;
+----
+Route numeric_object_key: POST /numeric-object-key
+
+query II
+SELECT status, contains(decode(body), '"loc":["body","01"]')
+FROM quackapi_request('POST', '/numeric-object-key', '{"01":2}');
+----
+422	true
+
+query I
+DROP ROUTE numeric_object_key;
+----
+Dropped route numeric_object_key
+
+# Error-location parsing bounds its own JSON walk. A hostile deeply nested body
+# still returns a normal 422 instead of recursing on the request stack.
+query I
+CREATE ROUTE deeply_nested_body POST '/deeply-nested-body'
+  BODY SCHEMA '{"type":"array","items":{"type":"integer"}}'
+  AS SELECT 1 AS ok;
+----
+Route deeply_nested_body: POST /deeply-nested-body
+
+query I
+SELECT status
+FROM quackapi_request('POST', '/deeply-nested-body', repeat('[', 129) || '0' || repeat(']', 129));
+----
+422
+
+query I
+DROP ROUTE deeply_nested_body;
+----
+Dropped route deeply_nested_body
+
+# Missing input takes DEFAULT NULL; explicit JSON null takes the separate native
+# null path; the string "null" is still a string and fails INTEGER conversion.
+query I
+CREATE ROUTE nullable_body POST '/nullable-body'
+  PARAM optional INTEGER DEFAULT NULL
+  AS SELECT $optional::INTEGER AS optional;
+----
+Route nullable_body: POST /nullable-body
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/nullable-body', '{}');
+----
+200	[{"optional":null}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/nullable-body', '{"optional":null}');
+----
+200	[{"optional":null}]
+
+query II
+SELECT status, contains(decode(body), '"type":"type_error"')
+FROM quackapi_request('POST', '/nullable-body', '{"optional":"null"}');
+----
+422	true
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/nullable-body', '{"optional":17}');
+----
+200	[{"optional":17}]
+
+query I
+DROP ROUTE nullable_body;
+----
+Dropped route nullable_body
+
+# Route binding aggregates independent body field failures in one FastAPI-style
+# detail array and preserves body locations for both entries.
+query I
+CREATE ROUTE aggregate_body_errors POST '/aggregate-body-errors'
+  AS SELECT $name::INTEGER AS name, $count::INTEGER AS count;
+----
+Route aggregate_body_errors: POST /aggregate-body-errors
+
+query II
+SELECT status,
+       contains(decode(body), '"body","name"') AND contains(decode(body), '"body","count"')
+FROM quackapi_request('POST', '/aggregate-body-errors', '{"name":"nope","count":null}');
+----
+422	true
+
+query I
+DROP ROUTE aggregate_body_errors;
+----
+Dropped route aggregate_body_errors
+
+# A '$body' spelling inside SQL text is not a request parameter. The DuckDB
+# lexer protects literals/comments/dollar-quoted text before body scanning.
+query I
+CREATE ROUTE quoted_param POST '/quoted-param'
+  AS SELECT '$phantom' AS literal_value;
+----
+Route quoted_param: POST /quoted-param
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/quoted-param');
+----
+200	[{"literal_value":"$phantom"}]
+
+query I
+DROP ROUTE quoted_param;
+----
+Dropped route quoted_param

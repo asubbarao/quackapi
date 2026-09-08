@@ -67,7 +67,7 @@ void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 			*it = route;
 			PublishRoutes();
 			// OR REPLACE is a new registration — do not inherit spent rate-limit windows.
-			QuackapiClearRouteRateLimit(route.name);
+			ClearRouteRateLimit(route.name);
 			return;
 		}
 	}
@@ -77,7 +77,7 @@ void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 	}
 	routes.push_back(route);
 	PublishRoutes();
-	QuackapiClearRouteRateLimit(route.name);
+	ClearRouteRateLimit(route.name);
 }
 
 bool QuackapiState::DropRoute(const string &name) {
@@ -86,7 +86,7 @@ bool QuackapiState::DropRoute(const string &name) {
 		if (it->name == name) {
 			routes.erase(it);
 			PublishRoutes();
-			QuackapiClearRouteRateLimit(name);
+			ClearRouteRateLimit(name);
 			return true;
 		}
 	}

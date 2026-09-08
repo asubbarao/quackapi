@@ -15,6 +15,7 @@ dist/
 
 # Generated conformance output
 test/conformance/results/
+test/conformance/__pycache__/
 
 # concurrent agent proposals (hive partitions)
 agent_signature/
@@ -23,3 +24,6 @@ bench/bench_*.duckdb
 bench/bench_*.duckdb.wal
 bench/__pycache__/
 bench/.tmp/
+bench/.venv/
+# Preserve raw benchmark runs locally; publish reviewed summaries in docs.
+bench/results/

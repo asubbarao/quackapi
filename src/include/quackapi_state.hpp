@@ -135,6 +135,11 @@ struct QuackapiRoute {
 	//! Optional JSON Schema (draft) for the request body. Empty = no schema check.
 	//! Validated via the community `json_schema` extension at request time.
 	string body_schema;
+	//! Optional DuckDB JSON transform structure for a typed request body. The
+	//! structure uses native DuckDB names (e.g. {"items":[{"id":"INTEGER"}]}),
+	//! is checked by json_transform_strict, and lets $body bind as STRUCT/LIST
+	//! without a duplicate application model. Empty = no typed body transform.
+	string body_type;
 	//! Group this route joined (empty if none). Pattern/auth already expanded.
 	string group_name;
 	//! OpenAPI tags CSV (from group inheritance or future per-route tags).
@@ -239,6 +244,9 @@ public:
 	}
 
 	static QuackapiState &Get(DatabaseInstance &db);
+	//! Database-scoped quotas; raw credentials are never retained as keys.
+	bool AllowRateLimit(const string &route, const string &client, int limit, int per_sec, int &retry_after);
+	void ClearRouteRateLimit(const string &route);
 
 	//! CREATE [OR REPLACE] ROUTE. Throws on duplicate name unless or_replace.
 	void AddRoute(const QuackapiRoute &route, bool or_replace);
@@ -285,12 +293,11 @@ public:
 	//! Lookup by name. Returns false if not registered.
 	bool GetQueue(const string &name, QuackapiQueue &out);
 	vector<QuackapiQueue> SnapshotQueues();
-	//! Shared dequeue claim fence (mutex + lease map) for this database.
+	//! Shared queue delivery fence for this database. It serializes dequeue,
+	//! expiry recovery, acknowledgement, retry, and lease renewal across static
+	//! and loadable copies of the extension.
 	std::mutex &DequeueClaimMutex() {
 		return dequeue_claim_mutex;
-	}
-	unordered_map<string, unordered_map<int64_t, int64_t>> &DequeueLeases() {
-		return dequeue_leases;
 	}
 
 	//! Start serving on host:port. Throws if a server already listens there.
@@ -367,6 +374,12 @@ private:
 	void PublishStreams();
 
 	std::atomic<int32_t> last_effective_write_timeout_sec {0};
+	struct RateLimitEntry {
+		int count = 0;
+		std::chrono::steady_clock::time_point expires;
+	};
+	std::mutex rate_limit_mutex;
+	unordered_map<string, RateLimitEntry> rate_limit_entries;
 
 	std::mutex routes_mutex;
 	vector<QuackapiRoute> routes;
@@ -386,12 +399,10 @@ private:
 
 	std::mutex queues_mutex;
 	vector<QuackapiQueue> queues;
-	//! Serialize dequeue claims for this database. Function-local statics are
-	//! unsafe: static+loadable extension copies each get their own mutex/lease
-	//! map, so concurrent HTTP workers can bypass the fence.
+	//! Serialize queue delivery transitions for this database. Function-local
+	//! statics are unsafe: static+loadable extension copies would each get an
+	//! independent mutex, allowing concurrent HTTP workers to bypass the fence.
 	std::mutex dequeue_claim_mutex;
-	//! queue -> job_id -> lease deadline (microseconds since epoch).
-	unordered_map<string, unordered_map<int64_t, int64_t>> dequeue_leases;
 
 	std::mutex policies_mutex;
 	vector<QuackapiRowAccessPolicy> row_access_policies;

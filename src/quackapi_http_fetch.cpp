@@ -1,5 +1,8 @@
 #include "quackapi_http_fetch.hpp"
+#include "quackapi_thread_join.hpp"
+#include "quackapi_limits.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -19,6 +22,10 @@ namespace duckdb {
 namespace {
 
 constexpr idx_t MAX_IDLE_PER_HOST = 64;
+// Concurrency cap when one chunk carries many independent calls. Kept at or below
+// MAX_IDLE_PER_HOST so a fan-out cannot dial more sockets than the pool will keep,
+// which would turn every burst into a churn of one-shot connections.
+constexpr idx_t MAX_OUTBOUND_FANOUT = 32;
 // Read/write: LLM upstreams are slow; the caller cancels. Connect stays short so
 // a dead peer (or CI loopback after stop) fails fast instead of parking a worker.
 constexpr time_t OUTBOUND_TIMEOUT_SECONDS = 600;
@@ -313,6 +320,14 @@ QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
 	if (!client) {
 		client = DialPlain(origin);
 	}
+	// Reset on every checkout: a previous request's short deadline must not leak.
+	const auto timeout_ms = QuackapiRemainingTimeoutMillis(OUTBOUND_TIMEOUT_SECONDS * 1000);
+	client->set_max_timeout(static_cast<time_t>(timeout_ms));
+	client->set_read_timeout(static_cast<time_t>(timeout_ms / 1000), static_cast<time_t>((timeout_ms % 1000) * 1000));
+	client->set_write_timeout(static_cast<time_t>(timeout_ms / 1000), static_cast<time_t>((timeout_ms % 1000) * 1000));
+	const auto connect_ms = std::min<int64_t>(timeout_ms, OUTBOUND_CONNECT_TIMEOUT_SECONDS * 1000);
+	client->set_connection_timeout(static_cast<time_t>(connect_ms / 1000),
+	                               static_cast<time_t>((connect_ms % 1000) * 1000));
 
 	QuackapiHttpFetchResult result;
 	bool healthy = false;
@@ -365,6 +380,9 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 
 	auto params = http_util.InitializeParameters(db, url);
 	params->keep_alive = true;
+	const auto timeout_ms = QuackapiRemainingTimeoutMillis(OUTBOUND_TIMEOUT_SECONDS * 1000);
+	params->timeout = timeout_ms / 1000;
+	params->timeout_usec = (timeout_ms % 1000) * 1000;
 	auto result = build(http_util, *params, client);
 	result.reused_connection = reused;
 
@@ -555,31 +573,120 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
 	return v.GetValue<int32_t>();
 }
 
+//! Issue one independent outbound call per row of a chunk, CONCURRENTLY.
+//!
+//! Why this exists: these are scalar functions, so a chunk can carry up to
+//! STANDARD_VECTOR_SIZE independent requests. Run serially, N calls against an
+//! upstream with latency L cost N*L while the machine idles and the connection
+//! pool sits unused. The pool already tolerates concurrent checkout (every path
+//! takes ConnectionPool::lock), so fanning out is the whole fix.
+//!
+//! `perform(i)` must be safe to call from any thread. Exceptions are captured per
+//! row rather than allowed to escape: WithPlainClient deliberately rethrows on a
+//! half-written socket, and an exception crossing a std::thread boundary would
+//! call std::terminate and take the server down with it. Argument validation that
+//! must still raise to the caller therefore happens BEFORE the fan-out.
+//!
+//! The single-request case — what a route handler doing one upstream call per
+//! request looks like — stays fully inline. No thread is created for it.
+template <class PERFORM>
+void FanOutRequests(idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out, PERFORM &&perform) {
+	const auto deadline = QuackapiCurrentDeadline();
+	auto run_one = [&](idx_t i) {
+		QuackapiSetCurrentDeadline(deadline);
+		try {
+			out[i] = perform(i);
+		} catch (std::exception &e) {
+			out[i].request_error = e.what();
+		} catch (...) {
+			out[i].request_error = "unknown error during outbound HTTP request";
+		}
+	};
+
+	idx_t active = 0;
+	for (idx_t i = 0; i < count; i++) {
+		if (!skip[i]) {
+			active++;
+		}
+	}
+	if (active == 0) {
+		return;
+	}
+	if (active == 1) {
+		for (idx_t i = 0; i < count; i++) {
+			if (!skip[i]) {
+				run_one(i);
+			}
+		}
+		return;
+	}
+
+	const idx_t n_threads = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
+	std::atomic<idx_t> cursor {0};
+	vector<std::thread> threads;
+	threads.reserve(n_threads);
+	JoinOutboundThreads<vector<std::thread>> join_threads {threads};
+	for (idx_t t = 0; t < n_threads; t++) {
+		threads.emplace_back([&]() {
+			for (;;) {
+				const idx_t i = cursor.fetch_add(1);
+				if (i >= count) {
+					return;
+				}
+				if (!skip[i]) {
+					run_one(i);
+				}
+			}
+		});
+	}
+}
+
 void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
 	const auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+
+	// Extract every argument up front, single-threaded: DataChunk/Vector reads are
+	// not safe to interleave with the fan-out below. stall_ms is validated here too,
+	// so its InvalidInputException still reaches the caller instead of being captured
+	// into a per-row error by the fan-out.
+	vector<bool> skip(count, false);
+	vector<string> urls(count);
+	vector<unordered_map<string, string>> headers(count);
+	vector<int32_t> stalls(count, 0);
 	for (idx_t i = 0; i < count; i++) {
 		auto url = args.data[0].GetValue(i);
 		if (url.IsNull()) {
-			result.SetValue(i, Value(FetchResultType()));
+			skip[i] = true;
 			continue;
 		}
-		unordered_map<string, string> headers;
-		int32_t stall_ms = 0;
+		urls[i] = url.ToString();
 		if (args.ColumnCount() == 2) {
 			// Overload is either (url, headers MAP) or (url, stall_ms INTEGER).
 			if (args.data[1].GetType().id() == LogicalTypeId::INTEGER ||
 			    args.data[1].GetType().id() == LogicalTypeId::BIGINT) {
-				stall_ms = StallMsFromArgs(args, i, 1);
+				stalls[i] = StallMsFromArgs(args, i, 1);
 			} else {
-				headers = HeadersFromValue(args.data[1].GetValue(i));
+				headers[i] = HeadersFromValue(args.data[1].GetValue(i));
 			}
 		} else if (args.ColumnCount() >= 3) {
-			headers = HeadersFromValue(args.data[1].GetValue(i));
-			stall_ms = StallMsFromArgs(args, i, 2);
+			headers[i] = HeadersFromValue(args.data[1].GetValue(i));
+			stalls[i] = StallMsFromArgs(args, i, 2);
 		}
-		result.SetValue(i, ToValue(QuackapiHttpFetch::Get(db, url.ToString(), headers, stall_ms)));
+		if (stalls[i] < 0) {
+			throw InvalidInputException("quackapi_fetch stall_ms must be >= 0");
+		}
+		if (stalls[i] > 0 && !IsPlainHTTP(urls[i])) {
+			throw InvalidInputException("quackapi_fetch stall_ms requires an http:// URL (plain TCP stall seam)");
+		}
+	}
+
+	vector<QuackapiHttpFetchResult> out(count);
+	FanOutRequests(count, skip, out,
+	               [&](idx_t i) { return QuackapiHttpFetch::Get(db, urls[i], headers[i], stalls[i]); });
+
+	for (idx_t i = 0; i < count; i++) {
+		result.SetValue(i, skip[i] ? Value(FetchResultType()) : ToValue(out[i]));
 	}
 }
 
@@ -587,24 +694,40 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
 	const auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+
+	vector<bool> skip(count, false);
+	vector<string> urls(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+	vector<unordered_map<string, string>> headers(count);
 	for (idx_t i = 0; i < count; i++) {
 		auto url = args.data[0].GetValue(i);
-		auto body = args.data[1].GetValue(i);
 		if (url.IsNull()) {
-			result.SetValue(i, Value(FetchResultType()));
+			skip[i] = true;
 			continue;
 		}
-		string content_type = "application/json";
+		urls[i] = url.ToString();
+		auto body = args.data[1].GetValue(i);
+		bodies[i] = body.IsNull() ? string() : body.ToString();
+		content_types[i] = "application/json";
 		if (args.ColumnCount() > 2) {
 			auto ct = args.data[2].GetValue(i);
 			if (!ct.IsNull()) {
-				content_type = ct.ToString();
+				content_types[i] = ct.ToString();
 			}
 		}
-		auto headers =
-		    args.ColumnCount() > 3 ? HeadersFromValue(args.data[3].GetValue(i)) : unordered_map<string, string>();
-		result.SetValue(i, ToValue(QuackapiHttpFetch::Post(
-		                       db, url.ToString(), body.IsNull() ? string() : body.ToString(), content_type, headers)));
+		if (args.ColumnCount() > 3) {
+			headers[i] = HeadersFromValue(args.data[3].GetValue(i));
+		}
+	}
+
+	vector<QuackapiHttpFetchResult> out(count);
+	FanOutRequests(count, skip, out, [&](idx_t i) {
+		return QuackapiHttpFetch::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
+	});
+
+	for (idx_t i = 0; i < count; i++) {
+		result.SetValue(i, skip[i] ? Value(FetchResultType()) : ToValue(out[i]));
 	}
 }
 
@@ -688,17 +811,26 @@ unique_ptr<GlobalTableFunctionState> ParallelFetchInit(ClientContext &context, T
 	auto &bind = input.bind_data->Cast<ParallelFetchBindData>();
 	auto state = make_uniq<ParallelFetchGlobalState>();
 	state->rows.resize(NumericCast<idx_t>(bind.n));
+	const auto deadline = QuackapiCurrentDeadline();
 	auto &db = *context.db;
 	vector<std::thread> threads;
 	threads.reserve(NumericCast<idx_t>(bind.n));
+	JoinOutboundThreads<vector<std::thread>> join_threads {threads};
 	for (int32_t i = 0; i < bind.n; i++) {
-		threads.emplace_back([&db, &bind, &state, i]() {
-			auto res = QuackapiHttpFetch::Get(db, bind.url);
+		threads.emplace_back([&db, &bind, &state, i, deadline]() {
+			QuackapiSetCurrentDeadline(deadline);
 			auto &row = state->rows[NumericCast<idx_t>(i)];
 			row.idx = i;
-			row.status = static_cast<int32_t>(res.status);
-			row.body = std::move(res.body);
-			row.error = std::move(res.request_error);
+			try {
+				auto res = QuackapiHttpFetch::Get(db, bind.url);
+				row.status = static_cast<int32_t>(res.status);
+				row.body = std::move(res.body);
+				row.error = std::move(res.request_error);
+			} catch (std::exception &ex) {
+				row.error = ex.what();
+			} catch (...) {
+				row.error = "unknown error during outbound HTTP request";
+			}
 		});
 	}
 	for (auto &t : threads) {

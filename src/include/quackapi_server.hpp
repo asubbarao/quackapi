@@ -79,6 +79,10 @@ struct QuackapiServeOptions {
 	int32_t read_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	//! Socket write timeout seconds. Default 30.
 	int32_t write_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
+	//! Query deadline is distinct from socket I/O timeouts. Always finite.
+	int64_t query_timeout_ms = 30000;
+	int64_t max_response_bytes = 16 * 1024 * 1024;
+	int32_t max_pending_requests = 256;
 
 	// --- Batteries: DuckDB SETs applied at serve (overridable) ---
 	//! Empty = apply non-clobber memory guard (256MB when still at system default).
@@ -212,11 +216,8 @@ private:
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers = nullptr,
-                              unordered_map<string, string> *headers_out = nullptr, const string &pg_dsn = string());
-
-//! Drop in-process rate-limit buckets for a route name (all client keys).
-//! Called on CREATE OR REPLACE / DROP ROUTE so a new registration starts fresh.
-void QuackapiClearRouteRateLimit(const string &route_name);
+                              unordered_map<string, string> *headers_out = nullptr, const string &pg_dsn = string(),
+                              const QuackapiServeOptions *request_options = nullptr);
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.

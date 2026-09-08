@@ -8,6 +8,7 @@
 
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
+#include "quackapi_validation.hpp"
 
 namespace duckdb {
 
@@ -118,14 +119,25 @@ string DuckTypeToOas(const LogicalType &type) {
 	case LogicalTypeId::TIMESTAMP_NS:
 		return "{\"type\":\"string\",\"format\":\"date-time\"}";
 	case LogicalTypeId::LIST:
-		return "{\"type\":\"array\",\"items\":{}}";
-	case LogicalTypeId::STRUCT:
+		return "{\"type\":\"array\",\"items\":" + DuckTypeToOas(ListType::GetChildType(type)) + "}";
+	case LogicalTypeId::STRUCT: {
+		auto &children = StructType::GetChildTypes(type);
+		string properties = "{";
+		for (idx_t i = 0; i < children.size(); i++) {
+			if (i > 0) {
+				properties += ",";
+			}
+			properties += JsonString(children[i].first) + ":" + DuckTypeToOas(children[i].second);
+		}
+		return "{\"type\":\"object\",\"properties\":" + properties + "}}";
+	}
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::UNION:
 		return "{\"type\":\"object\"}";
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::UUID:
+		return "{\"type\":\"string\",\"format\":\"uuid\"}";
 	case LogicalTypeId::BIT:
 	default: {
 		// JSON extension type and other aliases fall through as string/object-ish.
@@ -294,6 +306,32 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		}
 		params_json += "]";
 
+		// BODY TYPE is DuckDB's native json_transform structure. Project its
+		// STRUCT/LIST/scalar shape and retain the exact declaration for
+		// DuckDB-aware clients.
+		string request_body_json;
+		if (!route.body_schema.empty() || !route.body_type.empty()) {
+			string body_schema;
+			if (!route.body_schema.empty() && !route.body_type.empty()) {
+				body_schema = "{\"allOf\":[" + route.body_schema + "," +
+				              QuackapiDuckdbTransformToOpenApi(route.body_type) +
+				              "],\"x-duckdb-json-transform\":" + JsonString(route.body_type) + "}";
+			} else if (!route.body_schema.empty()) {
+				body_schema = route.body_schema;
+			} else {
+				body_schema = QuackapiDuckdbTransformToOpenApi(route.body_type);
+				if (body_schema.size() > 1 && body_schema.back() == '}') {
+					body_schema.pop_back();
+					body_schema += ",\"x-duckdb-json-transform\":" + JsonString(route.body_type) + "}";
+				} else {
+					body_schema = "{\"x-duckdb-json-transform\":" + JsonString(route.body_type) + "}";
+				}
+			}
+			request_body_json =
+			    "\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":" + body_schema +
+			    "}}},";
+		}
+
 		// response schema (exclude location / set_cookie control columns)
 		string response_schema;
 		string content_type;
@@ -413,6 +451,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				op += "\"tags\":" + tags_json + ",";
 			}
 		}
+		op += request_body_json;
 		op += "\"parameters\":" + params_json + ",";
 		op += "\"responses\":" + responses + ",";
 		op += "\"security\":" + security;

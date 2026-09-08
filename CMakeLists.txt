@@ -17,10 +17,13 @@ set(EXTENSION_SOURCES
     src/quackapi_extension.cpp
     src/quackapi_registry.cpp
     src/quackapi_server.cpp
+    src/quackapi_validation.cpp
     src/quackapi_batteries.cpp
     src/quackapi_ddl.cpp
     src/quackapi_auth.cpp
     src/quackapi_http_fetch.cpp
+    src/quackapi_limits.cpp
+    src/quackapi_middleware.cpp
     src/quackapi_table_api.cpp
     src/quackapi_openapi.cpp
     src/quackapi_graphql.cpp
@@ -34,6 +37,8 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 
 # The HTTP *server* uses the VENDORED copy in third_party/httplib (patched —
 # see the header of that file for the RFC 7230 §3.3.3 empty-body fix).

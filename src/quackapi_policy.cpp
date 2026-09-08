@@ -7,7 +7,15 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/list.hpp"
 
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
@@ -141,33 +149,6 @@ string JoinComma(const vector<string> &parts) {
 	return out;
 }
 
-string QuoteIdentIfNeeded(const string &ident) {
-	bool needs = false;
-	if (ident.empty() || !IsIdentStart(ident[0])) {
-		needs = true;
-	} else {
-		for (char c : ident) {
-			if (!IsIdentChar(c)) {
-				needs = true;
-				break;
-			}
-		}
-	}
-	if (!needs) {
-		// reserved-ish tokens still fine as bare for table names we control
-		return ident;
-	}
-	string escaped;
-	for (char c : ident) {
-		if (c == '"') {
-			escaped += "\"\"";
-		} else {
-			escaped += c;
-		}
-	}
-	return "\"" + escaped + "\"";
-}
-
 //! Replace whole-word identifier `val` with `replacement` (masking policy body).
 string SubstituteValPlaceholder(const string &expr, const string &replacement) {
 	string out;
@@ -214,179 +195,19 @@ string SubstituteValPlaceholder(const string &expr, const string &replacement) {
 	return out;
 }
 
-//! SQL keywords that cannot be a table alias when following a table name.
-bool IsSqlClauseKeyword(const string &tok_upper) {
-	return tok_upper == "WHERE" || tok_upper == "JOIN" || tok_upper == "LEFT" || tok_upper == "RIGHT" ||
-	       tok_upper == "INNER" || tok_upper == "OUTER" || tok_upper == "FULL" || tok_upper == "CROSS" ||
-	       tok_upper == "ON" || tok_upper == "GROUP" || tok_upper == "ORDER" || tok_upper == "LIMIT" ||
-	       tok_upper == "OFFSET" || tok_upper == "HAVING" || tok_upper == "UNION" || tok_upper == "EXCEPT" ||
-	       tok_upper == "INTERSECT" || tok_upper == "RETURNING" || tok_upper == "WINDOW" || tok_upper == "QUALIFY" ||
-	       tok_upper == "USING" || tok_upper == "NATURAL" || tok_upper == "AS" || tok_upper == "FROM" ||
-	       tok_upper == "SELECT" || tok_upper == "WITH" || tok_upper == "AND" || tok_upper == "OR";
-}
-
-//! Build secure subquery body (no outer alias) for one table.
-string BuildSecureSubquery(const string &table, const QuackapiRowAccessPolicy *rap,
-                           const vector<std::pair<string, string>> &masked_cols /* col -> expr with val subbed */) {
-	string t = QuoteIdentIfNeeded(table);
-	string where_sql;
-	if (rap) {
-		// Rewrite policy arg names → bound table column names when they differ.
-		// Convention: expression uses signature names; binding ON (cols) maps by position.
-		// When names match (common case) expression is used as-is.
-		where_sql = " WHERE (" + rap->expression + ")";
-	}
-	if (masked_cols.empty()) {
-		return "SELECT * FROM " + t + where_sql;
-	}
-	string excludes;
-	string extras;
-	for (idx_t i = 0; i < masked_cols.size(); i++) {
-		if (i > 0) {
-			excludes += ", ";
-			extras += ", ";
-		}
-		auto colq = QuoteIdentIfNeeded(masked_cols[i].first);
-		excludes += colq;
-		extras += "(" + masked_cols[i].second + ") AS " + colq;
-	}
-	return "SELECT * EXCLUDE (" + excludes + "), " + extras + " FROM " + t + where_sql;
-}
-
-//! Replace identifier occurrences of `table` with `(secure) AS alias` in SQL.
-string RewriteTableRefs(const string &sql, const string &table, const string &secure_body) {
-	string result;
-	result.reserve(sql.size() + secure_body.size());
-	bool in_str = false;
-	idx_t i = 0;
-	string table_lower = StringUtil::Lower(table);
-	while (i < sql.size()) {
-		char c = sql[i];
-		if (in_str) {
-			result += c;
-			if (c == '\'') {
-				if (i + 1 < sql.size() && sql[i + 1] == '\'') {
-					result += sql[i + 1];
-					i += 2;
-					continue;
-				}
-				in_str = false;
-			}
-			i++;
-			continue;
-		}
-		if (c == '\'') {
-			in_str = true;
-			result += c;
-			i++;
-			continue;
-		}
-		// Skip already-rewritten `(SELECT … FROM table …)` inner occurrences: only
-		// replace when the preceding non-space char is not '(' after FROM was already
-		// expanded. Simpler: match whole identifier equal to table.
-		if (IsIdentStart(c) || (c >= '0' && c <= '9')) {
-			// Only start identifiers at alpha/_
-			if (!IsIdentStart(c)) {
-				result += c;
-				i++;
-				continue;
-			}
-			idx_t j = i + 1;
-			while (j < sql.size() && IsIdentChar(sql[j])) {
-				j++;
-			}
-			string tok = sql.substr(i, j - i);
-			if (StringUtil::Lower(tok) != table_lower) {
-				result += tok;
-				i = j;
-				continue;
-			}
-			// Word-boundary: previous char must not be ident (already true) and next
-			// already non-ident. Check not schema-qualified prefix (skip "schema.table"
-			// when we only registered bare table) — if prev is '.', still rewrite
-			// (rare); operators leave it.
-			// Consume optional alias: [AS] alias
-			idx_t k = j;
-			while (k < sql.size() && StringUtil::CharacterIsSpace(sql[k])) {
-				k++;
-			}
-			string alias = table;
-			if (k < sql.size()) {
-				// AS alias
-				if (IsIdentStart(sql[k])) {
-					idx_t a0 = k;
-					idx_t a1 = k + 1;
-					while (a1 < sql.size() && IsIdentChar(sql[a1])) {
-						a1++;
-					}
-					string maybe = sql.substr(a0, a1 - a0);
-					auto mu = StringUtil::Upper(maybe);
-					if (mu == "AS") {
-						k = a1;
-						while (k < sql.size() && StringUtil::CharacterIsSpace(sql[k])) {
-							k++;
-						}
-						if (k < sql.size() && IsIdentStart(sql[k])) {
-							idx_t b0 = k;
-							idx_t b1 = k + 1;
-							while (b1 < sql.size() && IsIdentChar(sql[b1])) {
-								b1++;
-							}
-							alias = sql.substr(b0, b1 - b0);
-							j = b1;
-						}
-					} else if (!IsSqlClauseKeyword(mu)) {
-						alias = maybe;
-						j = a1;
-					}
-				}
-			}
-			// Avoid double-wrapping: if already `(SELECT …) AS table` from a prior pass
-			// for the same table, the outer alias is still the table name — but the
-			// inner FROM table is still present. We only rewrite outer refs by doing
-			// a single pass left-to-right; inner FROM table is rewritten too which
-			// would recurse. Solution: rewrite ONLY when not immediately after FROM
-			// inside a secure wrapper is hard.
-			// Instead: build secure with the physical table quoted, and mark with a
-			// sentinel so we don't re-match. Use quoted "table" form inside secure
-			// subquery which won't match bare identifier scan of bare table name
-			// when table is unquoted identifier... Actually QuoteIdentIfNeeded leaves
-			// bare names bare. Force-quote the physical table inside the subquery.
-			result += "(" + secure_body + ") AS " + QuoteIdentIfNeeded(alias);
-			i = j;
-			continue;
-		}
-		result += c;
-		i++;
-	}
-	return result;
-}
-
-// Force double-quote physical table so RewriteTableRefs won't rematch inside body.
-string BuildSecureSubqueryQuoted(const string &table, const QuackapiRowAccessPolicy *rap_for_where,
+// `physical_relation` is built from parsed catalog/schema/table identifiers. It
+// is deliberately not reconstructed from route text, so an attached catalog or
+// quoted identifier cannot silently target a different object.
+string BuildSecureSubqueryQuoted(const string &physical_relation, const QuackapiRowAccessPolicy *rap_for_where,
                                  const string &where_expr_or_empty,
                                  const vector<std::pair<string, string>> &masked_cols) {
-	// Always quote physical base table.
-	string t = "\"" + table + "\"";
-	// Escape embedded quotes in table name
-	{
-		string esc;
-		for (char c : table) {
-			if (c == '"') {
-				esc += "\"\"";
-			} else {
-				esc += c;
-			}
-		}
-		t = "\"" + esc + "\"";
-	}
 	string where_sql;
 	if (!where_expr_or_empty.empty()) {
 		where_sql = " WHERE (" + where_expr_or_empty + ")";
 	}
 	(void)rap_for_where;
 	if (masked_cols.empty()) {
-		return "SELECT * FROM " + t + where_sql;
+		return "SELECT * FROM " + physical_relation + where_sql;
 	}
 	string excludes;
 	string extras;
@@ -408,7 +229,7 @@ string BuildSecureSubqueryQuoted(const string &table, const QuackapiRowAccessPol
 		excludes += colq;
 		extras += "(" + masked_cols[i].second + ") AS " + colq;
 	}
-	return "SELECT * EXCLUDE (" + excludes + "), " + extras + " FROM " + t + where_sql;
+	return "SELECT * EXCLUDE (" + excludes + "), " + extras + " FROM " + physical_relation + where_sql;
 }
 
 //===--------------------------------------------------------------------===//
@@ -1053,193 +874,485 @@ void PoliciesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output
 // Enforcement rewrite
 //===--------------------------------------------------------------------===//
 
-bool HandlerTouchesPoliciedTable(DatabaseInstance &db, const string &handler_sql) {
-	auto &state = QuackapiState::Get(db);
-	auto rap_binds = state.SnapshotRowAccessBindings();
-	auto mask_binds = state.SnapshotMaskingBindings();
-	string sql_lower = StringUtil::Lower(handler_sql);
-	auto touches = [&](const string &table) -> bool {
-		string t = StringUtil::Lower(table);
-		// crude but sufficient: whole-word match
-		idx_t pos = 0;
-		while (pos < sql_lower.size()) {
-			auto found = sql_lower.find(t, pos);
-			if (found == string::npos) {
+//! Parsed identity of a catalog relation. Policy DDL historically stores a
+//! string name, so turn that name into the same AST representation used for a
+//! route before comparing it to a route reference.
+struct PolicyTableIdentity {
+	string catalog;
+	string schema;
+	string table;
+};
+
+string QuoteCatalogIdentifier(const string &ident) {
+	string out = "\"";
+	for (auto c : ident) {
+		if (c == '"') {
+			out += "\"\"";
+		} else {
+			out += c;
+		}
+	}
+	return out + "\"";
+}
+
+bool SameCatalogIdentifier(const string &left, const string &right) {
+	return StringUtil::Lower(left) == StringUtil::Lower(right);
+}
+
+string CurrentCatalog(Connection &con) {
+	auto result = con.Query("SELECT current_database()");
+	if (result->HasError()) {
+		return string();
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).IsNull()) {
+		return string();
+	}
+	return chunk->GetValue(0, 0).ToString();
+}
+
+PolicyTableIdentity IdentityFromBaseRef(const BaseTableRef &ref, const string &default_catalog) {
+	PolicyTableIdentity identity;
+	identity.catalog = ref.catalog_name.empty() ? default_catalog : ref.catalog_name;
+	identity.schema = ref.schema_name.empty() ? "main" : ref.schema_name;
+	identity.table = ref.table_name;
+	return identity;
+}
+
+bool ParsePolicyTableIdentity(const string &table_name, const string &default_catalog, PolicyTableIdentity &identity) {
+	try {
+		Parser parser;
+		parser.ParseQuery("SELECT * FROM " + table_name);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			return false;
+		}
+		auto &select = parser.statements[0]->Cast<SelectStatement>();
+		if (!select.node || select.node->type != QueryNodeType::SELECT_NODE) {
+			return false;
+		}
+		auto &node = select.node->Cast<SelectNode>();
+		if (!node.from_table || node.from_table->type != TableReferenceType::BASE_TABLE) {
+			return false;
+		}
+		identity = IdentityFromBaseRef(node.from_table->Cast<BaseTableRef>(), default_catalog);
+		return !identity.table.empty();
+	} catch (...) {
+		return false;
+	}
+}
+
+bool SamePolicyTableIdentity(const PolicyTableIdentity &left, const PolicyTableIdentity &right) {
+	return SameCatalogIdentifier(left.catalog, right.catalog) && SameCatalogIdentifier(left.schema, right.schema) &&
+	       SameCatalogIdentifier(left.table, right.table);
+}
+
+string QuotePolicyTableIdentity(const PolicyTableIdentity &identity) {
+	return QuoteCatalogIdentifier(identity.catalog) + "." + QuoteCatalogIdentifier(identity.schema) + "." +
+	       QuoteCatalogIdentifier(identity.table);
+}
+
+//! Replace a policy signature argument without touching SQL string literals.
+string ReplacePolicyIdentifier(const string &expr, const string &from, const string &to) {
+	string out;
+	bool in_str = false;
+	for (idx_t i = 0; i < expr.size();) {
+		if (in_str) {
+			out += expr[i];
+			if (expr[i] == '\'') {
+				if (i + 1 < expr.size() && expr[i + 1] == '\'') {
+					out += expr[i + 1];
+					i += 2;
+					continue;
+				}
+				in_str = false;
+			}
+			i++;
+			continue;
+		}
+		if (expr[i] == '\'') {
+			in_str = true;
+			out += expr[i++];
+			continue;
+		}
+		if (IsIdentStart(expr[i])) {
+			idx_t end = i + 1;
+			while (end < expr.size() && IsIdentChar(expr[end])) {
+				end++;
+			}
+			auto token = expr.substr(i, end - i);
+			out += SameCatalogIdentifier(token, from) ? to : token;
+			i = end;
+			continue;
+		}
+		out += expr[i++];
+	}
+	return out;
+}
+
+struct PolicyRewriteContext {
+	DatabaseInstance &db;
+	Connection con;
+	const vector<QuackapiRowAccessBinding> &rap_bindings;
+	const vector<QuackapiMaskingBinding> &mask_bindings;
+	bool authenticated;
+	string default_catalog;
+	bool deny_unauthenticated = false;
+	string error;
+	unordered_map<string, bool> view_cache;
+
+	PolicyRewriteContext(DatabaseInstance &db_p, const vector<QuackapiRowAccessBinding> &rap_bindings_p,
+	                     const vector<QuackapiMaskingBinding> &mask_bindings_p, bool authenticated_p)
+	    : db(db_p), con(db_p), rap_bindings(rap_bindings_p), mask_bindings(mask_bindings_p),
+	      authenticated(authenticated_p), default_catalog(CurrentCatalog(con)) {
+	}
+
+	void Reject(const string &reason) {
+		if (error.empty()) {
+			error = reason;
+		}
+		if (!authenticated) {
+			deny_unauthenticated = true;
+		}
+	}
+};
+
+bool IsCatalogView(PolicyRewriteContext &ctx, const PolicyTableIdentity &identity, bool &is_view) {
+	auto key = StringUtil::Lower(identity.catalog) + "\x1f" + StringUtil::Lower(identity.schema) + "\x1f" +
+	           StringUtil::Lower(identity.table);
+	auto cached = ctx.view_cache.find(key);
+	if (cached != ctx.view_cache.end()) {
+		is_view = cached->second;
+		return true;
+	}
+	auto result = ctx.con.Query(
+	    "SELECT 1 FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ? LIMIT 1",
+	    Value(identity.catalog), Value(identity.schema), Value(identity.table));
+	if (result->HasError()) {
+		return false;
+	}
+	auto chunk = result->Fetch();
+	is_view = chunk && chunk->size() > 0;
+	ctx.view_cache.emplace(std::move(key), is_view);
+	return true;
+}
+
+bool ParseSecureSubquery(const string &sql, unique_ptr<SelectStatement> &out) {
+	try {
+		Parser parser;
+		parser.ParseQuery(sql);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			return false;
+		}
+		out.reset(static_cast<SelectStatement *>(parser.statements[0].release()));
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+bool RewritePolicyQueryNode(QueryNode &node, PolicyRewriteContext &ctx);
+bool RewritePolicySelect(SelectStatement &statement, PolicyRewriteContext &ctx);
+
+//! Policy-bearing relations can occur in scalar/EXISTS/IN subqueries inside a
+//! SELECT list, predicate, join condition, or modifier — not only in FROM.
+//! Walk parsed expressions recursively so those reads receive the same AST
+//! rewrite as top-level relation sources.
+bool RewritePolicyExpression(ParsedExpression &expression, PolicyRewriteContext &ctx) {
+	if (!ctx.error.empty()) {
+		return false;
+	}
+	try {
+		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			auto &subquery = expression.Cast<SubqueryExpression>();
+			if (!subquery.subquery || !RewritePolicySelect(*subquery.subquery, ctx)) {
+				if (ctx.error.empty()) {
+					ctx.Reject("policy enforcement could not inspect a nested subquery");
+				}
 				return false;
 			}
-			bool left_ok = found == 0 || !IsIdentChar(sql_lower[found - 1]);
-			idx_t end = found + t.size();
-			bool right_ok = end >= sql_lower.size() || !IsIdentChar(sql_lower[end]);
-			if (left_ok && right_ok) {
-				return true;
+		}
+		bool rewritten = true;
+		ParsedExpressionIterator::EnumerateChildren(expression, [&](ParsedExpression &child) {
+			if (rewritten && !RewritePolicyExpression(child, ctx)) {
+				rewritten = false;
 			}
-			pos = found + 1;
-		}
+		});
+		return rewritten && ctx.error.empty();
+	} catch (...) {
+		ctx.Reject("policy enforcement could not inspect a nested expression");
 		return false;
-	};
-	for (auto &b : rap_binds) {
-		if (touches(b.table_name)) {
+	}
+}
+
+bool RewritePolicyModifiers(QueryNode &node, PolicyRewriteContext &ctx) {
+	bool rewritten = true;
+	try {
+		ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &expression) {
+			if (rewritten && expression && !RewritePolicyExpression(*expression, ctx)) {
+				rewritten = false;
+			}
+		});
+	} catch (...) {
+		ctx.Reject("policy enforcement could not inspect a query modifier");
+		return false;
+	}
+	return rewritten && ctx.error.empty();
+}
+
+bool RewritePolicySelect(SelectStatement &statement, PolicyRewriteContext &ctx) {
+	if (!statement.node) {
+		ctx.Reject("policy enforcement could not inspect an empty SELECT statement");
+		return false;
+	}
+	return RewritePolicyQueryNode(*statement.node, ctx);
+}
+
+bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx) {
+	if (!ref || !ctx.error.empty()) {
+		return false;
+	}
+	switch (ref->type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base = ref->Cast<BaseTableRef>();
+		auto identity = IdentityFromBaseRef(base, ctx.default_catalog);
+		bool is_view = false;
+		if (!IsCatalogView(ctx, identity, is_view)) {
+			ctx.Reject("policy enforcement could not resolve catalog object identity");
+			return false;
+		}
+		if (is_view) {
+			// A view can hide a protected relation. Do not infer dependencies from
+			// view SQL text: reject the indirect source until it has a bound rewrite.
+			ctx.Reject("policy enforcement rejects indirect view reads");
+			return false;
+		}
+
+		const QuackapiRowAccessBinding *rap_binding = nullptr;
+		const QuackapiMaskingBinding *first_mask = nullptr;
+		for (auto &binding : ctx.rap_bindings) {
+			PolicyTableIdentity bound;
+			if (!ParsePolicyTableIdentity(binding.table_name, ctx.default_catalog, bound)) {
+				ctx.Reject("policy binding has an invalid catalog identity");
+				return false;
+			}
+			if (SamePolicyTableIdentity(identity, bound)) {
+				rap_binding = &binding;
+				break;
+			}
+		}
+		for (auto &binding : ctx.mask_bindings) {
+			PolicyTableIdentity bound;
+			if (!ParsePolicyTableIdentity(binding.table_name, ctx.default_catalog, bound)) {
+				ctx.Reject("policy binding has an invalid catalog identity");
+				return false;
+			}
+			if (SamePolicyTableIdentity(identity, bound)) {
+				first_mask = &binding;
+				break;
+			}
+		}
+		if (!rap_binding && !first_mask) {
 			return true;
 		}
+		if (!ctx.authenticated) {
+			ctx.deny_unauthenticated = true;
+			return false;
+		}
+
+		auto &state = QuackapiState::Get(ctx.db);
+		QuackapiRowAccessPolicy rap_storage;
+		const QuackapiRowAccessPolicy *rap = nullptr;
+		string where_expr;
+		if (rap_binding) {
+			if (!state.GetRowAccessPolicy(rap_binding->policy_name, rap_storage)) {
+				ctx.Reject("row-access policy binding references a missing policy");
+				return false;
+			}
+			where_expr = rap_storage.expression;
+			for (idx_t i = 0; i < rap_storage.arg_columns.size() && i < rap_binding->columns.size(); i++) {
+				if (!SameCatalogIdentifier(rap_storage.arg_columns[i], rap_binding->columns[i])) {
+					where_expr =
+					    ReplacePolicyIdentifier(where_expr, rap_storage.arg_columns[i], rap_binding->columns[i]);
+				}
+			}
+			rap = &rap_storage;
+		}
+
+		vector<std::pair<string, string>> masked;
+		for (auto &binding : ctx.mask_bindings) {
+			PolicyTableIdentity bound;
+			if (!ParsePolicyTableIdentity(binding.table_name, ctx.default_catalog, bound)) {
+				ctx.Reject("policy binding has an invalid catalog identity");
+				return false;
+			}
+			if (!SamePolicyTableIdentity(identity, bound)) {
+				continue;
+			}
+			QuackapiMaskingPolicy mask;
+			if (!state.GetMaskingPolicy(binding.policy_name, mask)) {
+				ctx.Reject("masking policy binding references a missing policy");
+				return false;
+			}
+			masked.emplace_back(binding.column_name,
+			                    SubstituteValPlaceholder(mask.expression, QuoteCatalogIdentifier(binding.column_name)));
+		}
+
+		unique_ptr<SelectStatement> secure_query;
+		if (!ParseSecureSubquery(BuildSecureSubqueryQuoted(QuotePolicyTableIdentity(identity), rap, where_expr, masked),
+		                         secure_query)) {
+			ctx.Reject("policy enforcement could not construct a secure subquery");
+			return false;
+		}
+		string alias = ref->alias.empty() ? base.table_name : ref->alias;
+		auto replacement = make_uniq<SubqueryRef>(std::move(secure_query), alias);
+		ref->CopyProperties(*replacement);
+		replacement->alias = alias;
+		ref = std::move(replacement);
+		return true;
 	}
-	for (auto &b : mask_binds) {
-		if (touches(b.table_name)) {
-			return true;
+	case TableReferenceType::SUBQUERY:
+		return RewritePolicySelect(*ref->Cast<SubqueryRef>().subquery, ctx);
+	case TableReferenceType::JOIN: {
+		auto &join = ref->Cast<JoinRef>();
+		if (!RewritePolicyTableRef(join.left, ctx) || !RewritePolicyTableRef(join.right, ctx)) {
+			return false;
+		}
+		return !join.condition || RewritePolicyExpression(*join.condition, ctx);
+	}
+	case TableReferenceType::PIVOT: {
+		auto &pivot = ref->Cast<PivotRef>();
+		if (!RewritePolicyTableRef(pivot.source, ctx)) {
+			return false;
+		}
+		for (auto &aggregate : pivot.aggregates) {
+			if (aggregate && !RewritePolicyExpression(*aggregate, ctx)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case TableReferenceType::TABLE_FUNCTION:
+		ctx.Reject("policy enforcement rejects table functions and table macros");
+		return false;
+	case TableReferenceType::CTE:
+	case TableReferenceType::EMPTY_FROM:
+		return true;
+	case TableReferenceType::EXPRESSION_LIST: {
+		auto &values = ref->Cast<ExpressionListRef>();
+		for (auto &row : values.values) {
+			for (auto &expression : row) {
+				if (expression && !RewritePolicyExpression(*expression, ctx)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+	default:
+		ctx.Reject("policy enforcement rejects an unsupported relation source");
+		return false;
+	}
+}
+
+bool RewritePolicyQueryNode(QueryNode &node, PolicyRewriteContext &ctx) {
+	for (auto &entry : node.cte_map.map) {
+		if (!entry.second || !entry.second->query || !RewritePolicySelect(*entry.second->query, ctx)) {
+			ctx.Reject("policy enforcement could not inspect a common table expression");
+			return false;
 		}
 	}
-	return false;
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE: {
+		auto &select = node.Cast<SelectNode>();
+		if (select.from_table && !RewritePolicyTableRef(select.from_table, ctx)) {
+			return false;
+		}
+		for (auto &expression : select.select_list) {
+			if (expression && !RewritePolicyExpression(*expression, ctx)) {
+				return false;
+			}
+		}
+		for (auto &expression : select.groups.group_expressions) {
+			if (expression && !RewritePolicyExpression(*expression, ctx)) {
+				return false;
+			}
+		}
+		if ((select.where_clause && !RewritePolicyExpression(*select.where_clause, ctx)) ||
+		    (select.having && !RewritePolicyExpression(*select.having, ctx)) ||
+		    (select.qualify && !RewritePolicyExpression(*select.qualify, ctx))) {
+			return false;
+		}
+		return RewritePolicyModifiers(node, ctx);
+	}
+	case QueryNodeType::SET_OPERATION_NODE: {
+		auto &setop = node.Cast<SetOperationNode>();
+		for (auto &child : setop.children) {
+			if (!child || !RewritePolicyQueryNode(*child, ctx)) {
+				return false;
+			}
+		}
+		return RewritePolicyModifiers(node, ctx);
+	}
+	default:
+		ctx.Reject("policy enforcement rejects an unsupported query form");
+		return false;
+	}
+}
+
+//! Parse and rewrite every supported SELECT shape. Callers receive an explicit
+//! error when a protected relation cannot be inspected safely.
+bool RewriteHandlerWithPoliciesAst(DatabaseInstance &db, const string &handler_sql, bool authenticated,
+                                   bool &deny_unauthenticated, string &policy_error, string &rewritten_sql) {
+	deny_unauthenticated = false;
+	policy_error.clear();
+	auto &state = QuackapiState::Get(db);
+	auto rap_bindings = state.SnapshotRowAccessBindings();
+	auto mask_bindings = state.SnapshotMaskingBindings();
+	if (rap_bindings.empty() && mask_bindings.empty()) {
+		rewritten_sql = handler_sql;
+		return true;
+	}
+	PolicyRewriteContext ctx(db, rap_bindings, mask_bindings, authenticated);
+	try {
+		Parser parser;
+		parser.ParseQuery(handler_sql);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			ctx.Reject("policy enforcement supports one SELECT statement per handler");
+		} else {
+			auto &select = parser.statements[0]->Cast<SelectStatement>();
+			RewritePolicySelect(select, ctx);
+			if (ctx.error.empty() && !ctx.deny_unauthenticated) {
+				rewritten_sql = select.ToString();
+			}
+		}
+	} catch (...) {
+		ctx.Reject("policy enforcement could not parse handler SQL");
+	}
+	deny_unauthenticated = ctx.deny_unauthenticated;
+	policy_error = ctx.error;
+	if (!policy_error.empty() && !authenticated) {
+		deny_unauthenticated = true;
+	}
+	if (policy_error.empty() && !deny_unauthenticated) {
+		return true;
+	}
+	rewritten_sql = handler_sql;
+	return true;
+}
+
+bool HandlerTouchesPoliciedTable(DatabaseInstance &db, const string &handler_sql) {
+	bool deny_unauthenticated = false;
+	string policy_error;
+	string rewritten;
+	RewriteHandlerWithPoliciesAst(db, handler_sql, false, deny_unauthenticated, policy_error, rewritten);
+	return deny_unauthenticated || !policy_error.empty();
 }
 
 string RewriteHandlerWithPolicies(DatabaseInstance &db, const string &handler_sql, bool authenticated,
-                                  bool &deny_unauthenticated) {
-	deny_unauthenticated = false;
-	auto &state = QuackapiState::Get(db);
-	auto rap_binds = state.SnapshotRowAccessBindings();
-	auto mask_binds = state.SnapshotMaskingBindings();
-	if (rap_binds.empty() && mask_binds.empty()) {
-		return handler_sql;
-	}
-
-	// Collect tables that appear in the handler and have bindings.
-	unordered_map<string, string> table_canonical; // lower -> original
-	auto consider = [&](const string &table) {
-		if (HandlerTouchesPoliciedTable(db, handler_sql)) {
-			// per-table check
-		}
-		string sql_lower = StringUtil::Lower(handler_sql);
-		string t = StringUtil::Lower(table);
-		idx_t pos = 0;
-		while (pos < sql_lower.size()) {
-			auto found = sql_lower.find(t, pos);
-			if (found == string::npos) {
-				break;
-			}
-			bool left_ok = found == 0 || !IsIdentChar(sql_lower[found - 1]);
-			idx_t end = found + t.size();
-			bool right_ok = end >= sql_lower.size() || !IsIdentChar(sql_lower[end]);
-			if (left_ok && right_ok) {
-				table_canonical[t] = table;
-				return;
-			}
-			pos = found + 1;
-		}
-	};
-	for (auto &b : rap_binds) {
-		consider(b.table_name);
-	}
-	for (auto &b : mask_binds) {
-		consider(b.table_name);
-	}
-	if (table_canonical.empty()) {
-		return handler_sql;
-	}
-
-	if (!authenticated) {
-		deny_unauthenticated = true;
-		return handler_sql;
-	}
-
-	// Longest table name first so "order_items" before "orders" if both exist.
-	vector<string> tables;
-	for (auto &kv : table_canonical) {
-		tables.push_back(kv.second);
-	}
-	std::sort(tables.begin(), tables.end(), [](const string &a, const string &b) { return a.size() > b.size(); });
-
-	string sql = handler_sql;
-	for (auto &table : tables) {
-		// Resolve RAP
-		const QuackapiRowAccessPolicy *rap = nullptr;
-		QuackapiRowAccessPolicy rap_storage;
-		string where_expr;
-		for (auto &b : rap_binds) {
-			if (StringUtil::Lower(b.table_name) != StringUtil::Lower(table)) {
-				continue;
-			}
-			if (!state.GetRowAccessPolicy(b.policy_name, rap_storage)) {
-				continue;
-			}
-			// Map signature column names in expression → bound table columns.
-			where_expr = rap_storage.expression;
-			for (idx_t i = 0; i < rap_storage.arg_columns.size() && i < b.columns.size(); i++) {
-				if (StringUtil::Lower(rap_storage.arg_columns[i]) == StringUtil::Lower(b.columns[i])) {
-					continue;
-				}
-				// Replace whole-word arg name with bound column.
-				string mapped;
-				bool in_str = false;
-				string src = where_expr;
-				string from = rap_storage.arg_columns[i];
-				string to = b.columns[i];
-				for (idx_t j = 0; j < src.size();) {
-					if (in_str) {
-						mapped += src[j];
-						if (src[j] == '\'') {
-							if (j + 1 < src.size() && src[j + 1] == '\'') {
-								mapped += src[j + 1];
-								j += 2;
-								continue;
-							}
-							in_str = false;
-						}
-						j++;
-						continue;
-					}
-					if (src[j] == '\'') {
-						in_str = true;
-						mapped += src[j++];
-						continue;
-					}
-					if (IsIdentStart(src[j])) {
-						idx_t k = j + 1;
-						while (k < src.size() && IsIdentChar(src[k])) {
-							k++;
-						}
-						string tok = src.substr(j, k - j);
-						if (StringUtil::Lower(tok) == StringUtil::Lower(from)) {
-							mapped += to;
-						} else {
-							mapped += tok;
-						}
-						j = k;
-						continue;
-					}
-					mapped += src[j++];
-				}
-				where_expr = mapped;
-			}
-			rap = &rap_storage;
-			break;
-		}
-
-		// Masks for this table
-		vector<std::pair<string, string>> masked;
-		for (auto &b : mask_binds) {
-			if (StringUtil::Lower(b.table_name) != StringUtil::Lower(table)) {
-				continue;
-			}
-			QuackapiMaskingPolicy mp;
-			if (!state.GetMaskingPolicy(b.policy_name, mp)) {
-				continue;
-			}
-			// Physical column in subquery must be quoted so rewrite doesn't rematch.
-			string col_esc;
-			for (char c : b.column_name) {
-				if (c == '"') {
-					col_esc += "\"\"";
-				} else {
-					col_esc += c;
-				}
-			}
-			string quoted_col = "\"" + col_esc + "\"";
-			string expr = SubstituteValPlaceholder(mp.expression, quoted_col);
-			masked.emplace_back(b.column_name, expr);
-		}
-
-		string body = BuildSecureSubqueryQuoted(table, rap, where_expr, masked);
-		sql = RewriteTableRefs(sql, table, body);
-	}
-	return sql;
+                                  bool &deny_unauthenticated, string &policy_error) {
+	string parsed_rewrite;
+	RewriteHandlerWithPoliciesAst(db, handler_sql, authenticated, deny_unauthenticated, policy_error, parsed_rewrite);
+	return parsed_rewrite;
 }
 
 PolicyDdlParserExtension::PolicyDdlParserExtension() {

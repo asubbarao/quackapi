@@ -176,14 +176,13 @@ bool ParseJsonObjectClaims(DatabaseInstance &db, const string &json, unordered_m
 	if (jtype != "OBJECT") {
 		return false;
 	}
-	auto fields_res = con.Query("SELECT k AS key, "
-	                            "  CASE json_type(json_extract(doc, '$.' || k)) "
-	                            "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
+	auto fields_res = con.Query("SELECT key, "
+	                            "  CASE type "
+	                            "    WHEN 'VARCHAR' THEN json_extract_string(value, '$') "
 	                            "    WHEN 'NULL' THEN NULL "
-	                            "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
+	                            "    ELSE CAST(value AS VARCHAR) "
 	                            "  END AS val "
-	                            "FROM (SELECT ?::JSON AS doc) t, "
-	                            "     UNNEST(json_keys(doc)) AS u(k)",
+	                            "FROM json_each(?::JSON)",
 	                            Value(json));
 	if (fields_res->HasError()) {
 		return false;
@@ -250,7 +249,7 @@ bool ExtractBearer(const string &authorization, string &token) {
 		return false;
 	}
 	auto scheme = StringUtil::Lower(authorization.substr(0, 6));
-	if (scheme != "bearer") {
+	if (scheme != "bearer" || !StringUtil::CharacterIsSpace(authorization[6])) {
 		return false;
 	}
 	idx_t i = 6;
@@ -336,6 +335,12 @@ bool VerifyJwtHs256(DatabaseInstance &db, const string &token, const string &sec
 	}
 	unordered_map<string, bool> null_claims;
 	if (!ParseJsonObjectClaims(db, payload_json, claims, null_claims)) {
+		error_detail = "Invalid authentication credentials";
+		return false;
+	}
+	// A present NumericDate cannot be JSON null. Keep absence optional, but
+	// reject malformed time constraints rather than silently dropping them.
+	if (null_claims.find("exp") != null_claims.end() || null_claims.find("nbf") != null_claims.end()) {
 		error_detail = "Invalid authentication credentials";
 		return false;
 	}
@@ -586,19 +591,21 @@ LogicalType VerifyAuthReturnType() {
 
 void QuackapiVerifyAuthFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
-	auto scheme = args.GetValue(0, 0);
-	auto auth_string = args.GetValue(1, 0);
-	string scheme_s = scheme.IsNull() ? string() : scheme.GetValue<string>();
-	string auth_s = auth_string.IsNull() ? string() : auth_string.GetValue<string>();
-
-	auto auth_result = VerifyAuthScheme(db, scheme_s, auth_s);
-	vector<Value> fields;
-	fields.emplace_back(Value::BOOLEAN(auth_result.ok));
-	fields.emplace_back(Value::INTEGER(auth_result.status));
-	fields.emplace_back(Value(auth_result.body));
-	fields.emplace_back(Value(auth_result.www_authenticate));
-	fields.emplace_back(Value(auth_result.ok ? ClaimsToJson(auth_result.claims) : string("{}")));
-	result.Reference(Value::STRUCT(VerifyAuthReturnType(), std::move(fields)));
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto scheme = args.GetValue(0, row);
+		auto auth_string = args.GetValue(1, row);
+		string scheme_s = scheme.IsNull() ? string() : scheme.GetValue<string>();
+		string auth_s = auth_string.IsNull() ? string() : auth_string.GetValue<string>();
+		auto auth_result = VerifyAuthScheme(db, scheme_s, auth_s);
+		vector<Value> fields;
+		fields.emplace_back(Value::BOOLEAN(auth_result.ok));
+		fields.emplace_back(Value::INTEGER(auth_result.status));
+		fields.emplace_back(Value(auth_result.body));
+		fields.emplace_back(Value(auth_result.www_authenticate));
+		fields.emplace_back(Value(auth_result.ok ? ClaimsToJson(auth_result.claims) : string("{}")));
+		result.SetValue(row, Value::STRUCT(VerifyAuthReturnType(), std::move(fields)));
+	}
 }
 
 //! Drop-in for SET quack_authentication_function = 'quackapi_authentication'.
@@ -609,25 +616,24 @@ void QuackapiAuthenticationFunction(DataChunk &args, ExpressionState &state, Vec
 	auto &db = *state.GetContext().db;
 	// args: session_id, auth_string, token — session_id unused for token equality
 	// (same as quack_check_token which only compares args[1] and args[2]).
-	string auth_string = args.GetValue(1, 0).IsNull() ? string() : args.GetValue(1, 0).GetValue<string>();
-	string token = args.GetValue(2, 0).IsNull() ? string() : args.GetValue(2, 0).GetValue<string>();
-
-	if (!auth_string.empty() && !token.empty() && TimingSafeTokenEqual(auth_string, token)) {
-		result.Reference(Value::BOOLEAN(true));
-		return;
-	}
-
 	// Fall through: try every registered CREATE AUTH scheme against auth_string.
 	// Lets a co-located quack_serve share API_KEY/JWT policy with REST.
 	auto schemes = QuackapiState::Get(db).SnapshotAuths();
-	for (auto &scheme : schemes) {
-		auto r = VerifyAuthScheme(db, scheme.name, auth_string);
-		if (r.ok) {
-			result.Reference(Value::BOOLEAN(true));
-			return;
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		string auth_string = args.GetValue(1, row).IsNull() ? string() : args.GetValue(1, row).GetValue<string>();
+		string token = args.GetValue(2, row).IsNull() ? string() : args.GetValue(2, row).GetValue<string>();
+		bool ok = !auth_string.empty() && !token.empty() && TimingSafeTokenEqual(auth_string, token);
+		if (!ok) {
+			for (auto &scheme : schemes) {
+				if (VerifyAuthScheme(db, scheme.name, auth_string).ok) {
+					ok = true;
+					break;
+				}
+			}
 		}
+		result.SetValue(row, Value::BOOLEAN(ok));
 	}
-	result.Reference(Value::BOOLEAN(false));
 }
 
 //! Drop-in for SET quack_authorization_function = 'quackapi_authorization'.
@@ -635,7 +641,7 @@ void QuackapiAuthenticationFunction(DataChunk &args, ExpressionState &state, Vec
 //! (duckdb-quack src/quack_extension.cpp QuackDummyAuthorization).
 void QuackapiAuthorizationFunction(DataChunk &args, ExpressionState &, Vector &result) {
 	// args: session_id, query_string
-	result.Reference(args.GetValue(1, 0));
+	result.Reference(args.data[1]);
 }
 
 } // namespace
