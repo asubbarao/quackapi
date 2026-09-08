@@ -8,7 +8,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+# Match DuckDB (C++11). C++17 on these TUs emits inline FileFlags/LogicalType
+# symbols that already live in libduckdb_static — Linux link then fails.
+set(CMAKE_CXX_STANDARD "11" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
@@ -37,8 +39,6 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
-target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
-target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 
 # The HTTP *server* uses the VENDORED copy in third_party/httplib (patched —
 # see the header of that file for the RFC 7230 §3.3.3 empty-body fix).

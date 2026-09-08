@@ -347,6 +347,22 @@ string ValidationErrorJsonBody(const string &msg, const string &type) {
 	       QuackapiJsonEscape(type) + "\"}]}";
 }
 
+//! httplib Headers/Params → JSON object. Function template, not a generic lambda
+//! (C++14), so the extension stays on DuckDB's C++11 dialect.
+template <class PairRange>
+string PairsToJsonObject(const PairRange &pairs) {
+	string json = "{";
+	bool first = true;
+	for (const auto &pair : pairs) {
+		if (!first) {
+			json += ",";
+		}
+		first = false;
+		json += "\"" + QuackapiJsonEscape(pair.first) + "\":\"" + QuackapiJsonEscape(pair.second) + "\"";
+	}
+	return json + "}";
+}
+
 //! The json_schema extension includes an RFC 6901 pointer in failures (for
 //! example, "At /items/0/qty: ..."). Surface it as FastAPI's typed loc array
 //! instead of losing the field path behind a synthetic _schema member.
@@ -383,7 +399,11 @@ string ValidationErrorJsonSchema(const string &msg, const string &type, const st
 //! "null" remains a string and must not silently become SQL NULL.
 struct JsonBodyField {
 	string value;
-	bool explicit_null = false;
+	bool explicit_null;
+	JsonBodyField() : explicit_null(false) {
+	}
+	JsonBodyField(string value_p, bool explicit_null_p) : value(std::move(value_p)), explicit_null(explicit_null_p) {
+	}
 };
 
 //! Media type from Content-Type (strip parameters; lowercased).
@@ -2850,20 +2870,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 			context->timeout_ms = options.query_timeout_ms;
 			context->elapsed_ms = elapsed_ms;
-			auto to_json = [](const auto &pairs) {
-				string json = "{";
-				bool first = true;
-				for (const auto &pair : pairs) {
-					if (!first) {
-						json += ",";
-					}
-					first = false;
-					json += "\"" + QuackapiJsonEscape(pair.first) + "\":\"" + QuackapiJsonEscape(pair.second) + "\"";
-				}
-				return json + "}";
-			};
-			context->headers_json = to_json(req.headers);
-			context->query_json = to_json(req.params);
+			context->headers_json = PairsToJsonObject(req.headers);
+			context->query_json = PairsToJsonObject(req.params);
 			if (!ExecuteQuackapiMiddleware(con, *db, QuackapiMiddlewarePhase::BEFORE, context->group_name, *context,
 			                               authenticated, auth_result.claims)) {
 				SetJson(res, context->status, context->response_body);
@@ -2873,7 +2881,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				finish();
 				return;
 			}
-			after_middleware = [context, db, authenticated, claims = auth_result.claims, &res, t0]() {
+			auto claims = auth_result.claims;
+			after_middleware = [context, db, authenticated, claims, &res, t0]() {
 				context->status = res.status;
 				context->response_body = res.body;
 				context->elapsed_ms =
