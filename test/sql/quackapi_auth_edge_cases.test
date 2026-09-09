@@ -1,0 +1,97 @@
+# name: test/sql/quackapi_auth_edge_cases.test
+# description: Per-row auth decisions, strict Bearer parsing, literal JWT keys and null NumericDates
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE AUTH edge_key AS API_KEY;
+
+statement ok
+SELECT * FROM quackapi_add_api_key('edge_key', 'edge-valid-key', 'alice');
+
+statement ok
+CREATE ROUTE edge_me GET '/edge-me' REQUIRE edge_key AS SELECT $claims_sub AS sub;
+
+# A valid token still needs the separator after its authentication scheme.
+query I
+SELECT status FROM quackapi_request('GET', '/edge-me', headers := MAP {'Authorization': 'Beareredge-valid-key'});
+----
+401
+
+query I
+SELECT status FROM quackapi_request('GET', '/edge-me', headers := MAP {'Authorization': 'bEaReR edge-valid-key'});
+----
+200
+
+# A vector of credentials must not inherit the first row's successful decision.
+query IT
+SELECT i, (quackapi_verify_auth('edge_key', CASE WHEN i % 2 = 0 THEN 'edge-valid-key' ELSE 'invalid' END)).ok
+FROM range(4) t(i) ORDER BY i;
+----
+0	true
+1	false
+2	true
+3	false
+
+query IT
+SELECT i, quackapi_authentication('session', CASE WHEN i % 2 = 0 THEN 'server-key' ELSE 'invalid' END, 'server-key')
+FROM range(4) t(i) ORDER BY i;
+----
+0	true
+1	false
+2	true
+3	false
+
+query IT
+SELECT i, quackapi_authentication('session', CASE WHEN i % 2 = 0 THEN 'edge-valid-key' ELSE 'invalid' END, 'server-key')
+FROM range(4) t(i) ORDER BY i;
+----
+0	true
+1	false
+2	true
+3	false
+
+query IT
+SELECT i, quackapi_authorization('session', 'SELECT ' || i::VARCHAR)
+FROM range(4) t(i) ORDER BY i;
+----
+0	SELECT 0
+1	SELECT 1
+2	SELECT 2
+3	SELECT 3
+
+statement ok
+CREATE AUTH edge_jwt AS JWT (SECRET 'jwt-edge-secret');
+
+# Signed fixtures use only a test secret. Explicit null exp/nbf is malformed,
+# whereas an absent time constraint remains supported.
+query I
+SELECT (quackapi_verify_auth('edge_jwt', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSIsImV4cCI6bnVsbH0.DHxtJIeuGR9PQws8qqQoS0xrl0_jRHOwt4kh42VVMY8')).status;
+----
+401
+
+query I
+SELECT (quackapi_verify_auth('edge_jwt', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSIsIm5iZiI6bnVsbH0.8aSTBRIQtJZIro94Q2eCladgJjVkoIWEvGfI0S3uQPY')).status;
+----
+401
+
+# Dots/brackets in top-level claim names are literal keys, not JSONPath.
+query TT
+WITH verified AS (
+ SELECT (quackapi_verify_auth('edge_jwt', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSIsImV4cCI6NDEwMjQ0NDgwMCwidGVuYW50LmlkIjoibGl0ZXJhbCIsInRlbmFudCI6eyJpZCI6Im5lc3RlZCJ9LCJyb2xlWzBdIjoiYWRtaW4ifQ.Of4-rDJfK5puEqNmGD9oCIYZeOs8MijW24d97sxR_Ys')).claims_json AS claims
+)
+SELECT json_extract_string(claims, '$."tenant.id"'), json_extract_string(claims, '$."role[0]"') FROM verified;
+----
+literal	admin
+
+statement ok
+DROP ROUTE edge_me;
+
+statement ok
+DROP AUTH edge_key;
+
+statement ok
+DROP AUTH edge_jwt;

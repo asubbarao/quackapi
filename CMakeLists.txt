@@ -8,7 +8,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+# Match DuckDB (C++11). C++17 on these TUs emits inline FileFlags/LogicalType
+# symbols that already live in libduckdb_static — Linux link then fails.
+set(CMAKE_CXX_STANDARD "11" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
@@ -17,10 +19,13 @@ set(EXTENSION_SOURCES
     src/quackapi_extension.cpp
     src/quackapi_registry.cpp
     src/quackapi_server.cpp
+    src/quackapi_validation.cpp
     src/quackapi_batteries.cpp
     src/quackapi_ddl.cpp
     src/quackapi_auth.cpp
     src/quackapi_http_fetch.cpp
+    src/quackapi_limits.cpp
+    src/quackapi_middleware.cpp
     src/quackapi_table_api.cpp
     src/quackapi_openapi.cpp
     src/quackapi_graphql.cpp

@@ -21,10 +21,19 @@ SET GLOBAL force_download=true;
 SET memory_limit='4GB';
 SET threads=64;
 CREATE ROUTE fanout GET '/fanout' AS
-  SELECT count(*) AS n, sum(id) AS sum_ids
+  SELECT
+    CASE WHEN $n::INTEGER BETWEEN 1 AND 64 THEN count(*)
+         ELSE error('fanout n must be between 1 and 64') END AS n,
+    CASE WHEN $n::INTEGER BETWEEN 1 AND 64
+           AND $ms::INTEGER BETWEEN 0 AND 30000
+         THEN sum(id)
+         ELSE error('fanout arguments are invalid') END AS sum_ids
   FROM read_json(
-    list_transform(range(0,$n::INTEGER),
-      x -> 'http://127.0.0.1:9000/slow?ms=' || $ms::VARCHAR || '&id=' || x::VARCHAR
-             || '&nz=' || (random()*1e9)::BIGINT::VARCHAR),
+    list_transform(
+      range(0, CASE WHEN $n::INTEGER BETWEEN 1 AND 64 THEN $n::INTEGER ELSE 0 END),
+      x -> 'http://127.0.0.1:9000/slow?ms=' ||
+           (CASE WHEN $ms::INTEGER BETWEEN 0 AND 30000 THEN $ms::INTEGER ELSE 0 END)::VARCHAR ||
+           '&id=' || x::VARCHAR || '&nz=' || (random()*1e9)::BIGINT::VARCHAR
+    ),
     columns={id:'INTEGER', ok:'BOOLEAN', ms:'INTEGER'}, format='unstructured'
   );

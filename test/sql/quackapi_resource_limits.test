@@ -1,0 +1,84 @@
+# name: test/sql/quackapi_resource_limits.test
+# description: Finite query budgets, response caps and normalized rate-limit identity
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE resource_large GET '/resource-large' AS SELECT repeat('x', 4096) AS text;
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-large', max_response_bytes := 1024);
+----
+507
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-large', max_response_bytes := 8192);
+----
+200
+
+# Socket TIMEOUT and query execution budgets are separate controls.
+statement ok
+CREATE ROUTE resource_slow GET '/resource-slow' TIMEOUT 180 AS SELECT sum(i * random()) AS n FROM range(1000000000) t(i);
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-slow', query_timeout_ms := 10);
+----
+504
+
+# Cancellation must never poison the next request.
+statement ok
+CREATE ROUTE resource_ok GET '/resource-ok' AS SELECT 42 AS answer;
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-ok');
+----
+200
+
+statement error
+SELECT * FROM quackapi_request('GET', '/resource-ok', query_timeout_ms := 0);
+----
+query_timeout_ms must be between
+
+statement error
+SELECT * FROM quackapi_request('GET', '/resource-ok', max_response_bytes := -1);
+----
+max_response_bytes must be between
+
+statement ok
+CREATE AUTH resource_auth AS API_KEY;
+
+statement ok
+SELECT * FROM quackapi_add_api_key('resource_auth', 'resource-key', 'resource-user');
+
+statement ok
+CREATE ROUTE resource_quota GET '/resource-quota' REQUIRE resource_auth RATE LIMIT 1 PER 600 BY token AS SELECT 1 AS n;
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-quota', headers := MAP {'Authorization': 'Bearer resource-key'});
+----
+200
+
+# Equivalent accepted encodings and the API-key header share the verified user.
+query I
+SELECT status FROM quackapi_request('GET', '/resource-quota', headers := MAP {'Authorization': 'bEaReR   resource-key'});
+----
+429
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-quota', headers := MAP {'X-API-Key': 'resource-key'});
+----
+429
+
+statement ok
+CREATE ROUTE resource_public GET '/resource-public' RATE LIMIT 1 PER 600 BY token AS SELECT 1 AS n;
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-public', headers := MAP {'Authorization': 'Bearer arbitrary-a'});
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/resource-public', headers := MAP {'Authorization': 'Bearer arbitrary-b'});
+----
+429

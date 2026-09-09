@@ -26,7 +26,7 @@ QuackapiLogLevel ParseQuackapiLogLevel(const string &raw) {
 		return QuackapiLogLevel::WARN;
 	}
 	if (lower == "debug" || lower == "trace" || lower == "verbose") {
-		return QuackapiLogLevel::DEBUG;
+		return QuackapiLogLevel::DEBUG_LEVEL;
 	}
 	// Default + "info" / empty / unknown
 	return QuackapiLogLevel::INFO;
@@ -39,7 +39,7 @@ static const char *LogLevelDuckDBName(QuackapiLogLevel level) {
 		return "ERROR";
 	case QuackapiLogLevel::WARN:
 		return "WARNING";
-	case QuackapiLogLevel::DEBUG:
+	case QuackapiLogLevel::DEBUG_LEVEL:
 		return "DEBUG";
 	case QuackapiLogLevel::INFO:
 	default:

@@ -25,18 +25,22 @@
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parser.hpp"
 
 #include "quackapi_auth.hpp"
 #include "quackapi_graphql.hpp"
 #include "quackapi_openapi.hpp"
 #include "quackapi_pg.hpp"
 #include "quackapi_policy.hpp"
+#include "quackapi_limits.hpp"
+#include "quackapi_middleware.hpp"
 #include "quackapi_state.hpp"
 
 #include "httplib.hpp"
 #include "miniz_wrapper.hpp"
 #include "zstd.h"
 #include "quackapi_util.hpp"
+#include "quackapi_validation.hpp"
 
 namespace duckdb {
 
@@ -105,41 +109,6 @@ void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
 		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
 	}
 	qa_state.SetLastEffectiveWriteTimeoutSec(static_cast<int32_t>(timeout_sec));
-}
-
-//! Per-worker-thread DuckDB connection.
-//! httplib's ThreadPool runs each request on a worker thread. Connection
-//! construction is avoided only within a single request; each new request
-//! gets a fresh Connection so TEMP tables / SET / session state cannot leak
-//! across keep-alive or in-process calls on the same worker.
-//!
-//! Do NOT cache serialized JSON bodies by SQL alone: zero-parameter handlers
-//! still read tables and call volatile functions (uuid/random/now) — a SQL-only
-//! key freezes the first response forever on that worker.
-//! Do NOT cache PreparedStatement by SQL alone across requests: session reset
-//! drops the connection, and VIEW/MACRO identity is not part of the SQL text.
-struct ThreadRequestCache {
-	DatabaseInstance *db = nullptr;
-	unique_ptr<Connection> con;
-
-	//! Start of a request: always a new Connection (clears TEMP/SET).
-	Connection &BeginRequest(DatabaseInstance &instance) {
-		con = make_uniq<Connection>(instance);
-		db = &instance;
-		return *con;
-	}
-
-	Connection &GetConnection(DatabaseInstance &instance) {
-		if (!con || db != &instance) {
-			return BeginRequest(instance);
-		}
-		return *con;
-	}
-};
-
-ThreadRequestCache &TlsRequestCache() {
-	thread_local ThreadRequestCache cache;
-	return cache;
 }
 
 //! Content-Encoding choice after Accept-Encoding negotiation.
@@ -368,11 +337,74 @@ string ValidationErrorJson(const string &loc_kind, const string &param_name, con
 	       "\"],\"msg\":\"" + QuackapiJsonEscape(msg) + "\",\"type\":\"" + QuackapiJsonEscape(type) + "\"}]}";
 }
 
+string ValidationLocJson(const string &loc_kind, const string &param_name) {
+	return "[\"" + QuackapiJsonEscape(loc_kind) + "\",\"" + QuackapiJsonEscape(param_name) + "\"]";
+}
+
 //! FastAPI-shaped body-only validation error (loc = ["body"]).
 string ValidationErrorJsonBody(const string &msg, const string &type) {
 	return "{\"detail\":[{\"loc\":[\"body\"],\"msg\":\"" + QuackapiJsonEscape(msg) + "\",\"type\":\"" +
 	       QuackapiJsonEscape(type) + "\"}]}";
 }
+
+//! httplib Headers/Params → JSON object. Function template, not a generic lambda
+//! (C++14), so the extension stays on DuckDB's C++11 dialect.
+template <class PairRange>
+string PairsToJsonObject(const PairRange &pairs) {
+	string json = "{";
+	bool first = true;
+	for (const auto &pair : pairs) {
+		if (!first) {
+			json += ",";
+		}
+		first = false;
+		json += "\"" + QuackapiJsonEscape(pair.first) + "\":\"" + QuackapiJsonEscape(pair.second) + "\"";
+	}
+	return json + "}";
+}
+
+//! The json_schema extension includes an RFC 6901 pointer in failures (for
+//! example, "At /items/0/qty: ..."). Surface it as FastAPI's typed loc array
+//! instead of losing the field path behind a synthetic _schema member.
+string ValidationErrorJsonSchema(const string &msg, const string &type, const string &raw_body) {
+	const string markers[] = {"At /", "at /"};
+	for (auto &marker : markers) {
+		auto start_marker = msg.find(marker);
+		if (start_marker == string::npos) {
+			continue;
+		}
+		auto start = start_marker + marker.size() - 1; // retain the leading '/'
+		// json_schema phrases a failing location as "At /path of <value>";
+		// older releases use a colon or newline after the pointer instead.
+		auto end = msg.find(" of ", start);
+		auto punctuation_end = msg.find_first_of(":\n\r", start);
+		if (end == string::npos || (punctuation_end != string::npos && punctuation_end < end)) {
+			end = punctuation_end;
+		}
+		if (end == string::npos) {
+			end = msg.size();
+		}
+		while (end > start && StringUtil::CharacterIsSpace(msg[end - 1])) {
+			end--;
+		}
+		if (end > start) {
+			return QuackapiValidationErrorsJson(
+			    {{QuackapiValidationBodyPointerLoc(msg.substr(start, end - start), raw_body), msg, type}});
+		}
+	}
+	return ValidationErrorJson("body", "_schema", msg, type);
+}
+
+//! Preserve whether a JSON member was an actual JSON null. A string value of
+//! "null" remains a string and must not silently become SQL NULL.
+struct JsonBodyField {
+	string value;
+	bool explicit_null;
+	JsonBodyField() : explicit_null(false) {
+	}
+	JsonBodyField(string value_p, bool explicit_null_p) : value(std::move(value_p)), explicit_null(explicit_null_p) {
+	}
+};
 
 //! Media type from Content-Type (strip parameters; lowercased).
 string ContentTypeMedia(const case_insensitive_map_t<string> &headers) {
@@ -433,13 +465,80 @@ void ParseFormUrlEncoded(const string &body, case_insensitive_map_t<string> &out
 
 //! Fast path: flat JSON object of string/number/bool/null scalars (no DuckDB round-trip).
 //! Returns true on success. false → caller may fall back to SQL extract or error.
-bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<string> &fields) {
+bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<JsonBodyField> &fields) {
 	const char *s = raw_body.c_str();
 	const char *end = s + raw_body.size();
 	auto skip_ws = [&]() {
 		while (s < end && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) {
 			s++;
 		}
+	};
+	auto is_digit = [](char c) {
+		return c >= '0' && c <= '9';
+	};
+	// This path deliberately accepts only unescaped JSON strings.  Escapes require
+	// full JSON decoding (in particular, UTF-16 surrogate handling), so leave them
+	// to DuckDB instead of attempting a partial implementation here.
+	auto parse_plain_string = [&](string &out) {
+		if (s >= end || *s != '"') {
+			return false;
+		}
+		s++;
+		while (s < end && *s != '"') {
+			const auto ch = static_cast<unsigned char>(*s);
+			if (ch < 0x20 || *s == '\\') {
+				return false;
+			}
+			out.push_back(*s++);
+		}
+		if (s >= end) {
+			return false;
+		}
+		s++;
+		return true;
+	};
+	auto parse_number = [&]() {
+		const char *start = s;
+		if (s < end && *s == '-') {
+			s++;
+		}
+		if (s >= end) {
+			return false;
+		}
+		if (*s == '0') {
+			s++;
+			if (s < end && is_digit(*s)) {
+				return false;
+			}
+		} else if (*s >= '1' && *s <= '9') {
+			do {
+				s++;
+			} while (s < end && is_digit(*s));
+		} else {
+			return false;
+		}
+		if (s < end && *s == '.') {
+			s++;
+			if (s >= end || !is_digit(*s)) {
+				return false;
+			}
+			do {
+				s++;
+			} while (s < end && is_digit(*s));
+		}
+		if (s < end && (*s == 'e' || *s == 'E')) {
+			s++;
+			if (s < end && (*s == '+' || *s == '-')) {
+				s++;
+			}
+			if (s >= end || !is_digit(*s)) {
+				return false;
+			}
+			do {
+				s++;
+			} while (s < end && is_digit(*s));
+		}
+		return s > start;
 	};
 	skip_ws();
 	if (s >= end || *s != '{') {
@@ -449,42 +548,16 @@ bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<str
 	fields.clear();
 	skip_ws();
 	if (s < end && *s == '}') {
-		return true;
+		s++;
+		skip_ws();
+		return s == end;
 	}
 	while (s < end) {
 		skip_ws();
-		if (s >= end || *s != '"') {
-			return false;
-		}
-		s++;
 		string key;
-		while (s < end && *s != '"') {
-			if (*s == '\\') {
-				s++;
-				if (s >= end) {
-					return false;
-				}
-				// minimal escapes
-				if (*s == '"' || *s == '\\' || *s == '/') {
-					key.push_back(*s);
-				} else if (*s == 'n') {
-					key.push_back('\n');
-				} else if (*s == 't') {
-					key.push_back('\t');
-				} else if (*s == 'r') {
-					key.push_back('\r');
-				} else {
-					key.push_back(*s);
-				}
-			} else {
-				key.push_back(*s);
-			}
-			s++;
-		}
-		if (s >= end || *s != '"') {
+		if (!parse_plain_string(key)) {
 			return false;
 		}
-		s++;
 		skip_ws();
 		if (s >= end || *s != ':') {
 			return false;
@@ -495,36 +568,13 @@ bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<str
 			return false;
 		}
 		string val;
+		bool explicit_null = false;
 		if (*s == '"') {
-			s++;
-			while (s < end && *s != '"') {
-				if (*s == '\\') {
-					s++;
-					if (s >= end) {
-						return false;
-					}
-					if (*s == '"' || *s == '\\' || *s == '/') {
-						val.push_back(*s);
-					} else if (*s == 'n') {
-						val.push_back('\n');
-					} else if (*s == 't') {
-						val.push_back('\t');
-					} else if (*s == 'r') {
-						val.push_back('\r');
-					} else {
-						val.push_back(*s);
-					}
-				} else {
-					val.push_back(*s);
-				}
-				s++;
-			}
-			if (s >= end || *s != '"') {
+			if (!parse_plain_string(val)) {
 				return false;
 			}
-			s++;
 		} else if (*s == 'n' && s + 4 <= end && string(s, 4) == "null") {
-			val = "null";
+			explicit_null = true;
 			s += 4;
 		} else if (*s == 't' && s + 4 <= end && string(s, 4) == "true") {
 			val = "true";
@@ -534,40 +584,24 @@ bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<str
 			s += 5;
 		} else if (*s == '-' || (*s >= '0' && *s <= '9')) {
 			const char *start = s;
-			if (*s == '-') {
-				s++;
-			}
-			while (s < end && *s >= '0' && *s <= '9') {
-				s++;
-			}
-			if (s < end && *s == '.') {
-				s++;
-				while (s < end && *s >= '0' && *s <= '9') {
-					s++;
-				}
-			}
-			if (s < end && (*s == 'e' || *s == 'E')) {
-				s++;
-				if (s < end && (*s == '+' || *s == '-')) {
-					s++;
-				}
-				while (s < end && *s >= '0' && *s <= '9') {
-					s++;
-				}
+			if (!parse_number()) {
+				return false;
 			}
 			val.assign(start, s - start);
 		} else {
 			// nested object/array — not flat; fall back
 			return false;
 		}
-		fields[key] = val;
+		fields[key] = {val, explicit_null};
 		skip_ws();
 		if (s < end && *s == ',') {
 			s++;
 			continue;
 		}
 		if (s < end && *s == '}') {
-			return true;
+			s++;
+			skip_ws();
+			return s == end;
 		}
 		return false;
 	}
@@ -576,8 +610,9 @@ bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<str
 
 //! Extract top-level JSON object fields as string values for binding.
 //! On invalid JSON sets err_json and returns false. Arrays/non-objects → model_attributes_type.
-bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensitive_map_t<string> &fields,
+bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensitive_map_t<JsonBodyField> &fields,
                            string &err_json) {
+	fields.clear();
 	if (raw_body.empty()) {
 		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
 		return false;
@@ -585,6 +620,13 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 	// Hot path: flat object without spinning DuckDB (POST /write etc.).
 	if (TryExtractFlatJsonObject(raw_body, fields)) {
 		return true;
+	}
+	// json_each lives in the JSON extension and is not available when automatic
+	// extension loading is disabled. Loading a bundled extension is idempotent.
+	auto json_load = con.Query("LOAD json");
+	if (json_load->HasError()) {
+		err_json = ValidationErrorJsonBody("JSON extension unavailable", "value_error");
+		return false;
 	}
 	// Validate JSON parse first (TRY_CAST → NULL on failure).
 	auto check = con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(raw_body));
@@ -612,15 +654,15 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 		                                   "model_attributes_type");
 		return false;
 	}
-	// Flatten top-level scalars: key → string form for BindParamValue.
-	auto fields_res = con.Query("SELECT k AS key, "
-	                            "  CASE json_type(json_extract(doc, '$.' || k)) "
-	                            "    WHEN 'VARCHAR' THEN json_extract_string(doc, '$.' || k) "
+	// json_each supplies the literal key, so keys containing dots or other JSONPath
+	// metacharacters cannot be reinterpreted as a path expression.
+	auto fields_res = con.Query("SELECT key, "
+	                            "  CASE type "
+	                            "    WHEN 'VARCHAR' THEN json_extract_string(value, '$') "
 	                            "    WHEN 'NULL' THEN NULL "
-	                            "    ELSE CAST(json_extract(doc, '$.' || k) AS VARCHAR) "
+	                            "    ELSE CAST(value AS VARCHAR) "
 	                            "  END AS val "
-	                            "FROM (SELECT ?::JSON AS doc) t, "
-	                            "     UNNEST(json_keys(doc)) AS u(k)",
+	                            "FROM json_each(?::JSON)",
 	                            Value(raw_body));
 	if (fields_res->HasError()) {
 		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
@@ -639,15 +681,10 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 			string key = key_v.GetValue<string>();
 			auto val_v = chunk->GetValue(1, row);
 			if (val_v.IsNull()) {
-				// Explicit JSON null: bind as empty string marker? Prefer skip so
-				// missing-style required still 422, or bind "" and let cast fail.
-				// FastAPI null for int → type error. Store special raw "null" text
-				// only if we want that; store empty and rely on type check is weak.
-				// Use the literal word that fails integer cast for ints: "null"
-				fields[key] = "null";
+				fields[key] = {string(), true};
 				continue;
 			}
-			fields[key] = val_v.GetValue<string>();
+			fields[key] = {val_v.GetValue<string>(), false};
 		}
 	}
 	return true;
@@ -697,7 +734,47 @@ bool ValidateBodySchema(Connection &con, const string &schema, const string &raw
 			msg = msg.substr(0, 200);
 		}
 	}
-	err_json = ValidationErrorJson("body", "_schema", msg, "value_error");
+	err_json = ValidationErrorJsonSchema(msg, "value_error", raw_body);
+	return false;
+}
+
+//! Run DuckDB's native JSON transform in strict mode. This is deliberately
+//! independent of the optional json_schema extension: a BODY TYPE declaration
+//! is a DuckDB type structure and validates/coerces through the engine itself.
+bool TransformTypedBody(Connection &con, const string &body_type, const string &raw_body, Value &out,
+                        string &err_json) {
+	auto result = con.Query("SELECT try(json_transform_strict(?::JSON, ?::JSON))", Value(raw_body), Value(body_type));
+	// json_transform is supplied by DuckDB's bundled json extension. Test and
+	// embedded deployments may turn automatic extension loading off, so load it
+	// explicitly only after DuckDB identifies this precise missing dependency.
+	if (result->HasError() && result->GetError().find("json extension") != string::npos) {
+		auto load = con.Query("LOAD json");
+		if (!load->HasError()) {
+			result =
+			    con.Query("SELECT try(json_transform_strict(?::JSON, ?::JSON))", Value(raw_body), Value(body_type));
+		}
+	}
+	if (!result->HasError()) {
+		auto chunk = result->Fetch();
+		if (chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull()) {
+			out = chunk->GetValue(0, 0);
+			return true;
+		}
+	}
+
+	string msg = "Body type validation failed";
+	auto strict = con.Query("SELECT json_transform_strict(?::JSON, ?::JSON)", Value(raw_body), Value(body_type));
+	if (strict->HasError()) {
+		msg = strict->GetError();
+		const string prefixes[] = {"Invalid Input Error: ", "Invalid Error: ", "Binder Error: "};
+		for (auto &prefix : prefixes) {
+			if (StringUtil::StartsWith(msg, prefix)) {
+				msg = msg.substr(prefix.size());
+				break;
+			}
+		}
+	}
+	err_json = ValidationErrorJsonBody(msg, "type_error");
 	return false;
 }
 
@@ -863,6 +940,90 @@ bool BindParamValue(const string &raw, const LogicalType &expected, const string
 		out = BoundParameterData(raw_value);
 	}
 	return true;
+}
+
+//! Mark quoted text and comments before looking for $params. The DuckDB lexer
+//! owns SQL quoting rules, including dollar-quoted bodies, so route body
+//! detection cannot mistake '$body' in a literal or comment for a request
+//! parameter.
+vector<bool> ProtectedSqlText(const string &sql) {
+	vector<bool> protected_text(sql.size(), false);
+	auto tokens = Parser::Tokenize(sql);
+	for (idx_t t = 0; t < tokens.size(); t++) {
+		auto &token = tokens[t];
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_STRING_CONSTANT &&
+		    token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT &&
+		    !(token.start < sql.size() && sql[token.start] == '"')) {
+			continue;
+		}
+		auto end = t + 1 < tokens.size() ? tokens[t + 1].start : sql.size();
+		for (idx_t p = token.start; p < end && p < sql.size(); p++) {
+			protected_text[p] = true;
+		}
+	}
+	return protected_text;
+}
+
+//! Resolve the native DuckDB type represented by a BODY TYPE declaration.
+//! This lets route SQL use $body.items directly: the server inserts the cast
+//! from the one declaration before DuckDB prepares the handler.
+bool ResolveTypedBodySqlType(Connection &con, const string &body_type, string &sql_type, string &error) {
+	auto first = body_type.find_first_not_of(" \t\n\r");
+	string sample = "null";
+	if (first != string::npos && body_type[first] == '{') {
+		sample = "{}";
+	} else if (first != string::npos && body_type[first] == '[') {
+		sample = "[]";
+	}
+	auto result = con.Query("SELECT typeof(json_transform(?::JSON, ?::JSON))", Value(sample), Value(body_type));
+	if (result->HasError()) {
+		error = result->GetError();
+		return false;
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).IsNull()) {
+		error = "BODY TYPE does not describe a DuckDB value type";
+		return false;
+	}
+	sql_type = chunk->GetValue(0, 0).GetValue<string>();
+	return true;
+}
+
+bool IsBodyParameterAt(const string &sql, const vector<bool> &protected_text, idx_t index) {
+	if (index + 5 > sql.size() || protected_text[index] || sql[index] != '$') {
+		return false;
+	}
+	if (StringUtil::Lower(sql.substr(index + 1, 4)) != "body") {
+		return false;
+	}
+	if (index + 5 < sql.size()) {
+		auto next = sql[index + 5];
+		if ((next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') || (next >= '0' && next <= '9') ||
+		    next == '_') {
+			return false;
+		}
+	}
+	return true;
+}
+
+string RewriteTypedBodyParameter(const string &sql, const string &sql_type) {
+	auto protected_text = ProtectedSqlText(sql);
+	string rewritten;
+	rewritten.reserve(sql.size() + sql_type.size());
+	for (idx_t i = 0; i < sql.size();) {
+		if (IsBodyParameterAt(sql, protected_text, i)) {
+			// Preserve a developer-supplied explicit cast for compatibility.
+			if (i + 6 < sql.size() && sql[i + 5] == ':' && sql[i + 6] == ':') {
+				rewritten += sql.substr(i, 5);
+			} else {
+				rewritten += "($body::" + sql_type + ")";
+			}
+			i += 5;
+			continue;
+		}
+		rewritten += sql[i++];
+	}
+	return rewritten;
 }
 
 struct RouteMatch {
@@ -1563,8 +1724,9 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
 	int32_t workers =
 	    opts.worker_threads > 0 ? opts.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
-	server->new_task_queue = [workers] {
-		return new duckdb_httplib::ThreadPool(static_cast<size_t>(workers));
+	const auto max_pending = opts.max_pending_requests;
+	server->new_task_queue = [workers, max_pending] {
+		return new duckdb_httplib::ThreadPool(static_cast<size_t>(workers), static_cast<size_t>(max_pending));
 	};
 	server->set_keep_alive_max_count(opts.keep_alive_max_count > 0 ? static_cast<size_t>(opts.keep_alive_max_count)
 	                                                               : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
@@ -1639,9 +1801,13 @@ void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &par
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path_in, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers,
-                              unordered_map<string, string> *headers_out, const string &pg_dsn) {
+                              unordered_map<string, string> *headers_out, const string &pg_dsn,
+                              const QuackapiServeOptions *request_options) {
 	// Quiet defaults for SQL tests: no access log, no compression (raw body).
 	QuackapiServeOptions opts;
+	if (request_options) {
+		opts = *request_options;
+	}
 	opts.access_log = false;
 	opts.compression = false;
 	opts.health_routes = true;
@@ -1870,79 +2036,69 @@ void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &re
 // route name + client key + floor(now / window). thread-safe.
 // CREATE OR REPLACE / DROP of a route clears that route's buckets so a new
 // registration does not inherit a spent window from the prior definition.
-struct RouteRateLimiter {
-	struct Entry {
-		int count = 0;
-		int64_t window_id = 0;
-	};
-	std::mutex lock;
-	unordered_map<string, Entry> entries;
-
-	// Returns true if allowed. On false, retry_after_sec is seconds until window end.
-	bool Allow(const string &bucket_key, int limit, int per_sec, int &retry_after_sec) {
-		retry_after_sec = per_sec;
-		if (limit <= 0 || per_sec <= 0) {
-			return true;
-		}
-		const auto now = std::chrono::system_clock::now().time_since_epoch();
-		const int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(now).count();
-		const int64_t window_id = now_sec / per_sec;
-		const int64_t window_end = (window_id + 1) * per_sec;
-		retry_after_sec = (int)std::max<int64_t>(1, window_end - now_sec);
-
-		std::lock_guard<std::mutex> guard(lock);
-		auto &e = entries[bucket_key];
-		if (e.window_id != window_id) {
-			e.window_id = window_id;
-			e.count = 0;
-		}
-		if (e.count >= limit) {
-			return false;
-		}
-		e.count++;
-		// Opportunistic prune when map grows large (unbounded routes × clients).
-		if (entries.size() > 100000) {
-			for (auto it = entries.begin(); it != entries.end();) {
-				if (it->second.window_id < window_id - 1) {
-					it = entries.erase(it);
+bool QuackapiState::AllowRateLimit(const string &route, const string &client, int limit, int per_sec,
+                                   int &retry_after_sec) {
+	const auto now = std::chrono::steady_clock::now();
+	const string key = std::to_string(route.size()) + ":" + route + "|" + client;
+	retry_after_sec = std::max(1, per_sec);
+	std::lock_guard<std::mutex> guard(rate_limit_mutex);
+	auto found = rate_limit_entries.find(key);
+	if (found == rate_limit_entries.end()) {
+		if (rate_limit_entries.size() >= 100000) {
+			for (auto it = rate_limit_entries.begin(); it != rate_limit_entries.end();) {
+				if (it->second.expires <= now) {
+					it = rate_limit_entries.erase(it);
 				} else {
 					++it;
 				}
 			}
 		}
-		return true;
+		// Fail closed rather than retaining an unbounded number of live identities.
+		if (rate_limit_entries.size() >= 100000) {
+			return false;
+		}
+		RateLimitEntry entry;
+		entry.expires = now + std::chrono::seconds(per_sec);
+		found = rate_limit_entries.emplace(key, entry).first;
 	}
+	auto &entry = found->second;
+	if (entry.expires <= now) {
+		entry.count = 0;
+		entry.expires = now + std::chrono::seconds(per_sec);
+	}
+	retry_after_sec =
+	    std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::seconds>(entry.expires - now).count() + 1);
+	if (entry.count >= limit) {
+		return false;
+	}
+	entry.count++;
+	return true;
+}
 
-	void ClearRoute(const string &route_name) {
-		const string prefix = route_name + "|";
-		std::lock_guard<std::mutex> guard(lock);
-		for (auto it = entries.begin(); it != entries.end();) {
-			if (StringUtil::StartsWith(it->first, prefix)) {
-				it = entries.erase(it);
-			} else {
-				++it;
-			}
+void QuackapiState::ClearRouteRateLimit(const string &route) {
+	const string prefix = std::to_string(route.size()) + ":" + route + "|";
+	std::lock_guard<std::mutex> guard(rate_limit_mutex);
+	for (auto it = rate_limit_entries.begin(); it != rate_limit_entries.end();) {
+		if (StringUtil::StartsWith(it->first, prefix)) {
+			it = rate_limit_entries.erase(it);
+		} else {
+			++it;
 		}
 	}
-};
-
-static RouteRateLimiter &GetRouteRateLimiter() {
-	static RouteRateLimiter lim;
-	return lim;
 }
 
-void QuackapiClearRouteRateLimit(const string &route_name) {
-	GetRouteRateLimiter().ClearRoute(route_name);
-}
-
-static string RateLimitClientKey(const duckdb_httplib::Request &req, const string &by) {
+static string RateLimitClientKey(DatabaseInstance &db, const duckdb_httplib::Request &req, const string &by,
+                                 const QuackapiRoute &route, const QuackapiAuthResult &verified) {
 	if (by == "token" || by == "key") {
-		string auth = req.get_header_value("Authorization");
-		if (auth.empty()) {
-			auth = req.get_header_value("X-API-Key");
-		}
-		if (!auth.empty()) {
-			return "tok:" + auth;
+		// Only verified identities can select their own bucket. An unauthenticated
+		// caller cannot evade an IP quota by inventing arbitrary token strings.
+		QuackapiAuth scheme;
+		if (!route.require_auth.empty() && verified.ok && QuackapiState::Get(db).GetAuth(route.require_auth, scheme)) {
+			auto sub = verified.claims.find("sub");
+			if (sub != verified.claims.end() && !sub->second.empty()) {
+				return "sub:" + QuackapiSha256(route.require_auth + ":" + sub->second);
+			}
+			return "tok:" + QuackapiSha256(ExtractAuthString(scheme, CollectHeaders(req)));
 		}
 		// Fall back to IP when no credential presented.
 	}
@@ -1961,7 +2117,21 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	const auto t0 = std::chrono::steady_clock::now();
 	string request_id; // filled once db is available; may be empty on 503 shutdown
 
+	std::function<void()> after_middleware;
 	auto finish = [&]() {
+		if (after_middleware) {
+			auto run_after = std::move(after_middleware);
+			after_middleware = nullptr;
+			run_after();
+		}
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() >=
+		    options.query_timeout_ms) {
+			res.headers.erase("Content-Encoding");
+			SetJson(res, 504, "{\"detail\":\"Query execution deadline exceeded\"}");
+		} else if (res.body.size() > static_cast<size_t>(options.max_response_bytes)) {
+			res.headers.erase("Content-Encoding");
+			SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+		}
 		if (!request_id.empty()) {
 			res.set_header("X-Request-ID", request_id);
 		}
@@ -2006,7 +2176,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			string version = "unknown";
 			bool ready = false;
 			try {
-				auto &con = TlsRequestCache().GetConnection(*db);
+				Connection con(*db);
 				auto resq = con.Query("SELECT version()");
 				if (!resq->HasError()) {
 					auto chunk = resq->Fetch();
@@ -2049,11 +2219,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		auto &gql_state = QuackapiState::Get(*db);
 		QuackapiGraphqlRoute gql_route;
 		if (req.method == "POST" && gql_state.GetGraphqlRouteByPath(req.path, req.method, gql_route)) {
+			QuackapiAuthResult auth_result;
 			if (!gql_route.require_auth.empty()) {
 				QuackapiRoute auth_probe;
 				auth_probe.require_auth = gql_route.require_auth;
 				auto headers = CollectHeaders(req);
-				auto auth_result = CheckAuth(*db, auth_probe, headers);
+				auth_result = CheckAuth(*db, auth_probe, headers);
 				if (!auth_result.ok) {
 					if (!auth_result.www_authenticate.empty()) {
 						res.set_header("WWW-Authenticate", auth_result.www_authenticate);
@@ -2073,6 +2244,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			try {
 				GraphqlExecOptions opts;
 				opts.allowed_tables = &gql_route.tables;
+				opts.authenticated = !gql_route.require_auth.empty() && auth_result.ok;
+				opts.claims = &auth_result.claims;
+				opts.query_timeout_ms = options.query_timeout_ms;
+				opts.max_response_bytes = options.max_response_bytes;
 				opts.limit = gql_route.limit == 0 ? QUACKAPI_GRAPHQL_DEFAULT_LIMIT : gql_route.limit;
 				SetJson(res, 200, ExecuteGraphqlQuery(*db, gql_query, opts));
 			} catch (std::exception &ex) {
@@ -2085,11 +2260,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		if ((req.method == "GET" || req.method == "HEAD") &&
 		    gql_state.GetGraphqlRouteBySchemaPath(req.path, gql_route)) {
+			QuackapiAuthResult auth_result;
 			if (!gql_route.require_auth.empty()) {
 				QuackapiRoute auth_probe;
 				auth_probe.require_auth = gql_route.require_auth;
 				auto headers = CollectHeaders(req);
-				auto auth_result = CheckAuth(*db, auth_probe, headers);
+				auth_result = CheckAuth(*db, auth_probe, headers);
 				if (!auth_result.ok) {
 					if (!auth_result.www_authenticate.empty()) {
 						res.set_header("WWW-Authenticate", auth_result.www_authenticate);
@@ -2103,6 +2279,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				GraphqlExecOptions opts;
 				opts.allowed_tables = &gql_route.tables;
 				opts.mode = "route";
+				opts.authenticated = !gql_route.require_auth.empty() && auth_result.ok;
+				opts.claims = &auth_result.claims;
+				opts.query_timeout_ms = options.query_timeout_ms;
+				opts.max_response_bytes = options.max_response_bytes;
 				opts.route_name = gql_route.name;
 				SetJson(res, 200, BuildGraphqlSchema(*db, opts));
 			} catch (std::exception &ex) {
@@ -2129,7 +2309,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				return;
 			}
 			try {
-				SetJson(res, 200, ExecuteGraphqlQuery(*db, gql_query));
+				GraphqlExecOptions opts;
+				opts.query_timeout_ms = options.query_timeout_ms;
+				opts.max_response_bytes = options.max_response_bytes;
+				SetJson(res, 200, ExecuteGraphqlQuery(*db, gql_query, opts));
 			} catch (std::exception &ex) {
 				SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
 			} catch (...) {
@@ -2159,7 +2342,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	if ((req.method == "GET" || req.method == "HEAD") &&
 	    (req.path == "/graphql/schema" || req.path == "/graphql/schema/")) {
 		try {
-			SetJson(res, 200, BuildGraphqlSchema(*db));
+			GraphqlExecOptions opts;
+			opts.query_timeout_ms = options.query_timeout_ms;
+			opts.max_response_bytes = options.max_response_bytes;
+			SetJson(res, 200, BuildGraphqlSchema(*db, opts));
 		} catch (std::exception &ex) {
 			SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
 		} catch (...) {
@@ -2386,25 +2572,18 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		return;
 	}
 
-	// ---- RATE LIMIT (before auth/handler work) ----
-	// CREATE ROUTE … RATE LIMIT <n> PER <seconds> [BY ip|token|key]
-	if (match.matched && match.route.rate_limit_n > 0 && match.route.rate_limit_per_sec > 0) {
-		string by = match.route.rate_limit_by.empty() ? string("ip") : match.route.rate_limit_by;
-		string client = RateLimitClientKey(req, by);
-		string bucket = match.route.name + "|" + client;
-		int retry_after = match.route.rate_limit_per_sec;
-		if (!GetRouteRateLimiter().Allow(bucket, match.route.rate_limit_n, match.route.rate_limit_per_sec,
-		                                 retry_after)) {
-			res.set_header("Retry-After", std::to_string(retry_after));
-			SetJson(res, 429, "{\"detail\":\"Rate limit exceeded\"}");
-			finish();
-			return;
-		}
-	}
-
 	// ---- CREATE STREAM (SSE) path — no auth schemes on streams in v1 ----
 	if (!match.matched && stream_match.matched) {
 		try {
+			bool policy_denied = false;
+			string stream_policy_error;
+			const auto stream_sql = RewriteHandlerWithPolicies(*db, stream_match.stream.handler_sql, false,
+			                                                   policy_denied, stream_policy_error);
+			if (policy_denied || !stream_policy_error.empty()) {
+				SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
+				finish();
+				return;
+			}
 			auto headers = CollectHeaders(req);
 			// HEAD: headers only — do not install a long-lived provider.
 			if (req.method == "HEAD") {
@@ -2419,7 +2598,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 			// Bind path + query (+ Last-Event-ID → $last_id) before installing provider.
 			auto con = make_shared_ptr<Connection>(*db);
-			auto prepared = con->Prepare(stream_match.stream.handler_sql);
+			QuackapiQueryDeadline initial_deadline(*con, options.query_timeout_ms);
+			auto prepared = con->Prepare(stream_sql);
 			if (prepared->HasError()) {
 				SetInternalError(res, prepared->GetError());
 				finish();
@@ -2475,14 +2655,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 
 			// Prove the first execute works before committing to chunked transfer.
-			{
-				auto probe = prepared->Execute(named_values, true);
-				if (probe->HasError()) {
-					SetInternalError(res, probe->GetError());
-					finish();
-					return;
-				}
-				// Drop probe; provider re-executes so the client sees a clean stream.
+			auto first_result = prepared->Execute(named_values, true);
+			if (first_result->HasError()) {
+				SetInternalError(res, first_result->GetError());
+				finish();
+				return;
 			}
 
 			struct SseProviderState {
@@ -2492,21 +2669,22 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				int64_t interval_ms = 0;
 				unique_ptr<PreparedStatement> prepared;
 				unique_ptr<QueryResult> result;
-				bool need_execute = true;
+				bool need_execute = false;
 				bool closed = false;
+				int64_t query_timeout_ms = 30000;
+				idx_t max_bytes = 0;
+				idx_t sent_bytes = 0;
 			};
 			auto state = make_shared_ptr<SseProviderState>();
 			state->con = con;
-			state->handler_sql = stream_match.stream.handler_sql;
+			state->handler_sql = stream_sql;
+			state->query_timeout_ms = options.query_timeout_ms;
+			state->max_bytes = options.max_response_bytes;
 			state->named_values = std::move(named_values);
 			state->interval_ms = stream_match.stream.interval_ms;
-			// Re-prepare owned by provider state (original prepared is local).
-			state->prepared = state->con->Prepare(state->handler_sql);
-			if (state->prepared->HasError()) {
-				SetInternalError(res, state->prepared->GetError());
-				finish();
-				return;
-			}
+			// Carry the first execution into the provider; never execute side effects twice.
+			state->prepared = std::move(prepared);
+			state->result = std::move(first_result);
 
 			res.status = 200;
 			res.set_header("Cache-Control", "no-cache");
@@ -2522,6 +2700,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					    return true;
 				    }
 				    try {
+					    QuackapiQueryDeadline deadline(*state->con, state->query_timeout_ms);
 					    if (state->need_execute) {
 						    state->result = state->prepared->Execute(state->named_values, true);
 						    if (state->result->HasError()) {
@@ -2564,8 +2743,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						    for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
 							    cols[col] = chunk->GetValue(col, row);
 						    }
-						    buf += FormatSseEvent(names, cols);
+						    auto event = FormatSseEvent(names, cols);
+						    if (state->sent_bytes + buf.size() + event.size() > state->max_bytes) {
+							    state->closed = true;
+							    return false;
+						    }
+						    buf += event;
 					    }
+					    state->sent_bytes += buf.size();
 					    if (!buf.empty() && !sink.write(buf.data(), buf.size())) {
 						    state->closed = true;
 						    return false;
@@ -2624,6 +2809,17 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// quackapi_authentication so the RPC plane shares that policy.
 	auto headers = CollectHeaders(req);
 	auto auth_result = CheckAuth(*db, match.route, headers);
+	if (match.route.rate_limit_n > 0 && match.route.rate_limit_per_sec > 0) {
+		string by = match.route.rate_limit_by.empty() ? string("ip") : match.route.rate_limit_by;
+		int retry_after = match.route.rate_limit_per_sec;
+		if (!qa_state.AllowRateLimit(match.route.name, RateLimitClientKey(*db, req, by, match.route, auth_result),
+		                             match.route.rate_limit_n, match.route.rate_limit_per_sec, retry_after)) {
+			res.set_header("Retry-After", std::to_string(retry_after));
+			SetJson(res, 429, "{\"detail\":\"Rate limit exceeded\"}");
+			finish();
+			return;
+		}
+	}
 	if (!auth_result.ok) {
 		if (!auth_result.www_authenticate.empty()) {
 			res.set_header("WWW-Authenticate", auth_result.www_authenticate);
@@ -2639,21 +2835,76 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// table refs as secure subqueries. Unauthenticated requests fail closed.
 	bool authenticated = !match.route.require_auth.empty() && auth_result.ok;
 	bool deny_unauth = false;
-	string handler_sql = RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth);
-	if (deny_unauth) {
+	string policy_error;
+	string handler_sql =
+	    RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth, policy_error);
+	if (deny_unauth || !policy_error.empty()) {
 		SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
 		finish();
 		return;
 	}
 
 	try {
-		auto &tls = TlsRequestCache();
-		// Fresh Connection per request — TEMP/SET must not survive to the next call.
-		auto &con = tls.BeginRequest(*db);
+		// Destroy the connection before leaving the request. Retaining it in TLS
+		// can keep the last DatabaseInstance alive until after DuckDB's allocator
+		// TLS has been destroyed, causing a shutdown use-after-free.
+		// TEMP/SET and prepared plans also remain strictly request-local.
+		Connection con(*db);
+		const auto elapsed_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+		QuackapiQueryDeadline deadline(con, std::max<int64_t>(1, options.query_timeout_ms - elapsed_ms));
+		auto &middleware_registry = QuackapiMiddlewareRegistry::Get(*db);
+		if (!middleware_registry.Snapshot(QuackapiMiddlewarePhase::BEFORE, match.route.group_name).empty() ||
+		    !middleware_registry.Snapshot(QuackapiMiddlewarePhase::AFTER, match.route.group_name).empty()) {
+			auto context = std::make_shared<QuackapiMiddlewareContext>();
+			context->method = req.method;
+			context->path = req.path;
+			context->route_name = match.route.name;
+			context->group_name = match.route.group_name;
+			context->request_id = request_id;
+			context->request_body = req.body;
+			context->client_ip = req.remote_addr;
+			auto subject = auth_result.claims.find("sub");
+			if (subject != auth_result.claims.end()) {
+				context->auth_subject = subject->second;
+			}
+			context->timeout_ms = options.query_timeout_ms;
+			context->elapsed_ms = elapsed_ms;
+			context->headers_json = PairsToJsonObject(req.headers);
+			context->query_json = PairsToJsonObject(req.params);
+			if (!ExecuteQuackapiMiddleware(con, *db, QuackapiMiddlewarePhase::BEFORE, context->group_name, *context,
+			                               authenticated, auth_result.claims)) {
+				SetJson(res, context->status, context->response_body);
+				for (const auto &header : context->response_headers) {
+					res.set_header(header.first, header.second);
+				}
+				finish();
+				return;
+			}
+			auto claims = auth_result.claims;
+			after_middleware = [context, db, authenticated, claims, &res, t0]() {
+				context->status = res.status;
+				context->response_body = res.body;
+				context->elapsed_ms =
+				    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+				        .count();
+				Connection middleware_connection(*db);
+				if (!ExecuteQuackapiMiddleware(middleware_connection, *db, QuackapiMiddlewarePhase::AFTER,
+				                               context->group_name, *context, authenticated, claims)) {
+					SetJson(res, context->status, context->response_body);
+				}
+				for (const auto &header : context->response_headers) {
+					res.set_header(header.first, header.second);
+				}
+			};
+		}
 
 		// Request params: path captures shadow query params of the same name.
 		// Body fields (JSON / form / multipart) fill remaining names with loc=body.
 		case_insensitive_map_t<std::pair<string, string>> provided; // name -> (loc, raw)
+		case_insensitive_map_t<bool> explicit_json_nulls;           // body field -> true; missing is absent
+		Value validated_typed_body;
+		bool has_validated_typed_body = false;
 		string media = ContentTypeMedia(headers);
 		bool form_ct = IsFormUrlEncodedMediaType(media);
 		bool multipart_ct = IsMultipartMediaType(media) || req.is_multipart_form_data();
@@ -2710,11 +2961,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// Named params inferred from handler SQL (prepare may never run).
 		bool body_method = IsBodyMethod(req.method);
 		bool has_body_named = false;
-		bool needs_body_fields = !match.route.body_schema.empty();
+		bool needs_json_field_extraction = false;
+		bool needs_body_fields = !match.route.body_schema.empty() || !match.route.body_type.empty();
 		{
-			// Lightweight $name scan (same rules as libpq CollectNamedParams).
+			// Use DuckDB's lexer so quoted literals/comments cannot create phantom
+			// $body/$field request parameters.
+			auto protected_text = ProtectedSqlText(handler_sql);
 			for (idx_t i = 0; i < handler_sql.size(); i++) {
-				if (handler_sql[i] != '$') {
+				if (protected_text[i] || handler_sql[i] != '$') {
 					continue;
 				}
 				if (i + 1 >= handler_sql.size() ||
@@ -2747,25 +3001,35 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					continue;
 				}
 				const QuackapiParamSpec *ps = FindParamSpec(match.route.params, pname);
-				if (ps && ps->has_default) {
-					continue;
-				}
 				if (ps && (ps->source == QuackapiParamSource::HEADER || ps->source == QuackapiParamSource::COOKIE)) {
 					continue;
 				}
+				if (ps && ps->has_default) {
+					// Defaults make the member optional when absent, but a supplied JSON
+					// body must still be extracted and override that default.
+					// This flag is consumed only inside the JSON-body branch below, so it
+					// must not depend on request media detection at scan time.
+					needs_json_field_extraction = true;
+					continue;
+				}
 				needs_body_fields = true;
+				needs_json_field_extraction = true;
 			}
 		}
 
 		if (body_method) {
 			if (IsJsonMediaType(media) ||
 			    (media.empty() && !req.body.empty() && (req.body[0] == '{' || req.body[0] == '['))) {
-				if (req.body.empty() && !needs_body_fields && match.route.body_schema.empty()) {
+				if (req.body.empty() && !needs_body_fields && match.route.body_schema.empty() &&
+				    match.route.body_type.empty()) {
 					// Empty JSON body with fully-bound query/path params — ignore.
 				} else {
-					case_insensitive_map_t<string> body_fields;
+					case_insensitive_map_t<JsonBodyField> body_fields;
 					string err_json;
-					if (!ExtractJsonBodyFields(con, req.body, body_fields, err_json)) {
+					// A native BODY TYPE bound only through $body can be an object or
+					// array. It does not need the flat-field extractor; the native
+					// transform below validates the complete payload directly.
+					if (needs_json_field_extraction && !ExtractJsonBodyFields(con, req.body, body_fields, err_json)) {
 						SetJson(res, 422, err_json);
 						finish();
 						return;
@@ -2777,10 +3041,21 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 							return;
 						}
 					}
+					if (!match.route.body_type.empty()) {
+						if (!TransformTypedBody(con, match.route.body_type, req.body, validated_typed_body, err_json)) {
+							SetJson(res, 422, err_json);
+							finish();
+							return;
+						}
+						has_validated_typed_body = true;
+					}
 					// Body fields fill missing names only (path/query win).
 					for (auto &kv : body_fields) {
 						if (provided.find(kv.first) == provided.end()) {
-							provided[kv.first] = {"body", kv.second};
+							provided[kv.first] = {"body", kv.second.value};
+							if (kv.second.explicit_null) {
+								explicit_json_nulls[kv.first] = true;
+							}
 						}
 					}
 					// $body binds the raw JSON payload.
@@ -2819,8 +3094,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				                                "model_attributes_type"));
 				finish();
 				return;
-			} else if (!match.route.body_schema.empty()) {
-				// BODY SCHEMA requires JSON.
+			} else if (!match.route.body_schema.empty() || !match.route.body_type.empty()) {
+				// BODY SCHEMA / BODY TYPE require JSON.
 				SetJson(res, 422,
 				        ValidationErrorJsonBody("Input should be a valid dictionary or object to extract fields from",
 				                                "model_attributes_type"));
@@ -2834,18 +3109,42 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// prepare so INSERT…RETURNING and other ATTACH-hostile SQL still work.
 		if (!options.pg_dsn.empty()) {
 			string pg_body, pg_err;
-			if (QuackapiTryPgNative(options.pg_dsn, handler_sql, provided, pg_body, pg_err)) {
+			auto pg_result =
+			    QuackapiTryPgNative(options.pg_dsn, handler_sql, provided, options.max_response_bytes, pg_body, pg_err);
+			if (pg_result == QuackapiPgNativeResult::SUCCESS) {
 				SetJson(res, match.route.status, pg_body);
 				finish();
 				return;
 			}
-			// Fall through to DuckDB on conversion miss / non-PG SQL.
-			(void)pg_err;
+			if (pg_result == QuackapiPgNativeResult::FAILED) {
+				if (pg_err == "PostgreSQL deadline exceeded") {
+					SetJson(res, 504, "{\"detail\":\"Query execution deadline exceeded\"}");
+				} else if (pg_err == "PostgreSQL response exceeds configured byte limit") {
+					SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+				} else {
+					SetJson(res, 502, "{\"detail\":\"Upstream database request failed\"}");
+				}
+				finish();
+				return;
+			}
+			// Fall through only when native execution is proven inapplicable.
 		}
 
 		// DuckDB prepare (after libpq short-circuit). Fresh prepare every request:
 		// no SQL-keyed body/plan cache — mutable tables and volatile functions
 		// (now/uuid) must re-execute.
+		if (has_body_named && !match.route.body_type.empty()) {
+			string body_sql_type = has_validated_typed_body ? validated_typed_body.type().ToString() : string();
+			if (body_sql_type.empty()) {
+				string type_error;
+				if (!ResolveTypedBodySqlType(con, match.route.body_type, body_sql_type, type_error)) {
+					SetInternalError(res, "Invalid BODY TYPE declaration: " + type_error);
+					finish();
+					return;
+				}
+			}
+			handler_sql = RewriteTypedBodyParameter(handler_sql, body_sql_type);
+		}
 		auto prepared_owned = con.Prepare(handler_sql);
 		if (prepared_owned->HasError()) {
 			SetInternalError(res, prepared_owned->GetError());
@@ -2862,6 +3161,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// PARAM … DEFAULT makes a query/path param optional (bind default/NULL).
 		auto expected_types = prepared->GetExpectedParameterTypes();
 		case_insensitive_map_t<BoundParameterData> named_values;
+		vector<QuackapiValidationIssue> validation_issues;
 		// Track raw strings for execute-time conversion error → param name recovery.
 		case_insensitive_map_t<std::pair<string, string>> bound_raw; // name -> (loc, raw)
 
@@ -2887,10 +3187,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			if (type_it != expected_types.end()) {
 				expected = type_it->second;
 			}
-			// PARAM type_name can refine UNKNOWN/VARCHAR when the planner did not
-			// surface a concrete type (e.g. LIMIT $limit::INTEGER sometimes).
-			if ((expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR) && spec &&
-			    !spec->type_name.empty()) {
+			// A declared PARAM type is the request contract. DuckDB may surface
+			// ANY for a cast parameter (for example $optional::INTEGER), so apply
+			// the declaration even when the planner did not report UNKNOWN/VARCHAR.
+			if (spec && !spec->type_name.empty()) {
 				auto tn = StringUtil::Upper(spec->type_name);
 				if (tn == "INTEGER" || tn == "INT") {
 					expected = LogicalType::INTEGER;
@@ -2922,6 +3222,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				loc_kind = "header";
 			} else if (spec && spec->source == QuackapiParamSource::COOKIE) {
 				loc_kind = "cookie";
+			} else if (body_method && (IsJsonMediaType(media) || (media.empty() && !req.body.empty() &&
+			                                                      (req.body[0] == '{' || req.body[0] == '[')))) {
+				// An undeclared handler parameter is body-bound for JSON requests;
+				// preserve that source for missing/type errors rather than reporting
+				// an invented query location.
+				loc_kind = "body";
 			}
 			string raw;
 			bool from_default = false;
@@ -2937,13 +3243,26 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					raw = spec->default_raw;
 					// Defaults keep the declared source loc for error shape.
 				} else {
-					SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, "Field required", "missing"));
-					finish();
-					return;
+					validation_issues.push_back({ValidationLocJson(loc_kind, param_name), "Field required", "missing"});
+					continue;
 				}
 			} else {
-				raw = it->second.second;
 				loc_kind = it->second.first;
+				if (explicit_json_nulls.find(param_name) != explicit_json_nulls.end()) {
+					// A missing field reaches the default branch above. JSON null reaches
+					// here and is only accepted when the BODY SCHEMA admitted null or
+					// the parameter explicitly declared DEFAULT NULL.
+					bool null_allowed = (loc_kind == "body" && !match.route.body_schema.empty()) ||
+					                    (spec && spec->has_default && spec->default_is_null);
+					if (!null_allowed) {
+						validation_issues.push_back({ValidationLocJson(loc_kind, param_name),
+						                             "Input should be a valid " + expected.ToString(), "type_error"});
+						continue;
+					}
+					named_values[param_name] = BoundParameterData(Value());
+					continue;
+				}
+				raw = it->second.second;
 			}
 
 			// Strict integral check even when type is UNKNOWN: if the raw value
@@ -2954,10 +3273,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			// but DefaultTryCastAs to INTEGER succeeds (the FastAPI gap).
 			if (IsIntegralType(expected)) {
 				if (!IsStrictIntegerString(raw, !IsUnsignedIntegralType(expected))) {
-					SetJson(res, 422,
-					        ValidationErrorJson(loc_kind, param_name, "Input should be a valid integer", "type_error"));
-					finish();
-					return;
+					validation_issues.push_back(
+					    {ValidationLocJson(loc_kind, param_name), "Input should be a valid integer", "type_error"});
+					continue;
 				}
 			} else if (expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR) {
 				// If raw is not a strict integer but DuckDB would accept it as
@@ -2982,22 +3300,51 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 							}
 						}
 						if (has_digit && has_non_digit) {
-							SetJson(res, 422,
-							        ValidationErrorJson(loc_kind, param_name, "Input should be a valid integer",
-							                            "type_error"));
-							finish();
-							return;
+							validation_issues.push_back({ValidationLocJson(loc_kind, param_name),
+							                             "Input should be a valid integer", "type_error"});
+							continue;
 						}
 					}
 				}
 			}
 
+			// BODY TYPE reuses the complete native transform already validated for
+			// this request before binding $body. Individual $field values still bind
+			// from extracted JSON text and use their prepared types.
+			if (param_name == "body" && !match.route.body_type.empty() &&
+			    (expected.id() == LogicalTypeId::STRUCT || expected.id() == LogicalTypeId::LIST ||
+			     expected.id() == LogicalTypeId::MAP)) {
+				Value typed_body = validated_typed_body;
+				if (!has_validated_typed_body) {
+					string err_json;
+					if (!TransformTypedBody(con, match.route.body_type, raw, typed_body, err_json)) {
+						SetJson(res, 422, err_json);
+						finish();
+						return;
+					}
+				}
+				if (typed_body.type() != expected) {
+					Value casted;
+					string cast_error;
+					if (!typed_body.DefaultTryCastAs(expected, casted, &cast_error)) {
+						SetJson(res, 422,
+						        ValidationErrorJson("body", "body", "BODY TYPE does not match handler parameter type",
+						                            "type_error"));
+						finish();
+						return;
+					}
+					typed_body = casted;
+				}
+				named_values[param_name] = BoundParameterData(typed_body);
+				continue;
+			}
+
 			BoundParameterData bound;
 			string err_json;
 			if (!BindParamValue(raw, expected, loc_kind, param_name, bound, err_json)) {
-				SetJson(res, 422, err_json);
-				finish();
-				return;
+				validation_issues.push_back({ValidationLocJson(loc_kind, param_name),
+				                             "Input should be a valid " + expected.ToString(), "type_error"});
+				continue;
 			}
 
 			// Constraint checks (LE/GE/…/min_length) — FastAPI Query(le=…) shape.
@@ -3019,15 +3366,19 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					constraint_val = Value(raw);
 				}
 				if (!CheckParamConstraints(*spec, raw, constraint_val, cmsg, ctype)) {
-					SetJson(res, 422, ValidationErrorJson(loc_kind, param_name, cmsg, ctype));
-					finish();
-					return;
+					validation_issues.push_back({ValidationLocJson(loc_kind, param_name), cmsg, ctype});
+					continue;
 				}
 			}
 
 			named_values[param_name] = bound;
 			bound_raw[param_name] = {loc_kind, raw};
 			(void)from_default;
+		}
+		if (!validation_issues.empty()) {
+			SetJson(res, 422, QuackapiValidationErrorsJson(validation_issues));
+			finish();
+			return;
 		}
 
 		auto result = prepared->Execute(named_values, false);
@@ -3120,6 +3471,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		// Materialize rows once so we can apply headers then serialize body.
 		vector<vector<Value>> rows;
+		idx_t response_value_bytes = 0;
 		while (true) {
 			auto chunk = result->Fetch();
 			if (!chunk || chunk->size() == 0) {
@@ -3130,6 +3482,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				cols.resize(chunk->ColumnCount());
 				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
 					cols[col] = chunk->GetValue(col, row);
+					response_value_bytes += cols[col].ToString().size();
+					if (response_value_bytes > static_cast<idx_t>(options.max_response_bytes)) {
+						SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+						finish();
+						return;
+					}
 				}
 				rows.push_back(std::move(cols));
 			}
