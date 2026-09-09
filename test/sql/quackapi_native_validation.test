@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 # BODY TYPE uses DuckDB json_transform structure syntax. It needs no optional
 # json_schema extension; the declared type is injected for $body at prepare time.
 query I
