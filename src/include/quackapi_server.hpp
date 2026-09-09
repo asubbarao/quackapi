@@ -39,7 +39,7 @@ enum class QuackapiLogLevel : uint8_t {
 	ERROR = 1,
 	WARN = 2,
 	INFO = 3,
-	DEBUG = 4,
+	DEBUG_LEVEL = 4,
 };
 
 //! Serve options (static files, CORS, batteries-included server defaults,
