@@ -1,0 +1,17 @@
+# name: test/sql/quackapi_jwt_duplicate_claims.test
+# description: JWT duplicate claim names are rejected
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE AUTH duplicate_jwt AS JWT (SECRET 'jwt-edge-secret');
+
+# Duplicate claim names must not be silently overwritten.
+query I
+SELECT (quackapi_verify_auth('duplicate_jwt', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSIsInN1YiI6ImJvYiJ9.8oy17CFYxkp8k6KXR7rvGjyDWFfRjCw2B9OMQ8EWT3Q')).status;
+----
+401
+
+statement ok
+DROP AUTH duplicate_jwt;
