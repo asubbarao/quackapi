@@ -184,7 +184,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **curl_httpfs guarantee** | **shipped** — `http_client:='curl'` fails serve if missing; auto loud fallback | batteries + `curl_httpfs_client.test.sh` |
 | **RFC 9457 problem+json** | FastAPI-shaped 422 only | `/tmp/quackapi_spec_problem_details/SPEC.md` |
 | **Envelope** default JSON **array of rows**; `ENVELOPE object` + `EMPTY STATUS` shipped | array stays default; object/404 opt-in | `docs/reference/ddl.md`; `quackapi_envelope.test` |
-| **Pydantic binder fidelity** ~19% needs C++ | field-level body `loc`, optional/null body, multi-error | `/tmp/quackapi_pydantic_bridge.md` |
+| **Pydantic binder fidelity** native core shipped | field-level body `loc`, missing/null/default distinction, multi-error, typed BODY TYPE | `docs/PYDANTIC_PARITY.md` |
 | **Multi-writer OLTP / wasm / Windows** | single-writer DuckDB; platforms excluded in `description.yml` | packaging descriptor |
 
 ---
@@ -226,7 +226,8 @@ From `/tmp/quackapi_pydantic_bridge.md` (live 8×200 + 12×422 curl transcript o
 | Band | Coverage | Mechanism |
 |------|----------|-----------|
 | **Real today (~81%)** | scalars, required/default, lists, nested, Literal/enum via schema, Field min/max/length/pattern via JSON Schema keywords, inheritance flatten | `BODY SCHEMA` + community **`json_schema`** + `PARAM` path/query constraints |
-| **Needs C++ (~19%)** | field-level body `loc` parity, optional/null body bind defaults, multi-error aggregation, strict `format:` checkers (email/uri/uuid/datetime) | binder + 422 emitter work |
+| **Native validation hardening** | BODY TYPE native DuckDB STRUCT/LIST/scalar bind with handler type derived from one declaration, aggregate parameter errors, explicit JSON-null vs missing/default, payload-aware JSON-Pointer body locations, and recursive OpenAPI requestBody emission | docs/PYDANTIC_PARITY.md, native binder + 422 emitter |
+| **Still outside automatic Pydantic import** | Python custom validators/default factories and rich format checker policy (email/uri/datetime) | express as DuckDB SQL, JSON Schema, or composed extensions |
 | Feature score (16-feature matrix) | **~78–81%** (full=1, partial=0.5) | §5 of pydantic_bridge |
 
 **Compose-not-core:** EmailStr → `anofox_tabular` (or pattern); do not reimplement email in C++.
@@ -314,7 +315,7 @@ Ship community-extensions `description.yml` **0.1.0** with the surface proven on
 | `quackapi_request` TestClient TF | S | CI without ports |
 | Lifespan `on_start`/`on_stop`/`drain_ms` | S | clean shutdown |
 | Problem+json format switch | S | RFC 9457 option |
-| Body optional/null binder + multi-error 422 polish | S–M | close Pydantic ~19% gap |
+| Pydantic custom-validator/default-factory bridge | S–M | preserve explicit unsupported boundary without a Python runtime |
 
 ### v1.2 — identity, middleware, serdes ( **M** )
 

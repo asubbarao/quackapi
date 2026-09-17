@@ -106,15 +106,6 @@ jobs:
           key: ccache-quackapi-pg-sqllogic-linux-amd64-v1.5.5
           restore-keys: ccache-quackapi-pg-sqllogic-linux-amd64-
 
-      - name: Point PG prepare-cache test at service DSN
-        run: |
-          f=test/sql/quackapi_pg_prepare_cache.test
-          test -f "$f"
-          # Local throwaway uses host=/tmp; CI service is TCP. require-env
-          # loads QUACKAPI_TEST_PG_DSN into SQLLogic ${VAR} substitution.
-          sed -i "s|SET quackapi_pg_dsn = '.*';|SET quackapi_pg_dsn = '\${QUACKAPI_TEST_PG_DSN}';|" "$f"
-          grep -n 'require-env\|quackapi_pg_dsn' "$f"
-
       - name: Wait for Postgres
         run: |
           until pg_isready -h 127.0.0.1 -p 5432 -U quackapi_pg_cache -d quackapi_pg_cache_test; do
@@ -126,6 +117,29 @@ jobs:
 
       - name: Run quackapi SQLLogic
         run: ./build/release/test/unittest "test/sql/quackapi*"
+
+      - name: Verify outbound worker cleanup
+        run: |
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -Isrc/include test/cpp/quackapi_thread_join_test.cpp -o /tmp/quackapi-thread-join-test
+          /tmp/quackapi-thread-join-test
+
+      - name: Verify build without libpq
+        run: c++ -std=c++17 -fsyntax-only -isystem duckdb/src/include -Isrc/include src/quackapi_pg.cpp
+
+      - name: Verify request database lifetime
+        run: |
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_lifetime_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-lifetime-test
+          /tmp/quackapi-lifetime-test
+
+      - name: Verify benchmark correctness gates
+        run: |
+          python3 bench/test_bench_config.py
+          bash bench/test_harness.sh
+          bash bench/test_report.sh
+          python3 test/conformance/test_driver.py
+
+      - name: Verify real HTTP contracts
+        run: bash test/conformance/run.sh
 
   publish-github-release:
     name: Publish GitHub Release assets

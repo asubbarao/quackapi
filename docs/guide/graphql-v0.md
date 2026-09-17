@@ -51,10 +51,10 @@ Optional AST→SQL recipe (sitting_duck, not the serve hot path): [`examples/gra
 |---------|----------|
 | **`POST /graphql`** | JSON body `{"query":"…"}` → GraphQL-ish result |
 | **`GET /graphql/schema`** | Main-schema tables → column names (not full `__schema`) |
-| **`CREATE GRAPHQL FOR TABLE`** | Optional **allowlist** for which tables the built-in endpoint exposes |
+| **`CREATE GRAPHQL FOR TABLE`** | Explicit allowlist for which tables the built-in endpoint exposes |
 | **`CREATE GRAPHQL ROUTE`** | Named path mounts with per-route tables, optional auth + LIMIT |
-| Auth | Built-in `/graphql` is **public**; named routes may `REQUIRE` a `CREATE AUTH` scheme |
-| Schema source | **DuckDB catalog only** (`duckdb_tables` / `duckdb_columns`) |
+| Auth | Built-in `/graphql` is public only for explicitly registered, unprotected tables; named routes may `REQUIRE` a `CREATE AUTH` scheme and apply the same row/masking policies as REST |
+| Schema source | Current database + `main` catalog identity, including tables and views |
 
 ## Minimal query language
 
@@ -135,6 +135,8 @@ Errors (GraphQL-ish; still HTTP 200 for document/execution issues; HTTP 400 only
 CREATE TABLE cases AS
 SELECT 1 AS id, '24-000117' AS case_no;
 
+CREATE GRAPHQL FOR TABLE cases;
+
 SELECT * FROM quackapi_serve(8000);
 ```
 
@@ -145,7 +147,7 @@ curl -sS -X POST http://127.0.0.1:8000/graphql \
 # {"data":{"cases":[{"id":1,"case_no":"24-000117"}]}}
 
 curl -sS http://127.0.0.1:8000/graphql/schema
-# {"mode":"open","tables":{"cases":["id","case_no"]}, "note":"…"}
+# {"mode":"allowlist","tables":{"cases":["id","case_no"]}, "note":"…"}
 ```
 
 In-process (no TCP):
@@ -159,9 +161,7 @@ SELECT status, decode(body) FROM quackapi_request(
 
 ## Allowlist: `CREATE GRAPHQL FOR TABLE`
 
-By default the built-in endpoint is **open**: every non-internal table/view in schema `main` is selectable (same as first v0).
-
-Register one or more tables to switch into **allowlist** mode — only those names work on `POST /graphql` and appear in `GET /graphql/schema`:
+By default the built-in endpoint is **closed**: no table is selectable or listed until it is registered. Register one or more tables to expose only those names through `POST /graphql` and `GET /graphql/schema`:
 
 ```sql
 CREATE GRAPHQL FOR TABLE users, posts;
@@ -171,15 +171,16 @@ SELECT * FROM quackapi_graphql_tables();
 -- mode=allowlist, table_name=posts|users
 
 DROP GRAPHQL FOR TABLE posts;
-DROP GRAPHQL ALL;   -- clear allowlist → open mode again
+DROP GRAPHQL ALL;   -- clear allowlist → closed mode again
 ```
 
 | Mode | When | `POST /graphql` | `GET /graphql/schema` |
 |------|------|-----------------|------------------------|
-| **open** | allowlist empty (default) | all main tables | all main tables |
+| **disabled** | allowlist empty (default) | no tables | no tables |
 | **allowlist** | ≥1 `CREATE GRAPHQL FOR TABLE` | registered only | registered only |
+| **open** | `SET GLOBAL quackapi_graphql_allow_all = true` | all main tables | all main tables |
 
-Does **not** mount a new path — still the global built-in `POST /graphql`. Tables must exist in `main` at CREATE time. Lifecycle matches other quackapi DDL (in-memory registry; re-declare after reopen).
+`SET GLOBAL quackapi_graphql_allow_all = true` restores the old catalog-wide behavior for a deliberate migration only. It is database-wide and should not be used as an authorization boundary. `CREATE GRAPHQL FOR TABLE` does **not** mount a new path — it configures the global built-in `POST /graphql`. Tables must exist in the current database's `main` schema at CREATE time. Lifecycle matches other quackapi DDL (in-memory registry; re-declare after reopen).
 
 ### How this differs from the bare built-in
 
@@ -214,13 +215,13 @@ DROP GRAPHQL ROUTE public_api;
 | **name** | Registry id; unique; `OR REPLACE` overwrites |
 | **METHOD** | **POST only** (v0) |
 | **path** | Absolute `/…`; not `/graphql` or `/graphql/schema`; unique among GraphQL routes |
-| **FROM tables** | Required ≥1; must exist in `main` at CREATE; **per-route only** (does not flip global allowlist) |
-| **REQUIRE** | Optional `CREATE AUTH` scheme (auth scheme must exist at CREATE) |
+| **FROM tables** | Required ≥1; must exist in the current database's `main` schema at CREATE; **per-route only** (does not flip global allowlist) |
+| **REQUIRE** | Optional `CREATE AUTH` scheme (auth scheme must exist at CREATE); required for row/masking-protected tables |
 | **LIMIT** | Optional row cap (default 100; range 1..100000) |
 
 Independence:
 
-- Built-in `POST /graphql` stays always-on; global allowlist via `CREATE GRAPHQL FOR TABLE` is separate.
+- Built-in `POST /graphql` stays available but catalog-closed until tables are registered; global allowlist via `CREATE GRAPHQL FOR TABLE` is separate.
 - A GraphQL route never mutates `quackapi_graphql_tables()`.
 - Unregistered path → normal 404.
 

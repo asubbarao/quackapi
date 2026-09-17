@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+import os
 from typing import Any
 
 import anyio
@@ -11,13 +12,15 @@ from fastapi import FastAPI, Query
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
+from bench_config import pg_dsn
 
-# Match quackapi QUACKAPI_DEFAULT_WORKER_THREADS in
-# quackapi/src/include/quackapi_server.hpp (static constexpr size_t = 32).
-THREADPOOL_SIZE = 32
+# Match the effective per-process budget emitted by serve_fastapi.sh:
+# 32 worker/pool slots at w1 and 8/4 at w8, for an aggregate 32/32 budget.
+THREADPOOL_SIZE = int(os.environ.get("BENCH_WORKER_THREADS", "32"))
+PG_POOL_MAX = int(os.environ.get("BENCH_PG_POOL_MAX", str(THREADPOOL_SIZE)))
 
 # pgEdge Postgres 17 (spock multi-master) — every request hits this live DB.
-PG_DSN = "postgresql://admin:password@127.0.0.1:6432/quackbench"
+PG_DSN = pg_dsn()
 
 app = FastAPI()
 pool: ConnectionPool | None = None
@@ -45,13 +48,13 @@ def _row_dicts(cur) -> list[dict[str, Any]]:
 def on_startup() -> None:
     global pool
     # Starlette runs plain `def` handlers in AnyIO's default threadpool.
-    # Raise the limit to match quackapi's httplib worker pool (32).
+    # Raise the limit to match the effective per-process QuackAPI worker pool.
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
     # Pool sized for the same concurrency ceiling as the threadpool.
     pool = ConnectionPool(
         conninfo=PG_DSN,
         min_size=2,
-        max_size=THREADPOOL_SIZE,
+        max_size=PG_POOL_MAX,
         kwargs={"row_factory": dict_row, "autocommit": True},
         open=True,
     )

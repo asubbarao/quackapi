@@ -65,6 +65,7 @@ CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
   [REQUIRE <auth>]
   [GROUP <group> | IN GROUP <group>]
   [BODY SCHEMA '<json-schema>']
+  [BODY TYPE '<duckdb-json-transform-structure>']
   [PARAM <name> [<type>] [HEADER|COOKIE|QUERY [wire-name]]
          [DEFAULT <lit>] [GE|GT|LE|LT <n>] [MIN_LENGTH|MAX_LENGTH <n>] …]
   AS <select>;
@@ -280,15 +281,15 @@ CREATE QUEUE emails WITH (max_attempts=5, visibility_timeout='30s');
 CREATE ROUTE enqueue POST '/jobs' STATUS 201 PARAM payload VARCHAR AS
 SELECT quackapi_enqueue('emails', $payload) AS job_id;
 
-SELECT id, payload, quackapi_ack('emails', id) AS acked
+SELECT id, payload, quackapi_ack('emails', id, delivery_generation) AS acked
 FROM quackapi_dequeue('emails', 10);
 ```
 
 | Function | Role |
 |----------|------|
 | `quackapi_enqueue(queue, payload [, max_attempts])` | → `job_id` |
-| `quackapi_dequeue(queue [, n])` | claim with visibility lease |
-| `quackapi_ack` / `quackapi_nack` | complete or retry / dead-letter |
+| `quackapi_dequeue(queue [, n])` | claim with a visibility lease and delivery generation |
+| `quackapi_ack` / `quackapi_nack` / `quackapi_renew` | complete, retry, or renew the matching delivery |
 | `quackapi_queues()` | depth, in_flight, dead, options |
 
 Worker = compose community `cronjob` (or a drain route). See [`docs/QUEUE.md`](docs/QUEUE.md).
@@ -471,8 +472,7 @@ LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```sh
 GEN=ninja make release
 make test                          # SQL unit tests
-bash test/http/run_all.sh          # live curl suite (needs release build)
-bash test/conformance/run.sh       # FastAPI parity harness
+bash test/conformance/run.sh       # real-HTTP contract suite (needs release build)
 ```
 
 ## Docs in this repo
@@ -486,6 +486,10 @@ bash test/conformance/run.sh       # FastAPI parity harness
 | [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md) | Scorecard vs FastAPI |
 | [`docs/SUPERIORITY_ORDER.md`](docs/SUPERIORITY_ORDER.md) | Equivalence → slaughter → leapfrog (work order) |
 | [`docs/QUEUE.md`](docs/QUEUE.md) | Job queue semantics |
+| [`docs/PYDANTIC_PARITY.md`](docs/PYDANTIC_PARITY.md) | Native typed bodies, validation errors, nulls, and OpenAPI |
+| [`docs/MIDDLEWARE.md`](docs/MIDDLEWARE.md) | SQL request and response middleware |
+| [`docs/RESOURCE_LIMITS.md`](docs/RESOURCE_LIMITS.md) | Query deadlines, response caps, admission, and rate limits |
+| [`docs/REVIEW_2026_09_07.md`](docs/REVIEW_2026_09_07.md) | Security and robustness review with remediation status |
 | [`docs/curl_httpfs.md`](docs/curl_httpfs.md) | Outbound HTTP via curl_httpfs |
 
 ## License

@@ -21,6 +21,7 @@ const overhead = new Trend('overhead_ms');       // gateway+DB cost, model exclu
 const ollamaTime = new Trend('ollama_total_ms'); // upstream service time
 const outTokens = new Counter('out_tokens');
 const ok = new Rate('logical_success');
+const timingInvalid = new Rate('timing_invalid');
 
 export const options = {
   scenarios: {
@@ -44,7 +45,7 @@ const PROMPTS = [
 ];
 
 export default function () {
-  const prompt = PROMPTS[Math.floor(Math.random() * PROMPTS.length)];
+  const prompt = PROMPTS[(__VU + __ITER) % PROMPTS.length];
   const qs =
     `model=${encodeURIComponent(MODEL)}&prompt=${encodeURIComponent(prompt)}` +
     (API === 'ask' ? `&num_predict=${NUM_PREDICT}` : '');
@@ -54,7 +55,8 @@ export default function () {
   const res = http.post(url, null, { timeout: '600s' });
   const e2e = Date.now() - started;
 
-  const good = check(res, { 'status 200': (r) => r.status === 200 });
+  const statusOk = res.status >= 200 && res.status < 300;
+  const good = check(res, { 'status 2xx': () => statusOk });
 
   let logical = false;
   if (good) {
@@ -63,15 +65,22 @@ export default function () {
       // quackapi returns a row array; FastAPI returns a bare object.
       if (Array.isArray(body)) { body = body[0]; }
       if (API === 'embed') {
-        logical = body && body.dims > 0;
+        logical = body && Number.isInteger(Number(body.dims)) && body.dims > 0;
       } else {
         logical = body && typeof body.response === 'string';
-        const t = Number(body.ollama_total_ms || 0);
-        if (t > 0) {
+        const t = Number(body && body.ollama_total_ms);
+        if (Number.isFinite(t) && t > 0) {
           ollamaTime.add(t);
-          overhead.add(Math.max(0, e2e - t));
+          // Keep the signed residual. Clamping a negative value hides clock,
+          // serialization, or upstream timing inconsistencies.
+          overhead.add(e2e - t);
+        } else {
+          timingInvalid.add(1);
+          logical = false;
         }
-        if (body.out_tokens) { outTokens.add(Number(body.out_tokens)); }
+        if (body && Number.isInteger(Number(body.out_tokens)) && Number(body.out_tokens) >= 0) {
+          outTokens.add(Number(body.out_tokens));
+        }
       }
     } catch (_e) {
       logical = false;

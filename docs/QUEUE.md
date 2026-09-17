@@ -16,9 +16,10 @@ CREATE [OR REPLACE] QUEUE <name>
 DROP QUEUE <name>;
 
 quackapi_enqueue(queue VARCHAR, payload VARCHAR|JSON [, max_attempts INTEGER]) → BIGINT
-quackapi_dequeue(queue VARCHAR [, n INTEGER]) → TABLE(id, queue, payload, status, attempts, max_attempts, visible_at, last_error)
-quackapi_ack(queue VARCHAR, job_id BIGINT) → BOOLEAN
-quackapi_nack(queue VARCHAR, job_id BIGINT [, requeue BOOLEAN [, error VARCHAR]]) → VARCHAR  -- new status
+quackapi_dequeue(queue VARCHAR [, n INTEGER]) → TABLE(id, queue, payload, status, attempts, max_attempts, visible_at, last_error, delivery_generation)
+quackapi_ack(queue VARCHAR, job_id BIGINT, delivery_generation BIGINT) → BOOLEAN
+quackapi_nack(queue VARCHAR, job_id BIGINT, delivery_generation BIGINT [, requeue BOOLEAN [, error VARCHAR]]) → VARCHAR  -- pending, dead, or stale
+quackapi_renew(queue VARCHAR, job_id BIGINT, delivery_generation BIGINT) → BOOLEAN
 quackapi_queues() → TABLE(name, depth, in_flight, dead, max_attempts, visibility_timeout_sec, backoff_base_sec)
 ```
 
@@ -36,15 +37,26 @@ quackapi_queues() → TABLE(name, depth, in_flight, dead, max_attempts, visibili
 | Op | Behavior |
 |----|----------|
 | enqueue | `status='pending'`, `visible_at=now()` |
-| dequeue | Atomic `UPDATE … WHERE id=(SELECT … LIMIT 1) RETURNING`: `status='running'`, `attempts++`, `visible_at=now()+visibility_timeout` |
-| redelivery | Rows with `status='running' AND visible_at <= now()` are claimable again |
-| ack | `status='done'` (only if currently `running`) |
-| nack (requeue) | `pending` + exponential backoff, or `dead` if `attempts >= max_attempts` |
+| dequeue | Atomic `UPDATE … WHERE id=(SELECT … LIMIT 1) RETURNING`: `status='running'`, `attempts++`, `delivery_generation++`, `visible_at=now()+visibility_timeout` |
+| redelivery | Each expired delivery is recovered independently. A timed-out final attempt becomes `dead`; earlier attempts become claimable again. |
+| ack | `status='done'` only for the supplied generation while its lease is active; `false` means stale, expired, or already completed. |
+| nack (requeue) | `pending` + exponential backoff, or `dead` if `attempts >= max_attempts`; returns `stale` when the supplied generation no longer owns the delivery. |
 | nack (requeue=false) | `dead` immediately |
+| renew | Extends the configured visibility timeout only for the supplied generation while its current lease is active. Returns `false` after expiry or supersession. |
 
-Concurrency: DuckDB is single-writer per database file. Claims serialize on the
-write lock — correct for one process / one file (BackgroundTasks tier). For
-multi-node workers use a real broker (Redis / NATS).
+The generation fences every delivery transition. A worker that times out and is
+superseded cannot acknowledge, retry, or renew the newer delivery. Queue
+transitions serialize on a per-database lock shared by static and loadable
+extension copies; DuckDB remains single-writer per database file. For multi-node
+workers use a real broker (Redis / NATS).
+
+## Delivery-generation migration
+
+This release adds the persisted `delivery_generation` column to existing
+`quackapi_jobs` tables automatically. The old two-argument `quackapi_ack` and
+old `quackapi_nack` forms have been removed because they could let a stale worker
+change a redelivered job. Update workers to carry the generation returned by
+`quackapi_dequeue` through every delivery transition.
 
 ## Worker = compose `cronjob`
 
@@ -55,7 +67,7 @@ INSTALL cronjob FROM community;
 LOAD cronjob;
 
 SELECT cron($$
-  SELECT quackapi_ack('emails', id)
+  SELECT quackapi_ack('emails', id, delivery_generation)
   FROM quackapi_dequeue('emails', 1)
 $$, '*/1 * * * * *');
 ```

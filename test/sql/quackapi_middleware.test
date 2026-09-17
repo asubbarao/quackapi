@@ -1,0 +1,131 @@
+# name: test/sql/quackapi_middleware.test
+# description: SQL middleware registry, deterministic scope ordering, fail-closed request controls
+# group: [sql]
+
+require quackapi
+
+# ---------------------------------------------------------------------------
+# Definitions are introspectable and OR REPLACE preserves creation order.
+# ---------------------------------------------------------------------------
+query I
+CREATE MIDDLEWARE global_trace BEFORE AS
+  SELECT true AS allow,
+         NULL::INTEGER AS status,
+         NULL::VARCHAR AS body,
+         'X-Request-Id' AS header_name,
+         $request_id AS header_value;
+----
+Middleware global_trace: BEFORE
+
+query I
+CREATE MIDDLEWARE group_trace BEFORE GROUP api_v1 AS
+  SELECT true AS allow,
+         NULL::INTEGER AS status,
+         NULL::VARCHAR AS body,
+         'X-Group-Middleware' AS header_name,
+         'api_v1' AS header_value;
+----
+Middleware group_trace: BEFORE GROUP api_v1
+
+query IIII
+SELECT name, phase, CASE WHEN group_name = '' THEN 'global' ELSE group_name END AS scope, registration_order
+FROM quackapi_middlewares()
+ORDER BY registration_order;
+----
+global_trace	BEFORE	global	1
+group_trace	BEFORE	api_v1	2
+
+query I
+CREATE OR REPLACE MIDDLEWARE global_trace BEFORE AS
+  SELECT true AS allow,
+         NULL::INTEGER AS status,
+         NULL::VARCHAR AS body,
+         'X-Request-Id' AS header_name,
+         $request_id AS header_value;
+----
+Middleware global_trace: BEFORE
+
+query II
+SELECT name, registration_order FROM quackapi_middlewares() ORDER BY registration_order;
+----
+global_trace	1
+group_trace	2
+
+statement error
+CREATE MIDDLEWARE global_trace BEFORE AS SELECT true AS allow;
+----
+already exists
+
+statement error
+CREATE MIDDLEWARE invalid_phase DURING AS SELECT true AS allow;
+----
+MIDDLEWARE phase must be BEFORE or AFTER
+
+# ---------------------------------------------------------------------------
+# Route auth always wins over a group-scoped blocking middleware. A valid,
+# authenticated caller reaches the middleware's declared response instead.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE AUTH api AS API_KEY;
+
+statement ok
+SELECT * FROM quackapi_add_api_key('api', 'middleware-key', 'middleware-user');
+
+statement ok
+CREATE GROUP api_v1 WITH (prefix='/api/v1', auth=api);
+
+statement ok
+CREATE ROUTE guarded GET '/guarded' GROUP api_v1 AS SELECT 'route body' AS value;
+
+statement ok
+CREATE MIDDLEWARE tenant_block BEFORE GROUP api_v1 AS
+  SELECT false AS allow,
+         429::INTEGER AS status,
+         '{"detail":"tenant limit"}' AS body,
+         NULL::VARCHAR AS header_name,
+         NULL::VARCHAR AS header_value;
+
+# Missing credentials fail during auth and cannot be intercepted by middleware.
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/api/v1/guarded');
+----
+401	{"detail":"Not authenticated"}
+
+# Verified request reaches the group hook; the route handler does not run.
+query II
+SELECT status, decode(body)
+FROM quackapi_request('GET', '/api/v1/guarded', headers := MAP {'X-API-Key': 'middleware-key'});
+----
+429	{"detail":"tenant limit"}
+
+# A malformed runtime control result never becomes an implicit allow.
+statement ok
+DROP MIDDLEWARE tenant_block;
+
+statement ok
+CREATE MIDDLEWARE malformed BEFORE GROUP api_v1 AS SELECT 'not-a-boolean' AS allow;
+
+query I
+SELECT status
+FROM quackapi_request('GET', '/api/v1/guarded', headers := MAP {'X-API-Key': 'middleware-key'});
+----
+500
+
+statement ok
+DROP MIDDLEWARE malformed;
+
+# AFTER hooks can add timing/security headers or deliberately replace a route
+# response. Group hook ordering is covered by the registry order above.
+statement ok
+CREATE MIDDLEWARE after_replace AFTER GROUP api_v1 AS
+  SELECT false AS allow,
+         202::INTEGER AS status,
+         '{"detail":"after hook"}' AS body,
+         NULL::VARCHAR AS header_name,
+         NULL::VARCHAR AS header_value;
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('GET', '/api/v1/guarded', headers := MAP {'X-API-Key': 'middleware-key'});
+----
+202	{"detail":"after hook"}

@@ -12,24 +12,14 @@ FIFO="${TMPDIR:-/tmp}/quackapi_conformance_$$.fifo"
 LOG="${TMPDIR:-/tmp}/quackapi_conformance_$$.log"
 PIDFILE="${TMPDIR:-/tmp}/quackapi_conformance_$$.pid"
 RESULTS_DIR="${RESULTS_DIR:-$CONF/results}"
+DPID=""
 
 cleanup() {
-  if [[ -f "$PIDFILE" ]]; then
-    local pid
-    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
-    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
-    rm -f "$PIDFILE"
+  if [[ -n "$DPID" ]] && kill -0 "$DPID" 2>/dev/null; then
+    kill "$DPID" 2>/dev/null || true
+    wait "$DPID" 2>/dev/null || true
   fi
-  local stale
-  stale="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null || true)"
-  if [[ -n "$stale" ]]; then
-    kill $stale 2>/dev/null || true
-    sleep 0.2
-  fi
-  rm -f "$FIFO" "$LOG"
+  rm -f "$FIFO" "$PIDFILE"
 }
 trap cleanup EXIT
 
@@ -39,10 +29,13 @@ if [[ ! -x "$DUCK" ]]; then
   exit 2
 fi
 
-cleanup
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+  echo "Port $PORT is already occupied; choose PORT for an isolated run" >&2
+  exit 2
+fi
 mkfifo "$FIFO"
 
-"$DUCK" -unsigned <"$FIFO" >"$LOG" 2>&1 &
+"$DUCK" -init /dev/null -unsigned <"$FIFO" >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 DPID=$!
 
@@ -51,7 +44,7 @@ exec 3>"$FIFO"
 {
   echo "LOAD quackapi;"
   cat "$CONF/routes.sql"
-  echo "SELECT * FROM quackapi_serve(${PORT});"
+  echo "SELECT * FROM quackapi_serve(${PORT}, health_routes := false, access_log := false);"
   echo "SELECT * FROM quackapi_servers();"
 } >&3
 
@@ -77,11 +70,10 @@ echo "quackapi listening on $BASE (pid $DPID)"
 
 mkdir -p "$RESULTS_DIR"
 export QUACKAPI_BASE="$BASE"
-python3 "$CONF/driver.py" --base "$BASE" --cases "$CONF/cases.jsonl" --out "$RESULTS_DIR/results.jsonl"
-DRIVER_RC=$?
+DRIVER_RC=0
+python3 "$CONF/driver.py" --base "$BASE" --cases "$CONF/cases.jsonl" --out "$RESULTS_DIR/results.jsonl" || DRIVER_RC=$?
 
 echo "SELECT * FROM quackapi_stop();" >&3
-echo ".quit" >&3
 exec 3>&-
 sleep 0.3
 if kill -0 "$DPID" 2>/dev/null; then
@@ -89,7 +81,8 @@ if kill -0 "$DPID" 2>/dev/null; then
   wait "$DPID" 2>/dev/null || true
 fi
 rm -f "$PIDFILE"
+DPID=""
 
 echo "driver exit=$DRIVER_RC"
-# Always 0 after run so scorecard can be written even with FAILs; use driver_rc for CI if needed
-exit 0
+echo "server log=$LOG"
+exit "$DRIVER_RC"
