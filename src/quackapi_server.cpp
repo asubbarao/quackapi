@@ -51,9 +51,82 @@ namespace {
 thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
 thread_local duckdb_httplib::Stream *quackapi_tls_stream = nullptr;
 
-//! httplib Server subclass: stash the live Stream/socket for per-route IO timeouts.
+//! Release a worker slot however process_and_close_socket leaves — the httplib
+//! keep-alive loop below can throw, and a leaked slot would report a worker
+//! budget that is permanently binding.
+struct QuackapiWorkerBusyGuard {
+	explicit QuackapiWorkerBusyGuard(QuackapiOverloadCounters &counters_p) : counters(counters_p) {
+	}
+	~QuackapiWorkerBusyGuard() {
+		counters.workers_busy.fetch_sub(1, std::memory_order_relaxed);
+	}
+	QuackapiOverloadCounters &counters;
+};
+
+//! httplib Server subclass: stash the live Stream/socket for per-route IO
+//! timeouts, count what the HTTP budget is doing, and answer an over-capacity
+//! connection instead of dropping it.
 struct QuackapiHttplibServer : duckdb_httplib::Server {
+	QuackapiHttplibServer(int32_t workers_p, int32_t max_pending_p, string listen_label_p, QuackapiLogLevel log_level_p,
+	                      shared_ptr<QuackapiOverloadCounters> overload_p)
+	    : workers(workers_p), max_pending(max_pending_p), listen_label(std::move(listen_label_p)),
+	      log_level(log_level_p), overload(std::move(overload_p)) {
+	}
+
+	//! The accept loop could not hand this socket to a worker: every worker is
+	//! busy AND the pending queue is full. Answer 503 here rather than let the
+	//! caller close it, so overload is a status a client can read and retry on
+	//! instead of a reset indistinguishable from the process dying.
+	void on_task_queue_full(socket_t sock) override {
+		const auto shed = overload->shed_requests.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto body = StringUtil::Format("{\"detail\":\"quackapi is at its HTTP request budget\","
+		                                     "\"budget\":\"pending\",\"worker_threads\":%d,"
+		                                     "\"max_pending_requests\":%d}",
+		                                     workers, max_pending);
+		const auto response = StringUtil::Format("HTTP/1.1 503 Service Unavailable\r\n"
+		                                         "Content-Type: application/json\r\n"
+		                                         "Content-Length: %llu\r\n"
+		                                         "Connection: close\r\n"
+		                                         "Retry-After: 1\r\n"
+		                                         "X-Quackapi-Budget: pending\r\n"
+		                                         "\r\n%s",
+		                                         (unsigned long long)body.size(), body);
+		// SocketStream rather than the accept-time SO_SNDTIMEO: this runs on the
+		// accept thread, so the deadline must be the short overload one.
+		duckdb_httplib::detail::SocketStream strm(sock, QUACKAPI_OVERLOAD_WRITE_TIMEOUT_SEC, 0,
+		                                          QUACKAPI_OVERLOAD_WRITE_TIMEOUT_SEC, 0);
+		char sink[1024];
+		size_t drained = 0;
+		while (drained < QUACKAPI_OVERLOAD_DRAIN_BYTES) {
+			// read() is the one that waits on the socket; is_readable() only
+			// reports SocketStream's own buffer and would never see the request.
+			const auto read_bytes = strm.read(sink, sizeof(sink));
+			if (read_bytes <= 0) {
+				break;
+			}
+			drained += static_cast<size_t>(read_bytes);
+			if (static_cast<size_t>(read_bytes) < sizeof(sink)) {
+				// The whole request head arrived in one read; another read would
+				// only wait out the deadline on a client that has nothing left.
+				break;
+			}
+		}
+		strm.write(response.data(), response.size());
+		if (log_level >= QuackapiLogLevel::WARN && !overload->shed_announced.exchange(true)) {
+			fprintf(stderr,
+			        "quackapi: %s is at its HTTP request budget — worker_threads=%d max_pending_requests=%d, "
+			        "shedding with 503 (binding budget: pending, first shed at request %lld). "
+			        "worker_threads is the single dial: raising it raises the pending queue with it.\n",
+			        listen_label.c_str(), workers, max_pending, (long long)shed);
+		}
+	}
+
 	bool process_and_close_socket(socket_t sock) override {
+		const auto busy = overload->workers_busy.fetch_add(1, std::memory_order_relaxed) + 1;
+		auto observed = overload->workers_peak.load(std::memory_order_relaxed);
+		while (busy > observed && !overload->workers_peak.compare_exchange_weak(observed, busy)) {
+		}
+		QuackapiWorkerBusyGuard busy_guard {*overload};
 		std::string remote_addr;
 		int remote_port = 0;
 		duckdb_httplib::detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
@@ -85,6 +158,12 @@ struct QuackapiHttplibServer : duckdb_httplib::Server {
 		duckdb_httplib::detail::close_socket(sock);
 		return ret;
 	}
+
+	const int32_t workers;
+	const int32_t max_pending;
+	const string listen_label;
+	const QuackapiLogLevel log_level;
+	const shared_ptr<QuackapiOverloadCounters> overload;
 };
 
 //! Extend httplib read/write deadlines for the current request.
@@ -1717,7 +1796,13 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		return;
 	}
 
-	server = make_uniq<QuackapiHttplibServer>();
+	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
+	const int32_t workers =
+	    opts.worker_threads > 0 ? opts.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
+	const int32_t max_pending = opts.max_pending_requests;
+	options.worker_threads = workers;
+	server = make_uniq<QuackapiHttplibServer>(workers, max_pending,
+	                                          StringUtil::Format("%s:%d", host, port), opts.log_level, overload);
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
 	// requests before route handlers, so API routes always win over files.
@@ -1725,10 +1810,6 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		throw IOException("quackapi: static_dir \"%s\" is not a directory", opts.static_dir);
 	}
 
-	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
-	int32_t workers =
-	    opts.worker_threads > 0 ? opts.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
-	const auto max_pending = opts.max_pending_requests;
 	server->new_task_queue = [workers, max_pending] {
 		return new duckdb_httplib::ThreadPool(static_cast<size_t>(workers), static_cast<size_t>(max_pending));
 	};
@@ -1741,6 +1822,13 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	server->set_write_timeout(opts.write_timeout_sec > 0 ? static_cast<time_t>(opts.write_timeout_sec)
 	                                                     : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	server->set_tcp_nodelay(true);
+	// The kernel accept queue is NOT a second policy dial — it must be wide
+	// enough that the shed decision is quackapi's. At httplib's stock backlog of
+	// 5 a burst is refused by TCP with ECONNREFUSED, which a client cannot tell
+	// from the process being down, and the 503 below never gets the chance to
+	// say so. Accept everything the kernel will hold, then answer. The OS clamps
+	// this to kern.ipc.somaxconn / net.core.somaxconn.
+	server->set_listen_backlog(MaxValue<int32_t>(SOMAXCONN, workers + max_pending));
 	// Cap request bodies to avoid unbounded memory DoS (httplib default is SIZE_MAX).
 	server->set_payload_max_length(QUACKAPI_PAYLOAD_MAX_LENGTH);
 

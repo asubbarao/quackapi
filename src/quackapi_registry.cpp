@@ -475,15 +475,32 @@ bool QuackapiState::GetServerHost(int port, string &host_out) {
 	return false;
 }
 
-vector<std::tuple<string, int, string, string>> QuackapiState::ListServers() {
+vector<QuackapiServerInfo> QuackapiState::ListServers() {
 	std::lock_guard<std::mutex> lock(servers_mutex);
-	vector<std::tuple<string, int, string, string>> result;
+	vector<QuackapiServerInfo> result;
 	result.reserve(servers.size());
 	for (auto &kv : servers) {
 		const auto &opts = kv.second->Options();
-		string client = opts.http_client_active.empty() ? string("curl") : opts.http_client_active;
-		string reason = opts.http_client_reason;
-		result.emplace_back(kv.second->Host(), kv.second->Port(), std::move(client), std::move(reason));
+		const auto &counters = *kv.second->Overload();
+		QuackapiServerInfo info;
+		info.host = kv.second->Host();
+		info.port = kv.second->Port();
+		info.http_client = opts.http_client_active.empty() ? string("curl") : opts.http_client_active;
+		info.http_client_reason = opts.http_client_reason;
+		info.worker_threads = opts.worker_threads;
+		info.max_pending_requests = opts.max_pending_requests;
+		info.workers_peak = counters.workers_peak.load(std::memory_order_relaxed);
+		info.shed_requests = counters.shed_requests.load(std::memory_order_relaxed);
+		// Ordered by what the operator would raise next, so the answer names a
+		// budget rather than a symptom.
+		if (info.shed_requests > 0) {
+			info.binding_budget = "pending";
+		} else if (info.workers_peak >= info.worker_threads) {
+			info.binding_budget = "workers";
+		} else {
+			info.binding_budget = "none";
+		}
+		result.push_back(std::move(info));
 	}
 	return result;
 }

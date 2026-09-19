@@ -1,0 +1,117 @@
+# name: test/sql/quackapi_overload.test
+# description: One HTTP budget, and past it a deliberate 503 that names the binding budget instead of a dropped socket
+# group: [sql]
+
+require quackapi
+
+statement ok
+LOAD curl_httpfs;
+
+# ---------------------------------------------------------------------------
+# The HTTP budget is one dial. The burst queue follows worker_threads instead
+# of being a second literal, so raising the worker count no longer leaves a
+# sweep crossing a 256-connection queue nobody asked for.
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29810, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29810
+
+query IIIII
+SELECT worker_threads, max_pending_requests, workers_peak, shed_requests, binding_budget
+FROM quackapi_servers() WHERE port = 29810;
+----
+32	256	0	0	none
+
+query I
+SELECT * FROM quackapi_stop(29810);
+----
+Stopped quackapi server on port 29810
+
+query I
+SELECT * FROM quackapi_serve(29811, host := '127.0.0.1', access_log := false, worker_threads := 64);
+----
+http://127.0.0.1:29811
+
+query II
+SELECT worker_threads, max_pending_requests FROM quackapi_servers() WHERE port = 29811;
+----
+64	512
+
+query I
+SELECT * FROM quackapi_stop(29811);
+----
+Stopped quackapi server on port 29811
+
+# Naming the queue still wins: the derivation is the default, not a ceiling.
+query I
+SELECT * FROM quackapi_serve(29812, host := '127.0.0.1', access_log := false,
+                             worker_threads := 64, max_pending_requests := 16);
+----
+http://127.0.0.1:29812
+
+query II
+SELECT worker_threads, max_pending_requests FROM quackapi_servers() WHERE port = 29812;
+----
+64	16
+
+query I
+SELECT * FROM quackapi_stop(29812);
+----
+Stopped quackapi server on port 29812
+
+# worker_threads := 0 used to fall back to 32 inside the server constructor and
+# say nothing, so the budget under test was not the budget being served.
+statement error
+SELECT * FROM quackapi_serve(29813, host := '127.0.0.1', access_log := false, worker_threads := 0);
+----
+worker_threads must be between 1 and 4096
+
+query I
+SELECT array_agg(DISTINCT port) AS ports FROM quackapi_servers();
+----
+NULL
+
+# ---------------------------------------------------------------------------
+# Past capacity: a deliberate 503, never a dropped socket. One worker with a
+# one-connection queue makes 16 simultaneous clients overload by construction,
+# and the handler is slow enough that the queue cannot drain between arrivals.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE ROUTE overload_slow GET '/overload-slow' AS SELECT sum(i) AS n FROM range(40000000) t(i);
+
+query I
+SELECT * FROM quackapi_serve(29814, host := '127.0.0.1', access_log := false,
+                             worker_threads := 1, max_pending_requests := 1);
+----
+http://127.0.0.1:29814
+
+statement ok
+CREATE TABLE overload_attempts AS
+SELECT idx, status, body, error FROM quackapi_parallel_fetch('http://127.0.0.1:29814/overload-slow', 16);
+
+# Every connection carries an HTTP status and nothing was reset at the socket.
+query II
+SELECT list_sort(array_agg(DISTINCT status)) AS statuses,
+       array_agg(DISTINCT coalesce(error, 'no socket error')) AS errors
+FROM overload_attempts;
+----
+[200, 503]	[no socket error]
+
+# The shed answer itself names the binding budget and both of its numbers.
+query I
+SELECT array_agg(DISTINCT body) FILTER (WHERE status = 503) FROM overload_attempts;
+----
+['{"detail":"quackapi is at its HTTP request budget","budget":"pending","worker_threads":1,"max_pending_requests":1}']
+
+# And the server answers the same question about itself.
+query III
+SELECT binding_budget, shed_requests > 0, workers_peak
+FROM quackapi_servers() WHERE port = 29814;
+----
+pending	true	1
+
+query I
+SELECT * FROM quackapi_stop(29814);
+----
+Stopped quackapi server on port 29814

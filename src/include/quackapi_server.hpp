@@ -26,6 +26,23 @@ static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
 
 //! Default HTTP worker thread-pool size (httplib TaskQueue).
 static constexpr size_t QUACKAPI_DEFAULT_WORKER_THREADS = 32;
+//! Upper bound on worker_threads. Past this the derived pending queue would
+//! leave the validated range, and the thread count stops being a server.
+static constexpr int32_t QUACKAPI_MAX_WORKER_THREADS = 4096;
+//! Pending connections per worker thread. The HTTP budget is ONE number: the
+//! operator sets worker_threads and the burst queue follows it, instead of two
+//! literals that have to be kept consistent by hand. 32 × 8 = 256, the pending
+//! default this replaces.
+static constexpr int32_t QUACKAPI_PENDING_PER_WORKER = 8;
+//! Write deadline for the overload answer, seconds. Deliberately short and not
+//! write_timeout_sec: this write happens on the accept thread, so a client that
+//! has stopped reading must not hold up accept() for the socket timeout.
+static constexpr int32_t QUACKAPI_OVERLOAD_WRITE_TIMEOUT_SEC = 1;
+//! Request bytes read and discarded before the overload answer. A socket closed
+//! while bytes are still queued for it makes the kernel send RST instead of FIN,
+//! and the 503 the client has not read yet goes with it — the reset this whole
+//! path exists to stop. One request head is far below this cap.
+static constexpr size_t QUACKAPI_OVERLOAD_DRAIN_BYTES = 8192;
 //! Default keep-alive max requests per connection.
 static constexpr size_t QUACKAPI_DEFAULT_KEEP_ALIVE_MAX = 128;
 //! Default keep-alive idle timeout (seconds).
@@ -85,7 +102,12 @@ struct QuackapiServeOptions {
 	//! Query deadline is distinct from socket I/O timeouts. Always finite.
 	int64_t query_timeout_ms = 30000;
 	int64_t max_response_bytes = 16 * 1024 * 1024;
-	int32_t max_pending_requests = 256;
+	//! Connections accepted but not yet handed to a worker. Derived from
+	//! worker_threads unless the operator named it (see max_pending_requests_set).
+	int32_t max_pending_requests = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS) * QUACKAPI_PENDING_PER_WORKER;
+	//! True only when max_pending_requests came from the named parameter or the
+	//! SET. Otherwise serve derives it and the operator turns one dial.
+	bool max_pending_requests_set = false;
 
 	// --- Batteries: DuckDB SETs applied at serve (opt-in) ---
 	//! Every SET below runs on the shared DatabaseInstance, so it reaches every
@@ -145,6 +167,21 @@ QuackapiLogLevel ParseQuackapiLogLevel(const string &raw);
 //! The accepted log_level tokens, for error messages.
 const char *QuackapiLogLevelTokens();
 
+//! What the HTTP budget actually did, so an operator can ask the server which
+//! budget is binding instead of inferring it from a client-side reset count.
+//! Written by the accept and worker threads; read by quackapi_servers().
+struct QuackapiOverloadCounters {
+	//! Deepest concurrent in-flight requests seen. Equal to worker_threads means
+	//! every worker has been busy at once: the worker budget is the next wall.
+	std::atomic<int64_t> workers_peak {0};
+	//! Requests currently holding a worker thread.
+	std::atomic<int64_t> workers_busy {0};
+	//! Connections answered 503 because the pending queue was full.
+	std::atomic<int64_t> shed_requests {0};
+	//! True once the loud line has been emitted, so a flood costs one line.
+	std::atomic<bool> shed_announced {false};
+};
+
 //! REST sidecar that dispatches requests to routes in QuackapiState.
 //!
 //! Why a sidecar (architecture C): the core quack HttpQuackServer hardcodes
@@ -198,6 +235,12 @@ public:
 	std::chrono::steady_clock::time_point StartedAt() const {
 		return started_at;
 	}
+	//! Shared with the httplib subclass rather than owned by it: httplib destroys
+	//! the Server on its own schedule, and quackapi_servers() must still be able
+	//! to read what the budget did.
+	const shared_ptr<QuackapiOverloadCounters> &Overload() const {
+		return overload;
+	}
 
 private:
 	static void ListenThread(QuackapiHttpServer *server);
@@ -216,6 +259,7 @@ private:
 	std::chrono::steady_clock::time_point started_at;
 	bool compression = true;
 	idx_t compression_min_bytes = 256;
+	shared_ptr<QuackapiOverloadCounters> overload = make_shared_ptr<QuackapiOverloadCounters>();
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};

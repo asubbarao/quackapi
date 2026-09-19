@@ -5,6 +5,15 @@
 // clients on empty POST/PUT/PATCH). Remove this vendored copy if/when the fix
 // lands upstream in DuckDB's bundled httplib.
 //
+// Second patch: Server::on_task_queue_full(socket_t), a no-op hook called from
+// the accept loop when the task queue will not take an accepted socket. Stock
+// httplib closes such a socket silently, so the client gets a reset with no
+// HTTP status and no way to tell overload from a crash.
+//
+// Third patch: Server::set_listen_backlog(int). CPPHTTPLIB_LISTEN_BACKLOG is a
+// compile-time 5, so the kernel refuses a burst before the server's own budget
+// is ever consulted; quackapi sizes the backlog from that budget instead.
+//
 // taken from: https://github.com/yhirose/cpp-httplib/blob/v0.27.0/httplib.h
 // Note: some modifications are made to file (replace std::regex with RE2)
 // Patched CreateFile2 for lower Windows versions
@@ -1220,6 +1229,11 @@ public:
 
   std::function<TaskQueue *(void)> new_task_queue;
 
+  //! quackapi: ::listen() backlog. The stock 5 drops connections in the kernel
+  //! before the server's own budget is consulted, so a burst is refused at the
+  //! TCP layer no matter how the task queue is sized. Call before bind.
+  void set_listen_backlog(int backlog) { listen_backlog_ = backlog; }
+
 protected:
   bool process_request(Stream &strm, const std::string &remote_addr,
                        int remote_port, const std::string &local_addr,
@@ -1230,6 +1244,8 @@ protected:
   std::atomic<socket_t> svr_sock_{INVALID_SOCKET};
 
   std::vector<std::string> trusted_proxies_;
+
+  int listen_backlog_ = CPPHTTPLIB_LISTEN_BACKLOG;
 
   size_t keep_alive_max_count_ = CPPHTTPLIB_KEEPALIVE_MAX_COUNT;
   time_t keep_alive_timeout_sec_ = CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND;
@@ -1290,6 +1306,11 @@ private:
                          ContentReceiver multipart_receiver) const;
 
   virtual bool process_and_close_socket(socket_t sock);
+
+  //! quackapi: the task queue refused this already-accepted socket. Stock
+  //! httplib only closes it, which reaches the client as a reset carrying no
+  //! HTTP status; an override answers on the socket first.
+  virtual void on_task_queue_full(socket_t /*sock*/) {}
 
   void output_log(const Request &req, const Response &res) const;
   void output_pre_compression_log(const Request &req,
@@ -8088,7 +8109,7 @@ Server::create_server_socket(const std::string &host, int port,
           output_error_log(Error::BindIPAddress, nullptr);
           return false;
         }
-        if (::listen(sock, CPPHTTPLIB_LISTEN_BACKLOG)) {
+        if (::listen(sock, listen_backlog_)) {
           output_error_log(Error::Listen, nullptr);
           return false;
         }
@@ -8187,6 +8208,7 @@ inline bool Server::listen_internal() {
       if (!task_queue->enqueue(
               [this, sock]() { process_and_close_socket(sock); })) {
         output_error_log(Error::ResourceExhaustion, nullptr);
+        on_task_queue_full(sock);
         detail::shutdown_socket(sock);
         detail::close_socket(sock);
       }
