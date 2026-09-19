@@ -2233,8 +2233,8 @@ size_t PeekRequestHead(socket_t sock, string &head_out) {
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(QUACKAPI_WS_PEEK_BUDGET_MS);
 	ssize_t previous = 0;
 	while (true) {
-		auto peeked = duckdb_httplib::detail::read_socket(sock, buffer.data(), buffer.size(),
-		                                                  CPPHTTPLIB_RECV_FLAGS | MSG_PEEK);
+		auto peeked =
+		    duckdb_httplib::detail::read_socket(sock, buffer.data(), buffer.size(), CPPHTTPLIB_RECV_FLAGS | MSG_PEEK);
 		if (peeked <= 0) {
 			return 0;
 		}
@@ -2359,8 +2359,8 @@ enum class WsInboundAction : uint8_t {
 } // namespace
 
 int32_t QuackapiHttpServer::WebSocketBudget() const {
-	auto workers = options.worker_threads > 0 ? options.worker_threads
-	                                          : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
+	auto workers =
+	    options.worker_threads > 0 ? options.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	auto budget = workers / 2;
 	return budget > 0 ? budget : 1;
 }
@@ -2671,15 +2671,13 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 				continue;
 			}
 			if (inbound.opcode == QuackapiWsOpcode::BINARY) {
-				conn.SendClose(QuackapiWsClose::UNSUPPORTED_DATA,
-				               "this endpoint binds $message from text frames only");
+				conn.SendClose(QuackapiWsClose::UNSUPPORTED_DATA, "this endpoint binds $message from text frames only");
 				break;
 			}
 			BoundParameterData bound;
 			string err_json;
 			if (!BindParamValue(inbound.payload, message_type, "body", "message", bound, err_json)) {
-				conn.SendClose(QuackapiWsClose::POLICY_VIOLATION,
-				               "message did not bind as " + message_type.ToString());
+				conn.SendClose(QuackapiWsClose::POLICY_VIOLATION, "message did not bind as " + message_type.ToString());
 				break;
 			}
 			auto call_values = named_values;
@@ -2759,7 +2757,8 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 	if (conn.CloseSent()) {
 		DrainBeforeClose(strm);
 	}
-	auto latency_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - session_start).count();
+	auto latency_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - session_start).count();
 	EmitAccessLog(log_req, log_res, request_id, latency_ms);
 	return true;
 }

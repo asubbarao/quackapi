@@ -180,9 +180,9 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 	opts.max_response_bytes = read("max_response_bytes", 16 * 1024 * 1024, 1024LL * 1024 * 1024);
 	// The fallback here is only a placeholder: when nothing named it, ServeExec
 	// derives the pending queue from worker_threads so the HTTP budget is one dial.
-	opts.max_pending_requests = static_cast<int32_t>(
-	    read("max_pending_requests", static_cast<int64_t>(QUACKAPI_DEFAULT_WORKER_THREADS) * QUACKAPI_PENDING_PER_WORKER,
-	         100000, &opts.max_pending_requests_set));
+	opts.max_pending_requests = static_cast<int32_t>(read(
+	    "max_pending_requests", static_cast<int64_t>(QUACKAPI_DEFAULT_WORKER_THREADS) * QUACKAPI_PENDING_PER_WORKER,
+	    100000, &opts.max_pending_requests_set));
 }
 
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,

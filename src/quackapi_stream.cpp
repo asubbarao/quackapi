@@ -151,7 +151,8 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 		    "WS '<path>' and terminate TLS in front of the server.");
 	} else if (method != "GET") {
 		return ParserExtensionParseResult("CREATE STREAM supports GET (Server-Sent Events) and WS (WebSocket). "
-		                                  "Unknown method \"" + method + "\"");
+		                                  "Unknown method \"" +
+		                                  method + "\"");
 	}
 	rest = QuackapiTrim(rest.substr(second_space));
 
@@ -297,8 +298,8 @@ unique_ptr<FunctionData> ApplyStreamBind(ClientContext &, TableFunctionBindInput
 	bind_data->stream.pattern = input.inputs[4].GetValue<string>();
 	bind_data->stream.handler_sql = input.inputs[5].GetValue<string>();
 	bind_data->stream.interval_ms = input.inputs[6].GetValue<int64_t>();
-	bind_data->stream.transport = input.inputs[7].GetValue<bool>() ? QuackapiStreamTransport::WS
-	                                                               : QuackapiStreamTransport::SSE;
+	bind_data->stream.transport =
+	    input.inputs[7].GetValue<bool>() ? QuackapiStreamTransport::WS : QuackapiStreamTransport::SSE;
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
@@ -327,8 +328,7 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 					break;
 				}
 			}
-			if (bind_data.stream.binds_message &&
-			    bind_data.stream.transport != QuackapiStreamTransport::WS) {
+			if (bind_data.stream.binds_message && bind_data.stream.transport != QuackapiStreamTransport::WS) {
 				throw InvalidInputException(
 				    "Stream \"%s\" binds $message, which only a WebSocket frame supplies. Declare it as "
 				    "CREATE STREAM %s WS '%s' AS …",
@@ -342,15 +342,13 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 			}
 		}
 		state.AddStream(bind_data.stream, bind_data.or_replace);
-		const char *transport_name =
-		    bind_data.stream.transport == QuackapiStreamTransport::WS ? "WS" : "GET";
+		const char *transport_name = bind_data.stream.transport == QuackapiStreamTransport::WS ? "WS" : "GET";
 		const char *shape = bind_data.stream.transport == QuackapiStreamTransport::WS
 		                        ? (bind_data.stream.binds_message ? "WebSocket message" : "WebSocket push")
 		                        : "SSE";
 		if (bind_data.stream.interval_ms > 0) {
-			message = StringUtil::Format("Stream %s: %s %s %s interval=%lldms", bind_data.stream.name,
-			                             transport_name, bind_data.stream.pattern, shape,
-			                             (long long)bind_data.stream.interval_ms);
+			message = StringUtil::Format("Stream %s: %s %s %s interval=%lldms", bind_data.stream.name, transport_name,
+			                             bind_data.stream.pattern, shape, (long long)bind_data.stream.interval_ms);
 		} else {
 			message = StringUtil::Format("Stream %s: %s %s %s", bind_data.stream.name, transport_name,
 			                             bind_data.stream.pattern, shape);

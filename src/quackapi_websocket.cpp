@@ -381,7 +381,7 @@ QuackapiWsReadResult QuackapiWsConn::Read(QuackapiWsMessage &message, int64_t wa
 			} else {
 				// 0 polls without waiting; anything else is that many milliseconds.
 				ready = duckdb_httplib::detail::select_read(stream.socket(), wait_budget_ms / 1000,
-				                                           (wait_budget_ms % 1000) * 1000) > 0;
+				                                            (wait_budget_ms % 1000) * 1000) > 0;
 			}
 			if (!ready) {
 				return QuackapiWsReadResult::IDLE;
@@ -918,8 +918,8 @@ void WsConnectExec(ClientContext &, TableFunctionInput &data_p, DataChunk &outpu
 		output.SetValue(0, row, Value::BIGINT(static_cast<int64_t>(state.offset) + 1));
 		output.SetValue(1, row, Value(frame.opcode));
 		output.SetValue(2, row, Value(frame.payload));
-		output.SetValue(3, row, frame.has_code ? Value::INTEGER(static_cast<int32_t>(frame.code))
-		                                       : Value(LogicalType::INTEGER));
+		output.SetValue(
+		    3, row, frame.has_code ? Value::INTEGER(static_cast<int32_t>(frame.code)) : Value(LogicalType::INTEGER));
 		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(frame.frames)));
 		row++;
 		state.offset++;

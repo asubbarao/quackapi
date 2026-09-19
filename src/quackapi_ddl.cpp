@@ -490,7 +490,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			}
 			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow") {
 				return ParserExtensionParseResult("FORMAT must be one of [json, ndjson, csv, parquet, arrow], not '" +
-				                                      fmt + "'");
+				                                  fmt + "'");
 			}
 			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));
@@ -882,10 +882,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				}
 				continue;
 			}
-			return ParserExtensionParseResult(
-			    "Unknown PARAM option \"" + key +
-			    "\" — valid sources are [query, header, cookie]; other options are "
-			    "[default, ge, gt, le, lt, min_length, max_length]");
+			return ParserExtensionParseResult("Unknown PARAM option \"" + key +
+			                                  "\" — valid sources are [query, header, cookie]; other options are "
+			                                  "[default, ge, gt, le, lt, min_length, max_length]");
 		}
 
 		params.push_back(std::move(spec));
@@ -1078,8 +1077,7 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 		if (fmt.empty()) {
 			fmt = "json";
 		}
-		if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow" &&
-		    fmt != "arrows") {
+		if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow" && fmt != "arrows") {
 			throw InvalidInputException("FORMAT must be one of [json, ndjson, csv, parquet, arrow], not '%s'",
 			                            input.inputs[14].GetValue<string>());
 		}

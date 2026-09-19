@@ -200,8 +200,8 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			sql = StringUtil::Format("SET threads TO '%s'", escaped);
 		}
 		RequireSet(con, sql, "threads");
-		applied.push_back(StringUtil::Format("threads=%s (WHY: operator-capped worker pool for multi-tenant hosts)",
-		                                     opts.threads));
+		applied.push_back(
+		    StringUtil::Format("threads=%s (WHY: operator-capped worker pool for multi-tenant hosts)", opts.threads));
 	} else {
 		applied.push_back("threads=<DuckDB default=all cores> (WHY: max parallel query work for server)");
 	}
@@ -281,10 +281,9 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		auto curl_load = con.Query("LOAD curl_httpfs");
 		if (curl_load->HasError()) {
 			const auto detail = StringUtil::Replace(curl_load->GetError(), "\n", " ");
-			throw InvalidInputException(
-			    "quackapi_serve: required extension curl_httpfs could not be loaded: %s. "
-			    "Install it with INSTALL curl_httpfs FROM community, then retry.",
-			    detail);
+			throw InvalidInputException("quackapi_serve: required extension curl_httpfs could not be loaded: %s. "
+			                            "Install it with INSTALL curl_httpfs FROM community, then retry.",
+			                            detail);
 		}
 		const auto active = StringUtil::Lower(QuackapiHttpFetch::ActiveHttpUtilName(*context.db));
 		if (!StringUtil::Contains(active, "curl")) {

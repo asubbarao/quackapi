@@ -126,10 +126,9 @@ void RequireCurlHttpfs(DatabaseInstance &db) {
 	if (active == "MultiCurl" || active == "HTTPFS-Curl") {
 		return;
 	}
-	throw InvalidConfigurationException(
-	    "quackapi outbound HTTP requires curl_httpfs. Install it with "
-	    "INSTALL curl_httpfs FROM community, then retry. Active HTTPUtil is '%s'.",
-	    active);
+	throw InvalidConfigurationException("quackapi outbound HTTP requires curl_httpfs. Install it with "
+	                                    "INSTALL curl_httpfs FROM community, then retry. Active HTTPUtil is '%s'.",
+	                                    active);
 }
 
 //! Split "http://host:port" (from SplitURL origin) into host + port.
@@ -388,22 +387,22 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 	auto &util = HTTPUtil::Get(db);
 	const auto util_name = util.GetName();
 	if (util_name == "Built-In") {
-		throw InvalidConfigurationException(
-		    "quackapi outbound POST requires an HTTP client with full method support. "
-		    "LOAD curl_httpfs, then retry. Active HTTPUtil is '%s'.",
-		    util_name);
+		throw InvalidConfigurationException("quackapi outbound POST requires an HTTP client with full method support. "
+		                                    "LOAD curl_httpfs, then retry. Active HTTPUtil is '%s'.",
+		                                    util_name);
 	}
 
-	return WithUtilClient(db, url, "POST", [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
-		HTTPHeaders headers(db);
-		if (!content_type.empty()) {
-			headers.Insert("Content-Type", content_type);
-		}
-		InsertExtraHeaders(headers, extra_headers);
-		PostRequestInfo request(url, headers, params, const_data_ptr_cast(body.data()), body.size());
-		request.try_request = true;
-		return FromResponse(http_util.Request(request, client));
-	});
+	return WithUtilClient(
+	    db, url, "POST", [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+		    HTTPHeaders headers(db);
+		    if (!content_type.empty()) {
+			    headers.Insert("Content-Type", content_type);
+		    }
+		    InsertExtraHeaders(headers, extra_headers);
+		    PostRequestInfo request(url, headers, params, const_data_ptr_cast(body.data()), body.size());
+		    request.try_request = true;
+		    return FromResponse(http_util.Request(request, client));
+	    });
 }
 
 vector<QuackapiHttpPoolStats> QuackapiHttpFetch::PoolStats() {
