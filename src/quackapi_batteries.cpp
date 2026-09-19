@@ -13,6 +13,10 @@
 
 namespace duckdb {
 
+const char *QuackapiLogLevelTokens() {
+	return "silent, off, none, error, warn, warning, info, debug, trace, verbose";
+}
+
 QuackapiLogLevel ParseQuackapiLogLevel(const string &raw) {
 	auto lower = StringUtil::Lower(raw);
 	StringUtil::Trim(lower);
@@ -28,8 +32,10 @@ QuackapiLogLevel ParseQuackapiLogLevel(const string &raw) {
 	if (lower == "debug" || lower == "trace" || lower == "verbose") {
 		return QuackapiLogLevel::DEBUG_LEVEL;
 	}
-	// Default + "info" / empty / unknown
-	return QuackapiLogLevel::INFO;
+	if (lower.empty() || lower == "info") {
+		return QuackapiLogLevel::INFO;
+	}
+	throw InvalidInputException("log_level must be one of [%s], not '%s'", QuackapiLogLevelTokens(), raw);
 }
 
 static const char *LogLevelDuckDBName(QuackapiLogLevel level) {
@@ -75,6 +81,16 @@ static bool RunSet(Connection &con, const string &sql, string &err_out) {
 	return true;
 }
 
+//! A SET the operator asked for by name. Serve returns a listen_url that is
+//! taken as a statement of fact about the process configuration, so a knob that
+//! could not be applied has to stop the serve rather than reach stderr.
+static void RequireSet(Connection &con, const string &sql, const string &setting) {
+	string err;
+	if (!RunSet(con, sql, err)) {
+		throw InvalidInputException("quackapi_serve: could not apply %s: %s", setting, err);
+	}
+}
+
 string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions &opts) {
 	// Correct-by-default SETs/PRAGMAs for a long-lived HTTP server process.
 	// Each SET is documented (WHY) and overridable via serve() named params.
@@ -90,12 +106,14 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	// --- memory_limit ---
 	// WHY: unbounded RAM is the #1 footgun for multi-tenant HTTP handlers; a
 	// conservative ceiling prevents a single query from OOMing the host.
-	// Non-clobber: never overwrite an operator-set DuckDB memory_limit.
+	// Non-clobber: never overwrite an operator-set DuckDB memory_limit — and
+	// never impose the serve default on an untuned instance, where the session
+	// that called serve would inherit a 256MB ceiling it never asked for.
 	{
 		string limit_to_apply;
 		if (!opts.memory_limit.empty()) {
 			limit_to_apply = opts.memory_limit;
-		} else if (IsAtSystemDefaultMemoryLimit(*context.db)) {
+		} else if (opts.tune && IsAtSystemDefaultMemoryLimit(*context.db)) {
 			limit_to_apply = SERVE_DEFAULT_MEMORY_LIMIT;
 		}
 		if (!limit_to_apply.empty()) {
@@ -105,14 +123,10 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 				throw InvalidInputException("quackapi_serve: invalid memory_limit '%s': %s", limit_to_apply, ex.what());
 			}
 			auto escaped = StringUtil::Replace(limit_to_apply, "'", "''");
-			if (RunSet(con, StringUtil::Format("SET memory_limit TO '%s'", escaped), err)) {
-				applied.push_back(
-				    StringUtil::Format("memory_limit=%s (WHY: RAM guardrail for multi-query HTTP workers; "
-				                       "prevents one handler from OOMing the process)",
-				                       limit_to_apply));
-			} else {
-				fprintf(stderr, "quackapi: could not SET memory_limit: %s\n", err.c_str());
-			}
+			RequireSet(con, StringUtil::Format("SET memory_limit TO '%s'", escaped), "memory_limit");
+			applied.push_back(StringUtil::Format("memory_limit=%s (WHY: RAM guardrail for multi-query HTTP workers; "
+			                                     "prevents one handler from OOMing the process)",
+			                                     limit_to_apply));
 		} else {
 			applied.push_back("memory_limit=<operator/prior> (WHY: non-clobber; left alone)");
 		}
@@ -121,16 +135,18 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	// --- preserve_insertion_order ---
 	// WHY: insertion-order preservation serializes some pipelines; servers almost
 	// never need row order unless ORDER BY is present — false raises throughput.
-	{
+	// It also changes what every ORDER BY-less query in the process returns, so
+	// it moves only on an explicit ask.
+	if (opts.preserve_insertion_order_set || opts.tune) {
 		const char *pio = opts.preserve_insertion_order ? "true" : "false";
-		if (RunSet(con, StringUtil::Format("SET preserve_insertion_order = %s", pio), err)) {
-			applied.push_back(StringUtil::Format("preserve_insertion_order=%s (WHY: %s)", pio,
-			                                     opts.preserve_insertion_order
-			                                         ? "operator requested stable scan order"
-			                                         : "server throughput — allow reordering when no ORDER BY"));
-		} else {
-			fprintf(stderr, "quackapi: could not SET preserve_insertion_order: %s\n", err.c_str());
-		}
+		RequireSet(con, StringUtil::Format("SET preserve_insertion_order = %s", pio), "preserve_insertion_order");
+		applied.push_back(StringUtil::Format("preserve_insertion_order=%s (WHY: %s)", pio,
+		                                     opts.preserve_insertion_order
+		                                         ? "operator requested stable scan order"
+		                                         : "server throughput — allow reordering when no ORDER BY"));
+	} else {
+		applied.push_back("preserve_insertion_order=<DuckDB default> (WHY: untuned serve leaves row-order "
+		                  "semantics of the shared instance alone)");
 	}
 
 	// --- postgres attach OLTP: disable ctid parallel page scan ---
@@ -138,26 +154,27 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	//   SELECT … FROM pg.t WHERE id = $id
 	// profile as POSTGRES_SCAN cumulative_rows_scanned ≈ whole table (~100k+),
 	// not an index probe. false forces COPY (SELECT … WHERE id=…) so Postgres
-	// uses the PK. Best-effort: no-op if postgres extension not loaded yet.
-	if (RunSet(con, "SET pg_use_ctid_scan = false", err)) {
-		applied.push_back("pg_use_ctid_scan=false (WHY: ATTACH point lookups use PG index via "
-		                  "WHERE pushdown, not full ctid range scan)");
+	// uses the PK. Best-effort: the setting only exists once postgres is loaded,
+	// so report which of the two happened instead of claiming it either way.
+	if (opts.tune) {
+		if (RunSet(con, "SET pg_use_ctid_scan = false", err)) {
+			applied.push_back("pg_use_ctid_scan=false (WHY: ATTACH point lookups use PG index via "
+			                  "WHERE pushdown, not full ctid range scan)");
+		} else {
+			applied.push_back("pg_use_ctid_scan=<unset> (WHY: postgres extension not loaded)");
+		}
 	}
 
 	// --- enable_http_metadata_cache ---
 	// WHY: outbound HTTP (httpfs / curl_httpfs companions) reuses ETag /
 	// Last-Modified; cuts origin load for repeated remote reads from handlers.
 	// (enable_object_cache is a DuckDB no-op placeholder — intentionally skipped.)
-	{
+	if (opts.enable_http_metadata_cache_set || opts.tune) {
 		const char *v = opts.enable_http_metadata_cache ? "true" : "false";
-		if (RunSet(con, StringUtil::Format("SET enable_http_metadata_cache = %s", v), err)) {
-			applied.push_back(
-			    StringUtil::Format("enable_http_metadata_cache=%s (WHY: cache HTTP ETag/Last-Modified for "
-			                       "outbound companion fetches)",
-			                       v));
-		} else {
-			fprintf(stderr, "quackapi: could not SET enable_http_metadata_cache: %s\n", err.c_str());
-		}
+		RequireSet(con, StringUtil::Format("SET enable_http_metadata_cache = %s", v), "enable_http_metadata_cache");
+		applied.push_back(StringUtil::Format("enable_http_metadata_cache=%s (WHY: cache HTTP ETag/Last-Modified for "
+		                                     "outbound companion fetches)",
+		                                     v));
 	}
 
 	// --- threads ---
@@ -180,21 +197,23 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		} else {
 			sql = StringUtil::Format("SET threads TO '%s'", escaped);
 		}
-		if (RunSet(con, sql, err)) {
-			applied.push_back(StringUtil::Format("threads=%s (WHY: operator-capped worker pool for multi-tenant hosts)",
-			                                     opts.threads));
-		} else {
-			fprintf(stderr, "quackapi: could not SET threads: %s\n", err.c_str());
-		}
+		RequireSet(con, sql, "threads");
+		applied.push_back(StringUtil::Format("threads=%s (WHY: operator-capped worker pool for multi-tenant hosts)",
+		                                     opts.threads));
 	} else {
 		applied.push_back("threads=<DuckDB default=all cores> (WHY: max parallel query work for server)");
 	}
 
-	// --- DuckDB built-in logging (OFF by default) ---
+	// --- DuckDB built-in logging (only on an explicit ask) ---
 	// WHY: QueryLog-per-handler-SQL to stdout is a multi-ms tax under load and
 	// serializes workers. HTTP ops use access_log (structured stderr). Opt in
-	// with enable_logging:=true when debugging query plans / errors.
-	if (opts.enable_logging && opts.log_level != QuackapiLogLevel::SILENT) {
+	// with enable_logging:=true when debugging query plans / errors. Omitting it
+	// leaves whatever logging the process already had — forcing it off here
+	// silenced loggers that had nothing to do with quackapi.
+	if (!opts.enable_logging_set && !opts.tune) {
+		applied.push_back("enable_logging=<DuckDB default> (WHY: untuned serve leaves the instance logger alone; "
+		                  "pass enable_logging:=true/false to move it)");
+	} else if (opts.enable_logging && opts.log_level != QuackapiLogLevel::SILENT) {
 		const char *level = LogLevelDuckDBName(opts.log_level);
 		// Prefer CALL enable_logging (current DuckDB API) — sets storage + level.
 		auto call = con.Query(StringUtil::Format("CALL enable_logging(level:='%s', storage:='stdout')", level));
@@ -230,8 +249,9 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	}
 
 	// --- Compose quack transport log if the option exists ---
-	// WHY: when duckdb-quack is loaded, share one log surface with REST.
-	{
+	// WHY: when duckdb-quack is loaded, share one log surface with REST. These
+	// are quack's process-wide settings, so they move only under tune.
+	if (opts.tune) {
 		auto &config = DBConfig::GetConfig(*context.db);
 		Value existing;
 		if (config.TryGetCurrentSetting("quack_log_level", existing) ||
@@ -269,12 +289,18 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		if (pref.empty()) {
 			pref = "auto";
 		}
-		if (pref != "auto" && pref != "curl" && pref != "httplib") {
-			throw InvalidInputException("quackapi_serve: http_client must be 'auto', 'curl', or 'httplib' (got '%s')",
-			                            opts.http_client);
-		}
+		// Value legality is settled in ServeBind; by here pref is auto|curl|httplib.
 
-		if (pref == "httplib") {
+		if (!opts.http_client_set && !opts.tune) {
+			// Nobody asked. Probing "auto" would INSTALL curl_httpfs from the
+			// community repo and repoint httpfs for every connection in the
+			// process — too much for a serve that named no client.
+			opts.http_client_active = "httplib";
+			opts.http_client_reason = "untuned";
+			applied.push_back("http_client=httplib reason=untuned (WHY: no http_client given and tune:=false — "
+			                  "no INSTALL, no httpfs_client_implementation change; pass http_client:='curl' "
+			                  "or tune:=true for the pooled client)");
+		} else if (pref == "httplib") {
 			// Operator forced stock client — do not INSTALL/LOAD curl_httpfs.
 			// If curl_httpfs was already LOADed earlier in the process, flip the
 			// backend back to httplib so this serve matches the knob.

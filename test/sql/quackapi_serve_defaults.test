@@ -1,0 +1,96 @@
+# name: test/sql/quackapi_serve_defaults.test
+# description: quackapi_serve() with no arguments leaves the shared DuckDB instance as it found it
+# group: [sql]
+
+require quackapi
+
+# Every SET quackapi_serve issues runs on the shared DatabaseInstance, so it
+# reaches this session and every other connection in the process. The zero-
+# argument call is the one an agent types into an analysis session, so it is
+# the one that must change nothing.
+
+statement ok
+CREATE TABLE memory_limit_before AS SELECT current_setting('memory_limit') AS value;
+
+statement ok
+SET enable_logging = true;
+
+query I
+SELECT * FROM quackapi_serve();
+----
+http://127.0.0.1:8000
+
+query I
+SELECT current_setting('memory_limit') = (SELECT value FROM memory_limit_before);
+----
+true
+
+query I
+SELECT current_setting('preserve_insertion_order');
+----
+true
+
+query I
+SELECT current_setting('enable_logging');
+----
+1
+
+query I
+SELECT current_setting('enable_http_metadata_cache');
+----
+false
+
+# The bare stop is no longer the destructive one, but with a single server up
+# there is nothing to disambiguate.
+query I
+SELECT * FROM quackapi_stop();
+----
+Stopped quackapi server on port 8000
+
+statement ok
+SET enable_logging = false;
+
+# ---------------------------------------------------------------------------
+# A named knob still moves its own setting — the opt-in is per knob.
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29301, host := '127.0.0.1', preserve_insertion_order := false);
+----
+http://127.0.0.1:29301
+
+query I
+SELECT current_setting('preserve_insertion_order');
+----
+false
+
+query I
+SELECT * FROM quackapi_stop(29301);
+----
+Stopped quackapi server on port 29301
+
+statement ok
+SET preserve_insertion_order = true;
+
+# ---------------------------------------------------------------------------
+# tune := true asks for the whole battery. http_client := 'httplib' keeps the
+# probe off the network; curl_httpfs would be INSTALLed from the community repo.
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', tune := true, http_client := 'httplib');
+----
+http://127.0.0.1:29302
+
+query I
+SELECT current_setting('preserve_insertion_order');
+----
+false
+
+query I
+SELECT current_setting('enable_http_metadata_cache');
+----
+true
+
+query I
+SELECT * FROM quackapi_stop(29302);
+----
+Stopped quackapi server on port 29302

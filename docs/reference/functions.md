@@ -12,7 +12,7 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `tune BOOLEAN` (default **false**), `wire_quack_auth BOOLEAN` (default **false**), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -37,13 +37,30 @@ SELECT * FROM quackapi_serve(8000, block := true);
 With `block := true`, the query emits `listen_url` then waits until `quackapi_stop`
 (or SIGINT/SIGTERM / query interrupt). Prefer this over shell `sleep` / `lsof` keepalive loops.
 
-**Memory limit precedence:** named param → `SET quackapi_memory_limit` → leave non-default DuckDB `memory_limit` alone → else safe default **256MB**.
+**`tune`:** default `false`. Every DuckDB `SET` serve issues runs on the shared
+`DatabaseInstance`, so it reaches every other connection in the process, including the
+session that called serve. An untuned serve changes nothing: `memory_limit`,
+`preserve_insertion_order`, `enable_http_metadata_cache`, `pg_use_ctid_scan` and DuckDB's
+logger stay where the process left them, and `curl_httpfs` is not installed. Pass
+`tune := true` for the whole battery, or name one knob (`memory_limit := '4GB'`,
+`preserve_insertion_order := false`) to move just that one. A knob that cannot be applied
+fails the serve rather than reaching stderr.
 
-**Outbound HTTP client:** default `auto` INSTALL/LOADs community `curl_httpfs` and sets
+**`wire_quack_auth`:** default `false`. When true and the quack extension is loaded, points
+`quack_authentication_function` / `quack_authorization_function` at quackapi's bridges so
+REST auth policy and quack RPC share one machinery. Off by default because those callbacks
+are process-wide.
+
+**Memory limit precedence:** named param → `SET quackapi_memory_limit` → otherwise left
+alone. The **256MB** serve default applies only under `tune := true`, and only while
+`memory_limit` is still at DuckDB's system default.
+
+**Outbound HTTP client:** `auto` INSTALL/LOADs community `curl_httpfs` and sets
 `httpfs_client_implementation='curl'` (connection pool, HTTP/2, async). If unavailable
 (Windows/WASM/offline), logs `quackapi.http_client=httplib reason=curl_httpfs_unavailable`
-and continues. Override with `http_client := 'httplib'` or `SET quackapi_http_client`.
-Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
+and continues. That probe runs only when `http_client` is named or `tune := true`;
+otherwise the client stays httplib with reason `untuned`. Unknown values are rejected at
+bind. Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
 
 ---
 
@@ -71,12 +88,13 @@ SELECT ready, listen_url FROM quackapi_wait(59999, 100);
 
 ---
 
-### `quackapi_stop([port])`
+### `quackapi_stop([port], all_servers := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
-| **Args** | `port INTEGER` optional — omit to stop **all** servers |
+| **Args** | `port INTEGER` optional — omit to stop the only running server |
+| **Named** | `all_servers BOOLEAN` (default **false**) — stop every server in the process |
 | **Returns** | `status VARCHAR` |
 
 ```sql
@@ -84,6 +102,10 @@ SELECT * FROM quackapi_stop(8000);
 -- Stopped quackapi server on port 8000
 
 SELECT * FROM quackapi_stop();
+-- Stopped quackapi server on port 8000   (when it is the only one)
+-- Error when two or more are up: names the ports and asks for one
+
+SELECT * FROM quackapi_stop(all_servers := true);
 -- Stopped all quackapi servers
 ```
 

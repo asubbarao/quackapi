@@ -102,7 +102,13 @@ QuackapiParamSource ParamSourceFromString(const string &s) {
 	if (u == "cookie") {
 		return QuackapiParamSource::COOKIE;
 	}
-	return QuackapiParamSource::QUERY;
+	// Empty is the wire default for param blobs written before sources existed.
+	// Anything else must not fall through: a header or cookie param that decoded
+	// as "query" would read an attacker-supplied ?name= and still answer 200.
+	if (u.empty() || u == "query") {
+		return QuackapiParamSource::QUERY;
+	}
+	throw InvalidInputException("param source must be one of [query, header, cookie], not '%s'", s);
 }
 
 string SerializeParamSpecs(const vector<QuackapiParamSpec> &specs) {
@@ -1059,10 +1065,19 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	if (input.inputs.size() > 13 && !input.inputs[13].IsNull()) {
 		bind_data->route.rate_limit_by = input.inputs[13].GetValue<string>();
 	}
+	// FORMAT / ENVELOPE are checked in the parser too, but this bind is also the
+	// entry point for quackapi_apply_route() itself. An unrecognised token here
+	// used to be stored verbatim and then read back as plain JSON at request
+	// time, so the route served a format nobody had asked for.
 	if (input.inputs.size() > 14 && !input.inputs[14].IsNull()) {
 		auto fmt = StringUtil::Lower(input.inputs[14].GetValue<string>());
 		if (fmt.empty()) {
 			fmt = "json";
+		}
+		if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow" &&
+		    fmt != "arrows") {
+			throw InvalidInputException("FORMAT must be one of [json, ndjson, csv, parquet, arrow], not '%s'",
+			                            input.inputs[14].GetValue<string>());
 		}
 		bind_data->route.response_format = fmt;
 	}
@@ -1070,6 +1085,10 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 		auto env = StringUtil::Lower(input.inputs[15].GetValue<string>());
 		if (env.empty()) {
 			env = "array";
+		}
+		if (env != "array" && env != "object") {
+			throw InvalidInputException("ENVELOPE must be one of [array, object], not '%s'",
+			                            input.inputs[15].GetValue<string>());
 		}
 		bind_data->route.response_envelope = env;
 	}

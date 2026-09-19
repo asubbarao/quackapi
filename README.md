@@ -222,8 +222,13 @@ Built-in OpenAPI (not listed in `quackapi_routes()`):
 
 1. `memory_limit := '…'` named parameter on `quackapi_serve` wins  
 2. else `SET quackapi_memory_limit = '…'`  
-3. else if DuckDB already has a **non-default** `memory_limit` → leave it alone  
-4. else apply the safe default of **256MB**
+3. else leave DuckDB's `memory_limit` alone  
+4. under `tune := true` only: apply the safe default of **256MB**, and only while
+   `memory_limit` is still at DuckDB's system default
+
+`quackapi_serve()` issues its `SET`s on the shared `DatabaseInstance`, so they reach every
+connection in the process. With no arguments it issues none — see `tune` in
+[docs/reference/functions.md](docs/reference/functions.md).
 
 ```sql
 -- App that needs headroom (PDF/HTML workloads, large joins, etc.)

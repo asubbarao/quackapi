@@ -87,8 +87,9 @@ SELECT * FROM quackapi_serve(8000);
 Stop with:
 
 ```sql
-SELECT * FROM quackapi_stop();
--- or SELECT * FROM quackapi_stop(8000);
+SELECT * FROM quackapi_stop(8000);
+-- or SELECT * FROM quackapi_stop();               -- the only server, when there is one
+-- or SELECT * FROM quackapi_stop(all_servers := true);
 ```
 
 ---

@@ -1,0 +1,76 @@
+# name: test/sql/quackapi_bind_validation.test
+# description: serve/stop reject unknown option values at bind instead of falling back
+# group: [sql]
+
+require quackapi
+
+# A value that quietly became a default left no way to tell from the server's
+# behaviour which bucket it landed in. Each of these is a literal in the
+# statement, so bind is where it is answerable.
+
+statement error
+SELECT * FROM quackapi_serve(29401, host := '127.0.0.1', log_level := 'bogus');
+----
+log_level must be one of
+
+statement error
+SELECT * FROM quackapi_serve(29402, host := '127.0.0.1', log_level := 'infoo');
+----
+log_level must be one of
+
+statement ok
+SET quackapi_log_level = 'bogus';
+
+# The setting is read at bind too, so a typo there fails the same way.
+statement error
+SELECT * FROM quackapi_serve(29403, host := '127.0.0.1');
+----
+log_level must be one of
+
+statement ok
+SET quackapi_log_level = 'info';
+
+# http_client was validated inside serve, after the bind had already succeeded.
+statement error
+SELECT * FROM quackapi_serve(29404, host := '127.0.0.1', http_client := 'libcurl');
+----
+http_client must be one of
+
+statement error
+SELECT * FROM quackapi_serve(29405, host := '127.0.0.1', http_client := '');
+----
+http_client must be one of
+
+# ---------------------------------------------------------------------------
+# quackapi_stop() with no port: never a silent teardown of servers this caller
+# did not start.
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_stop();
+----
+No quackapi servers running
+
+query I
+SELECT * FROM quackapi_serve(29406, host := '127.0.0.1');
+----
+http://127.0.0.1:29406
+
+query I
+SELECT * FROM quackapi_serve(29407, host := '127.0.0.1');
+----
+http://127.0.0.1:29407
+
+statement error
+SELECT * FROM quackapi_stop();
+----
+2 servers are running
+
+statement error
+SELECT * FROM quackapi_stop(29406, all_servers := true);
+----
+pass a port or all_servers := true
+
+query I
+SELECT * FROM quackapi_stop(all_servers := true);
+----
+Stopped all quackapi servers

@@ -63,6 +63,9 @@ struct QuackapiServeOptions {
 	//! **false** — per-handler QueryLog to stdout destroys HTTP throughput.
 	//! Opt in with enable_logging:=true for debugging; use access_log for ops.
 	bool enable_logging = false;
+	//! True only when the caller named enable_logging. Serve leaves DuckDB's
+	//! logging state alone otherwise — see `tune`.
+	bool enable_logging_set = false;
 
 	// --- Batteries: health routes (ON by default) ---
 	//! Auto-register GET /health + GET /healthz. Default true.
@@ -84,15 +87,24 @@ struct QuackapiServeOptions {
 	int64_t max_response_bytes = 16 * 1024 * 1024;
 	int32_t max_pending_requests = 256;
 
-	// --- Batteries: DuckDB SETs applied at serve (overridable) ---
-	//! Empty = apply non-clobber memory guard (256MB when still at system default).
+	// --- Batteries: DuckDB SETs applied at serve (opt-in) ---
+	//! Every SET below runs on the shared DatabaseInstance, so it reaches every
+	//! other connection in the process — including the analysis session that
+	//! typed `FROM quackapi_serve()`. Serve therefore leaves the instance as it
+	//! found it unless the operator asks: `tune := true` for the whole battery,
+	//! or one named knob for one setting. Default false.
+	bool tune = false;
+	//! Empty = leave DuckDB's memory_limit alone. Under tune, empty applies the
+	//! non-clobber 256MB guard only while memory_limit is still at the system default.
 	string memory_limit;
 	//! Empty = leave DuckDB threads at system default (all cores). Else e.g. "8".
 	string threads;
-	//! When true (default), SET preserve_insertion_order=false for throughput.
+	//! SET preserve_insertion_order. Only applied when named or under tune.
 	bool preserve_insertion_order = false;
-	//! When true (default), SET enable_http_metadata_cache=true for outbound HTTP.
+	bool preserve_insertion_order_set = false;
+	//! SET enable_http_metadata_cache. Only applied when named or under tune.
 	bool enable_http_metadata_cache = true;
+	bool enable_http_metadata_cache_set = false;
 
 	// --- Batteries: outbound HTTP client (curl_httpfs preferred) ---
 	//! Preference: "auto" (default — prefer curl_httpfs, fall back to httplib with
@@ -101,6 +113,11 @@ struct QuackapiServeOptions {
 	//! Does NOT touch the inbound httplib SERVER — only the client used by
 	//! httpfs / read_* over https.
 	string http_client = "auto";
+	//! True only when the caller named http_client (or SET quackapi_http_client).
+	//! "auto" is a preference, not an instruction: probing it INSTALLs an
+	//! extension and flips httpfs_client_implementation for the whole process,
+	//! so an untuned, unasked serve does neither.
+	bool http_client_set = false;
 	//! Filled at serve after probe: "curl" or "httplib".
 	string http_client_active;
 	//! Why active is what it is. Empty when curl is active after a successful
@@ -124,11 +141,22 @@ struct QuackapiServeOptions {
 	//! fresh PQexecParams per request) instead of DuckDB ATTACH.
 	//! Empty = DuckDB path only. Example: postgresql://user:pass@127.0.0.1:5432/db
 	string pg_dsn;
+
+	//! Point quack's quack_authentication_function / quack_authorization_function
+	//! at quackapi's bridges so REST auth policy and quack RPC share one
+	//! machinery. Off by default: it overwrites process-wide callbacks another
+	//! session may depend on. Default false.
+	bool wire_quack_auth = false;
 };
 
 //! Parse log_level named param / setting. Accepts silent|error|warn|info|debug
-//! (case-insensitive). Unknown → INFO.
+//! and the aliases off|none|warning|trace|verbose (case-insensitive). Empty is
+//! INFO. Anything else throws: a typo that quietly became INFO left no way to
+//! tell which bucket the server actually landed in.
 QuackapiLogLevel ParseQuackapiLogLevel(const string &raw);
+
+//! The accepted log_level tokens, for error messages.
+const char *QuackapiLogLevelTokens();
 
 //! REST sidecar that dispatches requests to routes in QuackapiState.
 //!

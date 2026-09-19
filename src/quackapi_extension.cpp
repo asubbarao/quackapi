@@ -106,10 +106,16 @@ struct ServeBindData : public TableFunctionData {
 	string log_level = "info";
 	bool access_log = true;
 	bool enable_logging = false;
+	bool enable_logging_set = false;
 	bool health_routes = true;
 	string threads;
+	//! Opt in to the instance-global SETs below. Default false — see
+	//! QuackapiServeOptions::tune.
+	bool tune = false;
 	bool preserve_insertion_order = false;
+	bool preserve_insertion_order_set = false;
 	bool enable_http_metadata_cache = true;
+	bool enable_http_metadata_cache_set = false;
 	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
 	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
@@ -121,6 +127,9 @@ struct ServeBindData : public TableFunctionData {
 	idx_t compression_min_bytes = 256;
 	//! Outbound HTTP client preference: auto|curl|httplib (default auto).
 	string http_client = "auto";
+	bool http_client_set = false;
+	//! Point quack's auth callbacks at quackapi's bridges. Default false.
+	bool wire_quack_auth = false;
 	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
 	string pg_dsn;
 	//! When true, hold the query open after listen_url until stop / SIGINT / SIGTERM.
@@ -206,6 +215,10 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			}
 		}
 	}
+	// Reject an unknown level here rather than at exec: the value is a literal
+	// in the statement, and a typo that silently became INFO left the server's
+	// verbosity unknowable from its behaviour.
+	ParseQuackapiLogLevel(bind_data->log_level);
 	auto access_entry = input.named_parameters.find("access_log");
 	if (access_entry != input.named_parameters.end()) {
 		bind_data->access_log = access_entry->second.GetValue<bool>();
@@ -213,6 +226,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto enlog_entry = input.named_parameters.find("enable_logging");
 	if (enlog_entry != input.named_parameters.end()) {
 		bind_data->enable_logging = enlog_entry->second.GetValue<bool>();
+		bind_data->enable_logging_set = true;
 	}
 	auto health_entry = input.named_parameters.find("health_routes");
 	if (health_entry != input.named_parameters.end()) {
@@ -227,13 +241,23 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->threads = threads_entry->second.ToString();
 		}
 	}
+	auto tune_entry = input.named_parameters.find("tune");
+	if (tune_entry != input.named_parameters.end()) {
+		bind_data->tune = tune_entry->second.GetValue<bool>();
+	}
+	auto wire_auth_entry = input.named_parameters.find("wire_quack_auth");
+	if (wire_auth_entry != input.named_parameters.end()) {
+		bind_data->wire_quack_auth = wire_auth_entry->second.GetValue<bool>();
+	}
 	auto pio_entry = input.named_parameters.find("preserve_insertion_order");
 	if (pio_entry != input.named_parameters.end()) {
 		bind_data->preserve_insertion_order = pio_entry->second.GetValue<bool>();
+		bind_data->preserve_insertion_order_set = true;
 	}
 	auto http_meta_entry = input.named_parameters.find("enable_http_metadata_cache");
 	if (http_meta_entry != input.named_parameters.end()) {
 		bind_data->enable_http_metadata_cache = http_meta_entry->second.GetValue<bool>();
+		bind_data->enable_http_metadata_cache_set = true;
 	}
 	auto wt_entry = input.named_parameters.find("worker_threads");
 	if (wt_entry != input.named_parameters.end()) {
@@ -297,13 +321,26 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto hc_entry = input.named_parameters.find("http_client");
 	if (hc_entry != input.named_parameters.end()) {
 		bind_data->http_client = hc_entry->second.GetValue<string>();
+		bind_data->http_client_set = true;
 	} else {
 		Value setting;
 		if (context.TryGetCurrentSetting("quackapi_http_client", setting) && !setting.IsNull()) {
 			auto s = setting.GetValue<string>();
-			if (!s.empty()) {
+			// The option's own default is "auto"; only a change from it is an ask.
+			if (!s.empty() && s != "auto") {
 				bind_data->http_client = s;
+				bind_data->http_client_set = true;
 			}
+		}
+	}
+	// Legal values belong at bind — the probe this selects happens deep inside
+	// serve, after the listener has already been accepted as startable.
+	{
+		auto pref = StringUtil::Lower(bind_data->http_client);
+		StringUtil::Trim(pref);
+		if (pref != "auto" && pref != "curl" && pref != "httplib") {
+			throw InvalidInputException("http_client must be one of [auto, curl, httplib], not '%s'",
+			                            bind_data->http_client);
 		}
 	}
 	auto block_entry = input.named_parameters.find("block");
@@ -354,8 +391,10 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 		bind_data.finished = true;
 		return;
 	}
-	// Compose with quack's auth settings when present (no-op if quack unloaded).
-	ComposeQuackAuthSettings(context);
+	// Compose with quack's auth settings on request (no-op if quack unloaded).
+	if (bind_data.wire_quack_auth) {
+		ComposeQuackAuthSettings(context);
+	}
 
 	// Batteries-included serve options (all ON / server-optimal by default).
 	QuackapiServeOptions opts = bind_data.limits;
@@ -365,16 +404,22 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
 	opts.access_log = bind_data.access_log;
 	opts.enable_logging = bind_data.enable_logging;
+	opts.enable_logging_set = bind_data.enable_logging_set;
 	opts.health_routes = bind_data.health_routes;
 	opts.threads = bind_data.threads;
+	opts.tune = bind_data.tune;
 	opts.preserve_insertion_order = bind_data.preserve_insertion_order;
+	opts.preserve_insertion_order_set = bind_data.preserve_insertion_order_set;
 	opts.enable_http_metadata_cache = bind_data.enable_http_metadata_cache;
+	opts.enable_http_metadata_cache_set = bind_data.enable_http_metadata_cache_set;
 	opts.worker_threads = bind_data.worker_threads;
 	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
 	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
 	opts.read_timeout_sec = bind_data.read_timeout_sec;
 	opts.write_timeout_sec = bind_data.write_timeout_sec;
 	opts.http_client = bind_data.http_client;
+	opts.http_client_set = bind_data.http_client_set;
+	opts.wire_quack_auth = bind_data.wire_quack_auth;
 	opts.pg_dsn = bind_data.pg_dsn;
 
 	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
@@ -406,7 +451,8 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 //===--------------------------------------------------------------------===//
 
 struct StopBindData : public TableFunctionData {
-	int32_t port = 0; // 0 = all
+	int32_t port = 0; // 0 = no port given
+	bool all = false;
 	bool finished = false;
 };
 
@@ -415,6 +461,13 @@ static unique_ptr<FunctionData> StopBind(ClientContext &, TableFunctionBindInput
 	auto bind_data = make_uniq<StopBindData>();
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
+	}
+	auto all_entry = input.named_parameters.find("all_servers");
+	if (all_entry != input.named_parameters.end()) {
+		bind_data->all = all_entry->second.GetValue<bool>();
+	}
+	if (bind_data->all && bind_data->port != 0) {
+		throw InvalidInputException("quackapi_stop: pass a port or all_servers := true, not both");
 	}
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("status");
@@ -428,9 +481,30 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	}
 	auto &state = QuackapiState::Get(*context.db);
 	string message;
-	if (bind_data.port == 0) {
+	if (bind_data.all) {
 		state.StopAllServers();
 		message = "Stopped all quackapi servers";
+	} else if (bind_data.port == 0) {
+		// The zero-argument call used to be the destructive one: it tore down
+		// every listener in the process, including ones another session owned.
+		// With exactly one server there is nothing to disambiguate; past that,
+		// say which ports are up and make the caller name one.
+		auto running = state.ListServers();
+		if (running.empty()) {
+			message = "No quackapi servers running";
+		} else if (running.size() == 1) {
+			auto only_port = std::get<1>(running[0]);
+			state.StopServer(only_port);
+			message = StringUtil::Format("Stopped quackapi server on port %d", only_port);
+		} else {
+			vector<string> ports;
+			for (auto &server : running) {
+				ports.push_back(to_string(std::get<1>(server)));
+			}
+			throw InvalidInputException("quackapi_stop: %llu servers are running (ports %s) — pass a port, "
+			                            "or all_servers := true to stop every one",
+			                            (unsigned long long)running.size(), StringUtil::Join(ports, ", "));
+		}
 	} else if (state.StopServer(bind_data.port)) {
 		message = StringUtil::Format("Stopped quackapi server on port %d", bind_data.port);
 	} else {
@@ -848,6 +922,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
 	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
 	serve.named_parameters["threads"] = LogicalType::VARCHAR;
+	serve.named_parameters["tune"] = LogicalType::BOOLEAN;
+	serve.named_parameters["wire_quack_auth"] = LogicalType::BOOLEAN;
 	serve.named_parameters["preserve_insertion_order"] = LogicalType::BOOLEAN;
 	serve.named_parameters["enable_http_metadata_cache"] = LogicalType::BOOLEAN;
 	serve.named_parameters["worker_threads"] = LogicalType::INTEGER;
@@ -871,6 +947,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quackapi_stop() / quackapi_stop(port)
 	TableFunctionSet stop_set("quackapi_stop");
 	TableFunction stop("quackapi_stop", {LogicalType::INTEGER}, StopExec, StopBind);
+	stop.named_parameters["all_servers"] = LogicalType::BOOLEAN;
 	stop_set.AddFunction(stop);
 	stop.arguments.clear();
 	stop_set.AddFunction(stop);
