@@ -489,7 +489,8 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				fmt = "arrow";
 			}
 			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow") {
-				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, parquet, or arrow");
+				return ParserExtensionParseResult("FORMAT must be one of [json, ndjson, csv, parquet, arrow], not '" +
+				                                      fmt + "'");
 			}
 			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));
@@ -505,7 +506,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			}
 			auto env = StringUtil::Lower(rest.substr(0, token_end));
 			if (env != "array" && env != "object") {
-				return ParserExtensionParseResult("ENVELOPE must be array or object");
+				return ParserExtensionParseResult("ENVELOPE must be one of [array, object], not '" + env + "'");
 			}
 			response_envelope = env;
 			rest = QuackapiTrim(rest.substr(token_end));
@@ -883,7 +884,8 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			}
 			return ParserExtensionParseResult(
 			    "Unknown PARAM option \"" + key +
-			    "\" — expected HEADER, COOKIE, DEFAULT, GE, GT, LE, LT, MIN_LENGTH, MAX_LENGTH");
+			    "\" — valid sources are [query, header, cookie]; other options are "
+			    "[default, ge, gt, le, lt, min_length, max_length]");
 		}
 
 		params.push_back(std::move(spec));

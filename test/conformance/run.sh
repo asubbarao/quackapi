@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live FastAPI-equivalence harness for quackapi (versioned under test/conformance/).
+# Live HTTP contract harness for quackapi (versioned under test/conformance/).
 # Uses FIFO interactive session (duckdb -c parses all statements upfront — serve would block).
 set -euo pipefail
 
@@ -12,6 +12,7 @@ FIFO="${TMPDIR:-/tmp}/quackapi_conformance_$$.fifo"
 LOG="${TMPDIR:-/tmp}/quackapi_conformance_$$.log"
 PIDFILE="${TMPDIR:-/tmp}/quackapi_conformance_$$.pid"
 RESULTS_DIR="${RESULTS_DIR:-$CONF/results}"
+TEST_HOME="${QUACKAPI_TEST_HOME:-$REPO/build/test-home}"
 DPID=""
 
 cleanup() {
@@ -34,14 +35,16 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
   exit 2
 fi
 mkfifo "$FIFO"
+mkdir -p "$TEST_HOME"
 
-"$DUCK" -init /dev/null -unsigned <"$FIFO" >"$LOG" 2>&1 &
+HOME="$TEST_HOME" USERPROFILE="$TEST_HOME" "$DUCK" -init /dev/null -unsigned <"$FIFO" >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 DPID=$!
 
 exec 3>"$FIFO"
 
 {
+  echo "INSTALL curl_httpfs FROM community;"
   echo "LOAD quackapi;"
   cat "$CONF/routes.sql"
   echo "SELECT * FROM quackapi_serve(${PORT}, health_routes := false, access_log := false);"

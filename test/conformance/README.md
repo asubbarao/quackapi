@@ -1,7 +1,12 @@
-# FastAPI-equivalence conformance suite
+# FastAPI-shaped HTTP contract suite
 
-Live HTTP checks against `quackapi_serve()` asserting FastAPI-documented behavior
-([fastapi.tiangolo.com](https://fastapi.tiangolo.com/)).
+Live HTTP checks against `quackapi_serve()` using expectations derived from
+documented FastAPI behavior ([fastapi.tiangolo.com](https://fastapi.tiangolo.com/)).
+
+This is not a differential equivalence harness: it does not start a FastAPI
+application or compare two live responses. `cases.jsonl` is a hand-maintained
+QuackAPI contract corpus whose FastAPI links explain the intended shape.
+Classification labels may explain failures but never turn them into passes.
 
 ## Run
 

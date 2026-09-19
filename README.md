@@ -203,14 +203,13 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', block := false, …)` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'curl', block := false, …)` | `listen_url` |
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
-| Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | auto=prefer+loud fallback; curl=require; httplib=force stock |
 
 Built-in OpenAPI (not listed in `quackapi_routes()`):
 
@@ -344,9 +343,8 @@ so every request paid a full dial. Against an ollama endpoint whose floor is
 12.7ms/call that cost **39.1ms p50**; through the pool the same route measures
 **13.2ms p50 / 13.8ms p90**.
 
-`http://` uses the vendored httplib client, which implements POST — no companion
-extension needed. `https://` goes through `HTTPUtil`, pooled the same way, so
-`LOAD curl_httpfs` (or `httpfs`) supplies TLS.
+Both `http://` and `https://` require the curl-backed DuckDB `HTTPUtil` installed
+by `curl_httpfs`. A missing curl client is an error, never an httplib fallback.
 
 Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
 `FROM range(1000)` would issue one request while reporting 1000 rows.
@@ -358,10 +356,10 @@ Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, an
 | `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
 
 Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
-`quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async).
-`http_client := 'auto'` falls back to httplib with a loud `http_client_reason` on
-`/healthz` / `quackapi_servers()`; `http_client := 'curl'` **fails serve** if
-curl_httpfs cannot INSTALL/LOAD — see [`docs/curl_httpfs.md`](docs/curl_httpfs.md).
+`quackapi_serve` **requires `curl_httpfs`** (pool + HTTP/2 + async) and fails
+before binding if it cannot load a curl-backed client. `/healthz` and
+`quackapi_servers()` report `http_client = 'curl'`; `http_client := 'httplib'`
+is rejected — see [`docs/curl_httpfs.md`](docs/curl_httpfs.md).
 
 ---
 
@@ -439,8 +437,9 @@ that quietly does nothing.
 - **Queue jobs** (`quackapi_jobs`) *are* catalog tables and survive restart.
 - **Concurrency:** DuckDB single-writer per file — fine for a few concurrent
   reviewers; not a high-write multi-tenant OLTP app server.
-- **FastAPI parity:** real-HTTP conformance suite in `test/conformance/` and
-  `test/http/` — see [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md).
+- **FastAPI-shaped contracts:** real-HTTP checks in `test/conformance/` and
+  `test/http/`; these do not run FastAPI as a differential oracle — see
+  [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md).
 
 ---
 

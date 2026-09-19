@@ -1,0 +1,22 @@
+# name: test/sql/quackapi_curl_httpfs_required.test
+# description: quackapi refuses to serve when its mandatory curl_httpfs dependency is unavailable
+# group: [sql]
+
+require quackapi
+
+# A clean per-test directory proves this from product state, even when the test
+# harness installed curl_httpfs for the rest of the suite.
+statement ok
+SET extension_directory = '__TEST_DIR__/missing-curl-httpfs';
+
+statement error
+SELECT * FROM quackapi_serve(29408, host := '127.0.0.1');
+----
+required extension curl_httpfs
+
+# The URL scheme cannot be a back door to the bundled client. This used to
+# succeed because plain HTTP bypassed DuckDB's active HTTPUtil entirely.
+statement error
+SELECT status FROM quackapi_fetch('http://127.0.0.1:29409/nothing');
+----
+requires curl_httpfs

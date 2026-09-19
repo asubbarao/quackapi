@@ -29,15 +29,16 @@ Full DDL and function tables stay in the [README](../../README.md) and
 ## Recipe 1 — Outbound gateway
 
 Join remote HTTP with local tables inside one route. Prefer DuckDB’s shared
-HTTP stack so `quackapi_serve` batteries (`curl_httpfs` when available) speed
-you up for free — see [curl_httpfs](../curl_httpfs.md).
+HTTP stack so `quackapi_serve` can require the pooled `curl_httpfs` client — see
+[curl_httpfs](../curl_httpfs.md).
 
 ### GET proxy via `read_text` / httpfs
 
 Runnable shape in-tree: [`examples/proxy_curl_httpfs.sql`](../../examples/proxy_curl_httpfs.sql).
 
 ```sql
-LOAD curl_httpfs;   -- optional; batteries also try this on serve
+INSTALL curl_httpfs FROM community; -- one-time setup
+LOAD curl_httpfs;
 LOAD quackapi;
 
 CREATE OR REPLACE ROUTE proxy GET '/proxy/:url' AS

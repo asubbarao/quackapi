@@ -1,8 +1,8 @@
-# quackapi ↔ FastAPI parity scorecard
+# Historical FastAPI-shaped HTTP contract scorecard
 
-**Source of truth:** [fastapi.tiangolo.com](https://fastapi.tiangolo.com/)  
+**Expectation basis:** [fastapi.tiangolo.com](https://fastapi.tiangolo.com/)
 **Harness (versioned):** `test/conformance/`  
-**Method:** every PASS/FAIL is a **real HTTP request** against `quackapi_serve()` (FIFO interactive session — never `duckdb -c` for live serve).  
+**Method:** every PASS/FAIL is a **real HTTP request** against `quackapi_serve()` and a hand-encoded expectation in `cases.jsonl`. The harness does not start FastAPI or compare two live responses, so these figures are not an equivalence measurement.
 **Date:** 2026-07-19 (G4 final verification)
 
 ---
@@ -23,7 +23,7 @@ PASS 89   FAIL 0   N/A 0   total 89
 classes: MATCH 88, STRONGER 1, BUG 0
 ```
 
-### Conformance % by group (final)
+### Contract pass rate by group (final)
 
 | Group | Match | Total | % |
 |-------|------:|------:|--:|
@@ -84,7 +84,7 @@ bash test/http/run_all.sh
 | **Query vs body loc** | Missing query-bound fields use `loc=["query", name]` when the client did not send a JSON body model | Body models use `loc=["body", name]` | Surface is SQL `$param` binding; JSON body still uses `loc=["body", …]` when fields come from the body |
 | **CORS default** | CORS **off** until `SET quackapi_cors_origins` / serve `cors_origins` | Same — CORS is middleware opt-in | Documented; OPTIONS 405 without CORS matches FastAPI |
 
-No silent gaps: anything not MATCH is either **STRONGER** or **INTENTIONAL** as above.
+The class labels explain a result but never change its PASS/FAIL/N/A verdict.
 
 ---
 

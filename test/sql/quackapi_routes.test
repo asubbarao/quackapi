@@ -128,7 +128,7 @@ Dropped route spaced
 statement error
 CREATE ROUTE bad_fmt GET '/x' FORMAT protobuf AS SELECT 1;
 ----
-FORMAT must be json, ndjson, csv, parquet, or arrow
+FORMAT must be one of [json, ndjson, csv, parquet, arrow], not 'protobuf'
 
 # Handler SQL is validated at CREATE time (not deferred to first request)
 statement error

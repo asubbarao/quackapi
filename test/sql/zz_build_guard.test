@@ -1,0 +1,12 @@
+# name: test/sql/zz_build_guard.test
+# description: lexically-last sentinel proving the SQLLogic runner reached the end of the suite
+# group: [sql]
+
+require quackapi
+
+# The outer runner checks this case is last and reconciles its assertion with
+# the suite total, so an earlier file cannot disappear behind a smaller count.
+query I
+SELECT 1;
+----
+1

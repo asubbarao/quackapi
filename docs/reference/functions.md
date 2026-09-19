@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := …, block := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := 'curl', block := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `tune BOOLEAN` (default **false**), `wire_quack_auth BOOLEAN` (default **false**), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`curl` only; compatibility spelling), `tune BOOLEAN` (default **false**), `wire_quack_auth BOOLEAN` (default **false**), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -24,8 +24,7 @@ SELECT * FROM quackapi_serve(
   host := '127.0.0.1',
   static_dir := './static',
   cors_origins := '*',
-  memory_limit := '4GB',
-  http_client := 'auto'   -- prefer curl_httpfs; fall back to httplib
+  memory_limit := '4GB'
 );
 
 -- Supervised process (launchd / KeepAlive): hold until quackapi_stop or SIGINT/SIGTERM.
@@ -39,9 +38,10 @@ With `block := true`, the query emits `listen_url` then waits until `quackapi_st
 
 **`tune`:** default `false`. Every DuckDB `SET` serve issues runs on the shared
 `DatabaseInstance`, so it reaches every other connection in the process, including the
-session that called serve. An untuned serve changes nothing: `memory_limit`,
-`preserve_insertion_order`, `enable_http_metadata_cache`, `pg_use_ctid_scan` and DuckDB's
-logger stay where the process left them, and `curl_httpfs` is not installed. Pass
+session that called serve. An untuned serve changes nothing for the incidental settings:
+`memory_limit`, `preserve_insertion_order`, `enable_http_metadata_cache`, `pg_use_ctid_scan`
+and DuckDB's logger stay where the process left them. The mandatory `curl_httpfs` load is
+separate and always occurs before the listener starts. Pass
 `tune := true` for the whole battery, or name one knob (`memory_limit := '4GB'`,
 `preserve_insertion_order := false`) to move just that one. A knob that cannot be applied
 fails the serve rather than reaching stderr.
@@ -55,12 +55,12 @@ are process-wide.
 alone. The **256MB** serve default applies only under `tune := true`, and only while
 `memory_limit` is still at DuckDB's system default.
 
-**Outbound HTTP client:** `auto` INSTALL/LOADs community `curl_httpfs` and sets
-`httpfs_client_implementation='curl'` (connection pool, HTTP/2, async). If unavailable
-(Windows/WASM/offline), logs `quackapi.http_client=httplib reason=curl_httpfs_unavailable`
-and continues. That probe runs only when `http_client` is named or `tune := true`;
-otherwise the client stays httplib with reason `untuned`. Unknown values are rejected at
-bind. Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
+**Outbound HTTP client:** `quackapi_serve` loads the mandatory community `curl_httpfs`
+extension and verifies that it installed a curl-backed DuckDB `HTTPUtil` (connection pool, HTTP/2, async).
+If it cannot be loaded, serve fails before binding with the `INSTALL curl_httpfs FROM
+community` remediation. The read-only `http_client` diagnostic always reports `curl`;
+the compatibility input accepts only `curl`, and the inbound server remains httplib. See
+[curl_httpfs.md](../curl_httpfs.md).
 
 ---
 
@@ -116,7 +116,7 @@ SELECT * FROM quackapi_stop(all_servers := true);
 | | |
 |--|--|
 | **Kind** | Table function |
-| **Returns** | `host`, `port`, `listen_url`, `http_client` (`curl` or `httplib`) |
+| **Returns** | `host`, `port`, `listen_url`, `http_client` (`curl`), `http_client_reason` |
 
 ```sql
 SELECT * FROM quackapi_servers();
@@ -359,10 +359,10 @@ SELECT id, payload, status FROM quackapi_jobs WHERE status = 'done';
 ```sql
 SELECT quackapi_http_util_name();
 -- Built-In
--- (becomes MultiCurl after LOAD curl_httpfs, if installed)
+-- (MultiCurl after quackapi_serve loads curl_httpfs)
 ```
 
-Outbound HTTPS for handlers that call `read_text` / httpfs uses DuckDB’s shared HTTP stack — quackapi does not link its own curl.
+Outbound HTTP and HTTPS use DuckDB’s shared curl-backed HTTP stack — quackapi does not link its own curl.
 
 ---
 
@@ -372,12 +372,10 @@ Outbound HTTPS for handlers that call `read_text` / httpfs uses DuckDB’s share
 |---------|---------|
 | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | CORS allow list; empty = off |
 | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | Serve memory preference when named param omitted |
-| `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | Outbound httpfs client preference (default `auto` → curl_httpfs) |
 
 ```sql
 SET quackapi_cors_origins = '*';
 SET quackapi_memory_limit = '4GB';
-SET quackapi_http_client = 'auto';
 ```
 
 ---

@@ -112,7 +112,7 @@ SELECT status, decode(body) FROM quackapi_request('GET', '/arr_miss');
 statement error
 CREATE ROUTE bad GET '/bad' ENVELOPE banana AS SELECT 1;
 ----
-ENVELOPE must be array or object
+ENVELOPE must be one of [array, object], not 'banana'
 
 statement error
 CREATE ROUTE bad GET '/bad' FORMAT csv ENVELOPE object AS SELECT 1;

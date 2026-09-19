@@ -1,16 +1,9 @@
 //===----------------------------------------------------------------------===//
 // quackapi_http_fetch.hpp
 //
-// Outbound HTTP for quackapi. Two paths, one rule: the TCP connection MUST
-// survive across requests.
-//
-//   1. http://   → the VENDORED httplib client, checked out of a per-host
-//                  free-list pool (QuackapiHttpPool). Keep-alive + TCP_NODELAY.
-//                  Full method support, no companion extension required.
-//   2. https://  → DuckDB's HTTPUtil, so `LOAD curl_httpfs` / `LOAD httpfs`
-//                  transparently supplies TLS. Pooled the same way, via
-//                  HTTPUtil::Request(request, client) which reuses the client
-//                  we hand it instead of building a fresh one.
+// Outbound HTTP for quackapi. HTTP and HTTPS both use DuckDB's HTTPUtil with
+// mandatory curl_httpfs; passing the reusable client into Request keeps the
+// connection alive across requests. The plain-TCP stall seam is test-only.
 //
 // Why the pool exists: HTTPUtil::Request(request) — the single-argument form —
 // declares a local `unique_ptr<HTTPClient> client;` and lets it die at the end
@@ -54,6 +47,9 @@ struct QuackapiHttpFetchResult {
 
 //! Snapshot of the outbound connection pool, exposed as quackapi_http_pool().
 struct QuackapiHttpPoolStats {
+	//! Which HTTPUtil holds these clients. A pooled client belongs to the
+	//! implementation that created it, so the pool is keyed by both.
+	string client;
 	string host;
 	idx_t idle = 0;
 	idx_t dialed = 0;
@@ -72,8 +68,7 @@ struct QuackapiHttpFetch {
 	static QuackapiHttpFetchResult Get(DatabaseInstance &db, const string &url,
 	                                   const unordered_map<string, string> &extra_headers = {}, int32_t stall_ms = 0);
 
-	//! POST url with a raw body and Content-Type.
-	//! http:// needs nothing loaded; https:// requires httpfs / curl_httpfs.
+	//! POST url with a raw body and Content-Type through mandatory curl_httpfs.
 	static QuackapiHttpFetchResult Post(DatabaseInstance &db, const string &url, const string &body,
 	                                    const string &content_type = "application/x-www-form-urlencoded",
 	                                    const unordered_map<string, string> &extra_headers = {});

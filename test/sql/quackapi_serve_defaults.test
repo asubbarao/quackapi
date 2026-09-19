@@ -4,16 +4,16 @@
 
 require quackapi
 
-# Every SET quackapi_serve issues runs on the shared DatabaseInstance, so it
-# reaches this session and every other connection in the process. The zero-
-# argument call is the one an agent types into an analysis session, so it is
-# the one that must change nothing.
-
 statement ok
-CREATE TABLE memory_limit_before AS SELECT current_setting('memory_limit') AS value;
+LOAD curl_httpfs;
 
 statement ok
 SET enable_logging = true;
+
+# The extension load and deliberate logger state are outside the snapshot:
+# curl_httpfs is a product dependency, while duckdb_settings() is caller-owned.
+statement ok
+CREATE TABLE settings_before AS SELECT name, value FROM duckdb_settings();
 
 query I
 SELECT * FROM quackapi_serve();
@@ -21,24 +21,28 @@ SELECT * FROM quackapi_serve();
 http://127.0.0.1:8000
 
 query I
-SELECT current_setting('memory_limit') = (SELECT value FROM memory_limit_before);
+SELECT http_client FROM quackapi_servers() WHERE port = 8000;
+----
+curl
+
+query I
+SELECT contains(lower(quackapi_http_util_name()), 'curl');
 ----
 true
 
 query I
-SELECT current_setting('preserve_insertion_order');
+SELECT count(*)
+FROM (
+  (SELECT name, value FROM settings_before
+   EXCEPT ALL
+   SELECT name, value FROM duckdb_settings())
+  UNION ALL
+  (SELECT name, value FROM duckdb_settings()
+   EXCEPT ALL
+   SELECT name, value FROM settings_before)
+);
 ----
-true
-
-query I
-SELECT current_setting('enable_logging');
-----
-1
-
-query I
-SELECT current_setting('enable_http_metadata_cache');
-----
-false
+0
 
 # The bare stop is no longer the destructive one, but with a single server up
 # there is nothing to disambiguate.
@@ -72,11 +76,11 @@ statement ok
 SET preserve_insertion_order = true;
 
 # ---------------------------------------------------------------------------
-# tune := true asks for the whole battery. http_client := 'httplib' keeps the
-# probe off the network; curl_httpfs would be INSTALLed from the community repo.
+# tune := true asks for the whole battery. curl_httpfs remains mandatory even
+# when the incidental process-wide tuning is explicitly requested.
 # ---------------------------------------------------------------------------
 query I
-SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', tune := true, http_client := 'httplib');
+SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', tune := true);
 ----
 http://127.0.0.1:29302
 

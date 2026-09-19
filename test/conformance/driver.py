@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""
-quackapi ↔ FastAPI equivalence driver.
+"""QuackAPI HTTP contract driver.
 
 Fires real HTTP requests against a live quackapi_serve() instance and asserts
-status / body / headers against documented FastAPI behavior encoded in cases.jsonl.
+status / body / headers against the expectations encoded in cases.jsonl.
 
 Every result is from a request that actually ran (or force_na / skip with reason).
 """

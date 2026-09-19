@@ -106,23 +106,10 @@ struct QuackapiServeOptions {
 	bool enable_http_metadata_cache = true;
 	bool enable_http_metadata_cache_set = false;
 
-	// --- Batteries: outbound HTTP client (curl_httpfs preferred) ---
-	//! Preference: "auto" (default — prefer curl_httpfs, fall back to httplib with
-	//! loud reason), "curl" (require curl_httpfs — fail serve if unavailable), or
-	//! "httplib" (skip curl_httpfs). Named param / SET quackapi_http_client.
-	//! Does NOT touch the inbound httplib SERVER — only the client used by
-	//! httpfs / read_* over https.
-	string http_client = "auto";
-	//! True only when the caller named http_client (or SET quackapi_http_client).
-	//! "auto" is a preference, not an instruction: probing it INSTALLs an
-	//! extension and flips httpfs_client_implementation for the whole process,
-	//! so an untuned, unasked serve does neither.
-	bool http_client_set = false;
-	//! Filled at serve after probe: "curl" or "httplib".
-	string http_client_active;
-	//! Why active is what it is. Empty when curl is active after a successful
-	//! probe. "operator_forced" when operator chose httplib.
-	//! "curl_httpfs_unavailable" when auto fell back (never silent).
+	// --- Batteries: outbound HTTP client ---
+	//! WHY: outbound quackapi work must share the pooled curl_httpfs client;
+	//! expose the process-wide choice so readiness and operators can verify it.
+	string http_client_active = "curl";
 	string http_client_reason;
 
 	//! Request-id source for X-Request-ID. Always **uuidv7** (C++ core, no SQL)

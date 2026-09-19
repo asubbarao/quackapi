@@ -61,20 +61,29 @@ QuackapiHttpFetchResult FromResponse(unique_ptr<HTTPResponse> response) {
 // handshake cost for a concurrency ceiling of 1. N idle clients give both reuse
 // and parallelism — the same shape as httpx's pool on the FastAPI side.
 
-struct PooledPlain {
-	unique_ptr<duckdb_httplib::Client> client;
-};
-
 struct PooledUtil {
 	unique_ptr<HTTPClient> client;
 };
 
 struct HostPool {
-	vector<PooledPlain> plain_idle;
-	vector<PooledUtil> util_idle;
+	//! The two halves of the pool key, kept as fields so reporting them never
+	//! means splitting the composite string back apart.
+	string client;
+	string origin;
+	//! curl_httpfs clients retain method-specific state. Reusing a GET client for
+	//! POST can crash inside MultiCurl, so each method has its own free-list.
+	unordered_map<string, vector<PooledUtil>> util_idle;
 	idx_t dialed = 0;
 	idx_t reused = 0;
 };
+
+idx_t IdleCount(const HostPool &host) {
+	idx_t count = 0;
+	for (auto &method : host.util_idle) {
+		count += method.second.size();
+	}
+	return count;
+}
 
 struct ConnectionPool {
 	static ConnectionPool &Get() {
@@ -94,8 +103,33 @@ void SplitURL(const string &url, string &origin, string &path) {
 	}
 }
 
+//! Only the stall seam asks this. Every real request, http:// or https://, goes
+//! through HTTPUtil so it uses the mandatory curl_httpfs client; routing plain
+//! http:// to the vendored httplib was how quackapi reached its own bundled
+//! client regardless of what the operator had loaded.
 bool IsPlainHTTP(const string &url) {
 	return StringUtil::StartsWith(StringUtil::Lower(url), "http://");
+}
+
+//! The active HTTPUtil is the ground truth for which client will carry the
+//! request. The httpfs_client_implementation setting is not: curl_httpfs
+//! registers itself on LOAD without the operator setting anything, and the
+//! setting is read from a different scope than the SET that changes it, so
+//! gating on it rejected a correctly-loaded curl_httpfs.
+//!
+//! curl_httpfs answers to two names — "MultiCurl" as it registers itself, and
+//! "HTTPFS-Curl" once httpfs_client_implementation is set to curl. Both are it.
+//! "Built-In" is DuckDB's own vendored httplib client, which is exactly what
+//! must never carry quackapi traffic.
+void RequireCurlHttpfs(DatabaseInstance &db) {
+	const auto active = HTTPUtil::Get(db).GetName();
+	if (active == "MultiCurl" || active == "HTTPFS-Curl") {
+		return;
+	}
+	throw InvalidConfigurationException(
+	    "quackapi outbound HTTP requires curl_httpfs. Install it with "
+	    "INSTALL curl_httpfs FROM community, then retry. Active HTTPUtil is '%s'.",
+	    active);
 }
 
 //! Split "http://host:port" (from SplitURL origin) into host + port.
@@ -257,106 +291,10 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	return out;
 }
 
-unique_ptr<duckdb_httplib::Client> DialPlain(const string &origin) {
-	auto client = make_uniq<duckdb_httplib::Client>(origin);
-	client->set_keep_alive(true);
-	// Same Nagle/delayed-ACK deadlock the server side hit (quackapi_server.cpp:917),
-	// just on the other end of the socket: without this a small POST body waits on
-	// the peer's delayed ACK before the request is even complete.
-	client->set_tcp_nodelay(true);
-	client->set_follow_location(true);
-	client->set_decompress(true);
-	client->set_read_timeout(OUTBOUND_TIMEOUT_SECONDS, 0);
-	client->set_write_timeout(OUTBOUND_TIMEOUT_SECONDS, 0);
-	client->set_connection_timeout(OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0);
-	return client;
-}
-
-duckdb_httplib::Headers ToHttplibHeaders(const unordered_map<string, string> &extra) {
-	duckdb_httplib::Headers headers;
-	for (auto &kv : extra) {
-		headers.emplace(kv.first, kv.second);
-	}
-	return headers;
-}
-
-QuackapiHttpFetchResult FromHttplibResult(const duckdb_httplib::Result &res) {
-	QuackapiHttpFetchResult out;
-	if (res.error() != duckdb_httplib::Error::Success) {
-		out.request_error = duckdb_httplib::to_string(res.error());
-		return out;
-	}
-	auto &response = res.value();
-	out.status = HTTPUtil::ToStatusCode(response.status);
-	out.body = response.body;
-	out.reason = response.reason;
-	out.success = response.status >= 200 && response.status < 400;
-	for (auto &entry : response.headers) {
-		out.headers.Insert(entry.first, entry.second);
-	}
-	return out;
-}
-
-//! Run `call` against a pooled plain-HTTP client for `origin`, then return the
-//! client to the pool. The client is only recycled when the transport stayed
-//! healthy — a broken socket must not be handed to the next request.
-template <class CALL>
-QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
-	unique_ptr<duckdb_httplib::Client> client;
-	bool reused = false;
-	{
-		auto &pool = ConnectionPool::Get();
-		std::lock_guard<std::mutex> guard(pool.lock);
-		auto &host = pool.hosts[origin];
-		if (!host.plain_idle.empty()) {
-			client = std::move(host.plain_idle.back().client);
-			host.plain_idle.pop_back();
-			host.reused++;
-			reused = true;
-		} else {
-			host.dialed++;
-		}
-	}
-	if (!client) {
-		client = DialPlain(origin);
-	}
-	// Reset on every checkout: a previous request's short deadline must not leak.
-	const auto timeout_ms = QuackapiRemainingTimeoutMillis(OUTBOUND_TIMEOUT_SECONDS * 1000);
-	client->set_max_timeout(static_cast<time_t>(timeout_ms));
-	client->set_read_timeout(static_cast<time_t>(timeout_ms / 1000), static_cast<time_t>((timeout_ms % 1000) * 1000));
-	client->set_write_timeout(static_cast<time_t>(timeout_ms / 1000), static_cast<time_t>((timeout_ms % 1000) * 1000));
-	const auto connect_ms = std::min<int64_t>(timeout_ms, OUTBOUND_CONNECT_TIMEOUT_SECONDS * 1000);
-	client->set_connection_timeout(static_cast<time_t>(connect_ms / 1000),
-	                               static_cast<time_t>((connect_ms % 1000) * 1000));
-
-	QuackapiHttpFetchResult result;
-	bool healthy = false;
-	try {
-		auto res = call(*client);
-		healthy = res.error() == duckdb_httplib::Error::Success;
-		result = FromHttplibResult(res);
-	} catch (...) {
-		// Drop the client on the floor; a half-written socket is not reusable.
-		throw;
-	}
-	result.reused_connection = reused;
-
-	if (healthy) {
-		auto &pool = ConnectionPool::Get();
-		std::lock_guard<std::mutex> guard(pool.lock);
-		auto &host = pool.hosts[origin];
-		if (host.plain_idle.size() < MAX_IDLE_PER_HOST) {
-			host.plain_idle.push_back(PooledPlain {std::move(client)});
-		}
-	}
-	return result;
-}
-
-//! Same checkout/return dance for the HTTPUtil path (https, or a loaded
-//! curl_httpfs the operator wants used). The two-argument HTTPUtil::Request
-//! reuses the client we pass instead of constructing a throwaway one.
+//! Every production fetch uses this HTTPUtil path. The two-argument Request
+//! reuses the curl client we pass instead of constructing a throwaway one.
 template <class BUILD>
-QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, BUILD &&build) {
+QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, const string &method, BUILD &&build) {
 	auto &http_util = HTTPUtil::Get(db);
 	string origin, path;
 	SplitURL(url, origin, path);
@@ -368,9 +306,12 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 		auto &pool = ConnectionPool::Get();
 		std::lock_guard<std::mutex> guard(pool.lock);
 		auto &host = pool.hosts[key];
-		if (!host.util_idle.empty()) {
-			client = std::move(host.util_idle.back().client);
-			host.util_idle.pop_back();
+		host.client = http_util.GetName();
+		host.origin = origin;
+		auto &idle = host.util_idle[method];
+		if (!idle.empty()) {
+			client = std::move(idle.back().client);
+			idle.pop_back();
 			host.reused++;
 			reused = true;
 		} else {
@@ -390,8 +331,8 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 		auto &pool = ConnectionPool::Get();
 		std::lock_guard<std::mutex> guard(pool.lock);
 		auto &host = pool.hosts[key];
-		if (host.util_idle.size() < MAX_IDLE_PER_HOST) {
-			host.util_idle.push_back(PooledUtil {std::move(client)});
+		if (IdleCount(host) < MAX_IDLE_PER_HOST) {
+			host.util_idle[method].push_back(PooledUtil {std::move(client)});
 		}
 	}
 	return result;
@@ -409,6 +350,7 @@ string QuackapiHttpFetch::ActiveHttpUtilName(DatabaseInstance &db) {
 
 QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const string &url,
                                                const unordered_map<string, string> &extra_headers, int32_t stall_ms) {
+	RequireCurlHttpfs(db);
 	if (stall_ms < 0) {
 		throw InvalidInputException("quackapi_fetch stall_ms must be >= 0");
 	}
@@ -418,14 +360,7 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const strin
 		}
 		return PlainGetWithStall(url, extra_headers, stall_ms);
 	}
-	if (IsPlainHTTP(url)) {
-		string origin, path;
-		SplitURL(url, origin, path);
-		auto headers = ToHttplibHeaders(extra_headers);
-		return WithPlainClient(origin, [&](duckdb_httplib::Client &client) { return client.Get(path, headers); });
-	}
-
-	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+	return WithUtilClient(db, url, "GET", [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
 		HTTPHeaders headers(db);
 		InsertExtraHeaders(headers, extra_headers);
 		GetRequestInfo request(url, headers, params, /*response_handler=*/nullptr,
@@ -438,30 +373,20 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const strin
 QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const string &url, const string &body,
                                                 const string &content_type,
                                                 const unordered_map<string, string> &extra_headers) {
-	if (IsPlainHTTP(url)) {
-		// The vendored httplib implements POST, so plain HTTP needs no companion
-		// extension at all — unlike the HTTPUtil path below.
-		string origin, path;
-		SplitURL(url, origin, path);
-		auto headers = ToHttplibHeaders(extra_headers);
-		const auto &ct = content_type.empty() ? string("application/octet-stream") : content_type;
-		return WithPlainClient(origin,
-		                       [&](duckdb_httplib::Client &client) { return client.Post(path, headers, body, ct); });
-	}
-
+	RequireCurlHttpfs(db);
 	// Built-In HTTPLibClient does not implement POST (http_util.cpp). Surface a
-	// clear error pointing operators at curl_httpfs / httpfs rather than a raw
-	// NotImplementedException deep in the client.
+	// clear error pointing operators at the mandatory curl_httpfs dependency
+	// rather than a raw NotImplementedException deep in the client.
 	auto &util = HTTPUtil::Get(db);
 	const auto util_name = util.GetName();
 	if (util_name == "Built-In") {
 		throw InvalidConfigurationException(
-		    "quackapi outbound POST over https requires an HTTP client with full method support. "
-		    "LOAD curl_httpfs (recommended) or LOAD httpfs, then retry. Active HTTPUtil is '%s'.",
+		    "quackapi outbound POST requires an HTTP client with full method support. "
+		    "LOAD curl_httpfs, then retry. Active HTTPUtil is '%s'.",
 		    util_name);
 	}
 
-	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+	return WithUtilClient(db, url, "POST", [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
 		HTTPHeaders headers(db);
 		if (!content_type.empty()) {
 			headers.Insert("Content-Type", content_type);
@@ -479,8 +404,9 @@ vector<QuackapiHttpPoolStats> QuackapiHttpFetch::PoolStats() {
 	std::lock_guard<std::mutex> guard(pool.lock);
 	for (auto &entry : pool.hosts) {
 		QuackapiHttpPoolStats stats;
-		stats.host = entry.first;
-		stats.idle = entry.second.plain_idle.size() + entry.second.util_idle.size();
+		stats.client = entry.second.client;
+		stats.host = entry.second.origin;
+		stats.idle = IdleCount(entry.second);
 		stats.dialed = entry.second.dialed;
 		stats.reused = entry.second.reused;
 		out.push_back(std::move(stats));
@@ -496,14 +422,8 @@ void QuackapiHttpFetch::ResetPool() {
 	auto &pool = ConnectionPool::Get();
 	std::lock_guard<std::mutex> guard(pool.lock);
 	for (auto &entry : pool.hosts) {
-		for (auto &plain : entry.second.plain_idle) {
-			if (plain.client) {
-				plain.client->stop();
-			}
-		}
 		// HTTPUtil clients: unique_ptr reset is enough (no keep-alive join path
 		// into our inbound Server).
-		entry.second.plain_idle.clear();
 		entry.second.util_idle.clear();
 	}
 	pool.hosts.clear();
@@ -582,7 +502,7 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
 //! takes ConnectionPool::lock), so fanning out is the whole fix.
 //!
 //! `perform(i)` must be safe to call from any thread. Exceptions are captured per
-//! row rather than allowed to escape: WithPlainClient deliberately rethrows on a
+//! row rather than allowed to escape: WithUtilClient deliberately rethrows on a
 //! half-written socket, and an exception crossing a std::thread boundary would
 //! call std::terminate and take the server down with it. Argument validation that
 //! must still raise to the caller therefore happens BEFORE the fan-out.
@@ -745,8 +665,9 @@ struct FetchTableBindData : public TableFunctionData {
 
 unique_ptr<FunctionData> PoolBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
                                   vector<string> &names) {
-	names = {"host", "idle", "dialed", "reused"};
-	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
+	names = {"client", "host", "idle", "dialed", "reused"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
+	                LogicalType::BIGINT};
 	return nullptr;
 }
 
@@ -761,10 +682,11 @@ void PoolExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	idx_t row = 0;
 	while (state.offset < state.rows.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &entry = state.rows[state.offset];
-		output.SetValue(0, row, Value(entry.host));
-		output.SetValue(1, row, Value::BIGINT(NumericCast<int64_t>(entry.idle)));
-		output.SetValue(2, row, Value::BIGINT(NumericCast<int64_t>(entry.dialed)));
-		output.SetValue(3, row, Value::BIGINT(NumericCast<int64_t>(entry.reused)));
+		output.SetValue(0, row, Value(entry.client));
+		output.SetValue(1, row, Value(entry.host));
+		output.SetValue(2, row, Value::BIGINT(NumericCast<int64_t>(entry.idle)));
+		output.SetValue(3, row, Value::BIGINT(NumericCast<int64_t>(entry.dialed)));
+		output.SetValue(4, row, Value::BIGINT(NumericCast<int64_t>(entry.reused)));
 		row++;
 		state.offset++;
 	}

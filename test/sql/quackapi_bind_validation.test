@@ -11,12 +11,12 @@ require quackapi
 statement error
 SELECT * FROM quackapi_serve(29401, host := '127.0.0.1', log_level := 'bogus');
 ----
-log_level must be one of
+log_level must be one of [silent, off, none, error, warn, warning, info, debug, trace, verbose]
 
 statement error
 SELECT * FROM quackapi_serve(29402, host := '127.0.0.1', log_level := 'infoo');
 ----
-log_level must be one of
+log_level must be one of [silent, off, none, error, warn, warning, info, debug, trace, verbose]
 
 statement ok
 SET quackapi_log_level = 'bogus';
@@ -25,21 +25,34 @@ SET quackapi_log_level = 'bogus';
 statement error
 SELECT * FROM quackapi_serve(29403, host := '127.0.0.1');
 ----
-log_level must be one of
+log_level must be one of [silent, off, none, error, warn, warning, info, debug, trace, verbose]
 
 statement ok
 SET quackapi_log_level = 'info';
 
-# http_client was validated inside serve, after the bind had already succeeded.
+# http_client cannot choose an implementation. The compatibility spelling
+# accepts only curl, so the old stock client spelling must fail closed.
 statement error
-SELECT * FROM quackapi_serve(29404, host := '127.0.0.1', http_client := 'libcurl');
+SELECT * FROM quackapi_serve(29404, host := '127.0.0.1', http_client := 'httplib');
 ----
-http_client must be one of
+http_client must be one of [curl], not 'httplib'
+
+# Invalid DDL must name the complete domain instead of quietly selecting the
+# default representation or request source.
+statement error
+CREATE ROUTE bad_format GET '/bad-format' FORMAT yaml AS SELECT 1;
+----
+FORMAT must be one of [json, ndjson, csv, parquet, arrow], not 'yaml'
 
 statement error
-SELECT * FROM quackapi_serve(29405, host := '127.0.0.1', http_client := '');
+CREATE ROUTE bad_envelope GET '/bad-envelope' ENVELOPE scalar AS SELECT 1;
 ----
-http_client must be one of
+ENVELOPE must be one of [array, object], not 'scalar'
+
+statement error
+CREATE ROUTE bad_source GET '/bad-source' PARAM p VARCHAR FORM AS SELECT 1;
+----
+valid sources are [query, header, cookie]
 
 # ---------------------------------------------------------------------------
 # quackapi_stop() with no port: never a silent teardown of servers this caller
