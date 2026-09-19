@@ -22,7 +22,7 @@ the outbound HTTP client:
 Flow:
 
 1. `LOAD curl_httpfs` before the listener binds
-2. `SET httpfs_client_implementation = 'curl'`
+2. Verify curl_httpfs installed a curl-backed DuckDB `HTTPUtil`
 3. Record `http_client=curl` on `/healthz`
    and `quackapi_servers()`
 
@@ -45,11 +45,10 @@ Community `description.yml` for curl_httpfs excludes:
 
 ### Client selection
 
-There is no outbound client choice. `http_client` is a read-only diagnostic
-on `/healthz` and `quackapi_servers()` and always reports `curl` after a
-successful serve. The former `http_client := …` and
-`SET quackapi_http_client = …` inputs are not accepted; in particular,
-`http_client := 'httplib'` cannot select the stock client.
+There is no outbound client choice. `/healthz` and `quackapi_servers()` always
+report `http_client = 'curl'` after a successful serve. The compatibility input
+`http_client := 'curl'` is accepted, but `http_client := 'httplib'` is rejected
+and there is no `quackapi_http_client` setting.
 
 ```sql
 -- Serve requires curl_httpfs and fails before binding when it is unavailable

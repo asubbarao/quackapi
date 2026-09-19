@@ -1,4 +1,4 @@
--- Conformance fixture routes for quackapi v2 vs FastAPI equivalence.
+-- These routes exercise the public HTTP contract against live QuackAPI responses.
 -- Loaded into an interactive session (FIFO) with build/release/duckdb -unsigned.
 -- Params bind from path captures and query string only (v2 has no JSON body binder).
 

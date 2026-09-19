@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, block := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := 'curl', block := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `tune BOOLEAN` (default **false**), `wire_quack_auth BOOLEAN` (default **false**), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`curl` only; compatibility spelling), `tune BOOLEAN` (default **false**), `wire_quack_auth BOOLEAN` (default **false**), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -56,10 +56,11 @@ alone. The **256MB** serve default applies only under `tune := true`, and only w
 `memory_limit` is still at DuckDB's system default.
 
 **Outbound HTTP client:** `quackapi_serve` loads the mandatory community `curl_httpfs`
-extension and sets `httpfs_client_implementation='curl'` (connection pool, HTTP/2, async).
+extension and verifies that it installed a curl-backed DuckDB `HTTPUtil` (connection pool, HTTP/2, async).
 If it cannot be loaded, serve fails before binding with the `INSTALL curl_httpfs FROM
 community` remediation. The read-only `http_client` diagnostic always reports `curl`;
-the inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
+the compatibility input accepts only `curl`, and the inbound server remains httplib. See
+[curl_httpfs.md](../curl_httpfs.md).
 
 ---
 
@@ -361,7 +362,7 @@ SELECT quackapi_http_util_name();
 -- (MultiCurl after quackapi_serve loads curl_httpfs)
 ```
 
-Outbound HTTPS for handlers that call `read_text` / httpfs uses DuckDB’s shared HTTP stack — quackapi does not link its own curl.
+Outbound HTTP and HTTPS use DuckDB’s shared curl-backed HTTP stack — quackapi does not link its own curl.
 
 ---
 

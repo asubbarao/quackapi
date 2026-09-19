@@ -377,4 +377,4 @@ in-repo `docs/FASTAPI_PARITY.md`, `description.yml`.
 
 ---
 
-**Ledger line:** **built ≈ 30+ first-class surfaces (8 CREATE nouns + full route/server/OpenAPI stack); designed-not-built ≈ 20 SPECs (≈12 still fully open, ≈8 partial/shipped-or-recipe); FastAPI harness parity old 62/89 (69.7%) → refreshed 89/89 (100%).**
+**Ledger line:** **built ≈ 30+ first-class surfaces (8 CREATE nouns + full route/server/OpenAPI stack); designed-not-built ≈ 20 SPECs (≈12 still fully open, ≈8 partial/shipped-or-recipe); the 89-case QuackAPI HTTP contract corpus is not a differential FastAPI equivalence measurement.**

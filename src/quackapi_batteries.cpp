@@ -1,4 +1,5 @@
 #include "quackapi_server.hpp"
+#include "quackapi_http_fetch.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -272,9 +273,9 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 
 	// --- Outbound HTTP client: curl_httpfs is mandatory ---
 	// WHY: quackapi's outbound HTTP needs the pooled curl_httpfs implementation;
-	// the stock DuckDB HTTPUtil is not an allowed serving client. Loading it also
-	// changes HTTPUtil for every consumer in this process, so the required global
-	// mutation is announced in the serve banner rather than hidden behind tune.
+	// the stock DuckDB HTTPUtil is not an allowed serving client. Loading it changes
+	// HTTPUtil for every consumer in this process, but selecting curl explicitly here
+	// would also rewrite a DuckDB setting the caller did not ask quackapi to own.
 	{
 		auto curl_load = con.Query("LOAD curl_httpfs");
 		if (curl_load->HasError()) {
@@ -284,11 +285,15 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			    "Install it with INSTALL curl_httpfs FROM community, then retry.",
 			    detail);
 		}
-		RequireSet(con, "SET httpfs_client_implementation = 'curl'", "httpfs_client_implementation=curl");
+		const auto active = StringUtil::Lower(QuackapiHttpFetch::ActiveHttpUtilName(*context.db));
+		if (!StringUtil::Contains(active, "curl")) {
+			throw InvalidInputException(
+			    "quackapi_serve: curl_httpfs loaded without activating a curl HTTPUtil; active client is '%s'",
+			    QuackapiHttpFetch::ActiveHttpUtilName(*context.db));
+		}
 		opts.http_client_active = "curl";
 		opts.http_client_reason.clear();
-		applied.push_back("http_client=curl (WHY: curl_httpfs is mandatory for quackapi outbound HTTP; "
-		                  "LOAD changes the process-wide DuckDB HTTPUtil for every consumer)");
+		applied.push_back("http_client=curl (WHY: curl_httpfs is mandatory for quackapi outbound HTTP)");
 	}
 
 	// Transport knobs are applied in QuackapiHttpServer ctor (httplib SERVER).

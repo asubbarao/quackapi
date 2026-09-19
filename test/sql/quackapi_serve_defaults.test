@@ -4,16 +4,16 @@
 
 require quackapi
 
-# Every SET quackapi_serve issues runs on the shared DatabaseInstance, so it
-# reaches this session and every other connection in the process. The zero-
-# argument call is the one an agent types into an analysis session, so it is
-# the one that must change nothing.
-
 statement ok
-CREATE TABLE memory_limit_before AS SELECT current_setting('memory_limit') AS value;
+LOAD curl_httpfs;
 
 statement ok
 SET enable_logging = true;
+
+# The extension load and deliberate logger state are outside the snapshot:
+# curl_httpfs is a product dependency, while duckdb_settings() is caller-owned.
+statement ok
+CREATE TABLE settings_before AS SELECT name, value FROM duckdb_settings();
 
 query I
 SELECT * FROM quackapi_serve();
@@ -26,24 +26,23 @@ SELECT http_client FROM quackapi_servers() WHERE port = 8000;
 curl
 
 query I
-SELECT current_setting('memory_limit') = (SELECT value FROM memory_limit_before);
+SELECT contains(lower(quackapi_http_util_name()), 'curl');
 ----
 true
 
 query I
-SELECT current_setting('preserve_insertion_order');
+SELECT count(*)
+FROM (
+  (SELECT name, value FROM settings_before
+   EXCEPT ALL
+   SELECT name, value FROM duckdb_settings())
+  UNION ALL
+  (SELECT name, value FROM duckdb_settings()
+   EXCEPT ALL
+   SELECT name, value FROM settings_before)
+);
 ----
-true
-
-query I
-SELECT current_setting('enable_logging');
-----
-1
-
-query I
-SELECT current_setting('enable_http_metadata_cache');
-----
-false
+0
 
 # The bare stop is no longer the destructive one, but with a single server up
 # there is nothing to disambiguate.

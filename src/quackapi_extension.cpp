@@ -126,6 +126,8 @@ struct ServeBindData : public TableFunctionData {
 	bool compression = true;
 	//! Min body size in bytes before compression. Default 256.
 	idx_t compression_min_bytes = 256;
+	//! Compatibility input: curl is the only legal outbound client.
+	string http_client = "curl";
 	//! Point quack's auth callbacks at quackapi's bridges. Default false.
 	bool wire_quack_auth = false;
 	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
@@ -143,8 +145,7 @@ struct ServeBindData : public TableFunctionData {
 static void RequireNativePgSupport(const string &pg_dsn, const char *function_name) {
 	if (!pg_dsn.empty() && !QuackapiPgNativeAvailable()) {
 		throw InvalidInputException("%s: pg_dsn needs the native libpq path, which this build does not link; "
-		                            "use the vcpkg-backed release build or rebuild with "
-		                            "-DQUACKAPI_ENABLE_LIBPQ=ON",
+		                            "rebuild with -DQUACKAPI_ENABLE_LIBPQ=ON",
 		                            function_name);
 	}
 }
@@ -326,6 +327,15 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			}
 			bind_data->compression_min_bytes = static_cast<idx_t>(v);
 		}
+	}
+	auto hc_entry = input.named_parameters.find("http_client");
+	if (hc_entry != input.named_parameters.end()) {
+		bind_data->http_client = hc_entry->second.GetValue<string>();
+	}
+	auto http_client = StringUtil::Lower(bind_data->http_client);
+	StringUtil::Trim(http_client);
+	if (http_client != "curl") {
+		throw InvalidInputException("http_client must be one of [curl], not '%s'", bind_data->http_client);
 	}
 	auto block_entry = input.named_parameters.find("block");
 	if (block_entry != input.named_parameters.end()) {
@@ -912,6 +922,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["compression"] = LogicalType::BOOLEAN;
 	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
+	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
 	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	serve.named_parameters["block"] = LogicalType::BOOLEAN;
 	serve.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;

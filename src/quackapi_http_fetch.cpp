@@ -70,10 +70,20 @@ struct HostPool {
 	//! means splitting the composite string back apart.
 	string client;
 	string origin;
-	vector<PooledUtil> util_idle;
+	//! curl_httpfs clients retain method-specific state. Reusing a GET client for
+	//! POST can crash inside MultiCurl, so each method has its own free-list.
+	unordered_map<string, vector<PooledUtil>> util_idle;
 	idx_t dialed = 0;
 	idx_t reused = 0;
 };
+
+idx_t IdleCount(const HostPool &host) {
+	idx_t count = 0;
+	for (auto &method : host.util_idle) {
+		count += method.second.size();
+	}
+	return count;
+}
 
 struct ConnectionPool {
 	static ConnectionPool &Get() {
@@ -281,11 +291,10 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	return out;
 }
 
-//! Same checkout/return dance for the HTTPUtil path (https, or a loaded
-//! curl_httpfs the operator wants used). The two-argument HTTPUtil::Request
-//! reuses the client we pass instead of constructing a throwaway one.
+//! Every production fetch uses this HTTPUtil path. The two-argument Request
+//! reuses the curl client we pass instead of constructing a throwaway one.
 template <class BUILD>
-QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, BUILD &&build) {
+QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, const string &method, BUILD &&build) {
 	auto &http_util = HTTPUtil::Get(db);
 	string origin, path;
 	SplitURL(url, origin, path);
@@ -299,9 +308,10 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 		auto &host = pool.hosts[key];
 		host.client = http_util.GetName();
 		host.origin = origin;
-		if (!host.util_idle.empty()) {
-			client = std::move(host.util_idle.back().client);
-			host.util_idle.pop_back();
+		auto &idle = host.util_idle[method];
+		if (!idle.empty()) {
+			client = std::move(idle.back().client);
+			idle.pop_back();
 			host.reused++;
 			reused = true;
 		} else {
@@ -321,8 +331,8 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 		auto &pool = ConnectionPool::Get();
 		std::lock_guard<std::mutex> guard(pool.lock);
 		auto &host = pool.hosts[key];
-		if (host.util_idle.size() < MAX_IDLE_PER_HOST) {
-			host.util_idle.push_back(PooledUtil {std::move(client)});
+		if (IdleCount(host) < MAX_IDLE_PER_HOST) {
+			host.util_idle[method].push_back(PooledUtil {std::move(client)});
 		}
 	}
 	return result;
@@ -350,7 +360,7 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const strin
 		}
 		return PlainGetWithStall(url, extra_headers, stall_ms);
 	}
-	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+	return WithUtilClient(db, url, "GET", [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
 		HTTPHeaders headers(db);
 		InsertExtraHeaders(headers, extra_headers);
 		GetRequestInfo request(url, headers, params, /*response_handler=*/nullptr,
@@ -371,12 +381,12 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 	const auto util_name = util.GetName();
 	if (util_name == "Built-In") {
 		throw InvalidConfigurationException(
-		    "quackapi outbound POST over https requires an HTTP client with full method support. "
+		    "quackapi outbound POST requires an HTTP client with full method support. "
 		    "LOAD curl_httpfs, then retry. Active HTTPUtil is '%s'.",
 		    util_name);
 	}
 
-	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+	return WithUtilClient(db, url, "POST", [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
 		HTTPHeaders headers(db);
 		if (!content_type.empty()) {
 			headers.Insert("Content-Type", content_type);
@@ -396,7 +406,7 @@ vector<QuackapiHttpPoolStats> QuackapiHttpFetch::PoolStats() {
 		QuackapiHttpPoolStats stats;
 		stats.client = entry.second.client;
 		stats.host = entry.second.origin;
-		stats.idle = entry.second.util_idle.size();
+		stats.idle = IdleCount(entry.second);
 		stats.dialed = entry.second.dialed;
 		stats.reused = entry.second.reused;
 		out.push_back(std::move(stats));

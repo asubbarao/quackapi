@@ -33,3 +33,8 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 ifneq ($(strip $(VCPKG_BOOTSTRAP_TARGET)),)
 release debug reldebug relassert: $(VCPKG_BOOTSTRAP_TARGET)
 endif
+
+# The stock target trusts Catch's aggregate even when one SQLLogic file stops
+# before its high-cardinality tail. Reconcile the file set and totals after it.
+test_release_internal:
+	python3 scripts/run_sql_tests.py build/release/test/unittest

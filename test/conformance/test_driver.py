@@ -1,4 +1,4 @@
-"""The parity scorecard must never turn missing evidence into a pass."""
+"""The HTTP contract scorecard must never turn missing evidence into a pass."""
 
 import unittest
 

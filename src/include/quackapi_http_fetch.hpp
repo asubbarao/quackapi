@@ -1,16 +1,9 @@
 //===----------------------------------------------------------------------===//
 // quackapi_http_fetch.hpp
 //
-// Outbound HTTP for quackapi. Two paths, one rule: the TCP connection MUST
-// survive across requests.
-//
-//   1. http://   → the VENDORED httplib client, checked out of a per-host
-//                  free-list pool (QuackapiHttpPool). Keep-alive + TCP_NODELAY.
-//                  Full method support, no companion extension required.
-//   2. https://  → DuckDB's HTTPUtil, with mandatory `LOAD curl_httpfs`
-//                  supplying the outbound client. Pooled the same way, via
-//                  HTTPUtil::Request(request, client) which reuses the client
-//                  we hand it instead of building a fresh one.
+// Outbound HTTP for quackapi. HTTP and HTTPS both use DuckDB's HTTPUtil with
+// mandatory curl_httpfs; passing the reusable client into Request keeps the
+// connection alive across requests. The plain-TCP stall seam is test-only.
 //
 // Why the pool exists: HTTPUtil::Request(request) — the single-argument form —
 // declares a local `unique_ptr<HTTPClient> client;` and lets it die at the end
@@ -75,9 +68,7 @@ struct QuackapiHttpFetch {
 	static QuackapiHttpFetchResult Get(DatabaseInstance &db, const string &url,
 	                                   const unordered_map<string, string> &extra_headers = {}, int32_t stall_ms = 0);
 
-	//! POST url with a raw body and Content-Type.
-	//! http:// uses the local plain-HTTP test transport; https:// requires the
-	//! curl_httpfs client selected by quackapi_serve.
+	//! POST url with a raw body and Content-Type through mandatory curl_httpfs.
 	static QuackapiHttpFetchResult Post(DatabaseInstance &db, const string &url, const string &body,
 	                                    const string &content_type = "application/x-www-form-urlencoded",
 	                                    const unordered_map<string, string> &extra_headers = {});

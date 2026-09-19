@@ -21,7 +21,7 @@ for r in rows:
 total = len(rows)
 passed = counts["PASS"]
 print(
-    f"overall FastAPI conformance {passed}/{total} ({100 * passed / total:.1f}%), "
+    f"overall HTTP contract score {passed}/{total} ({100 * passed / total:.1f}%), "
     f"#{classes['BUG']} BUGs, #{classes['NOT-BUILT-YET']} not-built-yet"
 )
 print("groups:")

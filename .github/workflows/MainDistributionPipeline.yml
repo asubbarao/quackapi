@@ -122,7 +122,7 @@ jobs:
         run: make release -j"$(nproc)"
 
       - name: Run quackapi SQLLogic
-        run: ./build/release/test/unittest "test/sql/quackapi*"
+        run: python3 scripts/run_sql_tests.py build/release/test/unittest
 
       - name: Verify outbound worker cleanup
         run: |

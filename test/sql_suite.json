@@ -1,0 +1,4 @@
+{
+  "description": "Install the mandatory outbound client before each isolated SQLLogic database opens.",
+  "on_init": "INSTALL curl_httpfs FROM community;"
+}
