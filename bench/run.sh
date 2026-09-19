@@ -82,7 +82,7 @@ record_environment() {
     printf 'upstream_commit=50113da16fec53b66b80d75e80a89296de4fa5a5\n'
     printf 'duckdb=%s\n' "$("${DUCKDB_BIN}" -no-init -version)"
     printf 'python=%s\n' "$(python3 --version)"
-    printf 'worker_threads=32\nmax_pending_requests=256\n'
+    printf 'worker_threads=%s\nmax_pending_requests=%s\n' "${QUACKAPI_WORKER_THREADS:-32}" "${QUACKAPI_MAX_PENDING_REQUESTS:-256}"
     printf 'trials=%s\nduration_sec=%s\nwarmup_sec=%s\n' "${TRIALS}" "${DURATION_SEC}" "${WARMUP_SEC}"
     printf 'concurrency_levels=%s\n' "${CONCURRENCY_LEVELS}"
     "${BENCH_VENV}/bin/python" -m pip freeze
