@@ -129,7 +129,8 @@ docs:
     ## Platforms & build
 
     Targets **DuckDB v1.5.5** only. C++17; depends only on DuckDB-bundled **httplib**
-    and **mbedtls** (no vcpkg, no libcurl). CI builds linux/macOS/windows_amd64;
+    and **mbedtls**, plus statically linked vcpkg **libpq** for `pg_dsn` (no
+    runtime libpq dependency, no libcurl). CI builds linux/macOS/windows_amd64;
     excludes wasm and Windows MinGW/rtools/arm64.
 
     ## Limits (honest)

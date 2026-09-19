@@ -41,6 +41,7 @@ jobs:
       extension_name: quackapi
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
       runners: '{"windows_x64":"windows-2022"}'
+      vcpkg_commit: 84bab45d415d22042bd0b9081aea57f362da3f35
 
   code-quality-check:
     name: Code Quality Check
@@ -53,7 +54,8 @@ jobs:
 
   # Own job (not the reusable distribution workflow): needs `services:` for
   # Postgres so require-env QUACKAPI_TEST_PG_DSN tests actually run. Linux
-  # amd64 only — does not publish artifacts or expand the release matrix.
+  # amd64 only — the reusable distribution workflow now also builds and tests
+  # the static libpq path that it publishes.
   linux-amd64-pg-sqllogic:
     name: Linux amd64 SQLLogic with Postgres
     runs-on: ubuntu-24.04
@@ -101,7 +103,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache libpq-dev postgresql-client
+          sudo apt-get install -y ninja-build ccache autoconf automake libtool libpq-dev postgresql-client
 
       - name: Setup Ccache
         uses: hendrikmuhs/ccache-action@main
@@ -116,11 +118,8 @@ jobs:
             sleep 1
           done
 
-      # This job is the only one that exercises the native Postgres path, and it
-      # is not a publishing job — opting in here keeps the distributed binaries
-      # free of a libpq load-time dependency.
       - name: Build extension
-        run: EXT_RELEASE_FLAGS="-DQUACKAPI_ENABLE_LIBPQ=ON" make release -j"$(nproc)"
+        run: make release -j"$(nproc)"
 
       - name: Run quackapi SQLLogic
         run: ./build/release/test/unittest "test/sql/quackapi*"

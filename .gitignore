@@ -8,6 +8,8 @@ test/python/__pycache__/
 .Rhistory
 .cache/
 *.log
+# `make release` bootstraps the pinned vcpkg checkout locally.
+vcpkg/
 vcpkg_installed/
 
 # Local multi-arch extension drops (use GitHub Releases / community CDN)
