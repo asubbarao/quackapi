@@ -8,13 +8,15 @@ namespace duckdb {
 
 //! CREATE [OR REPLACE] STREAM / DROP STREAM syntax.
 //! Grammar:
-//!   CREATE [OR REPLACE] STREAM <name> GET '<path>'
+//!   CREATE [OR REPLACE] STREAM <name> (GET|WS) '<path>'
 //!     [WITH (interval='1s'|1000)]
 //!     AS <select>
 //!   DROP STREAM <name>
 //!
-//! SSE only (text/event-stream). WebSocket is not supported on bundled
-//! cpp-httplib — CREATE STREAM … WS is rejected with a clear error.
+//! GET is Server-Sent Events (text/event-stream). WS is an RFC 6455 WebSocket,
+//! answered from QuackapiHttplibServer::process_and_close_socket. A WS handler
+//! that binds $message answers inbound frames instead of pushing; one that does
+//! not pushes rows exactly as the SSE transport does.
 class StreamDdlParserExtension : public ParserExtension {
 public:
 	StreamDdlParserExtension();

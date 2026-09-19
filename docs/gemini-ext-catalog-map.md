@@ -11,7 +11,7 @@
 | `CREATE ROUTE … RATE LIMIT n PER s [BY ip\|token\|key]` → 429 | Built (`quackapi_ddl` / server) |
 | `FORMAT json\|ndjson\|csv` + Accept negotiation | Built |
 | Response `gzip` / `zstd` via `Accept-Encoding` | Built in `quackapi_server.cpp` (`compression` serve knobs) — **FEATURE_STATUS.md is stale** on gzip |
-| `CREATE STREAM … GET` SSE | Built; **WS rejected** (httplib) |
+| `CREATE STREAM … GET` SSE | Built; **WS built** (`CREATE STREAM … WS`) |
 | `CREATE QUEUE` + workers | Built |
 | `CREATE AUTH` JWT / API_KEY | Built; **OIDC browser code-flow not** |
 | Batteries: try `curl_httpfs`, auth verify helpers, `quack_from_*` | Built |
@@ -50,7 +50,7 @@ Status vocabulary:
 |-------|--------|
 | **Status** | **EXISTS_PARTIAL** (+ **ALREADY_IN_QUACKAPI** for SSE wire) |
 | **extension_name(s)** | **`radio`** (Query.Farm: WebSocket **clients**, message queues, event buses — listen + broadcast into queryable buffers). SSE owned by quackapi. |
-| **Compose** | `CREATE STREAM … GET` for browser EventSource; feed stream SQL from tables/views that **radio** fills. No `CREATE STREAM … WS` on httplib. |
+| **Compose** | `CREATE STREAM … GET` for browser EventSource, `CREATE STREAM … WS` for duplex; feed stream SQL from tables/views that **radio** fills. `radio` stays the outbound client — it has no server. |
 | **Sample (catalog)** | ```sql<br>INSTALL radio FROM community;<br>LOAD radio;<br>``` README: “interact seamlessly with real-time event systems such as WebSocket servers, message queues, and event buses” — catalog has almost no function samples (README thin). Confirm live symbols after LOAD. |
 | **Ship as** | **Recipe** (`radio` in + SSE out). **Not** browser WebSocket Upgrade on quackapi port (SKIP-BLOAT / transport). |
 

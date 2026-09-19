@@ -266,8 +266,10 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `CREATE` / `DROP STREAM` | DDL | SSE (`GET` only); WS rejected |
+| `CREATE` / `DROP STREAM` | DDL | SSE (`GET`) and WebSocket (`WS`) |
 | `quackapi_streams()` | table | Inspect streams |
+| `quackapi_ws_connect()` | table | WebSocket client (frames as rows) |
+| `quackapi_ws_accept()` | scalar | `Sec-WebSocket-Accept` from a key |
 | `CREATE ROW ACCESS POLICY` / `CREATE MASKING POLICY` | DDL | Claims-oriented policies |
 | `ALTER TABLE …` policy bind | DDL | Attach/detach |
 | `quackapi_policies()` | table | Inspect policies |
@@ -325,7 +327,7 @@ clean release tag with **no merge-conflict markers** in `src/`, green
 4. **Body size** — 8 MiB max payload.
 5. **JWT** — HS256 only.
 6. **Table API** — read-only GET scaffold.
-7. **No WebSocket** on the HTTP sidecar (SSE via `CREATE STREAM` only).
+7. **No TLS** on the HTTP sidecar — terminate in front of it (`ws://`, not `wss://`).
 8. **Unsigned until accepted** — community `INSTALL` path goes live after the
    community-extensions PR and signing pipeline succeed.
 

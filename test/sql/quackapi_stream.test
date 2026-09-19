@@ -10,11 +10,23 @@ CREATE STREAM ticks GET '/ticks' AS SELECT i AS id, 'tick' AS msg FROM range(3) 
 ----
 Stream ticks: GET /ticks SSE
 
-# WebSocket method is rejected (httplib has no WS server)
-statement error
-CREATE STREAM chat WS '/ws' AS SELECT 1;
+# WS is a real transport now — quackapi_websocket.test exercises the socket.
+# Here it only has to be a different transport on the same DDL.
+query I
+CREATE STREAM chat WS '/ws' AS SELECT 1 AS n;
 ----
-WebSocket is not supported
+Stream chat: WS /ws WebSocket push
+
+query II
+SELECT name, transport FROM quackapi_streams() ORDER BY name;
+----
+chat	ws
+ticks	sse
+
+query I
+DROP STREAM chat;
+----
+Dropped stream chat
 
 # Path must start with /
 statement error

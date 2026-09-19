@@ -32,7 +32,7 @@
 | 3 | **`CREATE [OR REPLACE] [API] GROUP`** | `src/quackapi_ddl.cpp` | `quackapi_groups()` | `test/sql/quackapi_group.test`, `test/http/group.test.sh` | `APIRouter(prefix=…, tags=…, dependencies=…)` |
 | 4 | **`CREATE [OR REPLACE] API FOR TABLE`** | `src/quackapi_table_api.cpp` | expands to routes → `quackapi_routes()` | `test/sql/quackapi_table_api.test` | FastAPI + SQLAlchemy list/get scaffold |
 | 5 | **`CREATE [OR REPLACE] QUEUE`** | `src/quackapi_queue.cpp` | `quackapi_queues()`, `quackapi_enqueue/dequeue/ack/nack`, table `quackapi_jobs` | `test/sql/quackapi_queue.test`, `test/http/queue.test.sh` | BackgroundTasks / Celery-shaped durable jobs (DB-native) |
-| 6 | **`CREATE [OR REPLACE] STREAM`** | `src/quackapi_stream.cpp` | `quackapi_streams()` | `test/sql/quackapi_stream.test`, `test/http/stream.test.sh` | SSE (`EventSourceResponse`); **WS rejected** (httplib) |
+| 6 | **`CREATE [OR REPLACE] STREAM`** | `src/quackapi_stream.cpp`, `src/quackapi_websocket.cpp` | `quackapi_streams()` | `test/sql/quackapi_stream.test`, `test/sql/quackapi_websocket.test`, `test/http/stream.test.sh` | SSE (`EventSourceResponse`) **and WS** (`@app.websocket`) |
 | 7 | **`CREATE [OR REPLACE] ROW ACCESS POLICY`** | `src/quackapi_policy.cpp` | `quackapi_policies()` | `test/sql/quackapi_policy.test`, `test/http/policy.test.sh` | No first-class FastAPI primitive (row filters / RLS) |
 | 8 | **`CREATE [OR REPLACE] MASKING POLICY`** | `src/quackapi_policy.cpp` | `quackapi_policies()` | same | No first-class FastAPI primitive (column mask) |
 
@@ -76,6 +76,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 | **ReDoc** | `GET /redoc` | `test/http/redoc.test.sh`, case `redoc_get` | `/redoc` |
 | **Queue** enqueue/dequeue/ack/nack | `quackapi_enqueue` / `_dequeue` / `_ack` / `_nack`, `quackapi_jobs` | queue SQL + HTTP tests | BackgroundTasks + broker |
 | **SSE stream** | `CREATE STREAM … GET '/path' AS <select>` | stream SQL + HTTP | `StreamingResponse` / SSE |
+| **WebSocket** | `CREATE STREAM … WS '/path' AS <select>` | socket SQL + RFC 6455 | `@app.websocket` |
 | **WebSocket** | **not built** — DDL errors with explicit httplib message | stream tests document reject | `WebSocket` |
 | **Row access + masking policies** | CREATE … POLICY + ALTER TABLE bind | policy SQL + HTTP | — (DB-native leapfrog) |
 | Quack RPC auth bridge | `quackapi_authentication` / `quackapi_authorization` | `quackapi_quack_bridge.test` | N/A (DuckDB quack sibling) |
@@ -88,7 +89,7 @@ quackapi_ack, quackapi_add_api_key, quackapi_authentication, quackapi_authorizat
 quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_fetch, quackapi_groups,
 quackapi_http_pool, quackapi_http_util_name, quackapi_nack, quackapi_policies, quackapi_post,
 quackapi_queues, quackapi_routes, quackapi_serve, quackapi_servers, quackapi_stop,
-quackapi_streams, quackapi_verify_auth, quackapi_wait
+quackapi_streams, quackapi_verify_auth, quackapi_wait, quackapi_ws_accept, quackapi_ws_connect
 ```
 
 Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.
@@ -345,7 +346,7 @@ Ship community-extensions `description.yml` **0.1.0** with the surface proven on
 
 | Item | Blocker | Escape hatch |
 |------|---------|--------------|
-| **WebSocket Upgrade** (browser RFC6455 server) | cpp-httplib **no** WebSocket/Upgrade API | **SSE** (`CREATE STREAM`) + **`radio`** for push bus; duplex RPC → **quack** protocol, not DIY WS |
+| **WebSocket Upgrade** (browser RFC6455 server) | quackapi's own, in `src/quackapi_websocket.cpp` — answered from the `process_and_close_socket` override where the raw socket is still held. `radio` is client-only (`grep -rn Server radio/src/` is empty) and excludes `windows_amd64`, so it cannot supply a server | `CREATE STREAM … WS` |
 | Full Arrow Flight **server** inside quackapi | airport/adbc are **clients** | External Flight server; quackapi stays HTTP+JSON/IPC-blob |
 
 ---

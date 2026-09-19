@@ -12,6 +12,7 @@
 
 namespace duckdb_httplib {
 class Server;
+class Stream;
 struct Request;
 struct Response;
 } // namespace duckdb_httplib
@@ -178,6 +179,19 @@ public:
 	//! Same handler path as the TCP server — for quackapi_request() tests.
 	void Dispatch(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
+	//! Called from QuackapiHttplibServer::process_and_close_socket before httplib
+	//! parses the request. When the pending request is an RFC 6455 upgrade this
+	//! answers it, runs the WebSocket session to completion, and returns true —
+	//! the caller then closes the socket and does not loop for keep-alive.
+	//! Returns false without consuming a byte for every other request.
+	bool TryServeWebSocket(duckdb_httplib::Stream &strm);
+
+	//! How many concurrent WebSocket sessions this server will hold. A held
+	//! socket owns an httplib worker for its whole lifetime, so sockets may
+	//! take at most half the pool (at least one) and ordinary HTTP keeps the
+	//! rest. Beyond it the upgrade is refused with 503, never queued.
+	int32_t WebSocketBudget() const;
+
 	const string &Host() const {
 		return host;
 	}
@@ -219,6 +233,8 @@ private:
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
+	//! Live WebSocket sessions, each holding one httplib worker thread.
+	std::atomic<int32_t> ws_sessions {0};
 };
 
 //! In-process HTTP-shape invoke (no TCP). Builds a Request, runs Dispatch, returns

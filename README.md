@@ -306,6 +306,7 @@ Worker = compose community `cronjob` (or a drain route). See [`docs/QUEUE.md`](d
 
 ```sql
 CREATE STREAM ticks GET '/events' AS SELECT …;   -- text/event-stream
+CREATE STREAM chat  WS  '/ws'     AS SELECT $message …;  -- RFC 6455 WebSocket
 -- WebSocket methods are rejected (bundled httplib has no Upgrade API)
 SELECT * FROM quackapi_streams();
 ```
@@ -474,7 +475,10 @@ that quietly does nothing.
   and DuckDB is still at its system default). Prefer
   `memory_limit := '4GB'` (or `SET quackapi_memory_limit`) for large PDF/HTML
   workloads — it will never clobber an explicit operator `SET memory_limit`.
-- **No WebSocket routes** on the HTTP transport (SSE via `CREATE STREAM` only).
+- **No TLS** on the HTTP transport — terminate in front of it. That also means
+  `ws://` and not `wss://` for `CREATE STREAM … WS`.
+- **WebSocket sessions hold a worker each**, so they may take at most half of
+  `worker_threads`; the upgrade past that budget is refused with 503.
 - **`CREATE API FOR TABLE`** scaffolds **GET list + GET by key** only.
 - **JWT:** HS256 only (`ALGORITHM HS256`); no RS256 / OIDC discovery yet.
 - **Not a general multi-tenant SaaS framework:** policies are claims-keyed

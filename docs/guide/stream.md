@@ -1,5 +1,7 @@
 # CREATE STREAM — Server-Sent Events (SSE)
 
+> For the WebSocket transport on the same DDL, see [websocket.md](websocket.md).
+
 Push a live event stream over HTTP with `text/event-stream`. Each result row becomes one SSE event (`id:` + `data:` JSON).
 
 All examples run against `build/release/duckdb -unsigned` with `LOAD quackapi;`.
@@ -68,14 +70,15 @@ FROM quackapi_streams();
 
 ---
 
-## WebSocket — not supported (use SSE)
+## WebSocket — the other transport on this DDL
 
 ```sql
-CREATE STREAM chat WS '/ws' AS SELECT 1;
--- error: WebSocket is not supported (bundled HTTP library has no Upgrade API)
+CREATE STREAM chat WS '/ws' AS SELECT $message AS said;
 ```
 
-Use **`CREATE STREAM … GET`** for browser EventSource / SSE clients. See also [coming soon](coming-soon.md).
+`GET` is Server-Sent Events, `WS` is an RFC 6455 WebSocket. Use SSE when the
+browser only listens; use WS when it also speaks. Full guide:
+[websocket.md](websocket.md).
 
 ---
 

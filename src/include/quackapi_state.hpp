@@ -213,23 +213,32 @@ struct QuackapiMaskingBinding {
 	string policy_name;
 };
 
-//! Transport for CREATE STREAM. SSE is first-class on cpp-httplib; WebSocket is
-//! not available on the bundled httplib (no Upgrade/WS API) — WS is rejected at DDL.
+//! Transport for CREATE STREAM. Both ride the same httplib listener: SSE is a
+//! chunked text/event-stream response, WS is an RFC 6455 upgrade answered in
+//! QuackapiHttplibServer::process_and_close_socket, which keeps the socket.
 enum class QuackapiStreamTransport : uint8_t {
 	SSE = 0,
+	WS = 1,
 };
 
-//! One SSE push stream registered via CREATE STREAM.
-//! Emits text/event-stream (one event per row). Optional interval re-runs the
-//! SELECT for polling/tailing — no separate thread pool (blocks the httplib worker).
+//! One push stream registered via CREATE STREAM.
+//! SSE emits text/event-stream (one event per row). WS emits one text frame per
+//! row over a WebSocket. Optional interval re-runs the SELECT for
+//! polling/tailing — no separate thread pool (blocks the httplib worker).
 struct QuackapiStream {
 	string name;
-	string method = "GET"; // SSE is GET; WS deferred
-	string pattern;        // e.g. /events
-	string handler_sql;    // AS <select>; named params bind like routes
+	//! HTTP method of the request that opens the stream. GET for both transports:
+	//! an RFC 6455 handshake is a GET, so route matching and Allow: stay uniform.
+	string method = "GET";
+	string pattern;     // e.g. /events
+	string handler_sql; // AS <select>; named params bind like routes
 	//! 0 = run SELECT once and close the stream. >0 = re-run after each empty/full cycle.
 	int64_t interval_ms = 0;
 	QuackapiStreamTransport transport = QuackapiStreamTransport::SSE;
+	//! True when the handler binds $message: the socket is request/response
+	//! (each inbound frame runs the SELECT) rather than push. Derived from the
+	//! prepared statement at CREATE time, never declared by the operator.
+	bool binds_message = false;
 };
 
 //! Per-database quackapi state: the route registry, auth registry, and running servers.
