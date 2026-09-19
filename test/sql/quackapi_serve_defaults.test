@@ -8,10 +8,14 @@ statement ok
 LOAD curl_httpfs;
 
 statement ok
+LOAD httpfs_timeout_retry;
+
+statement ok
 SET enable_logging = true;
 
-# The extension load and deliberate logger state are outside the snapshot:
-# curl_httpfs is a product dependency, while duckdb_settings() is caller-owned.
+# The extension loads and deliberate logger state are outside the snapshot:
+# curl_httpfs and httpfs_timeout_retry are product dependencies serve LOADs for
+# itself, while duckdb_settings() is caller-owned.
 statement ok
 CREATE TABLE settings_before AS SELECT name, value FROM duckdb_settings();
 

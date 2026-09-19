@@ -17,25 +17,20 @@ namespace duckdb {
 namespace {
 
 //===--------------------------------------------------------------------===//
-// sitting_duck bootstrap (INSTALL FROM community + LOAD; idempotent)
+// sitting_duck gate (LOAD only — never INSTALL)
 //===--------------------------------------------------------------------===//
 
-void EnsureSittingDuck(Connection &con) {
-	// LOAD is cheap and idempotent when already present.
+//! LOAD is local and idempotent. An INSTALL here put a network download behind
+//! an ordinary SELECT: on an offline box, or the day the community package is
+//! renamed, the extractor 404s mid-query instead of saying what is missing.
+void RequireSittingDuck(Connection &con) {
 	auto load = con.Query("LOAD sitting_duck");
 	if (!load->HasError()) {
 		return;
 	}
-	auto inst = con.Query("INSTALL sitting_duck FROM community");
-	if (inst->HasError()) {
-		throw InvalidInputException("quack_from_x: could not INSTALL sitting_duck FROM community: %s\n"
-		                            "sitting_duck is a runtime dependency of quack_from_* extractors.",
-		                            inst->GetError().c_str());
-	}
-	load = con.Query("LOAD sitting_duck");
-	if (load->HasError()) {
-		throw InvalidInputException("quack_from_x: could not LOAD sitting_duck: %s", load->GetError().c_str());
-	}
+	throw InvalidConfigurationException("quack_from_x requires the 'sitting_duck' extension: %s. Install it with "
+	                                    "INSTALL sitting_duck FROM community, then retry.",
+	                                    StringUtil::Replace(load->GetError(), "\n", " "));
 }
 
 //===--------------------------------------------------------------------===//
@@ -213,7 +208,7 @@ unique_ptr<GlobalTableFunctionState> FromXInit(ClientContext &context, TableFunc
 	string sql = SubstituteRepo(sql_tmpl, repo);
 
 	Connection con(*context.db);
-	EnsureSittingDuck(con);
+	RequireSittingDuck(con);
 
 	auto result = con.Query(sql);
 	if (result->HasError()) {

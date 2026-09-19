@@ -26,6 +26,10 @@ Requires **DuckDB v1.5.5** (linux, macOS, windows_amd64).
 
 ```sql
 INSTALL quackapi FROM community;
+-- Companions quackapi LOADs and refuses by name without. It never downloads an
+-- extension at serve or inside a handler.
+INSTALL curl_httpfs FROM community;
+INSTALL httpfs_timeout_retry FROM community;
 LOAD quackapi;
 
 CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;

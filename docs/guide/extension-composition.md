@@ -13,6 +13,10 @@ browser  ──►  quackapi (SQL handlers + thin GraphQL)
                     ├── CREATE ROUTE / API FOR TABLE   (REST → your SQL)
                     ├── POST /graphql | GRAPHQL ROUTE  (GQL → SELECT …)
                     ├── curl_httpfs / httpfs  (read_text, read_json, …)
+                    ├── httpfs_timeout_retry  (http_timeout / http_retries, per operation)
+                    ├── otlp                  (otlp_serve — traces/metrics/logs as tables)
+                    ├── cronjob               (cron — the queue drain's runner)
+                    ├── radio / events        (event bus in; DB events out)
                     ├── http_client           (http_get, http_post, …)
                     ├── sitting_duck          (AST / quack_from_*; optional GQL parse recipe)
                     ├── quack                 (quack_query / ATTACH)
@@ -138,8 +142,14 @@ when LOADed; quackapi only owns the SSE wire format.
 
 ## Recipe 3 — `sitting_duck` / `quack_from_x`
 
-Point at an existing app tree; get **route + model IR rows**. Native table functions
-ship in quackapi and **auto-INSTALL/LOAD `sitting_duck` FROM community** on first use.
+Point at an existing app tree; get **route + model IR rows**. The table functions ship
+in quackapi; the extraction is `sitting_duck`'s. Install it once — quackapi `LOAD`s it
+and refuses by name if it is missing, because a download inside a `SELECT` fails the
+query on an offline box instead of the setup.
+
+```sql
+INSTALL sitting_duck FROM community;   -- one-time setup
+```
 
 ```sql
 LOAD quackapi;
@@ -247,6 +257,80 @@ SELECT * FROM quackapi_serve(8000, memory_limit := '4GB');  -- headroom for PDF 
 ```
 
 Calling the “PDF service” is a function call in the same address space — not an RPC.
+
+---
+
+## Recipe 6 — Observability is `otlp`, not a quackapi table
+
+quackapi keeps **no request history of its own** — no ring buffer, no
+`quackapi_requests()`. The community **`otlp`** extension runs a real OTLP/HTTP
+receiver inside the same process and lands spans, metrics and logs as tables.
+
+```sql
+INSTALL otlp FROM community;   -- one-time setup
+LOAD otlp;
+LOAD quackapi;                 -- default-creates otlp:localhost:4318 and says so
+
+SELECT uri, catalog, state, detail FROM quackapi_otlp();
+-- otlp:localhost:4318  (empty)  serving  otlp_serve
+
+SELECT * FROM read_otlp_traces();
+```
+
+| Knob | Effect |
+|------|--------|
+| `SET quackapi_otlp = 'local'` | default — loopback receiver when `otlp` is loaded |
+| `SET quackapi_otlp = 'off'` | create nothing |
+| `SET quackapi_otlp = 'otlp:0.0.0.0:4318'` | explicit endpoint; **`quackapi_serve` fails** if `otlp` is missing |
+| `SET quackapi_otlp_catalog = 'my_ducklake'` | durable ingest into a DuckLake or Iceberg catalog instead of local tables |
+
+The default binds loopback on purpose. **Beyond this box, an OpenTelemetry
+Collector is the answer** — point it at the endpoint, or at your backend, and let
+it do the fan-out, batching and retention a database should not.
+
+`quackapi_serve` never downloads `otlp`. With `quackapi_otlp` set to an explicit
+URI and the extension missing, it refuses to bind and names it.
+
+---
+
+## Recipe 7 — Queue workers run on `cronjob`
+
+The queue's drain is SQL. The runner is the community **`cronjob`** extension, in
+this process:
+
+```sql
+INSTALL cronjob FROM community;   -- one-time setup
+LOAD cronjob;
+
+CREATE QUEUE emails;
+SELECT * FROM quackapi_queue_worker('emails');            -- every second
+SELECT * FROM quackapi_queue_worker('emails', schedule := '*/5 * * * * *',
+                                    sql := 'SELECT send(payload) FROM quackapi_dequeue(''emails'', 10)');
+```
+
+`cron_jobs()` and `cron_delete(job_id)` stay `cronjob`'s — quackapi wraps
+neither. A process that is already obliged to stay online is exactly what an
+external scheduler exists to work around, so the scheduler moves in.
+
+Full surface: [queue guide](queue.md).
+
+---
+
+## Recipe 8 — Event bus in, database events out
+
+quackapi owns the SSE wire format and nothing else about messaging.
+
+- **`radio`** (`query-farm/radio`) is the event-bus client: `radio_subscribe`,
+  `radio_received_messages()`, `radio_transmit_message` against WebSocket or
+  Redis pub/sub. A `CREATE STREAM` whose `SELECT` reads
+  `radio_subscription_received_messages(...)` is a bus-fed SSE endpoint with no
+  quackapi code involved.
+- **`events`** (`query-farm/events`) turns DuckDB's own lifecycle — connections,
+  queries, transactions — into JSON on an external program's stdin, via
+  `events_destination` / `events_types`. It needs nothing from quackapi either.
+
+Neither has a quackapi wrapper, on purpose: a wrapper would be a second API over
+somebody else's, and the first thing to rot.
 
 ---
 

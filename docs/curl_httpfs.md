@@ -23,8 +23,27 @@ Flow:
 
 1. `LOAD curl_httpfs` before the listener binds
 2. Verify curl_httpfs installed a curl-backed DuckDB `HTTPUtil`
-3. Record `http_client=curl` on `/healthz`
+3. `LOAD httpfs_timeout_retry`, which owns the timeout and retry knobs
+4. Record `http_client=curl` on `/healthz`
    and `quackapi_servers()`
+
+### Timeouts and retries belong to `httpfs_timeout_retry`
+
+quackapi sets no outbound ceiling of its own. `HTTPUtil::InitializeParameters`
+already carries `http_timeout`, `http_retries`, `http_retry_wait_ms` and
+`http_retry_backoff`; the community `httpfs_timeout_retry` extension refines them
+per operation (`httpfs_timeout_stat_ms`, `httpfs_retries_list`, …). It is
+required at serve for the same reason curl_httpfs is: a limit only quackapi could
+move is exactly the knob an operator came looking for.
+
+```sql
+INSTALL httpfs_timeout_retry FROM community;   -- one-time setup
+SET http_timeout = 5000;                       -- 5s, and quackapi honours it
+```
+
+The one thing quackapi still applies is the request's own deadline: an outbound
+call inside a route with `TIMEOUT 5` cannot outlive that route. It can only lower
+what `http_timeout` chose, never raise it.
 
 The serve path never installs extensions or falls back to DuckDB's stock
 httplib client. If the load fails, serve fails before binding and names the

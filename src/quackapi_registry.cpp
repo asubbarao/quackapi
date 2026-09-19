@@ -375,6 +375,16 @@ vector<QuackapiQueue> QuackapiState::SnapshotQueues() {
 	return queues;
 }
 
+void QuackapiState::SetOtlpEndpoint(const QuackapiOtlpEndpoint &endpoint) {
+	std::lock_guard<std::mutex> lock(otlp_mutex);
+	otlp_endpoint = endpoint;
+}
+
+QuackapiOtlpEndpoint QuackapiState::GetOtlpEndpoint() {
+	std::lock_guard<std::mutex> lock(otlp_mutex);
+	return otlp_endpoint;
+}
+
 void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts) {
 	// Mirrors QuackStorageExtensionInfo::CreateServer (duckdb-quack
 	// src/quack_storage.cpp): lock map → reject duplicate key → construct

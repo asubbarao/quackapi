@@ -129,11 +129,11 @@ Concurrency: DuckDB is single-writer per file. Claims serialize on the write loc
 
 ## Worker options
 
-1. **HTTP drain route** (above) — cron or a second process POSTs `/drain`.  
-2. **Scheduled SQL** — community `cronjob` extension (or any external scheduler) running the same `SELECT … FROM quackapi_dequeue … ack`.  
+1. **`quackapi_queue_worker(queue)`** — registers the drain with the community `cronjob` extension, in this process. `LOAD cronjob` first; quackapi refuses and names it otherwise.
+2. **HTTP drain route** (above) — a second process POSTs `/drain`.
 3. **Interactive shell** — run dequeue/ack by hand while developing.
 
-There is no built-in C++ thread pool. The queue is storage + claim primitives; **you** schedule the worker.
+There is no built-in C++ thread pool and no quackapi scheduler. The queue is storage + claim primitives; `cronjob` is the runner.
 
 ---
 

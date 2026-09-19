@@ -26,6 +26,8 @@ GEN=ninja make release
 In the DuckDB shell:
 
 ```sql
+INSTALL curl_httpfs FROM community;          -- one-time: outbound HTTP client
+INSTALL httpfs_timeout_retry FROM community; -- one-time: its timeout/retry knobs
 LOAD quackapi;
 
 CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;

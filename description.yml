@@ -33,6 +33,11 @@ repo:
 
 docs:
   hello_world: |
+    -- One-time setup: quackapi LOADs its companions and refuses by name if one
+    -- is missing. It never downloads an extension at serve or inside a handler.
+    INSTALL curl_httpfs FROM community;
+    INSTALL httpfs_timeout_retry FROM community;
+
     LOAD quackapi;
 
     -- JSON endpoint: the SELECT is the handler
@@ -118,13 +123,18 @@ docs:
     - **Table API:** `CREATE API FOR TABLE t [AT '/path'] [KEY 'id']` → GET list
       + GET by key only.
     - **Queue:** `CREATE QUEUE`, `quackapi_enqueue/dequeue/ack/nack`, table
-      `quackapi_jobs` (broker-less; compose `cronjob` for workers).
+      `quackapi_jobs` (broker-less). `quackapi_queue_worker(queue)` hands the
+      drain to community `cronjob` — quackapi has no scheduler of its own.
     - **SSE:** `CREATE STREAM … GET '/path' AS <select>` (`text/event-stream`;
       WebSocket not supported on httplib).
     - **Policies:** `CREATE ROW ACCESS POLICY` / `CREATE MASKING POLICY` +
       `ALTER TABLE` bind; `quackapi_policies()`.
+    - **Observability:** none of quackapi's own. `LOAD otlp` and quackapi
+      default-creates `otlp:localhost:4318` locally; `quackapi_otlp()` reports
+      it, `quackapi_otlp_catalog` sends it to DuckLake or Iceberg, and a
+      Collector is the answer beyond one box.
     - **Inspect:** `quackapi_routes()`, `quackapi_servers()`,
-      `quackapi_http_util_name()`.
+      `quackapi_http_util_name()`, `quackapi_otlp()`.
 
     ## Platforms & build
 

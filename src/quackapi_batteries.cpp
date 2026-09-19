@@ -1,5 +1,6 @@
 #include "quackapi_server.hpp"
 #include "quackapi_http_fetch.hpp"
+#include "quackapi_imports.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -294,6 +295,29 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		opts.http_client_active = "curl";
 		opts.http_client_reason.clear();
 		applied.push_back("http_client=curl (WHY: curl_httpfs is mandatory for quackapi outbound HTTP)");
+	}
+
+	// --- Outbound timeout / retry: httpfs_timeout_retry owns the knobs ---
+	// WHY: quackapi used to pin a 600s read/write ceiling of its own onto every
+	// HTTPParams it built, which no operator could move. http_timeout /
+	// http_retries plus this extension's per-operation overrides are the knobs,
+	// and HTTPUtil::InitializeParameters already reads them.
+	QuackapiRequireExtensionSetting(*context.db, "httpfs_timeout_retry", "httpfs_timeout_file_operation_ms",
+	                                "quackapi_serve");
+	applied.push_back("outbound_timeout=httpfs_timeout_retry (WHY: http_timeout/http_retries + per-operation "
+	                  "httpfs_timeout_*_ms are the operator's knobs, not a quackapi constant)");
+
+	// --- Observability: otlp owns the receiver ---
+	// WHY: an explicitly configured quackapi_otlp is a promise the listen_url
+	// implies; enforce=true turns a missing otlp into a refusal to serve rather
+	// than a server that quietly records nothing.
+	QuackapiOtlpReconcile(*context.db, &context, /*enforce=*/true);
+	{
+		auto endpoint = QuackapiState::Get(*context.db).GetOtlpEndpoint();
+		applied.push_back(StringUtil::Format("otlp=%s uri=%s catalog=%s (WHY: telemetry is the otlp extension's "
+		                                     "receiver; a Collector is the answer beyond local)",
+		                                     endpoint.state, endpoint.uri.empty() ? "<none>" : endpoint.uri,
+		                                     endpoint.catalog.empty() ? "<none>" : endpoint.catalog));
 	}
 
 	// Transport knobs are applied in QuackapiHttpServer ctor (httplib SERVER).

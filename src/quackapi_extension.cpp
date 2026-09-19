@@ -24,6 +24,7 @@
 #include "quackapi_from_x.hpp"
 #include "quackapi_graphql.hpp"
 #include "quackapi_http_fetch.hpp"
+#include "quackapi_imports.hpp"
 #include "quackapi_pg.hpp"
 #include "quackapi_queue.hpp"
 #include "quackapi_policy.hpp"
@@ -1005,7 +1006,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterQuackapiHttpFetchFunctions(loader);
 
 	// Durable broker-less job queue (CREATE QUEUE + enqueue/dequeue/ack/nack).
-	// Backing store is the plain quackapi_jobs table; worker = compose cronjob.
+	// Backing store is the plain quackapi_jobs table; the drain runs on cronjob
+	// via quackapi_queue_worker (RegisterQuackapiImportFunctions).
 	RegisterQuackapiQueueFunctions(loader);
 	loader.RegisterFunction(GetApplyMiddlewareFunction());
 	loader.RegisterFunction(GetQuackapiMiddlewaresFunction());
@@ -1031,6 +1033,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ExtensionCallbackManager::Get(db).Register(StreamDdlParserExtension());
 	// CREATE / DROP GRAPHQL FOR TABLE (+ DROP GRAPHQL ALL) + GRAPHQL ROUTE
 	ExtensionCallbackManager::Get(db).Register(GraphqlDdlParserExtension());
+
+	// Companions quackapi composes: otlp (observability) + cronjob (queue drain).
+	// Settings and quackapi_otlp() / quackapi_queue_worker() live there.
+	RegisterQuackapiImportFunctions(loader);
+
+	// OTLP on LOAD, locally, loudly: default-create the loopback receiver when
+	// the otlp extension is loaded, and say what is (not) collecting either way.
+	// No session exists yet, so the settings are still their defaults.
+	// enforce=false — a missing companion may not fail LOAD quackapi; an
+	// explicitly configured endpoint is enforced at quackapi_serve instead.
+	QuackapiOtlpReconcile(db, nullptr, /*enforce=*/false);
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

@@ -26,10 +26,10 @@ constexpr idx_t MAX_IDLE_PER_HOST = 64;
 // MAX_IDLE_PER_HOST so a fan-out cannot dial more sockets than the pool will keep,
 // which would turn every burst into a churn of one-shot connections.
 constexpr idx_t MAX_OUTBOUND_FANOUT = 32;
-// Read/write: LLM upstreams are slow; the caller cancels. Connect stays short so
-// a dead peer (or CI loopback after stop) fails fast instead of parking a worker.
-constexpr time_t OUTBOUND_TIMEOUT_SECONDS = 600;
-constexpr time_t OUTBOUND_CONNECT_TIMEOUT_SECONDS = 5;
+// Test-only plain-TCP stall seam (PlainGetWithStall). Production requests go
+// through HTTPUtil, whose timeouts belong to httpfs / httpfs_timeout_retry.
+constexpr time_t STALL_SEAM_TIMEOUT_SECONDS = 600;
+constexpr time_t STALL_SEAM_CONNECT_TIMEOUT_SECONDS = 5;
 
 void InsertExtraHeaders(HTTPHeaders &headers, const unordered_map<string, string> &extra) {
 	for (auto &kv : extra) {
@@ -238,8 +238,8 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	duckdb_httplib::Error conn_error = duckdb_httplib::Error::Success;
 	auto sock = duckdb_httplib::detail::create_client_socket(
 	    host, "", port, AF_UNSPEC, /*tcp_nodelay=*/true, /*ipv6_v6only=*/false, duckdb_httplib::default_socket_options,
-	    OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0, /*intf=*/"",
-	    conn_error);
+	    STALL_SEAM_CONNECT_TIMEOUT_SECONDS, 0, STALL_SEAM_TIMEOUT_SECONDS, 0, STALL_SEAM_TIMEOUT_SECONDS, 0,
+	    /*intf=*/"", conn_error);
 	if (sock == INVALID_SOCKET) {
 		out.request_error = "stall_ms connect: " + duckdb_httplib::to_string(conn_error);
 		return out;
@@ -319,11 +319,19 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 		}
 	}
 
+	// InitializeParameters already carries http_timeout / http_retries /
+	// http_retry_backoff, which httpfs_timeout_retry refines per operation.
+	// quackapi supplies no ceiling of its own — a limit only quackapi could move
+	// is exactly the knob an operator came here to set. The request's own
+	// deadline may still lower it: an outbound call must not outlive the request
+	// that made it.
 	auto params = http_util.InitializeParameters(db, url);
 	params->keep_alive = true;
-	const auto timeout_ms = QuackapiRemainingTimeoutMillis(OUTBOUND_TIMEOUT_SECONDS * 1000);
-	params->timeout = timeout_ms / 1000;
-	params->timeout_usec = (timeout_ms % 1000) * 1000;
+	const auto configured_ms =
+	    static_cast<int64_t>(params->timeout) * 1000 + static_cast<int64_t>(params->timeout_usec) / 1000;
+	const auto timeout_ms = QuackapiRemainingTimeoutMillis(configured_ms);
+	params->timeout = static_cast<uint64_t>(timeout_ms / 1000);
+	params->timeout_usec = static_cast<uint64_t>((timeout_ms % 1000) * 1000);
 	auto result = build(http_util, *params, client);
 	result.reused_connection = reused;
 

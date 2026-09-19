@@ -1,4 +1,4 @@
 {
-  "description": "Install the mandatory outbound client before each isolated SQLLogic database opens.",
-  "on_init": "INSTALL curl_httpfs FROM community;"
+  "description": "Install the companions quackapi composes, before each isolated SQLLogic database opens. quackapi LOADs them and refuses to run without them; it never downloads one at serve or inside a handler, so the install belongs here.",
+  "on_init": "INSTALL curl_httpfs FROM community; INSTALL httpfs_timeout_retry FROM community; INSTALL sitting_duck FROM community; INSTALL json_schema FROM community;"
 }

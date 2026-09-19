@@ -90,6 +90,16 @@ struct QuackapiQueue {
 	int32_t backoff_base_sec = 2;
 };
 
+//! The OTLP receiver quackapi default-creates through the otlp extension.
+//! state: serving | off | unavailable | error.
+struct QuackapiOtlpEndpoint {
+	string uri;
+	//! DuckLake or Iceberg catalog otlp_serve writes into. Empty = local tables.
+	string catalog;
+	string state = "off";
+	string detail;
+};
+
 //! One registered route group (FastAPI APIRouter-style prefix + default auth).
 //! Expanded into routes at CREATE ROUTE time — runtime registry stays flat.
 struct QuackapiGroup {
@@ -300,6 +310,11 @@ public:
 		return dequeue_claim_mutex;
 	}
 
+	//! What the otlp extension is doing on quackapi's behalf. quackapi keeps no
+	//! request history of its own — this is a pointer at the receiver, not a log.
+	void SetOtlpEndpoint(const QuackapiOtlpEndpoint &endpoint);
+	QuackapiOtlpEndpoint GetOtlpEndpoint();
+
 	//! Start serving on host:port. Throws if a server already listens there.
 	void StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
 	//! Stop the server on port (any host). Returns false if none.
@@ -415,6 +430,9 @@ private:
 	vector<string> graphql_tables;
 	//! Named GraphQL path mounts (independent of graphql_tables).
 	vector<QuackapiGraphqlRoute> graphql_routes;
+
+	std::mutex otlp_mutex;
+	QuackapiOtlpEndpoint otlp_endpoint;
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;

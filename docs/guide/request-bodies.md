@@ -162,7 +162,7 @@ curl -X POST http://127.0.0.1:8000/users \
 
 `BODY SCHEMA` can appear before or after `PARAM` clauses. Quote the schema as a SQL string (`''` to escape a single quote inside).
 
-Validation runs through the community `json_schema` extension, which quackapi installs on first use. Where that install cannot happen — no network, or a DuckDB build the community repository has no artifact for — the route answers **500** “Body schema validation is unavailable”. That is a server condition and deliberately not a 422: the body was never judged.
+Validation runs through the community `json_schema` extension, which you install once (`INSTALL json_schema FROM community`). quackapi only `LOAD`s it — it never downloads an extension inside a request. Without it the route answers **500** “Body schema validation is unavailable” and names the extension on stderr. That is a server condition and deliberately not a 422: the body was never judged.
 
 ---
 

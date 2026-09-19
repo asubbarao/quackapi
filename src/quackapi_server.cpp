@@ -697,18 +697,16 @@ enum class BodySchemaResult { VALID, INVALID, UNAVAILABLE };
 //! Validate body against BODY SCHEMA using community json_schema extension.
 //! json_schema_validate returns true on pass and THROWS on fail — wrap with try().
 BodySchemaResult ValidateBodySchema(Connection &con, const string &schema, const string &raw_body, string &err_json) {
-	// LOAD is idempotent; INSTALL FROM community on first failure (network).
+	// LOAD only: a per-request INSTALL puts a network download inside a handler,
+	// and the 404 it returns offline reads as "validation unavailable" forever.
 	auto load = con.Query("LOAD json_schema");
 	if (load->HasError()) {
-		auto inst = con.Query("INSTALL json_schema FROM community");
-		if (!inst->HasError()) {
-			load = con.Query("LOAD json_schema");
-		}
-		if (load->HasError()) {
-			fprintf(stderr, "quackapi: json_schema unavailable: %s\n", load->GetError().c_str());
-			err_json = "{\"detail\":\"Body schema validation is unavailable\"}";
-			return BodySchemaResult::UNAVAILABLE;
-		}
+		fprintf(stderr,
+		        "quackapi: BODY SCHEMA needs the 'json_schema' extension: %s. "
+		        "Install it with INSTALL json_schema FROM community, then restart.\n",
+		        load->GetError().c_str());
+		err_json = "{\"detail\":\"Body schema validation is unavailable\"}";
+		return BodySchemaResult::UNAVAILABLE;
 	}
 	// try() → true on pass, NULL when the function throws (never returns false).
 	auto res = con.Query("SELECT try(json_schema_validate(?::JSON, ?::JSON))", Value(schema), Value(raw_body));
@@ -1605,22 +1603,16 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 	return ReadAndRemoveFileBytes(con, path);
 }
 
-//! Ensure community nanoarrow is available (LOAD, else INSTALL FROM community).
-void EnsureNanoarrowLoaded(Connection &con) {
+//! LOAD only — never INSTALL. FORMAT ARROWS runs inside a request, and a
+//! download there fails the response instead of the operator's setup.
+void RequireNanoarrow(Connection &con) {
 	auto load = con.Query("LOAD nanoarrow");
 	if (!load->HasError()) {
 		return;
 	}
-	auto inst = con.Query("INSTALL nanoarrow FROM community");
-	if (inst->HasError()) {
-		throw InvalidInputException(
-		    "arrow serialize: nanoarrow not available (%s). INSTALL nanoarrow FROM community and retry.",
-		    inst->GetError());
-	}
-	load = con.Query("LOAD nanoarrow");
-	if (load->HasError()) {
-		throw InvalidInputException("arrow serialize: could not LOAD nanoarrow: %s", load->GetError());
-	}
+	throw InvalidConfigurationException("FORMAT arrow requires the 'nanoarrow' extension: %s. Install it with "
+	                                    "INSTALL nanoarrow FROM community, then retry.",
+	                                    StringUtil::Replace(load->GetError(), "\n", " "));
 }
 
 //! Serialize result rows as Arrow IPC stream bytes (nanoarrow FORMAT ARROWS).
@@ -1631,7 +1623,7 @@ string SerializeRowsArrow(Connection &con, const vector<string> &names, const ve
 	if (data_cols.empty()) {
 		throw InvalidInputException("arrow serialize: no data columns");
 	}
-	EnsureNanoarrowLoaded(con);
+	RequireNanoarrow(con);
 	auto &fs = FileSystem::GetFileSystem(*con.context);
 	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
 	string table = "qa_arrow_" + uid;

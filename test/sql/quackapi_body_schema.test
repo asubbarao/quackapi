@@ -6,11 +6,11 @@ require quackapi
 
 require json
 
-# BODY SCHEMA is validated by `json_schema`, which quackapi installs from the
-# community repository on first use. `require` cannot ask for a community
-# extension, so the dependency is declared as an env gate instead: without it
-# these assertions read as a broken response builder rather than a missing
-# extension. CI sets it on the job that has a network and a tagged DuckDB.
+# BODY SCHEMA is validated by `json_schema`, which the suite bootstrap installs
+# and quackapi only LOADs. `require` cannot ask for a community extension, so
+# the dependency is declared as an env gate instead: without it these assertions
+# read as a broken response builder rather than a missing extension. CI sets it
+# on the job that has a network and a tagged DuckDB.
 require-env QUACKAPI_TEST_JSON_SCHEMA
 
 # maximum:10 is schema-only — SQL INTEGER bind would accept 100 without it.

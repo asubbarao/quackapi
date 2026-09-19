@@ -1,0 +1,93 @@
+# name: test/sql/quackapi_companions.test
+# description: the imported companions doing the work — otlp serving the default endpoint, cronjob running the queue drain
+# group: [sql]
+
+require quackapi
+
+# These assertions need the community companions and the network that fetches
+# them, and the otlp receiver binds a real port. CI turns them on for the job
+# that has both; the rest of the suite proves the gates without either.
+require-env QUACKAPI_TEST_COMPANIONS
+
+# otlp_serve writes through DuckDB's crypto module, which needs httpfs loaded;
+# without it the endpoint reports state='error' rather than pretending to serve.
+statement ok
+INSTALL httpfs;
+
+statement ok
+LOAD httpfs;
+
+# A per-test extension directory: an otlp installed here cannot leak into the
+# databases of the other files, where LOAD quackapi would then default-create a
+# second receiver on the same port.
+statement ok
+SET extension_directory = '__TEST_DIR__/companions';
+
+statement ok
+INSTALL otlp FROM community;
+
+statement ok
+LOAD otlp;
+
+# LOAD quackapi ran before otlp existed. The next quackapi_otlp() reconciles and
+# default-creates the local receiver — quackapi decides there is one, otlp_serve
+# owns the OTLP wire format, the schema and the DuckLake/Iceberg write path.
+query IIII
+SELECT uri, catalog = '' AS no_catalog, state, detail FROM quackapi_otlp();
+----
+otlp:localhost:4318	true	serving	otlp_serve
+
+query III
+SELECT listen_uri, host, is_listening FROM otlp_server_list();
+----
+otlp:localhost:4318	localhost	true
+
+statement ok
+SELECT * FROM otlp_stop('otlp:localhost:4318');
+
+# --- cronjob runs the queue drain -------------------------------------------
+statement ok
+INSTALL cronjob FROM community;
+
+statement ok
+LOAD cronjob;
+
+statement ok
+CREATE QUEUE emails;
+
+# A schedule far in the future: this asserts the drain is registered with the
+# scheduler, not that it fires inside the test process.
+statement ok
+CREATE TABLE worker AS
+SELECT * FROM quackapi_queue_worker('emails', schedule := '0 0 0 1 1 *');
+
+query III
+SELECT queue, schedule, sql FROM worker;
+----
+emails	0 0 0 1 1 *	SELECT quackapi_ack('emails', id, delivery_generation) AS acked FROM quackapi_dequeue('emails', 1)
+
+query II
+SELECT j.schedule, j.query FROM cron_jobs() j JOIN worker w ON j.job_id = w.job_id;
+----
+0 0 0 1 1 *	SELECT quackapi_ack('emails', id, delivery_generation) AS acked FROM quackapi_dequeue('emails', 1)
+
+# cron_delete / cron_jobs stay cronjob's — quackapi wraps neither.
+query I
+SELECT cron_delete(job_id) AS deleted FROM worker;
+----
+true
+
+# sql := replaces the ack-drain with the operator's own handler SQL.
+statement ok
+CREATE TABLE custom AS
+SELECT * FROM quackapi_queue_worker('emails', schedule := '0 0 0 1 1 *', sql := 'SELECT 1 AS tick');
+
+query II
+SELECT schedule, sql FROM custom;
+----
+0 0 0 1 1 *	SELECT 1 AS tick
+
+query I
+SELECT cron_delete(job_id) AS deleted FROM custom;
+----
+true

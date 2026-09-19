@@ -65,10 +65,13 @@ jobs:
       ENABLE_EXTENSION_AUTOLOADING: "1"
       ENABLE_EXTENSION_AUTOINSTALL: "1"
       QUACKAPI_TEST_PG_DSN: postgresql://quackapi_pg_cache:qa_pg_cache_test@127.0.0.1:5432/quackapi_pg_cache_test
-      # BODY SCHEMA runs the community json_schema extension, which quackapi
-      # installs on first use. This job has the network and the tagged DuckDB
-      # build that makes that install resolve; a dev machine may not.
+      # BODY SCHEMA runs the community json_schema extension, which the suite
+      # bootstrap installs. This job has the network and the tagged DuckDB build
+      # that makes that install resolve; a dev machine may not.
       QUACKAPI_TEST_JSON_SCHEMA: "1"
+      # otlp and cronjob doing the real work: an OTLP receiver on a real port
+      # and a cron job registered in-process. Same network requirement.
+      QUACKAPI_TEST_COMPANIONS: "1"
     services:
       postgres:
         image: postgres:16

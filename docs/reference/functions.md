@@ -325,6 +325,27 @@ SELECT quackapi_nack('default', 1, false, 'no_retry');  -- dead
 
 ---
 
+### `quackapi_queue_worker(queue, schedule := …, sql := …, batch := …)`
+
+| | |
+|--|--|
+| **Kind** | Table function |
+| **Returns** | `queue`, `job_id`, `schedule`, `sql` |
+| **Needs** | community `cronjob` — throws naming it when not loaded |
+
+Registers the queue's drain with `cronjob`, which is the scheduler. Defaults:
+`schedule := '*/1 * * * * *'`, `batch := 1`, and a `sql` of
+`SELECT quackapi_ack(<queue>, id, delivery_generation) AS acked FROM quackapi_dequeue(<queue>, <batch>)`.
+
+```sql
+LOAD cronjob;
+SELECT * FROM quackapi_queue_worker('emails');
+-- remove it with cronjob's own function
+SELECT cron_delete('task_0');
+```
+
+---
+
 ## Durable table
 
 ### `quackapi_jobs`
@@ -344,6 +365,45 @@ Created on first `CREATE QUEUE`. Ordinary catalog table:
 ```sql
 SELECT id, payload, status FROM quackapi_jobs WHERE status = 'done';
 ```
+
+---
+
+## Companions
+
+quackapi `LOAD`s the extensions it composes and refuses by name when one is
+missing. It never `INSTALL`s at serve time or inside a handler: an install there
+fails a request instead of a setup, and a 404 from the community repository used
+to leave the server running as if nothing were wrong.
+
+| Extension | Needed for | Failure |
+|-----------|-----------|---------|
+| `curl_httpfs` | all outbound HTTP | `quackapi_serve` refuses |
+| `httpfs_timeout_retry` | outbound timeout / retry knobs | `quackapi_serve` refuses |
+| `otlp` | the OTLP endpoint, when `quackapi_otlp` names one | `quackapi_serve` refuses |
+| `cronjob` | `quackapi_queue_worker` | that call refuses |
+| `sitting_duck` | `quack_from_*` extractors | that call refuses |
+| `json_schema` | `BODY SCHEMA` validation | 500, extension named on stderr |
+| `nanoarrow` | `FORMAT arrow` responses | that response refuses |
+
+### `quackapi_otlp()`
+
+| | |
+|--|--|
+| **Kind** | Table function |
+| **Returns** | one row: `uri`, `catalog`, `state`, `detail` |
+| **`state`** | `serving` / `off` / `unavailable` / `error` |
+
+Re-reads `quackapi_otlp` and `quackapi_otlp_catalog`, so `SET` then `SELECT` is
+how the endpoint moves after LOAD. Inspection never fails the query — the
+enforcement lives in `quackapi_serve`.
+
+```sql
+SELECT uri, catalog, state FROM quackapi_otlp();
+-- otlp:localhost:4318   (empty)   serving
+```
+
+quackapi keeps no request log of its own. See
+[extension composition, recipe 6](../guide/extension-composition.md).
 
 ---
 
@@ -372,6 +432,8 @@ Outbound HTTP and HTTPS use DuckDB’s shared curl-backed HTTP stack — quackap
 |---------|---------|
 | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | CORS allow list; empty = off |
 | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | Serve memory preference when named param omitted |
+| `SET quackapi_otlp = 'local' \| 'off' \| 'otlp:host:port'` | OTLP endpoint created through `otlp`; an explicit URI is mandatory at serve |
+| `SET quackapi_otlp_catalog = 'my_ducklake'` | DuckLake / Iceberg catalog `otlp_serve` writes into; empty = local tables |
 
 ```sql
 SET quackapi_cors_origins = '*';

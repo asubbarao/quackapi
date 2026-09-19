@@ -45,6 +45,7 @@ exec 3>"$FIFO"
 
 {
   echo "INSTALL curl_httpfs FROM community;"
+  echo "INSTALL httpfs_timeout_retry FROM community;"
   echo "LOAD quackapi;"
   cat "$CONF/routes.sql"
   echo "SELECT * FROM quackapi_serve(${PORT}, health_routes := false, access_log := false);"

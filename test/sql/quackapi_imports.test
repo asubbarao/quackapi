@@ -1,0 +1,94 @@
+# name: test/sql/quackapi_imports.test
+# description: quackapi composes otlp / cronjob / httpfs_timeout_retry, and a missing companion is a startup error instead of a download
+# group: [sql]
+
+require quackapi
+
+# --- httpfs_timeout_retry owns the outbound timeout and retry knobs ----------
+# serve requires it the way it requires curl_httpfs. The per-operation settings
+# it registers are the active thing: quackapi no longer pins a ceiling of its
+# own onto every outbound HTTPParams.
+statement ok
+SELECT * FROM quackapi_serve(29420, host := '127.0.0.1');
+
+query II
+SELECT array_agg(DISTINCT name ORDER BY name) AS names, len(names) AS n
+FROM duckdb_settings()
+WHERE name IN ('httpfs_retries_file_operation', 'httpfs_timeout_file_operation_ms');
+----
+[httpfs_retries_file_operation, httpfs_timeout_file_operation_ms]	2
+
+statement ok
+SELECT * FROM quackapi_stop(29420);
+
+# --- Every companion below is absent from here on ---------------------------
+# A clean per-test directory proves the gates from product state rather than
+# from whatever the suite bootstrap happened to install.
+statement ok
+SET extension_directory = '__TEST_DIR__/no-companions';
+
+# --- otlp: default-created locally, never downloaded ------------------------
+# LOAD quackapi asks for the loopback receiver. Without the otlp extension it
+# reports what is missing instead of installing it, and quackapi keeps no
+# request history of its own to fall back on.
+query III
+SELECT uri, catalog = '' AS no_catalog, state FROM quackapi_otlp();
+----
+otlp:localhost:4318	true	unavailable
+
+statement ok
+SET quackapi_otlp_catalog = 'my_ducklake';
+
+query II
+SELECT catalog, state FROM quackapi_otlp();
+----
+my_ducklake	unavailable
+
+# An explicit endpoint is a promise the listen_url implies, so serve refuses.
+statement ok
+SET quackapi_otlp = 'otlp:localhost:14318';
+
+statement error
+SELECT * FROM quackapi_serve(29421, host := '127.0.0.1');
+----
+requires the 'otlp' extension
+
+query II
+SELECT uri, state FROM quackapi_otlp();
+----
+otlp:localhost:14318	unavailable
+
+# 'off' is the one setting that asks for nothing, so serve has nothing to check.
+statement ok
+SET quackapi_otlp = 'off';
+
+query II
+SELECT uri = '' AS no_uri, state FROM quackapi_otlp();
+----
+true	off
+
+statement ok
+SELECT * FROM quackapi_serve(29421, host := '127.0.0.1');
+
+statement ok
+SELECT * FROM quackapi_stop(29421);
+
+# --- cronjob runs the queue drain -------------------------------------------
+statement ok
+CREATE QUEUE drains;
+
+statement error
+SELECT * FROM quackapi_queue_worker('drains');
+----
+requires the 'cronjob' extension
+
+statement error
+SELECT * FROM quackapi_queue_worker('never_declared');
+----
+is not registered
+
+# --- sitting_duck is a setup step, not a download inside a SELECT -----------
+statement error
+SELECT method, path FROM quack_from_fastapi('bridges/from_x/fixtures/fastapi_mini');
+----
+requires the 'sitting_duck' extension
