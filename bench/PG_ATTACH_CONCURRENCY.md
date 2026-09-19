@@ -1,5 +1,14 @@
 # DuckDB `postgres` ATTACH under concurrency
 
+> **Superseded in part by `bench/PG_QUERY_2026_09_19.md`.** This note compares
+> native libpq against `ATTACH`-as-table-scan, which is the wrong comparand:
+> a route that reaches Postgres should use `postgres_query()`. Redone against
+> `postgres_query()` on a throwaway local PostgreSQL, the c=32 collapse below
+> does **not** reproduce — ATTACH plateaus rather than collapsing, and
+> `postgres_query()` scales past it. The native-libpq conclusion survives; the
+> 48x gap this note implies does not. Sections 1 and 2 (extension settings,
+> method) still stand.
+
 Research note for the quackapi vs FastAPI bench. Question: does a naive
 `ATTACH … (TYPE postgres)` open a **single** Postgres connection and serialize
 all concurrent HTTP workers behind it?

@@ -241,6 +241,29 @@ struct QuackapiStream {
 	bool binds_message = false;
 };
 
+//! One running server as quackapi_servers() reports it. The two budget columns
+//! and their high-water marks are here so "which budget is binding" is a
+//! question the server answers, not one an operator infers from client resets.
+struct QuackapiServerInfo {
+	string host;
+	int port = 0;
+	string http_client;
+	string http_client_reason;
+	//! Requests that can run at once. The single dial: the pending queue is
+	//! derived from it unless the operator named max_pending_requests.
+	int32_t worker_threads = 0;
+	//! Connections accepted while every worker is busy, before shedding starts.
+	int32_t max_pending_requests = 0;
+	//! Deepest concurrent in-flight requests. == worker_threads means the worker
+	//! budget has been fully subscribed at least once.
+	int64_t workers_peak = 0;
+	//! Connections answered 503 because the pending queue was full.
+	int64_t shed_requests = 0;
+	//! "none" (worker budget never filled), "workers" (it filled, nothing shed),
+	//! or "pending" (the queue filled and connections were shed).
+	string binding_budget;
+};
+
 //! Per-database quackapi state: the route registry, auth registry, and running servers.
 //! Lives in the DatabaseInstance's ObjectCache (non-evictable), so LOAD never
 //! touches the user's catalog and state dies with the database.
@@ -334,8 +357,8 @@ public:
 	bool HasServerOnPort(int port);
 	//! Host for the server on port, if any. Returns false if none.
 	bool GetServerHost(int port, string &host_out);
-	//! (host, port, http_client_active, http_client_reason) for each running server.
-	vector<std::tuple<string, int, string, string>> ListServers();
+	//! One row per running server, including what its HTTP budget has done.
+	vector<QuackapiServerInfo> ListServers();
 
 	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
 	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);

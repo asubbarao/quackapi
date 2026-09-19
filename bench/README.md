@@ -47,11 +47,13 @@ them at `/`, `/items/`, and `/admin/`. That is why the manual map is explicit.
   catalog-backed queue on the request path. Acknowledgements and surviving rows
   are counted after death.
 
-The quackapi server is explicitly configured with `worker_threads := 32` and
-`max_pending_requests := 256`. The 64-connection cell is 2x the active worker
-count. The 320-connection cell exceeds active plus pending capacity
-(`32 + 256`) and is expected to expose overload behavior, including sockets
-that close without an HTTP response.
+The quackapi server is configured with `worker_threads := 32`, which is the only
+HTTP dial: the pending queue follows it, so capacity is 32 active plus 256
+queued. `QUACKAPI_MAX_PENDING_REQUESTS` pins the queue separately when a cell
+wants the two budgets apart on purpose. The 64-connection cell is 2x the active
+worker count. The 320-connection cell exceeds capacity deliberately; past it,
+connections are shed with HTTP 503 naming the binding budget, never dropped
+without a response.
 
 The load generator is `bench/loadgen.py`, implemented with Python's standard
 library. This avoids making k6 a hidden prerequisite. It preserves a gzip CSV

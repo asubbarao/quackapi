@@ -327,9 +327,10 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	applied.push_back(StringUtil::Format("http read_timeout_sec=%d write_timeout_sec=%d "
 	                                     "(WHY: bound stalled clients so workers are not pinned forever)",
 	                                     opts.read_timeout_sec, opts.write_timeout_sec));
-	applied.push_back(StringUtil::Format("http worker_threads=%d (WHY: concurrent request handlers; cap prevents "
-	                                     "unbounded thread spawn under load)",
-	                                     opts.worker_threads));
+	applied.push_back(StringUtil::Format("http worker_threads=%d max_pending_requests=%d (WHY: one HTTP budget — "
+	                                     "concurrent handlers, plus a burst queue derived from them unless named. "
+	                                     "Past both, connections get 503, never a silent reset)",
+	                                     opts.worker_threads, opts.max_pending_requests));
 	applied.push_back(StringUtil::Format("http payload_max_length=%llu (WHY: body size DoS guard — 413 above cap)",
 	                                     (unsigned long long)QUACKAPI_PAYLOAD_MAX_LENGTH));
 	applied.push_back(StringUtil::Format("access_log=%s log_level=%s (WHY: every request → structured stderr line "

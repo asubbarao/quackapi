@@ -153,7 +153,7 @@ static void RequireNativePgSupport(const string &pg_dsn, const char *function_na
 }
 
 static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
-	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
+	auto read = [&](const string &name, int64_t fallback, int64_t maximum, bool *provided = nullptr) {
 		Value setting;
 		int64_t value = fallback;
 		auto named = input.named_parameters.find(name);
@@ -162,8 +162,14 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 				throw InvalidInputException("%s must not be NULL", name);
 			}
 			value = named->second.GetValue<int64_t>();
+			if (provided) {
+				*provided = true;
+			}
 		} else if (context.TryGetCurrentSetting("quackapi_" + name, setting) && !setting.IsNull()) {
 			value = setting.GetValue<int64_t>();
+			if (provided) {
+				*provided = true;
+			}
 		}
 		if (value <= 0 || value > maximum) {
 			throw InvalidInputException("%s must be between 1 and %lld", name, maximum);
@@ -172,7 +178,11 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 	};
 	opts.query_timeout_ms = read("query_timeout_ms", 30000, 86400000);
 	opts.max_response_bytes = read("max_response_bytes", 16 * 1024 * 1024, 1024LL * 1024 * 1024);
-	opts.max_pending_requests = static_cast<int32_t>(read("max_pending_requests", 256, 100000));
+	// The fallback here is only a placeholder: when nothing named it, ServeExec
+	// derives the pending queue from worker_threads so the HTTP budget is one dial.
+	opts.max_pending_requests = static_cast<int32_t>(
+	    read("max_pending_requests", static_cast<int64_t>(QUACKAPI_DEFAULT_WORKER_THREADS) * QUACKAPI_PENDING_PER_WORKER,
+	         100000, &opts.max_pending_requests_set));
 }
 
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
@@ -274,6 +284,12 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto wt_entry = input.named_parameters.find("worker_threads");
 	if (wt_entry != input.named_parameters.end()) {
 		bind_data->worker_threads = wt_entry->second.GetValue<int32_t>();
+		// A non-positive count used to fall back to the default inside the server
+		// constructor, so worker_threads := 0 served 32 and said nothing.
+		if (bind_data->worker_threads < 1 || bind_data->worker_threads > QUACKAPI_MAX_WORKER_THREADS) {
+			throw InvalidInputException("quackapi_serve: worker_threads must be between 1 and %d",
+			                            QUACKAPI_MAX_WORKER_THREADS);
+		}
 	}
 	auto kam_entry = input.named_parameters.find("keep_alive_max_count");
 	if (kam_entry != input.named_parameters.end()) {
@@ -417,6 +433,12 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.enable_http_metadata_cache = bind_data.enable_http_metadata_cache;
 	opts.enable_http_metadata_cache_set = bind_data.enable_http_metadata_cache_set;
 	opts.worker_threads = bind_data.worker_threads;
+	// One dial: the burst queue follows the worker count unless the operator
+	// named a pending size. Two independent literals meant a sweep that raised
+	// worker_threads still crossed the old 256-connection queue.
+	if (!opts.max_pending_requests_set) {
+		opts.max_pending_requests = opts.worker_threads * QUACKAPI_PENDING_PER_WORKER;
+	}
 	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
 	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
 	opts.read_timeout_sec = bind_data.read_timeout_sec;
@@ -495,13 +517,13 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 		if (running.empty()) {
 			message = "No quackapi servers running";
 		} else if (running.size() == 1) {
-			auto only_port = std::get<1>(running[0]);
+			auto only_port = running[0].port;
 			state.StopServer(only_port);
 			message = StringUtil::Format("Stopped quackapi server on port %d", only_port);
 		} else {
 			vector<string> ports;
 			for (auto &server : running) {
-				ports.push_back(to_string(std::get<1>(server)));
+				ports.push_back(to_string(server.port));
 			}
 			throw InvalidInputException("quackapi_stop: %llu servers are running (ports %s) — pass a port, "
 			                            "or all_servers := true to stop every one",
@@ -775,7 +797,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 struct ServersBindData : public TableFunctionData {};
 
 struct ServersGlobalState : public GlobalTableFunctionState {
-	vector<std::tuple<string, int, string, string>> servers;
+	vector<QuackapiServerInfo> servers;
 	idx_t offset = 0;
 };
 
@@ -791,6 +813,18 @@ static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindIn
 	names.emplace_back("http_client");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("http_client_reason");
+	// The HTTP budget, and what it has actually done, so an operator asks the
+	// server which budget is binding instead of counting resets at the client.
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("worker_threads");
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("max_pending_requests");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("workers_peak");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("shed_requests");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("binding_budget");
 	return make_uniq<ServersBindData>();
 }
 
@@ -805,15 +839,16 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 	idx_t row = 0;
 	while (state.offset < state.servers.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &server = state.servers[state.offset];
-		const auto &host = std::get<0>(server);
-		const auto port = std::get<1>(server);
-		const auto &http_client = std::get<2>(server);
-		const auto &http_client_reason = std::get<3>(server);
-		output.SetValue(0, row, Value(host));
-		output.SetValue(1, row, Value::INTEGER(port));
-		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", host, port)));
-		output.SetValue(3, row, Value(http_client));
-		output.SetValue(4, row, Value(http_client_reason));
+		output.SetValue(0, row, Value(server.host));
+		output.SetValue(1, row, Value::INTEGER(server.port));
+		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", server.host, server.port)));
+		output.SetValue(3, row, Value(server.http_client));
+		output.SetValue(4, row, Value(server.http_client_reason));
+		output.SetValue(5, row, Value::INTEGER(server.worker_threads));
+		output.SetValue(6, row, Value::INTEGER(server.max_pending_requests));
+		output.SetValue(7, row, Value::BIGINT(server.workers_peak));
+		output.SetValue(8, row, Value::BIGINT(server.shed_requests));
+		output.SetValue(9, row, Value(server.binding_budget));
 		row++;
 		state.offset++;
 	}
@@ -895,8 +930,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BIGINT, Value::BIGINT(30000));
 	config.AddExtensionOption("quackapi_max_response_bytes", "Maximum uncompressed response bytes", LogicalType::BIGINT,
 	                          Value::BIGINT(16 * 1024 * 1024));
-	config.AddExtensionOption("quackapi_max_pending_requests", "Maximum queued HTTP connections", LogicalType::BIGINT,
-	                          Value::BIGINT(256));
+	// NULL (default) means "derive it": the pending queue follows worker_threads,
+	// so the HTTP budget is one dial. A SET here pins it and stops the derivation.
+	config.AddExtensionOption("quackapi_max_pending_requests",
+	                          "Maximum queued HTTP connections. Unset (default) derives it from "
+	                          "worker_threads; setting it pins the queue independently.",
+	                          LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	config.AddExtensionOption("quackapi_graphql_allow_all", "Explicit legacy opt-in to public GraphQL catalog exposure",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.

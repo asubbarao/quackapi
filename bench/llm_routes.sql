@@ -26,7 +26,12 @@
 LOAD httpfs;
 SET GLOBAL force_download=true;   -- see fanout_routes.sql: httpfs HEAD probe
 SET memory_limit='4GB';
-SET threads=32;
+-- SET threads=32 used to sit here. It is the DuckDB query budget, and pinning it
+-- to the same 32 as the HTTP worker budget made the two fight: every in-flight
+-- handler holds a worker thread AND quackapi_enqueue opens a nested connection
+-- that wants query capacity of its own, so the ask at 32 concurrent requests was
+-- twice what was on offer. The two are different resources. Leave the query
+-- budget at DuckDB's default (all cores) and size the HTTP side below.
 
 -- IMPORTANT — serve this file with worker_threads WELL ABOVE peak concurrency:
 --   SELECT * FROM quackapi_serve(8000, worker_threads := 128);
@@ -37,6 +42,8 @@ SET threads=32;
 -- slow as ollama generate (~1.2s), a 32-worker pool starves almost immediately.
 -- Raising it to 128 removes the cliff completely: ~0ms overhead over the upstream's
 -- own service time. Full measurements: bench/LLM_GATEWAY.md.
+-- worker_threads is the only HTTP dial: the pending queue follows it, and past
+-- both the server answers 503 rather than dropping the connection.
 
 CREATE OR REPLACE QUEUE llm_log WITH (max_attempts=5, visibility_timeout='60s');
 

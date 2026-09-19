@@ -211,7 +211,7 @@ the “PDF service” is a function call in the same address space — not an RP
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format` |
-| `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
+| `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason, worker_threads, max_pending_requests, workers_peak, shed_requests, binding_budget` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
 

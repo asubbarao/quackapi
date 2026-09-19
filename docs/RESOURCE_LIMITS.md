@@ -17,12 +17,22 @@ SELECT status, body FROM quackapi_request(
 );
 ```
 
-The defaults are a 30-second execution budget, a 16 MiB response cap, and 256
-pending HTTP worker tasks (accepted connections). Configure the defaults with
-`quackapi_query_timeout_ms`, `quackapi_max_response_bytes`, and
-`quackapi_max_pending_requests`, or pass the named server options. In-process
+The defaults are a 30-second execution budget and a 16 MiB response cap.
+
+The HTTP budget is one dial. `worker_threads` (default 32, maximum 4096) is how
+many requests run at once; `max_pending_requests` is derived from it as eight
+accepted connections per worker — 256 at the default — unless the operator names
+it or sets `quackapi_max_pending_requests`, which pins the queue independently.
+Raising `worker_threads` therefore raises the queue with it, instead of leaving
+a sweep to cross a queue size it never chose. Neither is the DuckDB `threads`
+setting: that is the query budget, a different resource, and `quackapi_serve()`
+does not touch it.
+
+Configure the other defaults with `quackapi_query_timeout_ms` and
+`quackapi_max_response_bytes`, or pass the named server options. In-process
 requests accept the execution and response options too. All limits must be
-positive; their maximum values are one day, 1 GiB, and 100,000 pending requests.
+positive; their maximum values are one day, 1 GiB, and 100,000 pending
+requests.
 
 A shared watchdog interrupts an active DuckDB connection when its budget
 expires. Middleware and GraphQL inherit the request budget; outbound HTTP
@@ -42,9 +52,19 @@ DuckDB; only a handler identified as inapplicable to native execution can fall
 back. A connection failure after a write was sent can leave the write outcome
 unknown, so applications should use idempotency keys when retrying writes.
 
-The HTTP worker pool rejects enqueue attempts when its bounded connection queue is
-full. Rejected connections are closed; the admission mechanism does not promise
-an HTTP 503 response. Active workers remain bounded by `worker_threads`.
+Past `worker_threads` active plus `max_pending_requests` queued, a connection is
+shed with `503 Service Unavailable`, `Retry-After: 1`, `X-Quackapi-Budget:
+pending` and a body naming both numbers. It is answered on the accept thread and
+never reaches a route or a DuckDB connection. The `::listen()` backlog is sized
+to at least `SOMAXCONN` so the kernel does not refuse a burst before quackapi
+can answer it; the OS still clamps that to `kern.ipc.somaxconn` /
+`net.core.somaxconn`.
+
+`quackapi_servers()` reports the budget and what it has done: `worker_threads`,
+`max_pending_requests`, `workers_peak` (deepest concurrent in-flight requests),
+`shed_requests`, and `binding_budget` — `none` while the worker budget has never
+filled, `workers` once it has, `pending` once connections have been shed. The
+first shed also writes one line to stderr at WARN.
 
 SSE applies a finite execution budget to each query/fetch operation and a
 cumulative output cap. Once headers have been sent, a limit closes the stream;
