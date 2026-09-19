@@ -181,7 +181,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **Rate limit (HTTP)** | **shipped** — `RATE LIMIT n PER s [BY ip\|token]` → 429 | `rate_limit.test.sh` |
 | **ETag-304 / CACHE TTL** | not built (outbound `cache_httpfs` is separate) | SPEC cache_etag |
 | **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor, SQL bind, stderr access log | `request_id.test.sh` |
-| **curl_httpfs guarantee** | **shipped** — `http_client:='curl'` fails serve if missing; auto loud fallback | batteries + `curl_httpfs_client.test.sh` |
+| **curl_httpfs guarantee** | **shipped** — every serve loads curl_httpfs or fails before binding; no httplib fallback | batteries + required-extension test |
 | **RFC 9457 problem+json** | FastAPI-shaped 422 only | `/tmp/quackapi_spec_problem_details/SPEC.md` |
 | **Envelope** default JSON **array of rows**; `ENVELOPE object` + `EMPTY STATUS` shipped | array stays default; object/404 opt-in | `docs/reference/ddl.md`; `quackapi_envelope.test` |
 | **Pydantic binder fidelity** native core shipped | field-level body `loc`, missing/null/default distinction, multi-error, typed BODY TYPE | `docs/PYDANTIC_PARITY.md` |

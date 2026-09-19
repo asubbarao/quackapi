@@ -7,8 +7,8 @@
 //   1. http://   → the VENDORED httplib client, checked out of a per-host
 //                  free-list pool (QuackapiHttpPool). Keep-alive + TCP_NODELAY.
 //                  Full method support, no companion extension required.
-//   2. https://  → DuckDB's HTTPUtil, so `LOAD curl_httpfs` / `LOAD httpfs`
-//                  transparently supplies TLS. Pooled the same way, via
+//   2. https://  → DuckDB's HTTPUtil, with mandatory `LOAD curl_httpfs`
+//                  supplying the outbound client. Pooled the same way, via
 //                  HTTPUtil::Request(request, client) which reuses the client
 //                  we hand it instead of building a fresh one.
 //
@@ -73,7 +73,8 @@ struct QuackapiHttpFetch {
 	                                   const unordered_map<string, string> &extra_headers = {}, int32_t stall_ms = 0);
 
 	//! POST url with a raw body and Content-Type.
-	//! http:// needs nothing loaded; https:// requires httpfs / curl_httpfs.
+	//! http:// uses the local plain-HTTP test transport; https:// requires the
+	//! curl_httpfs client selected by quackapi_serve.
 	static QuackapiHttpFetchResult Post(DatabaseInstance &db, const string &url, const string &body,
 	                                    const string &content_type = "application/x-www-form-urlencoded",
 	                                    const unordered_map<string, string> &extra_headers = {});

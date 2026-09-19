@@ -98,6 +98,23 @@ bool IsPlainHTTP(const string &url) {
 	return StringUtil::StartsWith(StringUtil::Lower(url), "http://");
 }
 
+void RequireCurlHttpfs(DatabaseInstance &db) {
+	Value implementation;
+	string active = HTTPUtil::Get(db).GetName();
+	auto &config = DBConfig::GetConfig(db);
+	if (config.TryGetCurrentSetting("httpfs_client_implementation", implementation) && !implementation.IsNull()) {
+		auto value = StringUtil::Lower(implementation.GetValue<string>());
+		StringUtil::Trim(value);
+		if (value == "curl") {
+			return;
+		}
+	}
+	throw InvalidConfigurationException(
+	    "quackapi outbound HTTP requires curl_httpfs and httpfs_client_implementation='curl'. "
+	    "Install it with INSTALL curl_httpfs FROM community, then retry. Active HTTPUtil is '%s'.",
+	    active);
+}
+
 //! Split "http://host:port" (from SplitURL origin) into host + port.
 void SplitOriginHostPort(const string &origin, string &host, int &port) {
 	host.clear();
@@ -409,6 +426,7 @@ string QuackapiHttpFetch::ActiveHttpUtilName(DatabaseInstance &db) {
 
 QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const string &url,
                                                const unordered_map<string, string> &extra_headers, int32_t stall_ms) {
+	RequireCurlHttpfs(db);
 	if (stall_ms < 0) {
 		throw InvalidInputException("quackapi_fetch stall_ms must be >= 0");
 	}
@@ -438,6 +456,7 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const strin
 QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const string &url, const string &body,
                                                 const string &content_type,
                                                 const unordered_map<string, string> &extra_headers) {
+	RequireCurlHttpfs(db);
 	if (IsPlainHTTP(url)) {
 		// The vendored httplib implements POST, so plain HTTP needs no companion
 		// extension at all — unlike the HTTPUtil path below.
@@ -450,14 +469,14 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 	}
 
 	// Built-In HTTPLibClient does not implement POST (http_util.cpp). Surface a
-	// clear error pointing operators at curl_httpfs / httpfs rather than a raw
-	// NotImplementedException deep in the client.
+	// clear error pointing operators at the mandatory curl_httpfs dependency
+	// rather than a raw NotImplementedException deep in the client.
 	auto &util = HTTPUtil::Get(db);
 	const auto util_name = util.GetName();
 	if (util_name == "Built-In") {
 		throw InvalidConfigurationException(
 		    "quackapi outbound POST over https requires an HTTP client with full method support. "
-		    "LOAD curl_httpfs (recommended) or LOAD httpfs, then retry. Active HTTPUtil is '%s'.",
+		    "LOAD curl_httpfs, then retry. Active HTTPUtil is '%s'.",
 		    util_name);
 	}
 

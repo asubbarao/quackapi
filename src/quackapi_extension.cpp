@@ -126,9 +126,6 @@ struct ServeBindData : public TableFunctionData {
 	bool compression = true;
 	//! Min body size in bytes before compression. Default 256.
 	idx_t compression_min_bytes = 256;
-	//! Outbound HTTP client preference: auto|curl|httplib (default auto).
-	string http_client = "auto";
-	bool http_client_set = false;
 	//! Point quack's auth callbacks at quackapi's bridges. Default false.
 	bool wire_quack_auth = false;
 	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
@@ -146,7 +143,8 @@ struct ServeBindData : public TableFunctionData {
 static void RequireNativePgSupport(const string &pg_dsn, const char *function_name) {
 	if (!pg_dsn.empty() && !QuackapiPgNativeAvailable()) {
 		throw InvalidInputException("%s: pg_dsn needs the native libpq path, which this build does not link; "
-		                            "rebuild with -DQUACKAPI_ENABLE_LIBPQ=ON",
+		                            "use the vcpkg-backed release build or rebuild with "
+		                            "-DQUACKAPI_ENABLE_LIBPQ=ON",
 		                            function_name);
 	}
 }
@@ -329,32 +327,6 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->compression_min_bytes = static_cast<idx_t>(v);
 		}
 	}
-	// http_client named param wins; else SET quackapi_http_client (default auto).
-	auto hc_entry = input.named_parameters.find("http_client");
-	if (hc_entry != input.named_parameters.end()) {
-		bind_data->http_client = hc_entry->second.GetValue<string>();
-		bind_data->http_client_set = true;
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_http_client", setting) && !setting.IsNull()) {
-			auto s = setting.GetValue<string>();
-			// The option's own default is "auto"; only a change from it is an ask.
-			if (!s.empty() && s != "auto") {
-				bind_data->http_client = s;
-				bind_data->http_client_set = true;
-			}
-		}
-	}
-	// Legal values belong at bind — the probe this selects happens deep inside
-	// serve, after the listener has already been accepted as startable.
-	{
-		auto pref = StringUtil::Lower(bind_data->http_client);
-		StringUtil::Trim(pref);
-		if (pref != "auto" && pref != "curl" && pref != "httplib") {
-			throw InvalidInputException("http_client must be one of [auto, curl, httplib], not '%s'",
-			                            bind_data->http_client);
-		}
-	}
 	auto block_entry = input.named_parameters.find("block");
 	if (block_entry != input.named_parameters.end()) {
 		bind_data->block = block_entry->second.GetValue<bool>();
@@ -437,13 +409,11 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
 	opts.read_timeout_sec = bind_data.read_timeout_sec;
 	opts.write_timeout_sec = bind_data.write_timeout_sec;
-	opts.http_client = bind_data.http_client;
-	opts.http_client_set = bind_data.http_client_set;
 	opts.wire_quack_auth = bind_data.wire_quack_auth;
 	opts.pg_dsn = bind_data.pg_dsn;
 
 	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
-	// Outbound client: auto prefers curl_httpfs (loud fallback); curl requires it.
+	// WHY: the listener must not exist unless its only outbound client is ready.
 	ApplyQuackapiServerDefaults(context, opts);
 	// Compose request_id source: community tsid if LOADable, else core uuidv7.
 	ProbeQuackapiRequestIdSource(*context.db, opts);
@@ -901,18 +871,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Minimum response body size (bytes) before compression. "
 	                          "Default 256. Overridden by compression_min_bytes named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
-	// SET quackapi_http_client = 'auto' | 'curl' | 'httplib'
-	// Default auto: INSTALL+LOAD curl_httpfs; fall back to httplib with loud reason.
-	// curl: REQUIRE curl_httpfs — fail serve if INSTALL/LOAD fails (no silent fallback).
-	// httplib: force stock client. Serve-time http_client := '…' wins.
-	// Inbound server remains httplib regardless.
-	config.AddExtensionOption("quackapi_http_client",
-	                          "Outbound HTTP client for httpfs/route fetches: auto|curl|httplib. "
-	                          "Default auto prefers curl_httpfs (pool, HTTP/2, async) and falls back "
-	                          "to httplib with http_client_reason on /healthz when unavailable. "
-	                          "curl fails serve if curl_httpfs cannot INSTALL/LOAD. Overridden by "
-	                          "http_client named parameter. Does not change the inbound HTTP server.",
-	                          LogicalType::VARCHAR, Value("auto"));
 	// SET quackapi_pg_dsn = 'postgresql://…' — native libpq path for serve + request.
 	// Empty (default) = DuckDB handler path only. Overridden by pg_dsn named parameter.
 	config.AddExtensionOption("quackapi_pg_dsn",
@@ -931,7 +889,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
-	// Also carries compression + compression_min_bytes + http_client.
+	// Also carries compression + compression_min_bytes.
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
@@ -954,7 +912,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["compression"] = LogicalType::BOOLEAN;
 	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
-	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
 	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	serve.named_parameters["block"] = LogicalType::BOOLEAN;
 	serve.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;

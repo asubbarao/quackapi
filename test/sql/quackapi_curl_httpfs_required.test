@@ -1,0 +1,14 @@
+# name: test/sql/quackapi_curl_httpfs_required.test
+# description: quackapi refuses to serve when its mandatory curl_httpfs dependency is unavailable
+# group: [sql]
+
+require quackapi
+
+# Keep this process from finding a previously installed community extension.
+statement ok
+SET extension_directory = '/tmp';
+
+statement error
+SELECT * FROM quackapi_serve(29408, host := '127.0.0.1');
+----
+required extension curl_httpfs

@@ -30,16 +30,12 @@ log_level must be one of
 statement ok
 SET quackapi_log_level = 'info';
 
-# http_client was validated inside serve, after the bind had already succeeded.
+# http_client is a read-only diagnostic, not a serving choice. The old stock
+# client spelling must not be accepted as an input.
 statement error
-SELECT * FROM quackapi_serve(29404, host := '127.0.0.1', http_client := 'libcurl');
+SELECT * FROM quackapi_serve(29404, host := '127.0.0.1', http_client := 'httplib');
 ----
-http_client must be one of
-
-statement error
-SELECT * FROM quackapi_serve(29405, host := '127.0.0.1', http_client := '');
-----
-http_client must be one of
+http_client
 
 # ---------------------------------------------------------------------------
 # quackapi_stop() with no port: never a silent teardown of servers this caller

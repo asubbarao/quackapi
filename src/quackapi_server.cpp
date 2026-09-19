@@ -2195,11 +2195,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			auto uptime_sec =
 			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count();
 			if (ready) {
-				// Surface active outbound HTTP client + reason so operators /
-				// readiness probes can confirm batteries applied. auto fallback
-				// is never silent: reason=curl_httpfs_unavailable when httplib.
+				// Surface the mandatory outbound HTTP client so operators /
+				// readiness probes can confirm the process-wide HTTPUtil choice.
 				const string http_client =
-				    options.http_client_active.empty() ? string("httplib") : options.http_client_active;
+				    options.http_client_active.empty() ? string("curl") : options.http_client_active;
 				SetJson(
 				    res, 200,
 				    StringUtil::Format(

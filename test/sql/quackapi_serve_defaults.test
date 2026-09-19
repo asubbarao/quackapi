@@ -21,6 +21,11 @@ SELECT * FROM quackapi_serve();
 http://127.0.0.1:8000
 
 query I
+SELECT http_client FROM quackapi_servers() WHERE port = 8000;
+----
+curl
+
+query I
 SELECT current_setting('memory_limit') = (SELECT value FROM memory_limit_before);
 ----
 true
@@ -72,11 +77,11 @@ statement ok
 SET preserve_insertion_order = true;
 
 # ---------------------------------------------------------------------------
-# tune := true asks for the whole battery. http_client := 'httplib' keeps the
-# probe off the network; curl_httpfs would be INSTALLed from the community repo.
+# tune := true asks for the whole battery. curl_httpfs remains mandatory even
+# when the incidental process-wide tuning is explicitly requested.
 # ---------------------------------------------------------------------------
 query I
-SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', tune := true, http_client := 'httplib');
+SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', tune := true);
 ----
 http://127.0.0.1:29302
 

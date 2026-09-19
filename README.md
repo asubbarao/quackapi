@@ -203,14 +203,13 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', block := false, …)` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, memory_limit := …, block := false, …)` | `listen_url` |
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
-| Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | auto=prefer+loud fallback; curl=require; httplib=force stock |
 
 Built-in OpenAPI (not listed in `quackapi_routes()`):
 
@@ -346,7 +345,7 @@ so every request paid a full dial. Against an ollama endpoint whose floor is
 
 `http://` uses the vendored httplib client, which implements POST — no companion
 extension needed. `https://` goes through `HTTPUtil`, pooled the same way, so
-`LOAD curl_httpfs` (or `httpfs`) supplies TLS.
+`LOAD curl_httpfs` supplies the mandatory outbound client.
 
 Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
 `FROM range(1000)` would issue one request while reporting 1000 rows.
@@ -358,10 +357,10 @@ Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, an
 | `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
 
 Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
-`quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async).
-`http_client := 'auto'` falls back to httplib with a loud `http_client_reason` on
-`/healthz` / `quackapi_servers()`; `http_client := 'curl'` **fails serve** if
-curl_httpfs cannot INSTALL/LOAD — see [`docs/curl_httpfs.md`](docs/curl_httpfs.md).
+`quackapi_serve` **requires `curl_httpfs`** (pool + HTTP/2 + async) and fails before
+binding if it cannot be loaded. The read-only `http_client` diagnostic on
+`/healthz` / `quackapi_servers()` always reports `curl`; see
+[`docs/curl_httpfs.md`](docs/curl_httpfs.md).
 
 ---
 
@@ -382,7 +381,7 @@ LOAD quackapi;
 | **CI / platforms** | linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64 |
 | **Community CDN** | `…/v1.5.5/{platform}/quackapi.duckdb_extension.gz` |
 | **Wasm** | excluded (no server sockets) |
-| **Native Postgres (`pg_dsn`)** | not in the distributed builds — source build with `-DQUACKAPI_ENABLE_LIBPQ=ON` |
+| **Native Postgres (`pg_dsn`)** | included in distributed builds through static vcpkg `libpq` |
 
 See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
 
@@ -417,13 +416,12 @@ LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
 **Target DuckDB:** **v1.5.5 only.** Dependencies: C++17, DuckDB’s bundled
-**httplib** + **mbedtls** only — no vcpkg, no libcurl, no libpq.
-
-The native Postgres `pg_dsn` path links `libpq`, which `find_library` resolves to
-a host path (Homebrew's keg here), so it is off by default and a distributed
-binary never depends on it. Build it with `-DQUACKAPI_ENABLE_LIBPQ=ON` and run it
-where that `libpq` exists; without it, `pg_dsn` is an error rather than a setting
-that quietly does nothing.
+**httplib** + **mbedtls**, and the statically linked vcpkg `libpq` package. The
+release build pins vcpkg to `84bab45d415d22042bd0b9081aea57f362da3f35` and does
+not require a machine-installed libpq at runtime. Static libpq brings its
+PostgreSQL license and the package's static TLS/compression dependencies into
+the build; it increases build time and artifact size. Without the vcpkg-backed
+native build, `pg_dsn` fails explicitly instead of silently using ATTACH.
 
 ---
 

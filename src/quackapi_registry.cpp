@@ -481,7 +481,7 @@ vector<std::tuple<string, int, string, string>> QuackapiState::ListServers() {
 	result.reserve(servers.size());
 	for (auto &kv : servers) {
 		const auto &opts = kv.second->Options();
-		string client = opts.http_client_active.empty() ? string("httplib") : opts.http_client_active;
+		string client = opts.http_client_active.empty() ? string("curl") : opts.http_client_active;
 		string reason = opts.http_client_reason;
 		result.emplace_back(kv.second->Host(), kv.second->Port(), std::move(client), std::move(reason));
 	}
