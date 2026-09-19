@@ -86,45 +86,8 @@ DROP ROUTE typed_increment;
 ----
 Dropped route typed_increment
 
-# JSON Pointer numeric segments use the actual payload container: object keys
-# remain JSON strings, including a leading-zero key, while array indexes are numbers.
-query I
-CREATE ROUTE numeric_object_key POST '/numeric-object-key'
-  BODY SCHEMA '{"type":"object","properties":{"01":{"type":"integer","maximum":1}}}'
-  AS SELECT 1 AS ok;
-----
-Route numeric_object_key: POST /numeric-object-key
-
-query II
-SELECT status, contains(decode(body), '"loc":["body","01"]')
-FROM quackapi_request('POST', '/numeric-object-key', '{"01":2}');
-----
-422	true
-
-query I
-DROP ROUTE numeric_object_key;
-----
-Dropped route numeric_object_key
-
-# Error-location parsing bounds its own JSON walk. A hostile deeply nested body
-# still returns a normal 422 instead of recursing on the request stack.
-query I
-CREATE ROUTE deeply_nested_body POST '/deeply-nested-body'
-  BODY SCHEMA '{"type":"array","items":{"type":"integer"}}'
-  AS SELECT 1 AS ok;
-----
-Route deeply_nested_body: POST /deeply-nested-body
-
-query I
-SELECT status
-FROM quackapi_request('POST', '/deeply-nested-body', repeat('[', 129) || '0' || repeat(']', 129));
-----
-422
-
-query I
-DROP ROUTE deeply_nested_body;
-----
-Dropped route deeply_nested_body
+# JSON Pointer error locations need the community json_schema extension at
+# request time, so they live in test/sql/quackapi_body_schema.test.
 
 # Missing input takes DEFAULT NULL; explicit JSON null takes the separate native
 # null path; the string "null" is still a string and fails INTEGER conversion.

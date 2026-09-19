@@ -163,40 +163,8 @@ DROP ROUTE keepme;
 ----
 Dropped route keepme
 
-# ---------------------------------------------------------------------------
-# BODY SCHEMA enforcement via quackapi_request (reject bad body, accept good)
-# maximum:10 is schema-only — SQL INTEGER bind would accept 100 without it.
-# ---------------------------------------------------------------------------
-query I
-CREATE ROUTE with_schema POST '/with-schema'
-  BODY SCHEMA '{"type":"object","required":["n"],"properties":{"n":{"type":"integer","maximum":10}}}'
-  AS SELECT $n::INTEGER AS n;
-----
-Route with_schema: POST /with-schema
-
-# Schema maximum violated (would bind fine as INTEGER) → 422
-query II
-SELECT status, contains(decode(body), '"loc":["body","n"]')
-FROM quackapi_request('POST', '/with-schema', '{"n":100}');
-----
-422	true
-
-# Wrong type → 422
-query I
-SELECT status FROM quackapi_request('POST', '/with-schema', '{"n":"not-int"}');
-----
-422
-
-# Valid body → 200
-query II
-SELECT status, decode(body) FROM quackapi_request('POST', '/with-schema', '{"n":1}');
-----
-200	[{"n":1}]
-
-query I
-DROP ROUTE with_schema;
-----
-Dropped route with_schema
+# BODY SCHEMA enforcement needs the community json_schema extension at request
+# time, so it lives in test/sql/quackapi_body_schema.test.
 
 # Unterminated BODY SCHEMA errors
 statement error

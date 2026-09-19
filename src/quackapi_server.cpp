@@ -690,9 +690,13 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 	return true;
 }
 
+//! Whether the body failed the schema, or the schema could never be run. A
+//! server that cannot validate has not discovered anything about the request.
+enum class BodySchemaResult { VALID, INVALID, UNAVAILABLE };
+
 //! Validate body against BODY SCHEMA using community json_schema extension.
 //! json_schema_validate returns true on pass and THROWS on fail — wrap with try().
-bool ValidateBodySchema(Connection &con, const string &schema, const string &raw_body, string &err_json) {
+BodySchemaResult ValidateBodySchema(Connection &con, const string &schema, const string &raw_body, string &err_json) {
 	// LOAD is idempotent; INSTALL FROM community on first failure (network).
 	auto load = con.Query("LOAD json_schema");
 	if (load->HasError()) {
@@ -702,8 +706,8 @@ bool ValidateBodySchema(Connection &con, const string &schema, const string &raw
 		}
 		if (load->HasError()) {
 			fprintf(stderr, "quackapi: json_schema unavailable: %s\n", load->GetError().c_str());
-			err_json = ValidationErrorJsonBody("json_schema extension unavailable", "value_error");
-			return false;
+			err_json = "{\"detail\":\"Body schema validation is unavailable\"}";
+			return BodySchemaResult::UNAVAILABLE;
 		}
 	}
 	// try() → true on pass, NULL when the function throws (never returns false).
@@ -711,12 +715,12 @@ bool ValidateBodySchema(Connection &con, const string &schema, const string &raw
 	if (res->HasError()) {
 		fprintf(stderr, "quackapi: body schema check error: %s\n", res->GetError().c_str());
 		err_json = ValidationErrorJsonBody("Body schema validation failed", "value_error");
-		return false;
+		return BodySchemaResult::INVALID;
 	}
 	auto chunk = res->Fetch();
 	bool ok = chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull() && chunk->GetValue(0, 0).GetValue<bool>();
 	if (ok) {
-		return true;
+		return BodySchemaResult::VALID;
 	}
 	// Recover a client-facing message from the bare throw.
 	string msg = "Body schema validation failed";
@@ -735,7 +739,7 @@ bool ValidateBodySchema(Connection &con, const string &schema, const string &raw
 		}
 	}
 	err_json = ValidationErrorJsonSchema(msg, "value_error", raw_body);
-	return false;
+	return BodySchemaResult::INVALID;
 }
 
 //! Run DuckDB's native JSON transform in strict mode. This is deliberately
@@ -3048,8 +3052,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						return;
 					}
 					if (!match.route.body_schema.empty()) {
-						if (!ValidateBodySchema(con, match.route.body_schema, req.body, err_json)) {
-							SetJson(res, 422, err_json);
+						auto schema_result = ValidateBodySchema(con, match.route.body_schema, req.body, err_json);
+						if (schema_result != BodySchemaResult::VALID) {
+							SetJson(res, schema_result == BodySchemaResult::INVALID ? 422 : 500, err_json);
 							finish();
 							return;
 						}

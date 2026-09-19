@@ -1,0 +1,86 @@
+# name: test/sql/quackapi_body_schema.test
+# description: BODY SCHEMA enforcement, which runs the community json_schema extension
+# group: [sql]
+
+require quackapi
+
+require json
+
+# BODY SCHEMA is validated by `json_schema`, which quackapi installs from the
+# community repository on first use. `require` cannot ask for a community
+# extension, so the dependency is declared as an env gate instead: without it
+# these assertions read as a broken response builder rather than a missing
+# extension. CI sets it on the job that has a network and a tagged DuckDB.
+require-env QUACKAPI_TEST_JSON_SCHEMA
+
+# maximum:10 is schema-only — SQL INTEGER bind would accept 100 without it.
+query I
+CREATE ROUTE with_schema POST '/with-schema'
+  BODY SCHEMA '{"type":"object","required":["n"],"properties":{"n":{"type":"integer","maximum":10}}}'
+  AS SELECT $n::INTEGER AS n;
+----
+Route with_schema: POST /with-schema
+
+# Schema maximum violated (would bind fine as INTEGER) → 422
+query II
+SELECT status, contains(decode(body), '"loc":["body","n"]')
+FROM quackapi_request('POST', '/with-schema', '{"n":100}');
+----
+422	true
+
+# Wrong type → 422
+query I
+SELECT status FROM quackapi_request('POST', '/with-schema', '{"n":"not-int"}');
+----
+422
+
+# Valid body → 200
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/with-schema', '{"n":1}');
+----
+200	[{"n":1}]
+
+query I
+DROP ROUTE with_schema;
+----
+Dropped route with_schema
+
+# JSON Pointer numeric segments use the actual payload container: object keys
+# remain JSON strings, including a leading-zero key, while array indexes are numbers.
+query I
+CREATE ROUTE numeric_object_key POST '/numeric-object-key'
+  BODY SCHEMA '{"type":"object","properties":{"01":{"type":"integer","maximum":1}}}'
+  AS SELECT 1 AS ok;
+----
+Route numeric_object_key: POST /numeric-object-key
+
+query II
+SELECT status, contains(decode(body), '"loc":["body","01"]')
+FROM quackapi_request('POST', '/numeric-object-key', '{"01":2}');
+----
+422	true
+
+query I
+DROP ROUTE numeric_object_key;
+----
+Dropped route numeric_object_key
+
+# Error-location parsing bounds its own JSON walk. A hostile deeply nested body
+# still returns a normal 422 instead of recursing on the request stack.
+query I
+CREATE ROUTE deeply_nested_body POST '/deeply-nested-body'
+  BODY SCHEMA '{"type":"array","items":{"type":"integer"}}'
+  AS SELECT 1 AS ok;
+----
+Route deeply_nested_body: POST /deeply-nested-body
+
+query I
+SELECT status
+FROM quackapi_request('POST', '/deeply-nested-body', repeat('[', 129) || '0' || repeat(']', 129));
+----
+422
+
+query I
+DROP ROUTE deeply_nested_body;
+----
+Dropped route deeply_nested_body
