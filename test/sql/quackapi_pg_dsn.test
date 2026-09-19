@@ -1,0 +1,19 @@
+# name: test/sql/quackapi_pg_dsn.test
+# description: quackapi_serve proves pg_dsn instead of listening and hoping
+# group: [sql]
+
+require quackapi
+
+# Two builds, one contract: without libpq the DSN is refused at bind because
+# nothing would use it, with libpq it is refused because nothing answers it.
+# Either way a bad pg_dsn is an error, never a listener that quietly ignores it.
+statement error
+SELECT * FROM quackapi_serve(29403, host := '127.0.0.1', access_log := false,
+                             pg_dsn := 'postgresql://127.0.0.1:1/nope');
+----
+quackapi_serve: pg_dsn
+
+query I
+SELECT count(*) FROM quackapi_servers() WHERE port = 29403;
+----
+0

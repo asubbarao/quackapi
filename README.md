@@ -382,6 +382,7 @@ LOAD quackapi;
 | **CI / platforms** | linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64 |
 | **Community CDN** | `…/v1.5.5/{platform}/quackapi.duckdb_extension.gz` |
 | **Wasm** | excluded (no server sockets) |
+| **Native Postgres (`pg_dsn`)** | not in the distributed builds — source build with `-DQUACKAPI_ENABLE_LIBPQ=ON` |
 
 See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
 
@@ -416,7 +417,13 @@ LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
 **Target DuckDB:** **v1.5.5 only.** Dependencies: C++17, DuckDB’s bundled
-**httplib** + **mbedtls** only — no vcpkg, no libcurl.
+**httplib** + **mbedtls** only — no vcpkg, no libcurl, no libpq.
+
+The native Postgres `pg_dsn` path links `libpq`, which `find_library` resolves to
+a host path (Homebrew's keg here), so it is off by default and a distributed
+binary never depends on it. Build it with `-DQUACKAPI_ENABLE_LIBPQ=ON` and run it
+where that `libpq` exists; without it, `pg_dsn` is an error rather than a setting
+that quietly does nothing.
 
 ---
 

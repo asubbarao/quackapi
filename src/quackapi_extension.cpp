@@ -24,6 +24,7 @@
 #include "quackapi_from_x.hpp"
 #include "quackapi_graphql.hpp"
 #include "quackapi_http_fetch.hpp"
+#include "quackapi_pg.hpp"
 #include "quackapi_queue.hpp"
 #include "quackapi_policy.hpp"
 #include "quackapi_server.hpp"
@@ -139,6 +140,16 @@ struct ServeBindData : public TableFunctionData {
 	bool started = false;
 	bool finished = false;
 };
+
+//! A build without libpq ignores pg_dsn and answers from DuckDB, which reads as
+//! the native path working. Say so at bind instead.
+static void RequireNativePgSupport(const string &pg_dsn, const char *function_name) {
+	if (!pg_dsn.empty() && !QuackapiPgNativeAvailable()) {
+		throw InvalidInputException("%s: pg_dsn needs the native libpq path, which this build does not link; "
+		                            "rebuild with -DQUACKAPI_ENABLE_LIBPQ=ON",
+		                            function_name);
+	}
+}
 
 static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
 	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
@@ -300,6 +311,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->pg_dsn = setting.GetValue<string>();
 		}
 	}
+	RequireNativePgSupport(bind_data->pg_dsn, "quackapi_serve");
 	auto min_entry = input.named_parameters.find("compression_min_bytes");
 	if (min_entry != input.named_parameters.end()) {
 		auto v = min_entry->second.GetValue<int64_t>();
@@ -390,6 +402,14 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 		}
 		bind_data.finished = true;
 		return;
+	}
+	// The DSN is I/O, so it is proved here rather than at bind: a serve that
+	// returns a listen_url has a Postgres path that actually connects.
+	{
+		string dsn_error;
+		if (!QuackapiValidatePgDsn(bind_data.pg_dsn, dsn_error)) {
+			throw InvalidInputException("quackapi_serve: pg_dsn cannot connect: %s", dsn_error);
+		}
 	}
 	// Compose with quack's auth settings on request (no-op if quack unloaded).
 	if (bind_data.wire_quack_auth) {
@@ -656,6 +676,7 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 			bind_data->pg_dsn = setting.GetValue<string>();
 		}
 	}
+	RequireNativePgSupport(bind_data->pg_dsn, "quackapi_request");
 	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
 	// "Invalid unicode" on Value(string). JSON/text clients: decode(body).
 	return_types.emplace_back(LogicalType::INTEGER);

@@ -24,6 +24,15 @@ enum class QuackapiPgNativeResult : uint8_t {
 	FAILED,
 };
 
+//! True when this build links libpq. A build without it silently ignores pg_dsn
+//! and answers every route from DuckDB, so callers refuse the DSN instead.
+bool QuackapiPgNativeAvailable();
+
+//! Connect once with `dsn` so an unusable DSN fails where it is supplied rather
+//! than on every request. A DSN that names no connect_timeout gets a bounded one:
+//! serve must not sit through the operating system's TCP timeout.
+bool QuackapiValidatePgDsn(const string &dsn, string &err_out);
+
 //! A bounded native libpq execution. `max_response_bytes` caps JSON assembly
 //! while rows arrive in single-row mode. On FAILED, err_out is a sanitized
 //! stable category; "PostgreSQL deadline exceeded" maps to HTTP 504.

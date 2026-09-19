@@ -77,11 +77,16 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mbedtls)
 
 # Optional libpq — pure-HTTP Postgres path (same idea as FastAPI+psycopg).
 # When pg_dsn is set on quackapi_serve, simple routes run via PQexecParams
-# instead of DuckDB ATTACH. Soft: build still succeeds without libpq.
+# instead of DuckDB ATTACH.
+#
+# OFF by default: find_library resolves a host-specific shared library — on this
+# machine Homebrew's keg by absolute path — and a distributed extension must not
+# carry that as a load-time dependency.
+option(QUACKAPI_ENABLE_LIBPQ "Link the native libpq Postgres path" OFF)
 #
 # Never link a host-only Homebrew dylib into a cross-arch build (CI osx_amd64
 # on arm64 runners finds /opt/homebrew arm64 libpq → link fails).
-set(QUACKAPI_TRY_LIBPQ ON)
+set(QUACKAPI_TRY_LIBPQ ${QUACKAPI_ENABLE_LIBPQ})
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
 	if (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" AND
 	    NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i386")
@@ -107,8 +112,10 @@ if (QUACKAPI_TRY_LIBPQ AND QUACKAPI_LIBPQ_INCLUDE AND QUACKAPI_LIBPQ_LIB)
 	target_link_libraries(${LOADABLE_EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
 	target_compile_definitions(${EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
 	target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
+elseif (QUACKAPI_ENABLE_LIBPQ)
+	message(FATAL_ERROR "quackapi: QUACKAPI_ENABLE_LIBPQ=ON but libpq headers/library were not found")
 else()
-	message(STATUS "quackapi: libpq not found — native Postgres path disabled")
+	message(STATUS "quackapi: native Postgres path off (build with -DQUACKAPI_ENABLE_LIBPQ=ON to link libpq)")
 endif()
 
 # Response compression: DuckDB-bundled zstd + miniz (gzip). NO new dependencies.

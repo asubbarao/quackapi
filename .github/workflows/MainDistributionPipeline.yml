@@ -112,8 +112,11 @@ jobs:
             sleep 1
           done
 
+      # This job is the only one that exercises the native Postgres path, and it
+      # is not a publishing job — opting in here keeps the distributed binaries
+      # free of a libpq load-time dependency.
       - name: Build extension
-        run: make release -j"$(nproc)"
+        run: EXT_RELEASE_FLAGS="-DQUACKAPI_ENABLE_LIBPQ=ON" make release -j"$(nproc)"
 
       - name: Run quackapi SQLLogic
         run: ./build/release/test/unittest "test/sql/quackapi*"

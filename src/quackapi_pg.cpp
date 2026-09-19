@@ -9,6 +9,18 @@
 #ifndef QUACKAPI_HAS_LIBPQ
 // Built without libpq — always fall through to DuckDB.
 namespace duckdb {
+bool QuackapiPgNativeAvailable() {
+	return false;
+}
+
+bool QuackapiValidatePgDsn(const string &dsn, string &err_out) {
+	if (dsn.empty()) {
+		return true;
+	}
+	err_out = "this build does not link libpq";
+	return false;
+}
+
 QuackapiPgNativeResult QuackapiTryPgNative(const string &, const string &,
                                            const case_insensitive_map_t<std::pair<string, string>> &, idx_t, string &,
                                            string &) {
@@ -510,6 +522,58 @@ bool EnsurePgStatementTimeout(TlsPg &tls, PGconn *conn, string &err_out) {
 }
 
 } // namespace
+
+bool QuackapiPgNativeAvailable() {
+	return true;
+}
+
+bool QuackapiValidatePgDsn(const string &dsn, string &err_out) {
+	if (dsn.empty()) {
+		return true;
+	}
+	char *parse_error = nullptr;
+	auto *parsed = PQconninfoParse(dsn.c_str(), &parse_error);
+	if (!parsed) {
+		err_out = parse_error ? string(parse_error) : string("libpq could not parse the DSN");
+		if (parse_error) {
+			PQfreemem(parse_error);
+		}
+		return false;
+	}
+	// Rebuild through libpq's own parse rather than appending to the DSN text, so
+	// a default connect_timeout can be added without knowing whether the caller
+	// wrote URI or keyword/value form.
+	vector<const char *> keywords;
+	vector<const char *> values;
+	bool has_connect_timeout = false;
+	for (auto *option = parsed; option->keyword; option++) {
+		if (!option->val || !*option->val) {
+			continue;
+		}
+		has_connect_timeout = has_connect_timeout || strcmp(option->keyword, "connect_timeout") == 0;
+		keywords.push_back(option->keyword);
+		values.push_back(option->val);
+	}
+	if (!has_connect_timeout) {
+		keywords.push_back("connect_timeout");
+		values.push_back("5");
+	}
+	keywords.push_back(nullptr);
+	values.push_back(nullptr);
+	auto *conn = PQconnectdbParams(keywords.data(), values.data(), 0);
+	PQconninfoFree(parsed);
+	if (!conn) {
+		err_out = "libpq returned no connection";
+		return false;
+	}
+	if (PQstatus(conn) != CONNECTION_OK) {
+		err_out = QuackapiTrim(PQerrorMessage(conn));
+		PQfinish(conn);
+		return false;
+	}
+	PQfinish(conn);
+	return true;
+}
 
 QuackapiPgNativeResult QuackapiTryPgNative(const string &dsn, const string &handler_sql,
                                            const case_insensitive_map_t<std::pair<string, string>> &provided,
