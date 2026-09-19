@@ -142,21 +142,22 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 		return ParserExtensionParseResult("Expected GET '<path>' after stream name");
 	}
 	auto method = StringUtil::Upper(rest.substr(0, second_space));
-	if (method == "WS" || method == "WEBSOCKET" || method == "WSS") {
+	auto transport = QuackapiStreamTransport::SSE;
+	if (method == "WS" || method == "WEBSOCKET") {
+		transport = QuackapiStreamTransport::WS;
+	} else if (method == "WSS") {
 		return ParserExtensionParseResult(
-		    "CREATE STREAM WebSocket is not supported: bundled cpp-httplib has no WebSocket/Upgrade API. "
-		    "Use CREATE STREAM <name> GET '<path>' for Server-Sent Events (text/event-stream). "
-		    "Bidirectional duplex belongs on the quack protocol, not HTTP Upgrade.");
-	}
-	if (method != "GET") {
-		return ParserExtensionParseResult("CREATE STREAM only supports GET (SSE). Unknown method \"" + method +
-		                                  "\" — WebSocket is deferred (no WS on httplib transport)");
+		    "CREATE STREAM WSS is not supported: quackapi_serve listens on plain TCP. Declare the endpoint as "
+		    "WS '<path>' and terminate TLS in front of the server.");
+	} else if (method != "GET") {
+		return ParserExtensionParseResult("CREATE STREAM supports GET (Server-Sent Events) and WS (WebSocket). "
+		                                  "Unknown method \"" + method + "\"");
 	}
 	rest = QuackapiTrim(rest.substr(second_space));
 
 	// '<path>'
 	if (rest.empty() || rest[0] != '\'') {
-		return ParserExtensionParseResult("Expected quoted '<path>' after GET");
+		return ParserExtensionParseResult("Expected quoted '<path>' after " + method);
 	}
 	auto path_end = rest.find('\'', 1);
 	if (path_end == string::npos) {
@@ -171,10 +172,11 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 
 	QuackapiStream stream;
 	stream.name = name;
+	// An RFC 6455 handshake is a GET, so both transports match as GET.
 	stream.method = "GET";
 	stream.pattern = pattern;
 	stream.interval_ms = 0;
-	stream.transport = QuackapiStreamTransport::SSE;
+	stream.transport = transport;
 
 	// optional WITH ( interval=... )
 	if (StringUtil::StartsWith(rest_upper, "WITH") &&
@@ -295,7 +297,8 @@ unique_ptr<FunctionData> ApplyStreamBind(ClientContext &, TableFunctionBindInput
 	bind_data->stream.pattern = input.inputs[4].GetValue<string>();
 	bind_data->stream.handler_sql = input.inputs[5].GetValue<string>();
 	bind_data->stream.interval_ms = input.inputs[6].GetValue<int64_t>();
-	bind_data->stream.transport = QuackapiStreamTransport::SSE;
+	bind_data->stream.transport = input.inputs[7].GetValue<bool>() ? QuackapiStreamTransport::WS
+	                                                               : QuackapiStreamTransport::SSE;
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
@@ -315,13 +318,42 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 				throw InvalidInputException("Invalid handler SQL for stream \"%s\": %s", bind_data.stream.name,
 				                            prepared->GetError());
 			}
+			// $message is the inbound frame. Only a socket has one, and a socket
+			// that answers messages has nothing to poll — say so here rather than
+			// binding NULL at request time and calling it a stream.
+			for (auto &entry : prepared->named_param_map) {
+				if (StringUtil::CIEquals(entry.first, "message")) {
+					bind_data.stream.binds_message = true;
+					break;
+				}
+			}
+			if (bind_data.stream.binds_message &&
+			    bind_data.stream.transport != QuackapiStreamTransport::WS) {
+				throw InvalidInputException(
+				    "Stream \"%s\" binds $message, which only a WebSocket frame supplies. Declare it as "
+				    "CREATE STREAM %s WS '%s' AS …",
+				    bind_data.stream.name, bind_data.stream.name, bind_data.stream.pattern);
+			}
+			if (bind_data.stream.binds_message && bind_data.stream.interval_ms > 0) {
+				throw InvalidInputException(
+				    "Stream \"%s\" binds $message, so it answers inbound frames; interval only drives a push "
+				    "stream. Drop one of the two.",
+				    bind_data.stream.name);
+			}
 		}
 		state.AddStream(bind_data.stream, bind_data.or_replace);
+		const char *transport_name =
+		    bind_data.stream.transport == QuackapiStreamTransport::WS ? "WS" : "GET";
+		const char *shape = bind_data.stream.transport == QuackapiStreamTransport::WS
+		                        ? (bind_data.stream.binds_message ? "WebSocket message" : "WebSocket push")
+		                        : "SSE";
 		if (bind_data.stream.interval_ms > 0) {
-			message = StringUtil::Format("Stream %s: GET %s SSE interval=%lldms", bind_data.stream.name,
-			                             bind_data.stream.pattern, (long long)bind_data.stream.interval_ms);
+			message = StringUtil::Format("Stream %s: %s %s %s interval=%lldms", bind_data.stream.name,
+			                             transport_name, bind_data.stream.pattern, shape,
+			                             (long long)bind_data.stream.interval_ms);
 		} else {
-			message = StringUtil::Format("Stream %s: GET %s SSE", bind_data.stream.name, bind_data.stream.pattern);
+			message = StringUtil::Format("Stream %s: %s %s %s", bind_data.stream.name, transport_name,
+			                             bind_data.stream.pattern, shape);
 		}
 	} else {
 		if (state.DropStream(bind_data.stream.name)) {
@@ -336,7 +368,7 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 TableFunction MakeApplyStreamFunction() {
 	return MakeApplyDdlFunction("quackapi_apply_stream",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN},
 	                            ApplyStreamExec, ApplyStreamBind);
 }
 
@@ -352,6 +384,7 @@ ParserExtensionPlanResult StreamDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.stream.pattern));
 	result.parameters.push_back(Value(data.stream.handler_sql));
 	result.parameters.push_back(Value::BIGINT(data.stream.interval_ms));
+	result.parameters.push_back(Value::BOOLEAN(data.stream.transport == QuackapiStreamTransport::WS));
 	FinishDdlPlan(result);
 	return result;
 }
@@ -381,6 +414,8 @@ unique_ptr<FunctionData> StreamsBind(ClientContext &, TableFunctionBindInput &, 
 	names.emplace_back("interval_ms");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("handler");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("binds_message");
 	return make_uniq<StreamsBindData>();
 }
 
@@ -398,9 +433,10 @@ void StreamsExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output)
 		output.SetValue(0, row, Value(s.name));
 		output.SetValue(1, row, Value(s.method));
 		output.SetValue(2, row, Value(s.pattern));
-		output.SetValue(3, row, Value("sse"));
+		output.SetValue(3, row, Value(s.transport == QuackapiStreamTransport::WS ? "ws" : "sse"));
 		output.SetValue(4, row, Value::BIGINT(s.interval_ms));
 		output.SetValue(5, row, Value(s.handler_sql));
+		output.SetValue(6, row, Value::BOOLEAN(s.binds_message));
 		row++;
 		state.offset++;
 	}

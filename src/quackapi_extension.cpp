@@ -30,6 +30,7 @@
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_stream.hpp"
+#include "quackapi_websocket.hpp"
 #include "quackapi_table_api.hpp"
 
 namespace duckdb {
@@ -989,6 +990,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// CREATE STREAM + quackapi_streams() (SSE push; WS deferred on httplib).
 	RegisterQuackapiStreamFunctions(loader);
+	RegisterQuackapiWebsocketFunctions(loader);
 
 	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.

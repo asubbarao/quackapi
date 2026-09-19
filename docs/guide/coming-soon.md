@@ -6,7 +6,7 @@ These features are **not** documented as done. They are actively designed or bui
 |---------|--------|--------|
 | **Access logging / request-id batteries** | `X-Request-ID` + `$request_id` + stderr access log | **Shipped** — see [headers-cookies-redirects.md](headers-cookies-redirects.md). Table form deferred |
 | **Response compression (gzip / zstd)** | Honor `Accept-Encoding` | Designed / building (miniz available; not wired) |
-| **WebSocket routes** | Browser RFC6455 duplex | **Blocked** on transport (HTTP library has no Upgrade API). Use [CREATE STREAM (SSE)](stream.md) instead |
+| **WebSocket routes** | Browser RFC6455 duplex | ~~Blocked on transport~~ **shipped** — [CREATE STREAM … WS](websocket.md) |
 | **OIDC / OAuth2 browser SSO** | `CREATE AUTH … OIDC` | Designed — JWT/API_KEY only today |
 | **Signed cookie sessions + CSRF** | Browser session cookies | Designed |
 | **Middleware BEFORE/AFTER SQL** | Declarative hooks around handlers | Designed |

@@ -35,6 +35,7 @@
 #include "quackapi_limits.hpp"
 #include "quackapi_middleware.hpp"
 #include "quackapi_state.hpp"
+#include "quackapi_websocket.hpp"
 
 #include "httplib.hpp"
 #include "miniz_wrapper.hpp"
@@ -51,8 +52,13 @@ namespace {
 thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
 thread_local duckdb_httplib::Stream *quackapi_tls_stream = nullptr;
 
-//! httplib Server subclass: stash the live Stream/socket for per-route IO timeouts.
+//! httplib Server subclass: stash the live Stream/socket for per-route IO
+//! timeouts, and give an RFC 6455 upgrade the chance to keep the socket before
+//! httplib parses the request and closes it.
 struct QuackapiHttplibServer : duckdb_httplib::Server {
+	//! The quackapi server that owns this listener. Null only in-process.
+	QuackapiHttpServer *owner = nullptr;
+
 	bool process_and_close_socket(socket_t sock) override {
 		std::string remote_addr;
 		int remote_port = 0;
@@ -68,6 +74,16 @@ struct QuackapiHttplibServer : duckdb_httplib::Server {
 		    [&](duckdb_httplib::Stream &strm, bool close_connection, bool &connection_closed) {
 			    quackapi_tls_sock = sock;
 			    quackapi_tls_stream = &strm;
+			    // The socket is still ours here. A WebSocket upgrade is answered
+			    // and served from this frame; httplib never sees the request, so
+			    // no response writer contends for the wire. Every other request
+			    // leaves the peeked bytes untouched and falls through unchanged.
+			    if (owner && owner->TryServeWebSocket(strm)) {
+				    quackapi_tls_stream = nullptr;
+				    quackapi_tls_sock = INVALID_SOCKET;
+				    connection_closed = true;
+				    return false;
+			    }
 			    auto ok = process_request(strm, remote_addr, remote_port, local_addr, local_port, close_connection,
 			                              connection_closed, nullptr);
 			    // Restore accept-time SO_* after handler+write (per-route TIMEOUT may
@@ -1717,7 +1733,9 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		return;
 	}
 
-	server = make_uniq<QuackapiHttplibServer>();
+	auto httplib_server = make_uniq<QuackapiHttplibServer>();
+	httplib_server->owner = this;
+	server = std::move(httplib_server);
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
 	// requests before route handlers, so API routes always win over files.
@@ -2108,6 +2126,564 @@ static string RateLimitClientKey(DatabaseInstance &db, const duckdb_httplib::Req
 	}
 	string ip = req.remote_addr.empty() ? string("unknown") : req.remote_addr;
 	return "ip:" + ip;
+}
+
+//===--------------------------------------------------------------------===//
+// WebSocket (RFC 6455) — answered from process_and_close_socket, which is the
+// one place quackapi still owns the raw accepted socket. Everything below runs
+// before httplib parses the request, so httplib's response writer never
+// contends for the wire with a 101 that must carry no body.
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+//! Longest a peek waits for the rest of a request head before handing the bytes
+//! back to httplib untouched. A handshake is one small segment in practice.
+constexpr int64_t QUACKAPI_WS_PEEK_BUDGET_MS = 2000;
+//! Head bytes a peek will look at. httplib's own header limits are smaller.
+constexpr size_t QUACKAPI_WS_PEEK_MAX_BYTES = 16ull * 1024ull;
+//! How long a closing session keeps reading so close() does not RST the peer
+//! before it has read the Close frame quackapi just sent.
+constexpr int64_t QUACKAPI_WS_DRAIN_BUDGET_MS = 1000;
+
+//! Peek — never consume — the pending request head. Returns the byte count
+//! through the terminating CRLFCRLF, or 0 when no complete head arrived inside
+//! the budget. Zero means nothing was taken off the socket and httplib parses
+//! exactly the stream it would have without this call.
+size_t PeekRequestHead(socket_t sock, string &head_out) {
+	vector<char> buffer(QUACKAPI_WS_PEEK_MAX_BYTES);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(QUACKAPI_WS_PEEK_BUDGET_MS);
+	ssize_t previous = 0;
+	while (true) {
+		auto peeked = duckdb_httplib::detail::read_socket(sock, buffer.data(), buffer.size(),
+		                                                  CPPHTTPLIB_RECV_FLAGS | MSG_PEEK);
+		if (peeked <= 0) {
+			return 0;
+		}
+		string view(buffer.data(), static_cast<size_t>(peeked));
+		auto end = view.find("\r\n\r\n");
+		if (end != string::npos) {
+			head_out = view.substr(0, end + 4);
+			return end + 4;
+		}
+		if (static_cast<size_t>(peeked) >= buffer.size()) {
+			// Longer than we will look at; httplib's header limits reject it.
+			return 0;
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return 0;
+		}
+		if (peeked == previous) {
+			// MSG_PEEK leaves the bytes in place, so select stays readable and
+			// cannot be used to wait for *more*. Sleep instead of spinning.
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		previous = peeked;
+	}
+}
+
+//! Consume the exact byte count a peek inspected.
+bool ConsumeBytes(duckdb_httplib::Stream &strm, size_t count) {
+	vector<char> scratch(count);
+	size_t filled = 0;
+	while (filled < count) {
+		auto n = strm.read(scratch.data() + filled, count - filled);
+		if (n <= 0) {
+			return false;
+		}
+		filled += static_cast<size_t>(n);
+	}
+	return true;
+}
+
+bool WriteAllToStream(duckdb_httplib::Stream &strm, const string &data) {
+	size_t sent = 0;
+	while (sent < data.size()) {
+		auto n = strm.write(data.data() + sent, data.size() - sent);
+		if (n <= 0) {
+			return false;
+		}
+		sent += static_cast<size_t>(n);
+	}
+	return true;
+}
+
+string DetailJson(const string &detail) {
+	return "{\"detail\":\"" + QuackapiJsonEscape(detail) + "\"}";
+}
+
+//! Write a whole HTTP response by hand. Only refused handshakes reach this:
+//! httplib has not seen the request, so nothing else will write the status line.
+void WriteRawHttpJson(duckdb_httplib::Stream &strm, int status, const string &reason, const string &body,
+                      const string &extra_headers) {
+	string response = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
+	response += "Content-Type: application/json\r\n";
+	response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+	response += "Connection: close\r\n";
+	response += extra_headers;
+	response += "\r\n";
+	response += body;
+	WriteAllToStream(strm, response);
+}
+
+//! One result row as the JSON object a text frame carries — the same object the
+//! SSE transport puts after `data:`.
+string RowToJsonObject(const vector<string> &names, const vector<Value> &cols) {
+	string object = "{";
+	bool first = true;
+	for (idx_t c = 0; c < names.size() && c < cols.size(); c++) {
+		if (!first) {
+			object += ",";
+		}
+		first = false;
+		object += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
+	}
+	object += "}";
+	return object;
+}
+
+//! Keep reading and discarding until the peer stops or the budget runs out, so
+//! closing the socket cannot reset a connection that still owes us bytes (an
+//! RST would destroy the Close frame we just wrote).
+void DrainBeforeClose(duckdb_httplib::Stream &strm) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(QUACKAPI_WS_DRAIN_BUDGET_MS);
+	char scratch[4096];
+	while (std::chrono::steady_clock::now() < deadline) {
+		if (duckdb_httplib::detail::select_read(strm.socket(), 0, 50 * 1000) <= 0) {
+			continue;
+		}
+		if (strm.read(scratch, sizeof(scratch)) <= 0) {
+			return;
+		}
+	}
+}
+
+//! Decrement the live-session counter on every exit path.
+struct WsSessionSlot {
+	explicit WsSessionSlot(std::atomic<int32_t> &counter_p) : counter(counter_p) {
+	}
+	~WsSessionSlot() {
+		counter.fetch_sub(1);
+	}
+	std::atomic<int32_t> &counter;
+};
+
+//! What the session loop should do after one inbound frame.
+enum class WsInboundAction : uint8_t {
+	//! Handled (control frame, or nothing arrived) — keep going.
+	CONTINUE = 0,
+	//! A data message is in `message` and the caller decides what it means.
+	DATA,
+	//! The session is over; the Close frame, if any, has already been written.
+	STOP,
+};
+
+} // namespace
+
+int32_t QuackapiHttpServer::WebSocketBudget() const {
+	auto workers = options.worker_threads > 0 ? options.worker_threads
+	                                          : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
+	auto budget = workers / 2;
+	return budget > 0 ? budget : 1;
+}
+
+bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
+	auto db = db_ptr.lock();
+	if (!db) {
+		return false;
+	}
+	auto &qa_state = QuackapiState::Get(*db);
+	auto streams = qa_state.LiveStreams();
+	bool any_socket_stream = false;
+	for (auto &stream : *streams) {
+		if (stream.transport == QuackapiStreamTransport::WS) {
+			any_socket_stream = true;
+			break;
+		}
+	}
+	if (!any_socket_stream) {
+		// Nothing could answer an upgrade, so do not even peek: an ordinary
+		// request pays nothing for a feature this server does not expose.
+		return false;
+	}
+
+	string head;
+	auto head_length = PeekRequestHead(strm.socket(), head);
+	if (head_length == 0) {
+		return false;
+	}
+	QuackapiWsHandshake handshake;
+	if (!QuackapiWsParseHandshake(head, handshake) || !QuackapiWsIsUpgradeRequest(handshake)) {
+		return false;
+	}
+
+	// Past this point the request is answered here, always, and the socket is
+	// never handed back to httplib — an upgrade that cannot be served gets an
+	// explicit HTTP status naming the reason, not a fall-through 404.
+	const auto session_start = std::chrono::steady_clock::now();
+	duckdb_httplib::Request log_req;
+	log_req.method = "GET";
+	log_req.path = handshake.path;
+	duckdb_httplib::Response log_res;
+	log_res.status = 101;
+	string request_id;
+
+	if (!ConsumeBytes(strm, head_length)) {
+		return true;
+	}
+
+	string accept;
+	auto handshake_error = QuackapiWsValidateHandshake(handshake, accept);
+	if (handshake_error == QuackapiWsHandshakeError::UNSUPPORTED_VERSION) {
+		log_res.status = 426;
+		WriteRawHttpJson(strm, 426, "Upgrade Required", DetailJson(QuackapiWsHandshakeErrorMessage(handshake_error)),
+		                 "Sec-WebSocket-Version: 13\r\n");
+		EmitAccessLog(log_req, log_res, "-", 0);
+		return true;
+	}
+	if (handshake_error != QuackapiWsHandshakeError::NONE) {
+		log_res.status = 400;
+		WriteRawHttpJson(strm, 400, "Bad Request", DetailJson(QuackapiWsHandshakeErrorMessage(handshake_error)), "");
+		EmitAccessLog(log_req, log_res, "-", 0);
+		return true;
+	}
+
+	QuackapiStream matched;
+	vector<std::pair<string, string>> path_params;
+	bool matched_socket = false;
+	bool path_is_taken = false;
+	for (auto &stream : *streams) {
+		vector<std::pair<string, string>> captures;
+		if (!MatchPattern(stream.pattern, handshake.path, captures)) {
+			continue;
+		}
+		if (stream.transport == QuackapiStreamTransport::WS) {
+			matched = stream;
+			path_params = std::move(captures);
+			matched_socket = true;
+			break;
+		}
+		path_is_taken = true;
+	}
+	if (!matched_socket) {
+		if (!path_is_taken) {
+			auto routes = qa_state.LiveRoutes();
+			for (auto &route : *routes) {
+				vector<std::pair<string, string>> captures;
+				if (MatchPattern(route.pattern, handshake.path, captures)) {
+					path_is_taken = true;
+					break;
+				}
+			}
+		}
+		log_res.status = path_is_taken ? 400 : 404;
+		auto detail = path_is_taken ? "\"" + handshake.path +
+		                                  "\" is registered, but not as a WebSocket endpoint — declare it with "
+		                                  "CREATE STREAM <name> WS '" +
+		                                  handshake.path + "' AS <select>"
+		                            : "No WebSocket endpoint at \"" + handshake.path + "\"";
+		WriteRawHttpJson(strm, log_res.status, path_is_taken ? "Bad Request" : "Not Found", DetailJson(detail), "");
+		EmitAccessLog(log_req, log_res, "-", 0);
+		return true;
+	}
+
+	// A held socket owns an httplib worker for its whole lifetime. Refuse
+	// loudly at the budget instead of starving the HTTP side into resets.
+	const auto budget = WebSocketBudget();
+	if (ws_sessions.fetch_add(1) + 1 > budget) {
+		ws_sessions.fetch_sub(1);
+		log_res.status = 503;
+		WriteRawHttpJson(strm, 503, "Service Unavailable",
+		                 DetailJson(StringUtil::Format(
+		                     "WebSocket budget exhausted: %d sessions already hold a worker, and sockets may take at "
+		                     "most half of worker_threads=%d. Raise quackapi_serve(worker_threads := …) to hold more.",
+		                     budget, options.worker_threads)),
+		                 "Retry-After: 1\r\n");
+		EmitAccessLog(log_req, log_res, "-", 0);
+		return true;
+	}
+	WsSessionSlot slot(ws_sessions);
+
+	bool policy_denied = false;
+	string policy_error;
+	const auto handler_sql = RewriteHandlerWithPolicies(*db, matched.handler_sql, false, policy_denied, policy_error);
+	if (policy_denied || !policy_error.empty()) {
+		log_res.status = 403;
+		WriteRawHttpJson(strm, 403, "Forbidden",
+		                 DetailJson(policy_denied ? "Policy denies unauthenticated access"
+		                                          : "Policy enforcement rejected this stream handler"),
+		                 "");
+		EmitAccessLog(log_req, log_res, "-", 0);
+		return true;
+	}
+
+	auto con = make_shared_ptr<Connection>(*db);
+	unique_ptr<PreparedStatement> prepared;
+	{
+		QuackapiQueryDeadline prepare_deadline(*con, options.query_timeout_ms);
+		prepared = con->Prepare(handler_sql);
+	}
+	if (prepared->HasError()) {
+		log_res.status = 500;
+		WriteRawHttpJson(strm, 500, "Internal Server Error", DetailJson(prepared->GetError()), "");
+		EmitAccessLog(log_req, log_res, "-", 0);
+		return true;
+	}
+
+	case_insensitive_map_t<string> provided;
+	duckdb_httplib::Params query_params;
+	ParseQueryStringIntoParams(handshake.query, query_params);
+	for (auto &kv : query_params) {
+		provided[kv.first] = kv.second;
+	}
+	for (auto &kv : path_params) {
+		provided[kv.first] = kv.second;
+	}
+	request_id = NextRequestId(*db);
+	provided["request_id"] = request_id;
+
+	auto expected_types = prepared->GetExpectedParameterTypes();
+	case_insensitive_map_t<BoundParameterData> named_values;
+	LogicalType message_type = LogicalType::VARCHAR;
+	for (auto &entry : prepared->named_param_map) {
+		auto &param_name = entry.first;
+		LogicalType expected = LogicalType::UNKNOWN;
+		auto type_it = expected_types.find(param_name);
+		if (type_it != expected_types.end()) {
+			expected = type_it->second;
+		}
+		if (matched.binds_message && StringUtil::CIEquals(param_name, "message")) {
+			// Rebound per inbound frame, never from the handshake URL.
+			message_type = expected;
+			continue;
+		}
+		auto it = provided.find(param_name);
+		string loc = IsPathParam(matched.pattern, param_name) ? "path" : "query";
+		if (it == provided.end()) {
+			log_res.status = 422;
+			WriteRawHttpJson(strm, 422, "Unprocessable Entity",
+			                 ValidationErrorJson(loc, param_name, "Field required", "missing"), "");
+			EmitAccessLog(log_req, log_res, request_id, 0);
+			return true;
+		}
+		BoundParameterData bound;
+		string err_json;
+		if (!BindParamValue(it->second, expected, loc, param_name, bound, err_json)) {
+			log_res.status = 422;
+			WriteRawHttpJson(strm, 422, "Unprocessable Entity", err_json, "");
+			EmitAccessLog(log_req, log_res, request_id, 0);
+			return true;
+		}
+		named_values[param_name] = bound;
+	}
+
+	string upgrade_response = "HTTP/1.1 101 Switching Protocols\r\n";
+	upgrade_response += "Upgrade: websocket\r\n";
+	upgrade_response += "Connection: Upgrade\r\n";
+	upgrade_response += "Sec-WebSocket-Accept: " + accept + "\r\n";
+	upgrade_response += "X-Request-ID: " + request_id + "\r\n\r\n";
+	if (!WriteAllToStream(strm, upgrade_response)) {
+		return true;
+	}
+
+	QuackapiWsConn conn(strm, /*client_side=*/false);
+	// The socket read timeout doubles as the keep-alive ping cadence: one quiet
+	// period sends a Ping, a second with nothing back at all retires the peer.
+	const int64_t idle_ms = static_cast<int64_t>(options.read_timeout_sec > 0 ? options.read_timeout_sec
+	                                                                          : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC) *
+	                        1000;
+	bool awaiting_pong = false;
+	auto quiet_since = std::chrono::steady_clock::now();
+
+	auto ping_if_quiet = [&]() -> bool {
+		auto quiet_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - quiet_since)
+		        .count();
+		if (quiet_ms < idle_ms) {
+			return true;
+		}
+		if (awaiting_pong) {
+			conn.SendClose(QuackapiWsClose::GOING_AWAY, "peer did not answer a ping");
+			return false;
+		}
+		if (!conn.Send(QuackapiWsOpcode::PING, "quackapi")) {
+			return false;
+		}
+		awaiting_pong = true;
+		quiet_since = std::chrono::steady_clock::now();
+		return true;
+	};
+
+	QuackapiWsMessage inbound;
+	auto take_inbound = [&](int64_t wait_ms) -> WsInboundAction {
+		auto result = conn.Read(inbound, wait_ms);
+		if (result == QuackapiWsReadResult::IDLE) {
+			return WsInboundAction::CONTINUE;
+		}
+		if (result == QuackapiWsReadResult::PEER_GONE) {
+			return WsInboundAction::STOP;
+		}
+		if (result == QuackapiWsReadResult::PROTOCOL_ERROR) {
+			conn.SendClose(conn.ErrorCode(), conn.ErrorReason());
+			return WsInboundAction::STOP;
+		}
+		quiet_since = std::chrono::steady_clock::now();
+		awaiting_pong = false;
+		switch (inbound.opcode) {
+		case QuackapiWsOpcode::CLOSE: {
+			// Echo the peer's code (1005 means it sent none) and stop.
+			auto code = QuackapiWsClose::NORMAL;
+			if (inbound.close_code >= 1000 && inbound.close_code <= 4999 && inbound.close_code != 1005) {
+				code = static_cast<QuackapiWsClose>(inbound.close_code);
+			}
+			conn.SendClose(code, "");
+			return WsInboundAction::STOP;
+		}
+		case QuackapiWsOpcode::PING:
+			return conn.Send(QuackapiWsOpcode::PONG, inbound.payload) ? WsInboundAction::CONTINUE
+			                                                          : WsInboundAction::STOP;
+		case QuackapiWsOpcode::PONG:
+			return WsInboundAction::CONTINUE;
+		default:
+			return WsInboundAction::DATA;
+		}
+	};
+
+	//! Send one result as text frames, one per row, capped like a route response.
+	auto send_result = [&](QueryResult &result) -> bool {
+		idx_t sent_bytes = 0;
+		while (true) {
+			unique_ptr<DataChunk> chunk;
+			{
+				QuackapiQueryDeadline fetch_deadline(*con, options.query_timeout_ms);
+				chunk = result.Fetch();
+			}
+			if (!chunk || chunk->size() == 0) {
+				return true;
+			}
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> cols(chunk->ColumnCount());
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					cols[col] = chunk->GetValue(col, row);
+				}
+				auto frame = RowToJsonObject(result.names, cols);
+				sent_bytes += frame.size();
+				if (sent_bytes > static_cast<idx_t>(options.max_response_bytes)) {
+					conn.SendClose(QuackapiWsClose::MESSAGE_TOO_BIG, "result exceeds max_response_bytes");
+					return false;
+				}
+				if (!conn.Send(QuackapiWsOpcode::TEXT, frame)) {
+					return false;
+				}
+			}
+		}
+	};
+
+	bool running = true;
+	if (matched.binds_message) {
+		// Request/response: every inbound frame binds $message and the rows it
+		// produces go back as frames.
+		while (running) {
+			auto action = take_inbound(idle_ms);
+			if (action == WsInboundAction::STOP) {
+				break;
+			}
+			if (action == WsInboundAction::CONTINUE) {
+				running = ping_if_quiet();
+				continue;
+			}
+			if (inbound.opcode == QuackapiWsOpcode::BINARY) {
+				conn.SendClose(QuackapiWsClose::UNSUPPORTED_DATA,
+				               "this endpoint binds $message from text frames only");
+				break;
+			}
+			BoundParameterData bound;
+			string err_json;
+			if (!BindParamValue(inbound.payload, message_type, "body", "message", bound, err_json)) {
+				conn.SendClose(QuackapiWsClose::POLICY_VIOLATION,
+				               "message did not bind as " + message_type.ToString());
+				break;
+			}
+			auto call_values = named_values;
+			call_values["message"] = bound;
+			unique_ptr<QueryResult> result;
+			{
+				QuackapiQueryDeadline exec_deadline(*con, options.query_timeout_ms);
+				result = prepared->Execute(call_values, true);
+			}
+			if (result->HasError()) {
+				conn.SendClose(QuackapiWsClose::INTERNAL_ERROR, result->GetError());
+				break;
+			}
+			running = send_result(*result);
+		}
+	} else {
+		// Push: run the SELECT, emit its rows, then close (or poll on interval).
+		bool need_execute = true;
+		while (running) {
+			while (running && conn.HasPendingInput()) {
+				auto action = take_inbound(0);
+				if (action == WsInboundAction::STOP) {
+					running = false;
+				} else if (action == WsInboundAction::DATA) {
+					conn.SendClose(QuackapiWsClose::UNSUPPORTED_DATA,
+					               "this endpoint pushes rows and binds no $message");
+					running = false;
+				}
+			}
+			if (!running) {
+				break;
+			}
+			if (need_execute) {
+				unique_ptr<QueryResult> result;
+				{
+					QuackapiQueryDeadline exec_deadline(*con, options.query_timeout_ms);
+					result = prepared->Execute(named_values, true);
+				}
+				if (result->HasError()) {
+					conn.SendClose(QuackapiWsClose::INTERNAL_ERROR, result->GetError());
+					break;
+				}
+				if (!send_result(*result)) {
+					break;
+				}
+				need_execute = false;
+			}
+			if (matched.interval_ms <= 0) {
+				conn.SendClose(QuackapiWsClose::NORMAL, "");
+				break;
+			}
+			// Sleep the interval in short steps so a Close or Ping is answered
+			// promptly rather than after a full cycle.
+			auto remaining = matched.interval_ms;
+			while (running && remaining > 0) {
+				auto step = remaining > 100 ? 100 : remaining;
+				std::this_thread::sleep_for(std::chrono::milliseconds(step));
+				remaining -= step;
+				while (running && conn.HasPendingInput()) {
+					auto action = take_inbound(0);
+					if (action == WsInboundAction::STOP) {
+						running = false;
+					} else if (action == WsInboundAction::DATA) {
+						conn.SendClose(QuackapiWsClose::UNSUPPORTED_DATA,
+						               "this endpoint pushes rows and binds no $message");
+						running = false;
+					}
+				}
+				if (running && !ping_if_quiet()) {
+					running = false;
+				}
+			}
+			need_execute = true;
+		}
+	}
+
+	if (conn.CloseSent()) {
+		DrainBeforeClose(strm);
+	}
+	auto latency_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - session_start).count();
+	EmitAccessLog(log_req, log_res, request_id, latency_ms);
+	return true;
 }
 
 void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {

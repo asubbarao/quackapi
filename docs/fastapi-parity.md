@@ -50,6 +50,7 @@ classes: MATCH 88, STRONGER 1, BUG 0
 | SQLAlchemy list scaffold | `CREATE API FOR TABLE t` |
 | `BackgroundTasks` / Celery | `CREATE QUEUE` + `quackapi_enqueue` / `dequeue` / `ack` |
 | `EventSourceResponse` / SSE | `CREATE STREAM … GET` |
+| `@app.websocket("/ws")` | `CREATE STREAM … WS` |
 | `StaticFiles` | `quackapi_serve(…, static_dir := '…')` |
 | auto OpenAPI + `/docs` + `/redoc` | built-in `/openapi.json`, `/docs`, `/redoc` |
 | `CORSMiddleware` | `cors_origins` / `SET quackapi_cors_origins` |

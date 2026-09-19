@@ -1,0 +1,259 @@
+# name: test/sql/quackapi_websocket.test
+# description: RFC 6455 WebSocket server behind CREATE STREAM … WS
+# group: [sql]
+
+require quackapi
+
+# RFC 6455 §1.3 carries this exact pair. It is the whole interop contract with
+# every browser and client library, so it is asserted literally.
+query I
+SELECT quackapi_ws_accept('dGhlIHNhbXBsZSBub25jZQ==');
+----
+s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+
+# A key that is not 16 base64 bytes never yields an accept value.
+statement error
+SELECT quackapi_ws_accept('too-short');
+----
+16 base64-encoded bytes
+
+# --- Declaration reads like CREATE ROUTE ---
+
+query I
+CREATE STREAM ticks WS '/ws/ticks' AS SELECT i AS id, 'tick' AS msg FROM range(3) t(i);
+----
+Stream ticks: WS /ws/ticks WebSocket push
+
+query I
+CREATE STREAM echo WS '/ws/echo' AS SELECT $message AS said, length($message) AS len;
+----
+Stream echo: WS /ws/echo WebSocket message
+
+query I
+CREATE STREAM big WS '/ws/big' AS SELECT repeat('x', 200000) AS blob;
+----
+Stream big: WS /ws/big WebSocket push
+
+query I
+CREATE STREAM slow WS '/ws/slow' WITH (interval='10s') AS SELECT 1 AS tick;
+----
+Stream slow: WS /ws/slow WebSocket push interval=10000ms
+
+# $message is an inbound frame, so only a socket can supply it.
+statement error
+CREATE STREAM bad_sse GET '/sse/echo' AS SELECT $message AS said;
+----
+binds $message
+
+# … and a socket that answers frames has nothing to poll.
+statement error
+CREATE STREAM bad_interval WS '/ws/bad' WITH (interval='1s') AS SELECT $message AS said;
+----
+interval only drives a push stream
+
+# WSS is refused by name rather than silently downgraded to plain TCP.
+statement error
+CREATE STREAM bad_tls WSS '/ws/tls' AS SELECT 1;
+----
+WSS is not supported
+
+# Introspection reports the transport that will actually be served.
+query IIIII
+SELECT name, method, pattern, transport, binds_message FROM quackapi_streams() ORDER BY name;
+----
+big	GET	/ws/big	ws	false
+echo	GET	/ws/echo	ws	true
+slow	GET	/ws/slow	ws	false
+ticks	GET	/ws/ticks	ws	false
+
+# An ordinary route on the same server — the upgrade seam must not disturb it.
+query I
+CREATE ROUTE plain GET '/plain' AS SELECT 1 AS one;
+----
+Route plain: GET /plain
+
+# --- Live socket ---
+
+query I
+SELECT * FROM quackapi_serve(29270, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29270
+
+# Plain HTTP still works while WebSocket endpoints are registered: every
+# request is peeked before httplib parses it, and a non-upgrade must fall
+# through byte-for-byte.
+# quackapi_fetch(url, headers := NULL, stall_ms := NULL) — url only here.
+query II
+SELECT r.status, r.body FROM (SELECT quackapi_fetch('http://127.0.0.1:29270/plain') AS r);
+----
+200	[{"one":1}]
+
+# Push stream: one text frame per row, then the server closes with 1000.
+# quackapi_ws_connect(url, send := NULL, raw := NULL, fragment_size := 0,
+#                     ping := false, max_frames := 0, idle_timeout_ms := 1000)
+query IIII
+SELECT seq, opcode, payload, coalesce(code, -1) FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/ticks');
+----
+1	text	{"id":0,"msg":"tick"}	-1
+2	text	{"id":1,"msg":"tick"}	-1
+3	text	{"id":2,"msg":"tick"}	-1
+4	close	(empty)	1000
+
+# Request/response: each inbound frame binds $message and its rows come back.
+query III
+SELECT seq, opcode, payload FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/echo', send := ['hello', 'world'], max_frames := 2);
+----
+1	text	{"said":"hello","len":5}
+2	text	{"said":"world","len":5}
+3	close	(empty)
+
+# A message the client split across continuation frames is one message to the
+# handler: length 10, not the 3 of its first fragment.
+query III
+SELECT seq, opcode, payload FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/echo', send := ['fragmented'], fragment_size := 3, max_frames := 1);
+----
+1	text	{"said":"fragmented","len":10}
+2	close	(empty)
+
+# A row larger than the 64 KiB outbound fragment size leaves as continuation
+# frames and arrives as one reassembled message: four frames, one payload.
+query IIII
+SELECT seq, opcode, length(payload), frames FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/big');
+----
+1	text	200011	4
+2	close	0	1
+
+# A Ping is answered with a Pong carrying the same payload (RFC 6455 §5.5.2).
+query III
+SELECT seq, opcode, payload FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/echo', ping := true, max_frames := 1, idle_timeout_ms := 500);
+----
+1	pong	quackapi
+2	close	(empty)
+
+# A message over the 8 MiB ceiling is refused with 1009 before it is buffered.
+query II
+SELECT opcode, code FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/echo', send := [repeat('x', 8388609)], idle_timeout_ms := 3000);
+----
+close	1009
+
+# A client frame that is not masked fails the connection with 1002 (§5.3).
+# 0x81 0x03 'a' 'b' 'c' is a well-formed *unmasked* text frame.
+query II
+SELECT opcode, code FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/echo', raw := '\x81\x03abc'::BLOB, idle_timeout_ms := 2000);
+----
+close	1002
+
+# A text frame whose payload is not UTF-8 is invalid payload data (1007):
+# 0x81 0x81 <zero mask> 0xFF, and no code point starts with 0xFF.
+query II
+SELECT opcode, code FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/echo', raw := '\x81\x81\x00\x00\x00\x00\xFF'::BLOB, idle_timeout_ms := 2000);
+----
+close	1007
+
+# A push endpoint says so rather than ignoring what the client sent. /ws/slow
+# polls during its interval, so the frame is always seen; the row it may or may
+# not have already pushed is not what this asserts.
+query II
+SELECT opcode, code FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/slow', send := ['hi'], idle_timeout_ms := 3000) WHERE opcode = 'close';
+----
+close	1003
+
+# A path with no WebSocket endpoint is answered, not upgraded.
+statement error
+SELECT * FROM quackapi_ws_connect('ws://127.0.0.1:29270/ws/nope');
+----
+404 Not Found
+
+# A path that is registered as something else names the reason.
+statement error
+SELECT * FROM quackapi_ws_connect('ws://127.0.0.1:29270/plain');
+----
+400 Bad Request
+
+# wss:// is refused in the client too — there is no TLS on this listener.
+statement error
+SELECT * FROM quackapi_ws_connect('wss://127.0.0.1:29270/ws/ticks');
+----
+wss:// is not supported
+
+query I
+SELECT * FROM quackapi_stop(29270);
+----
+Stopped quackapi server on port 29270
+
+# --- The worker budget is refused out loud, never queued ---
+
+# A held socket owns an httplib worker for its whole lifetime, so sockets may
+# take at most half of worker_threads. With two workers that is one session.
+query I
+SELECT * FROM quackapi_serve(29272, host := '127.0.0.1', access_log := false, worker_threads := 2);
+----
+http://127.0.0.1:29272
+
+query I
+CREATE STREAM budget WS '/ws/budget' AS SELECT opcode FROM quackapi_ws_connect('ws://127.0.0.1:29272/ws/ticks');
+----
+Stream budget: WS /ws/budget WebSocket push
+
+# The outer socket holds the only slot; the handler's own upgrade is refused
+# with 503 rather than waiting for a worker that will never come free.
+query III
+SELECT opcode, code, contains(payload, '503') FROM quackapi_ws_connect('ws://127.0.0.1:29272/ws/budget', idle_timeout_ms := 3000);
+----
+close	1011	true
+
+query I
+SELECT * FROM quackapi_stop(29272);
+----
+Stopped quackapi server on port 29272
+
+query I
+DROP STREAM budget;
+----
+Dropped stream budget
+
+# --- Keep-alive ping: the socket read timeout is the cadence ---
+
+query I
+SELECT * FROM quackapi_serve(29271, host := '127.0.0.1', access_log := false, read_timeout_sec := 1);
+----
+http://127.0.0.1:29271
+
+# /ws/slow emits one row then sleeps its interval. With read_timeout_sec := 1
+# the server must ping rather than sit silent until the poll comes round.
+query II
+SELECT seq, opcode FROM quackapi_ws_connect('ws://127.0.0.1:29271/ws/slow', idle_timeout_ms := 2500, max_frames := 2);
+----
+1	text
+2	ping
+3	close
+
+query I
+SELECT * FROM quackapi_stop(29271);
+----
+Stopped quackapi server on port 29271
+
+query I
+DROP STREAM ticks;
+----
+Dropped stream ticks
+
+query I
+DROP STREAM echo;
+----
+Dropped stream echo
+
+query I
+DROP STREAM big;
+----
+Dropped stream big
+
+query I
+DROP STREAM slow;
+----
+Dropped stream slow
+
+query I
+DROP ROUTE plain;
+----
+Dropped route plain

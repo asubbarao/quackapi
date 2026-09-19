@@ -71,6 +71,7 @@ That is the whole product idea:
 | Versioned prefix + shared auth | `CREATE GROUP` | APIRouter-style |
 | Background jobs | `CREATE QUEUE` + enqueue/dequeue/ack | durable `quackapi_jobs` table |
 | Live push | `CREATE STREAM … GET` | Server-Sent Events |
+| Duplex sockets | `CREATE STREAM … WS` | RFC 6455 WebSocket |
 | Row security | `CREATE ROW ACCESS POLICY` | claims-keyed filters |
 | Column redaction | `CREATE MASKING POLICY` | claims-keyed masks |
 | Static files | `static_dir := '…'` on serve | unrouted GETs |
@@ -160,6 +161,7 @@ Handler SQL is validated at `CREATE` time. Broken SQL fails at create — not on
 6. [CREATE GROUP (prefix + shared auth = versioning)](guide/groups.md)  
 7. [CREATE QUEUE (background jobs + worker)](guide/queue.md)  
 8. [CREATE STREAM (SSE)](guide/stream.md)  
+8b. [CREATE STREAM … WS (WebSockets)](guide/websocket.md)  
 9. [Extension composition (fetch, SSE, from_x, mesh, PDF)](guide/extension-composition.md)  
 10. [Row access & masking policies](guide/policies.md)  
 11. [Static files (`static_dir`)](guide/static-files.md)  
