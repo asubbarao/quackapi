@@ -379,10 +379,15 @@ void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int po
 	// Mirrors QuackStorageExtensionInfo::CreateServer (duckdb-quack
 	// src/quack_storage.cpp): lock map → reject duplicate key → construct
 	// (bind happens in ctor so EADDRINUSE propagates) → emplace.
-	auto key = host + ":" + std::to_string(port);
+	// One listening endpoint, one entry. 127.0.0.1 and ::1 are separate bind
+	// addresses but the same URL to a client, so keying on the spelling let two
+	// servers hold one localhost port and answer differently depending on which
+	// family the caller's resolver picked.
+	auto key = (QuackapiHostIsLoopback(host) ? string("localhost") : host) + ":" + std::to_string(port);
 	std::lock_guard<std::mutex> lock(servers_mutex);
-	if (servers.find(key) != servers.end()) {
-		throw InvalidInputException("quackapi already serving on %s", key);
+	auto existing = servers.find(key);
+	if (existing != servers.end()) {
+		throw InvalidInputException("quackapi already serving on %s:%d", existing->second->Host(), port);
 	}
 	servers.emplace(key, make_uniq<QuackapiHttpServer>(db, host, port, opts));
 }

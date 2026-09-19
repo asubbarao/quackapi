@@ -5,6 +5,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
 #include "quackapi_ddl.hpp"
@@ -1106,6 +1107,24 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	return std::move(bind_data);
 }
 
+//! A prepared statement is session-local, so EXECUTE can never resolve on the
+//! connection a request worker runs on. DuckDB's binder says so already; asking
+//! the parser covers the pg_dsn path, which admits handler SQL it cannot prepare.
+bool HandlerExecutesPreparedStatement(const string &handler_sql) {
+	try {
+		Parser parser;
+		parser.ParseQuery(handler_sql);
+		for (auto &statement : parser.statements) {
+			if (statement && statement->type == StatementType::EXECUTE_STATEMENT) {
+				return true;
+			}
+		}
+	} catch (...) {
+		// Postgres-dialect handlers are the pg_dsn path's business, not this check's.
+	}
+	return false;
+}
+
 void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->CastNoConst<ApplyRouteBindData>();
 	if (bind_data.finished) {
@@ -1136,6 +1155,12 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 		// not at first request. Do this BEFORE mutating the registry so
 		// CREATE OR REPLACE does not leave a half-applied route on failure.
 		{
+			if (HandlerExecutesPreparedStatement(bind_data.route.handler_sql)) {
+				throw InvalidInputException(
+				    "Route \"%s\" cannot execute a prepared statement: request workers run on their own DuckDB "
+				    "connections, where the prepared name does not exist. Put the handler SQL in CREATE ROUTE.",
+				    bind_data.route.name);
+			}
 			Connection con(*context.db);
 			auto prepared = con.Prepare(bind_data.route.handler_sql);
 			if (prepared->HasError()) {

@@ -194,6 +194,41 @@ SELECT count(*) FROM quackapi_routes() WHERE starts_with(name, '__quackapi_healt
 statement ok
 SELECT * FROM quackapi_stop(29451);
 
+# ---------------------------------------------------------------------------
+# Bug: the registry keyed on the host spelling, so 127.0.0.1 and ::1 each bound
+# port 29452 and one localhost URL answered from two different servers.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT * FROM quackapi_serve(29452, host := '127.0.0.1');
+
+statement error
+SELECT * FROM quackapi_serve(29452, host := '::1');
+----
+quackapi already serving on 127.0.0.1:29452
+
+statement error
+SELECT * FROM quackapi_serve(29452, host := 'localhost');
+----
+quackapi already serving on 127.0.0.1:29452
+
+query II
+SELECT host, port FROM quackapi_servers();
+----
+127.0.0.1	29452
+
+statement ok
+SELECT * FROM quackapi_stop(29452);
+
+# A prepared statement is session-local, so a request worker's own connection
+# could never resolve the name. Say so at CREATE ROUTE.
+statement ok
+PREPARE route_handler AS SELECT 1 AS ok;
+
+statement error
+CREATE ROUTE prepared_handler GET '/prepared-handler' AS EXECUTE route_handler;
+----
+cannot execute a prepared statement
+
 # OpenAPI after DROP ROUTE: path must vanish (live snapshot — regression lock).
 statement ok
 CREATE ROUTE oa GET '/oa' AS SELECT 1 AS n;

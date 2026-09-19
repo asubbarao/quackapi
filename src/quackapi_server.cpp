@@ -3656,6 +3656,32 @@ QuackapiHttpServer::~QuackapiHttpServer() {
 	}
 }
 
+bool QuackapiHostIsLoopback(const string &host) {
+	if (host.empty()) {
+		return false;
+	}
+	addrinfo hints {};
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	addrinfo *resolved = nullptr;
+	if (getaddrinfo(host.c_str(), nullptr, &hints, &resolved) != 0) {
+		return false;
+	}
+	static const unsigned char ipv6_loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+	bool loopback = false;
+	for (auto *entry = resolved; entry && !loopback; entry = entry->ai_next) {
+		if (entry->ai_family == AF_INET) {
+			auto *ipv4 = reinterpret_cast<const sockaddr_in *>(entry->ai_addr);
+			loopback = (ntohl(ipv4->sin_addr.s_addr) >> 24) == 127;
+		} else if (entry->ai_family == AF_INET6) {
+			auto *ipv6 = reinterpret_cast<const sockaddr_in6 *>(entry->ai_addr);
+			loopback = memcmp(ipv6->sin6_addr.s6_addr, ipv6_loopback, sizeof(ipv6_loopback)) == 0;
+		}
+	}
+	freeaddrinfo(resolved);
+	return loopback;
+}
+
 bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_ms) {
 	if (port < 1 || port > 65535 || host.empty()) {
 		return false;

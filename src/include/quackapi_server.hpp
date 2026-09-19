@@ -265,4 +265,9 @@ void ProbeQuackapiRequestIdSource(DatabaseInstance &db, QuackapiServeOptions &op
 //! response, including 404). Used by quackapi_wait for readiness.
 bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_ms = 200);
 
+//! True when host resolves to a loopback address. Asked rather than compared
+//! against a list of spellings, so the rest of 127.0.0.0/8 and a remapped hosts
+//! entry answer the same as 127.0.0.1, ::1 and localhost.
+bool QuackapiHostIsLoopback(const string &host);
+
 } // namespace duckdb
