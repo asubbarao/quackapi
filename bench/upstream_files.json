@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/fastapi/fastapi",
+  "commit": "50113da16fec53b66b80d75e80a89296de4fa5a5",
+  "application_root": "docs_src/bigger_applications/app_an_py310",
+  "files": {
+    "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "dependencies.py": "b55adb4cbc5adec1ec76e8ea3d6ce181a2770552fd569b3f51a84d82436eec58",
+    "internal/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "internal/admin.py": "2c81315bfe86c99ab3481f74420d561cf9d9a59c340db702ec6e1bf6ab6806c1",
+    "main.py": "8df1c8f236376374a2cc065fe08ca2d8888b0a3b3bfe916e4f5d35e75b6f22c8",
+    "routers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "routers/items.py": "b5fd6677ef47e3861eb39135015702b4a9f452a47cd5e6f0ebecd7b1d7ea55bb",
+    "routers/users.py": "b2276e608ff0937a12e74103ef2966cd468b1e156675a4b936babbba7d9d3756"
+  }
+}
