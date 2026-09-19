@@ -1,63 +1,29 @@
 #!/usr/bin/env bash
-# Reproducible report smoke test. Uses only generated k6-shaped rows.
 set -euo pipefail
 
-BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 DUCKDB_BIN="${DUCKDB_BIN:-${BENCH_DIR}/../build/release/duckdb}"
-if [[ ! -x "$DUCKDB_BIN" ]]; then
-  echo "SKIP: duckdb CLI not found: $DUCKDB_BIN"
-  exit 0
-fi
+fixture="$(mktemp -d /tmp/quackapi-honest-report.XXXXXX)"
+trap 'rm -rf "${fixture}"' EXIT
 
-fixture="$(mktemp -d /tmp/quackapi-report.XXXXXX)"
-trap 'rm -rf "$fixture"' EXIT
-mkdir -p "$fixture/raw"
-
-cat >"$fixture/cells.tsv" <<'EOF'
-export_name	stack	scenario	vus	k6_exit	measure_requests	measure_successful	measure_http_failures	measure_check_failures	valid	invalid_reason	all_requests	all_successful	all_http_failures	measure_seconds
-good__item__vus1	quackapi-w1	item	1	0	3	3	0	0	1		3	3	0	1
-bad__item__vus1	fastapi-w1	item	1	0	3	3	0	1	0	measure_check_failures=1	3	3	0	1
-EOF
-
-{
-  printf '%s\n' 'metric_name,metric_value,scenario'
-  printf '%s\n' 'http_req_duration,1,measure' 'http_req_duration,2,measure' 'http_req_duration,3,measure'
-} | gzip >"$fixture/raw/good__item__vus1.csv.gz"
-{
-  printf '%s\n' 'metric_name,metric_value,scenario'
-  printf '%s\n' 'http_req_duration,1,measure' 'http_req_duration,2,measure' 'http_req_duration,3,measure'
-} | gzip >"$fixture/raw/bad__item__vus1.csv.gz"
-printf 'stack\tscenario\tvus\tpg_rows\tk6_ok\n' >"$fixture/rowchecks.tsv"
+printf '%s\n' \
+  '{"stack":"quackapi","trial":1,"concurrency":32,"attempted":96,"successful":92,"successful_rps":100,"p50_ms":1,"p99_ms":9,"max_ms":10028,"contract_failures":0,"timeouts":0,"resets":4,"eofs":0,"other_no_response":0}' \
+  '{"stack":"fastapi","trial":1,"concurrency":32,"attempted":90,"successful":90,"successful_rps":90,"p50_ms":2,"p99_ms":10,"max_ms":12,"contract_failures":0,"timeouts":0,"resets":0,"eofs":0,"other_no_response":0}' \
+  >"${fixture}/measurements.jsonl"
+printf '%s\n' \
+  '{"stack":"quackapi","passed":8,"total":9}' \
+  '{"stack":"fastapi","passed":9,"total":9}' \
+  >"${fixture}/conformance.jsonl"
+printf '%s\n' \
+  '{"stack":"quackapi","attempted":64,"acknowledged":64,"survived":64}' \
+  '{"stack":"fastapi","attempted":64,"acknowledged":64,"survived":0}' \
+  >"${fixture}/crash.jsonl"
 
 (
-  cd "$fixture"
-  "$DUCKDB_BIN" -init /dev/null -json < "${BENCH_DIR}/report.sql" > report.json
+  cd "${fixture}"
+  "${DUCKDB_BIN}" -no-init -csv <"${BENCH_DIR}/report.sql" >report.csv
+  rg '10028' report.csv >/dev/null
+  rg '64,64,64,0' report.csv >/dev/null
 )
-python3 - "$fixture/report.json" <<'PY'
-import json
-import sys
 
-with open(sys.argv[1]) as report:
-    rows = json.load(report)
-
-by_stack = {row["stack"]: row for row in rows}
-good = by_stack["quackapi-w1"]
-bad = by_stack["fastapi-w1"]
-
-# This guards the manifest-to-raw correlation, raw measure-stage filter, and
-# quantile join. A filename parser used to lose the VUS and leave the row with
-# no latency samples while this smoke test still passed.
-assert good["scenario"] == "item"
-assert good["vus"] == 1
-assert good["sample_count"] == 3
-assert good["p1_ms"] == 1.0
-assert good["p50_ms"] == 2.0
-assert good["p95_ms"] == 3.0
-assert good["p99_ms"] == 3.0
-assert good["valid"] is True
-
-assert bad["sample_count"] == 3
-assert bad["valid"] is False
-assert "measure_check_failures=1" in bad["invalid_reason"]
-PY
-echo "PASS: report preserves valid and invalid cells with parsed VUs and latency samples"
+echo "PASS: report preserves max latency and crash survivors"
