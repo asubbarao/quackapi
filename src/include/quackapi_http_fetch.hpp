@@ -54,6 +54,9 @@ struct QuackapiHttpFetchResult {
 
 //! Snapshot of the outbound connection pool, exposed as quackapi_http_pool().
 struct QuackapiHttpPoolStats {
+	//! Which HTTPUtil holds these clients. A pooled client belongs to the
+	//! implementation that created it, so the pool is keyed by both.
+	string client;
 	string host;
 	idx_t idle = 0;
 	idx_t dialed = 0;

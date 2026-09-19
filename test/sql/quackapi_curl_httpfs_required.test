@@ -12,3 +12,13 @@ statement error
 SELECT * FROM quackapi_serve(29408, host := '127.0.0.1');
 ----
 required extension curl_httpfs
+
+# Plain http:// is not exempt. It used to be: IsPlainHTTP routed every http://
+# URL to the vendored duckdb_httplib::Client, so quackapi reached its own bundled
+# client no matter which HTTPUtil the operator had loaded, and this statement
+# succeeded. Outbound fetch now goes through HTTPUtil for every scheme, so with
+# no curl_httpfs available it must refuse rather than quietly use httplib.
+statement error
+SELECT status FROM quackapi_fetch('http://127.0.0.1:29409/nothing');
+----
+requires curl_httpfs
