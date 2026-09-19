@@ -8,6 +8,8 @@
 -- Or interactive: paste after LOAD quackapi;
 --
 -- In-process checks use quackapi_request (no TCP). For live HTTP, add:
+--   INSTALL curl_httpfs FROM community;            -- serve requires both
+--   INSTALL httpfs_timeout_retry FROM community;
 --   SELECT * FROM quackapi_serve(18090);
 
 LOAD quackapi;

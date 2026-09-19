@@ -3,6 +3,7 @@
 --
 -- Prerequisites (once):
 --   INSTALL curl_httpfs FROM community;
+--   INSTALL httpfs_timeout_retry FROM community;   -- serve requires it too
 --   INSTALL quackapi FROM community;   -- or LOAD a local build
 --
 -- Recommended load order:

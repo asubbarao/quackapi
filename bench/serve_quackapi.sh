@@ -13,6 +13,11 @@ PORT="${QUACKAPI_PORT:-18080}"
 WORKER_THREADS="${QUACKAPI_WORKER_THREADS:-32}"
 MAX_PENDING="${QUACKAPI_MAX_PENDING_REQUESTS:-256}"
 
+# quackapi_serve LOADs curl_httpfs and httpfs_timeout_retry and refuses by name
+# without them. Installing here keeps the download out of the measured process.
+"${DUCKDB_BIN}" -no-init -unsigned "${DATABASE}" \
+  -c "INSTALL curl_httpfs FROM community; INSTALL httpfs_timeout_retry FROM community;"
+
 exec "${DUCKDB_BIN}" -no-init -unsigned "${DATABASE}" \
   -f "${ROUTES_SQL}" \
   -c "SELECT * FROM quackapi_serve(${PORT}, host := '127.0.0.1', access_log := false, enable_logging := false, worker_threads := ${WORKER_THREADS}, max_pending_requests := ${MAX_PENDING}, block := true);"

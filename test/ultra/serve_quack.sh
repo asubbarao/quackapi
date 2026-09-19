@@ -33,6 +33,9 @@ mkfifo "$FIFO"
 DPID=$!
 exec 3>"$FIFO"
 
+# quackapi_serve LOADs these and refuses by name without them; it never installs.
+printf "INSTALL curl_httpfs FROM community;\n" >&3
+printf "INSTALL httpfs_timeout_retry FROM community;\n" >&3
 printf "LOAD '%s';\n" "${EXT//\'/\'\'}" >&3
 cat "${ROOT}/test/ultra/routes.sql" >&3
 printf "SELECT * FROM quackapi_serve(%s, host := '%s', health_routes := false, access_log := false, enable_logging := false, compression := true, cors_origins := 'http://example.test');\n" "$PORT" "$HOST" >&3
