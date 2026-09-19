@@ -127,6 +127,24 @@ Names must be unique across both policy kinds.
 
 ---
 
+## Writes
+
+Policies rewrite reads. A handler that is not a single `SELECT` — `INSERT`, `UPDATE`, `DELETE` — is admitted whenever none of the relations it touches carries a binding, so a policy on one column of one table does not disable writes elsewhere in the process.
+
+A handler that does reach a bound relation is refused, because there is no write policy to apply:
+
+```sql
+CREATE ROUTE zero_orders POST '/zero' REQUIRE jwt_pol AS
+UPDATE pol_orders SET amount = 0 WHERE id = 1 RETURNING id;
+-- Invalid Input Error: Invalid handler SQL for route "zero_orders": policy
+-- enforcement supports one SELECT statement per handler, and this handler
+-- reaches policy-protected relation "memory"."main"."pol_orders"
+```
+
+Bind a policy after such a route already exists and the refusal moves to request time: **403** “Policy enforcement rejected this route handler”, which is a different condition from the **403** “Policy denies unauthenticated access” above.
+
+---
+
 ## Design notes
 
 - Policies are **helpers**, not a full multi-tenant RBAC product.  

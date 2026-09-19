@@ -156,13 +156,13 @@ CREATE ROUTE auth_orders_macro GET '/auth_orders_macro' REQUIRE jwt_pol AS
 ----
 Route auth_orders_macro: GET /auth_orders_macro
 
-# Policy enforcement is read-only today. Reject protected-table mutations
-# rather than executing an update without a row-level write policy.
-query I
+# Policy enforcement is read-only today. A mutation of a protected table has no
+# write policy to apply, so it is refused where the handler is written.
+statement error
 CREATE ROUTE mutate_orders POST '/mutate_orders' REQUIRE jwt_pol AS
   UPDATE policy_orders SET amount = 0 WHERE id = 1 RETURNING id;
 ----
-Route mutate_orders: POST /mutate_orders
+reaches policy-protected relation "memory"."main"."policy_orders"
 
 query I
 CREATE STREAM policy_orders_sse GET '/policy-orders-sse' AS
@@ -295,8 +295,8 @@ SELECT status, decode(body) FROM quackapi_request('GET', '/public_users_scalar')
 ----
 403	{"detail":"Policy denies unauthenticated access"}
 
-# Indirect table macros and protected-table writes are denied even after JWT
-# verification. Confirm the rejected mutation left the table unchanged.
+# Indirect table macros are denied even after JWT verification, and the refusal
+# says so rather than blaming the caller's credentials.
 query II
 SELECT status, decode(body)
 FROM quackapi_request(
@@ -304,21 +304,7 @@ FROM quackapi_request(
   headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
 );
 ----
-403	{"detail":"Policy denies unauthenticated access"}
-
-query II
-SELECT status, decode(body)
-FROM quackapi_request(
-  'POST', '/mutate_orders',
-  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
-);
-----
-403	{"detail":"Policy denies unauthenticated access"}
-
-query I
-SELECT amount FROM policy_orders WHERE id = 1;
-----
-100
+403	{"detail":"Policy enforcement rejected this route handler"}
 
 # ---------------------------------------------------------------------------
 # Fail closed — unauthenticated request to policied table → 403 (not open)
@@ -501,11 +487,6 @@ query I
 DROP ROUTE auth_orders_macro;
 ----
 Dropped route auth_orders_macro
-
-query I
-DROP ROUTE mutate_orders;
-----
-Dropped route mutate_orders
 
 query I
 DROP AUTH jwt_pol;

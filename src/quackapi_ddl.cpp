@@ -8,6 +8,7 @@
 #include "duckdb/parser/parser_extension.hpp"
 
 #include "quackapi_ddl.hpp"
+#include "quackapi_policy.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
 
@@ -1151,6 +1152,16 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 				if (!pg_returning && !has_pg_dsn) {
 					throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name, err);
 				}
+			}
+		}
+		// Policies rewrite reads, so a handler that mutates a protected relation has
+		// no write policy to apply. Refuse it here, where the handler is written,
+		// rather than as a 403 on the first request.
+		{
+			string policy_reason;
+			if (HandlerUnsupportedByPolicies(*context.db, bind_data.route.handler_sql, policy_reason)) {
+				throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name,
+				                            policy_reason);
 			}
 		}
 		state.AddRoute(bind_data.route, bind_data.or_replace);

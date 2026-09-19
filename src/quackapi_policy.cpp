@@ -14,7 +14,10 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/list.hpp"
 
 #include "quackapi_state.hpp"
@@ -997,6 +1000,9 @@ struct PolicyRewriteContext {
 	bool authenticated;
 	string default_catalog;
 	bool deny_unauthenticated = false;
+	//! Report bound relations instead of rewriting them. Set for handlers the
+	//! rewriter cannot express, where the answer is admit-or-refuse.
+	bool detect_only = false;
 	string error;
 	unordered_map<string, bool> view_cache;
 
@@ -1010,7 +1016,7 @@ struct PolicyRewriteContext {
 		if (error.empty()) {
 			error = reason;
 		}
-		if (!authenticated) {
+		if (!authenticated && !detect_only) {
 			deny_unauthenticated = true;
 		}
 	}
@@ -1153,6 +1159,14 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 		}
 		if (!rap_binding && !first_mask) {
 			return true;
+		}
+		if (ctx.detect_only) {
+			// Policies rewrite reads; there is no write policy to apply. Name the
+			// relation so the refusal points at the binding that caused it.
+			ctx.Reject(StringUtil::Format("policy enforcement supports one SELECT statement per handler, and this "
+			                              "handler reaches policy-protected relation %s",
+			                              QuotePolicyTableIdentity(identity)));
+			return false;
 		}
 		if (!ctx.authenticated) {
 			ctx.deny_unauthenticated = true;
@@ -1299,6 +1313,116 @@ bool RewritePolicyQueryNode(QueryNode &node, PolicyRewriteContext &ctx) {
 	}
 }
 
+bool InspectPolicyExpressionList(vector<unique_ptr<ParsedExpression>> &expressions, PolicyRewriteContext &ctx) {
+	for (auto &expression : expressions) {
+		if (expression && !RewritePolicyExpression(*expression, ctx)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool InspectPolicyCteMap(CommonTableExpressionMap &cte_map, PolicyRewriteContext &ctx) {
+	for (auto &entry : cte_map.map) {
+		if (!entry.second || !entry.second->query || !RewritePolicySelect(*entry.second->query, ctx)) {
+			ctx.Reject("policy enforcement could not inspect a common table expression");
+			return false;
+		}
+	}
+	return true;
+}
+
+bool InspectPolicySetInfo(UpdateSetInfo &set_info, PolicyRewriteContext &ctx) {
+	if (set_info.condition && !RewritePolicyExpression(*set_info.condition, ctx)) {
+		return false;
+	}
+	return InspectPolicyExpressionList(set_info.expressions, ctx);
+}
+
+//! Walk a statement the rewriter cannot express, reporting every relation it
+//! reaches. Reuses the SELECT walkers so views, table macros and unsupported
+//! sources stay refused rather than trusted, and treats a statement whose
+//! relations cannot be enumerated at all as one of those.
+bool InspectUnrewritableStatement(SQLStatement &statement, PolicyRewriteContext &ctx) {
+	switch (statement.type) {
+	case StatementType::SELECT_STATEMENT:
+		return RewritePolicySelect(statement.Cast<SelectStatement>(), ctx);
+	case StatementType::INSERT_STATEMENT: {
+		auto &insert = statement.Cast<InsertStatement>();
+		auto target = make_uniq<BaseTableRef>();
+		target->catalog_name = insert.catalog;
+		target->schema_name = insert.schema;
+		target->table_name = insert.table;
+		unique_ptr<TableRef> target_ref = std::move(target);
+		if (!InspectPolicyCteMap(insert.cte_map, ctx) || !RewritePolicyTableRef(target_ref, ctx)) {
+			return false;
+		}
+		if (insert.select_statement && !RewritePolicySelect(*insert.select_statement, ctx)) {
+			return false;
+		}
+		if (insert.on_conflict_info) {
+			auto &conflict = *insert.on_conflict_info;
+			if (conflict.condition && !RewritePolicyExpression(*conflict.condition, ctx)) {
+				return false;
+			}
+			if (conflict.set_info && !InspectPolicySetInfo(*conflict.set_info, ctx)) {
+				return false;
+			}
+		}
+		return InspectPolicyExpressionList(insert.returning_list, ctx);
+	}
+	case StatementType::UPDATE_STATEMENT: {
+		auto &update = statement.Cast<UpdateStatement>();
+		if (!InspectPolicyCteMap(update.cte_map, ctx) || !RewritePolicyTableRef(update.table, ctx)) {
+			return false;
+		}
+		if (update.from_table && !RewritePolicyTableRef(update.from_table, ctx)) {
+			return false;
+		}
+		// UPDATE keeps its WHERE on set_info, not on the statement.
+		if (update.set_info && !InspectPolicySetInfo(*update.set_info, ctx)) {
+			return false;
+		}
+		return InspectPolicyExpressionList(update.returning_list, ctx);
+	}
+	case StatementType::DELETE_STATEMENT: {
+		auto &remove = statement.Cast<DeleteStatement>();
+		if (!InspectPolicyCteMap(remove.cte_map, ctx) || !RewritePolicyTableRef(remove.table, ctx)) {
+			return false;
+		}
+		for (auto &using_clause : remove.using_clauses) {
+			if (!RewritePolicyTableRef(using_clause, ctx)) {
+				return false;
+			}
+		}
+		if (remove.condition && !RewritePolicyExpression(*remove.condition, ctx)) {
+			return false;
+		}
+		return InspectPolicyExpressionList(remove.returning_list, ctx);
+	}
+	default:
+		ctx.Reject(StringUtil::Format("policy enforcement cannot resolve the relations a %s handler reaches",
+		                              StatementTypeToString(statement.type)));
+		return false;
+	}
+}
+
+//! Row-access and masking policies rewrite reads only, so a handler the rewriter
+//! cannot express is admissible exactly when it reaches no bound relation.
+//! Returns the refusal reason, empty when the handler may run unchanged.
+string InspectUnrewritableHandler(DatabaseInstance &db, const vector<QuackapiRowAccessBinding> &rap_bindings,
+                                  const vector<QuackapiMaskingBinding> &mask_bindings,
+                                  vector<unique_ptr<SQLStatement>> &statements) {
+	PolicyRewriteContext ctx(db, rap_bindings, mask_bindings, true);
+	ctx.detect_only = true;
+	for (auto &statement : statements) {
+		if (statement && !InspectUnrewritableStatement(*statement, ctx)) {
+			break;
+		}
+	}
+	return ctx.error;
+}
+
 //! Parse and rewrite every supported SELECT shape. Callers receive an explicit
 //! error when a protected relation cannot be inspected safely.
 bool RewriteHandlerWithPoliciesAst(DatabaseInstance &db, const string &handler_sql, bool authenticated,
@@ -1316,13 +1440,19 @@ bool RewriteHandlerWithPoliciesAst(DatabaseInstance &db, const string &handler_s
 	try {
 		Parser parser;
 		parser.ParseQuery(handler_sql);
-		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-			ctx.Reject("policy enforcement supports one SELECT statement per handler");
-		} else {
+		if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
 			auto &select = parser.statements[0]->Cast<SelectStatement>();
 			RewritePolicySelect(select, ctx);
 			if (ctx.error.empty() && !ctx.deny_unauthenticated) {
 				rewritten_sql = select.ToString();
+			}
+		} else {
+			// Assigned rather than Reject()ed: an unsupported handler is not an
+			// authentication failure, and folding it into deny_unauthenticated makes
+			// every caller report the wrong reason.
+			ctx.error = InspectUnrewritableHandler(db, rap_bindings, mask_bindings, parser.statements);
+			if (ctx.error.empty()) {
+				rewritten_sql = handler_sql;
 			}
 		}
 	} catch (...) {
@@ -1330,9 +1460,6 @@ bool RewriteHandlerWithPoliciesAst(DatabaseInstance &db, const string &handler_s
 	}
 	deny_unauthenticated = ctx.deny_unauthenticated;
 	policy_error = ctx.error;
-	if (!policy_error.empty() && !authenticated) {
-		deny_unauthenticated = true;
-	}
 	if (policy_error.empty() && !deny_unauthenticated) {
 		return true;
 	}
@@ -1346,6 +1473,29 @@ bool HandlerTouchesPoliciedTable(DatabaseInstance &db, const string &handler_sql
 	string rewritten;
 	RewriteHandlerWithPoliciesAst(db, handler_sql, false, deny_unauthenticated, policy_error, rewritten);
 	return deny_unauthenticated || !policy_error.empty();
+}
+
+bool HandlerUnsupportedByPolicies(DatabaseInstance &db, const string &handler_sql, string &reason) {
+	reason.clear();
+	auto &state = QuackapiState::Get(db);
+	auto rap_bindings = state.SnapshotRowAccessBindings();
+	auto mask_bindings = state.SnapshotMaskingBindings();
+	if (rap_bindings.empty() && mask_bindings.empty()) {
+		return false;
+	}
+	try {
+		Parser parser;
+		parser.ParseQuery(handler_sql);
+		if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
+			return false;
+		}
+		reason = InspectUnrewritableHandler(db, rap_bindings, mask_bindings, parser.statements);
+	} catch (...) {
+		// Handler SQL that does not parse is already reported by the caller's own
+		// prepare step, which quotes the parser's error instead of guessing.
+		return false;
+	}
+	return !reason.empty();
 }
 
 string RewriteHandlerWithPolicies(DatabaseInstance &db, const string &handler_sql, bool authenticated,

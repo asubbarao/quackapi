@@ -40,4 +40,11 @@ inline string RewriteHandlerWithPolicies(DatabaseInstance &db, const string &han
 //! source that must be rejected while policies are active.
 bool HandlerTouchesPoliciedTable(DatabaseInstance &db, const string &handler_sql);
 
+//! True when policy enforcement cannot admit `handler_sql` at all: the rewriter
+//! only expresses a single SELECT, and anything else reaching a bound relation
+//! has no write policy to apply. `reason` names the relation. Checked at
+//! CREATE ROUTE so the refusal lands where the handler is written; a handler
+//! that reaches nothing bound is unaffected by policies existing elsewhere.
+bool HandlerUnsupportedByPolicies(DatabaseInstance &db, const string &handler_sql, string &reason);
+
 } // namespace duckdb

@@ -2579,8 +2579,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			string stream_policy_error;
 			const auto stream_sql = RewriteHandlerWithPolicies(*db, stream_match.stream.handler_sql, false,
 			                                                   policy_denied, stream_policy_error);
-			if (policy_denied || !stream_policy_error.empty()) {
+			if (policy_denied) {
 				SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
+				finish();
+				return;
+			}
+			if (!stream_policy_error.empty()) {
+				SetJson(res, 403, "{\"detail\":\"Policy enforcement rejected this stream handler\"}");
 				finish();
 				return;
 			}
@@ -2838,8 +2843,16 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	string policy_error;
 	string handler_sql =
 	    RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth, policy_error);
-	if (deny_unauth || !policy_error.empty()) {
+	if (deny_unauth) {
 		SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
+		finish();
+		return;
+	}
+	if (!policy_error.empty()) {
+		// Policy enforcement refused the handler itself. Calling that an
+		// authentication failure sends the operator after credentials that were
+		// never the problem; the reason stays server-side.
+		SetJson(res, 403, "{\"detail\":\"Policy enforcement rejected this route handler\"}");
 		finish();
 		return;
 	}

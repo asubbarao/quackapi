@@ -1,0 +1,115 @@
+# name: test/sql/quackapi_policy_writes.test
+# description: One policy anywhere must not disable every write route
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE TABLE write_secrets (id INTEGER, email VARCHAR);
+
+statement ok
+CREATE TABLE write_audit (id INTEGER, note VARCHAR);
+
+statement ok
+INSERT INTO write_secrets VALUES (1, 'alice@acme.test');
+
+# Registered before any policy exists: the request-time path, not CREATE ROUTE,
+# is what has to hold once a policy appears.
+query I
+CREATE ROUTE write_note POST '/notes' AS
+  INSERT INTO write_audit VALUES (1, 'hello') RETURNING id;
+----
+Route write_note: POST /notes
+
+query I
+CREATE ROUTE write_secret POST '/secrets' AS
+  DELETE FROM write_secrets WHERE id = 1 RETURNING id;
+----
+Route write_secret: POST /secrets
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/notes');
+----
+200	[{"id":1}]
+
+query I
+CREATE MASKING POLICY write_mask ON VARCHAR USING (CASE WHEN $claims_role = 'admin' THEN val ELSE '***' END);
+----
+Masking policy write_mask ON VARCHAR
+
+query I
+ALTER TABLE write_secrets MODIFY COLUMN email SET MASKING POLICY write_mask;
+----
+Set masking policy write_mask on write_secrets.email
+
+# A masking policy on one column of one table is not a process-wide write
+# kill-switch: a handler that reaches no bound relation still runs.
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/notes');
+----
+200	[{"id":1}]
+
+query I
+SELECT count(*) FROM write_audit;
+----
+2
+
+# A handler that does reach the bound relation is refused, and the refusal does
+# not blame the caller's credentials.
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/secrets');
+----
+403	{"detail":"Policy enforcement rejected this route handler"}
+
+query I
+SELECT count(*) FROM write_secrets;
+----
+1
+
+# Once the binding exists, the same handler is refused where it is written.
+statement error
+CREATE ROUTE write_secret_again POST '/secrets-again' AS
+  DELETE FROM write_secrets WHERE id = 1 RETURNING id;
+----
+reaches policy-protected relation "memory"."main"."write_secrets"
+
+# Reads feeding a write are walked too — the write target being unbound is not
+# enough to let a protected relation out through an INSERT ... SELECT.
+statement error
+CREATE ROUTE write_leak POST '/leak' AS
+  INSERT INTO write_audit SELECT id, email FROM write_secrets RETURNING id;
+----
+reaches policy-protected relation "memory"."main"."write_secrets"
+
+# A write route naming no bound relation is still creatable while policies exist.
+query I
+CREATE ROUTE write_note_two POST '/notes-two' AS
+  INSERT INTO write_audit VALUES (2, 'second') RETURNING id;
+----
+Route write_note_two: POST /notes-two
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/notes-two');
+----
+200	[{"id":2}]
+
+statement ok
+DROP ROUTE write_note;
+
+statement ok
+DROP ROUTE write_note_two;
+
+statement ok
+DROP ROUTE write_secret;
+
+query I
+ALTER TABLE write_secrets MODIFY COLUMN email UNSET MASKING POLICY;
+----
+Unset masking policy on write_secrets.email
+
+query I
+DROP MASKING POLICY write_mask;
+----
+Dropped masking policy write_mask
