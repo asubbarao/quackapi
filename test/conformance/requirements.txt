@@ -1,0 +1,13 @@
+# Pins for test/conformance/fastapi_app.py, the live equivalence reference.
+#
+# These are the newest versions available as of 2026-09, not an arbitrary
+# floor: on a Python 3.14 host (the only interpreter this machine has),
+# older common pins such as fastapi==0.115.x / pydantic==2.10.x have no
+# prebuilt pydantic-core wheel and fail to build from source (pyo3/maturin
+# rejects 3.14 as newer than its supported ABI ceiling). Re-pin deliberately,
+# not by dropping the pins, if the target Python changes.
+fastapi==0.141.1
+uvicorn==0.53.0
+starlette==1.6.0
+pydantic==2.13.5
+python-multipart==0.0.32
