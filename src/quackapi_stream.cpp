@@ -19,7 +19,7 @@ namespace {
 
 //! Parse duration to milliseconds: 30 | '30' | '30s' | '500ms' | '1m' | '1h'
 bool ParseIntervalMs(const string &raw, int64_t &out_ms, string &err) {
-	auto s = QuackapiTrim(raw);
+	auto s = QuackapiDdlTrim(raw);
 	if (s.empty()) {
 		err = "empty interval";
 		return false;
@@ -101,7 +101,7 @@ struct StreamDdlParseData : public ParserExtensionParseData {
 //!     AS <select>
 //!   DROP STREAM <name>
 ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -112,7 +112,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 		pos = 25;
 		or_replace = true;
 	} else if (StringUtil::StartsWith(upper, "DROP STREAM ")) {
-		auto name = QuackapiTrim(q.substr(12));
+		auto name = QuackapiDdlTrim(q.substr(12));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP STREAM expects a single stream name");
 		}
@@ -124,7 +124,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = QuackapiTrim(q.substr(pos));
+	auto rest = QuackapiDdlTrim(q.substr(pos));
 	// <name> <METHOD>
 	auto first_space = rest.find(' ');
 	if (first_space == string::npos) {
@@ -136,7 +136,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 			return ParserExtensionParseResult("Stream name must be an identifier ([A-Za-z0-9_-]+)");
 		}
 	}
-	rest = QuackapiTrim(rest.substr(first_space));
+	rest = QuackapiDdlTrim(rest.substr(first_space));
 	auto second_space = rest.find(' ');
 	if (second_space == string::npos) {
 		return ParserExtensionParseResult("Expected GET '<path>' after stream name");
@@ -154,7 +154,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 		                                  "Unknown method \"" +
 		                                  method + "\"");
 	}
-	rest = QuackapiTrim(rest.substr(second_space));
+	rest = QuackapiDdlTrim(rest.substr(second_space));
 
 	// '<path>'
 	if (rest.empty() || rest[0] != '\'') {
@@ -168,7 +168,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 	if (pattern.empty() || pattern[0] != '/') {
 		return ParserExtensionParseResult("Stream path must start with '/'");
 	}
-	rest = QuackapiTrim(rest.substr(path_end + 1));
+	rest = QuackapiDdlTrim(rest.substr(path_end + 1));
 	auto rest_upper = StringUtil::Upper(rest);
 
 	QuackapiStream stream;
@@ -182,7 +182,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 	// optional WITH ( interval=... )
 	if (StringUtil::StartsWith(rest_upper, "WITH") &&
 	    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '(')) {
-		rest = QuackapiTrim(rest.substr(4));
+		rest = QuackapiDdlTrim(rest.substr(4));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("WITH expects a parenthesized option list");
 		}
@@ -190,8 +190,8 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 		if (close == string::npos) {
 			return ParserExtensionParseResult("Unterminated WITH ( ... ) options");
 		}
-		auto opts = QuackapiTrim(rest.substr(1, close - 1));
-		rest = QuackapiTrim(rest.substr(close + 1));
+		auto opts = QuackapiDdlTrim(rest.substr(1, close - 1));
+		rest = QuackapiDdlTrim(rest.substr(close + 1));
 		rest_upper = StringUtil::Upper(rest);
 
 		idx_t oi = 0;
@@ -268,7 +268,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2]))) {
 		return ParserExtensionParseResult("Expected AS <select> in CREATE STREAM");
 	}
-	auto handler = QuackapiTrim(rest.substr(2));
+	auto handler = QuackapiDdlTrim(rest.substr(2));
 	if (handler.empty()) {
 		return ParserExtensionParseResult("Empty handler after AS");
 	}

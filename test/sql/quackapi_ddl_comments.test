@@ -1,0 +1,160 @@
+# name: test/sql/quackapi_ddl_comments.test
+# description: SQL comments (--, /* */) at or inside a DDL statement boundary must not make a quackapi parser extension decline the statement.
+# group: [sql]
+
+require quackapi
+
+# Baseline: no comment involved — must always work, comment or no comment.
+query I
+CREATE ROUTE cmt_baseline GET '/cmt-baseline' AS SELECT 1;
+----
+Route cmt_baseline: GET /cmt-baseline
+
+# A single '--' line comment immediately before CREATE ROUTE, in the same script,
+# is the exact reported reproduction: it must not surface a core-parser syntax
+# error at "ROUTE".
+query I
+-- a comment
+CREATE ROUTE cmt_dash GET '/cmt-dash' AS SELECT 1;
+----
+Route cmt_dash: GET /cmt-dash
+
+# A '/* */' block comment before the statement.
+query I
+/* a block comment */
+CREATE ROUTE cmt_block GET '/cmt-block' AS SELECT 1;
+----
+Route cmt_block: GET /cmt-block
+
+# A comment whose text contains the word ROUTE must not confuse keyword matching —
+# the comment's content is irrelevant, only its extent matters.
+query I
+-- this note mentions CREATE ROUTE and ROUTE on purpose
+CREATE ROUTE cmt_word GET '/cmt-word' AS SELECT 1;
+----
+Route cmt_word: GET /cmt-word
+
+# A comment containing an apostrophe must not desynchronize quote tracking.
+query I
+-- it's a comment with an apostrophe
+CREATE ROUTE cmt_apos GET '/cmt-apos' AS SELECT 1;
+----
+Route cmt_apos: GET /cmt-apos
+
+# A trailing '--' comment on the same line as part of the statement, sitting
+# between two clauses (not just before the whole statement).
+query I
+CREATE ROUTE cmt_trailing GET '/cmt-trailing' STATUS 201 -- trailing note, mentions ROUTE
+FORMAT json AS SELECT 1;
+----
+Route cmt_trailing: GET /cmt-trailing
+
+query I
+SELECT status FROM quackapi_routes() WHERE name = 'cmt_trailing';
+----
+201
+
+# DROP ROUTE preceded by a comment.
+query I
+-- drop time
+DROP ROUTE cmt_dash;
+----
+Dropped route cmt_dash
+
+# CREATE GROUP preceded by a comment (GroupDdlParse shares the same bug pattern).
+query I
+-- group comment
+CREATE GROUP cmt_group WITH (prefix='/cmt-group');
+----
+Group cmt_group: /cmt-group
+
+# DROP GROUP preceded by a block comment.
+query I
+/* drop group */
+DROP GROUP cmt_group;
+----
+Dropped group cmt_group
+
+# Final registry sanity: every route that should still exist, does (cmt_dash
+# was dropped above).
+query I
+SELECT array_agg(name ORDER BY name) FROM quackapi_routes();
+----
+[cmt_apos, cmt_baseline, cmt_block, cmt_trailing, cmt_word]
+
+# ---------------------------------------------------------------------------
+# The same bug pattern (QuackapiTrim + literal StartsWith, no comment
+# awareness) was present in all nine of quackapi's DDL parser extensions, not
+# just ROUTE/GROUP. One representative CREATE + DROP smoke test per remaining
+# verb, each preceded by a comment, proves the fix generalizes.
+# ---------------------------------------------------------------------------
+
+# --- AUTH ---
+statement ok
+-- comment before CREATE AUTH
+CREATE AUTH cmt_auth AS API_KEY;
+
+statement ok
+/* comment before DROP AUTH */
+DROP AUTH cmt_auth;
+
+# --- STREAM ---
+statement ok
+-- comment before CREATE STREAM
+CREATE STREAM cmt_stream GET '/cmt-stream' AS SELECT 1 AS n;
+
+statement ok
+/* comment before DROP STREAM */
+DROP STREAM cmt_stream;
+
+# --- QUEUE ---
+statement ok
+-- comment before CREATE QUEUE
+CREATE QUEUE cmt_queue WITH (max_attempts=3, visibility_timeout='1s', backoff_base_seconds=0);
+
+statement ok
+/* comment before DROP QUEUE */
+DROP QUEUE cmt_queue;
+
+# --- MIDDLEWARE ---
+statement ok
+-- comment before CREATE MIDDLEWARE
+CREATE MIDDLEWARE cmt_mw BEFORE AS SELECT true AS allow;
+
+statement ok
+/* comment before DROP MIDDLEWARE */
+DROP MIDDLEWARE cmt_mw;
+
+# --- TABLE API ---
+statement ok
+CREATE TABLE cmt_tbl AS SELECT 1 AS id;
+
+statement ok
+-- comment before CREATE API FOR TABLE
+CREATE API FOR TABLE cmt_tbl;
+
+# --- GRAPHQL FOR TABLE ---
+statement ok
+-- comment before CREATE GRAPHQL FOR TABLE
+CREATE GRAPHQL FOR TABLE cmt_tbl;
+
+statement ok
+/* comment before DROP GRAPHQL FOR TABLE */
+DROP GRAPHQL FOR TABLE cmt_tbl;
+
+# --- ROW ACCESS POLICY / MASKING POLICY ---
+statement ok
+-- comment before CREATE ROW ACCESS POLICY
+CREATE ROW ACCESS POLICY cmt_rap AS (id INTEGER) RETURNS BOOLEAN USING (true);
+
+statement ok
+/* comment before DROP ROW ACCESS POLICY */
+DROP ROW ACCESS POLICY cmt_rap;
+
+statement ok
+-- comment before CREATE MASKING POLICY
+CREATE MASKING POLICY cmt_mask ON VARCHAR USING ('***');
+
+statement ok
+/* comment before DROP MASKING POLICY */
+DROP MASKING POLICY cmt_mask;

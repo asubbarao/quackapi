@@ -410,7 +410,7 @@ string SelectTableJson(Connection &con, const string &source_sql, const vector<s
 
 //! Parse a SQL identifier: bare token OR double-quoted with "" escapes.
 bool ParseIdent(string &rest, string &out) {
-	rest = QuackapiTrim(rest);
+	rest = QuackapiDdlTrim(rest);
 	if (rest.empty()) {
 		return false;
 	}
@@ -425,7 +425,7 @@ bool ParseIdent(string &rest, string &out) {
 					continue;
 				}
 				out = result;
-				rest = QuackapiTrim(rest.substr(i + 1));
+				rest = QuackapiDdlTrim(rest.substr(i + 1));
 				return !out.empty();
 			}
 			result += rest[i];
@@ -445,7 +445,7 @@ bool ParseIdent(string &rest, string &out) {
 		return false;
 	}
 	out = rest.substr(0, i);
-	rest = QuackapiTrim(rest.substr(i));
+	rest = QuackapiDdlTrim(rest.substr(i));
 	return true;
 }
 
@@ -462,12 +462,12 @@ bool ParseTableList(string &rest, vector<string> &tables, string &err) {
 			return false;
 		}
 		tables.push_back(name);
-		rest = QuackapiTrim(rest);
+		rest = QuackapiDdlTrim(rest);
 		if (rest.empty()) {
 			return true;
 		}
 		if (rest[0] == ',') {
-			rest = QuackapiTrim(rest.substr(1));
+			rest = QuackapiDdlTrim(rest.substr(1));
 			if (rest.empty()) {
 				err = "trailing comma in table list";
 				return false;
@@ -538,7 +538,7 @@ struct GraphqlDdlParseData : public ParserExtensionParseData {
 bool ParseTableListUntilKeywords(string &rest, vector<string> &tables, string &err) {
 	tables.clear();
 	while (true) {
-		rest = QuackapiTrim(rest);
+		rest = QuackapiDdlTrim(rest);
 		if (rest.empty()) {
 			if (tables.empty()) {
 				err = "expected at least one table name";
@@ -566,12 +566,12 @@ bool ParseTableListUntilKeywords(string &rest, vector<string> &tables, string &e
 			return false;
 		}
 		tables.push_back(name);
-		rest = QuackapiTrim(rest);
+		rest = QuackapiDdlTrim(rest);
 		if (rest.empty()) {
 			return true;
 		}
 		if (rest[0] == ',') {
-			rest = QuackapiTrim(rest.substr(1));
+			rest = QuackapiDdlTrim(rest.substr(1));
 			if (rest.empty()) {
 				err = "trailing comma in table list";
 				return false;
@@ -597,13 +597,13 @@ bool ParseTableListUntilKeywords(string &rest, vector<string> &tables, string &e
 //!        [REQUIRE <auth>] [LIMIT <n>]
 //!   DROP GRAPHQL ROUTE <name>
 ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	// DROP GRAPHQL ALL — token boundary so "DROP GRAPHQL ALLOWED" is not ours.
 	if (StringUtil::StartsWith(upper, "DROP GRAPHQL ALL") &&
 	    (upper.size() == 16 || (!StringUtil::CharacterIsAlphaNumeric(upper[16]) && upper[16] != '_'))) {
-		auto tail = QuackapiTrim(q.substr(16));
+		auto tail = QuackapiDdlTrim(q.substr(16));
 		if (!tail.empty()) {
 			return ParserExtensionParseResult("DROP GRAPHQL ALL takes no arguments");
 		}
@@ -614,7 +614,7 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 
 	// DROP GRAPHQL ROUTE <name>
 	if (StringUtil::StartsWith(upper, "DROP GRAPHQL ROUTE ")) {
-		auto name = QuackapiTrim(q.substr(19));
+		auto name = QuackapiDdlTrim(q.substr(19));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP GRAPHQL ROUTE expects a single route name");
 		}
@@ -634,14 +634,14 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		route_or_replace = true;
 	}
 	if (route_pos > 0) {
-		auto rest = QuackapiTrim(q.substr(route_pos));
+		auto rest = QuackapiDdlTrim(q.substr(route_pos));
 		// <name>
 		auto sp = rest.find(' ');
 		if (sp == string::npos) {
 			return ParserExtensionParseResult("CREATE GRAPHQL ROUTE <name> POST '<path>' FROM <table> [, …]");
 		}
 		auto name = rest.substr(0, sp);
-		rest = QuackapiTrim(rest.substr(sp));
+		rest = QuackapiDdlTrim(rest.substr(sp));
 		// POST
 		sp = rest.find(' ');
 		if (sp == string::npos) {
@@ -651,7 +651,7 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		if (method != "POST") {
 			return ParserExtensionParseResult("CREATE GRAPHQL ROUTE only supports POST in v0 (got " + method + ")");
 		}
-		rest = QuackapiTrim(rest.substr(sp));
+		rest = QuackapiDdlTrim(rest.substr(sp));
 		// '<path>'
 		if (rest.empty() || rest[0] != '\'') {
 			return ParserExtensionParseResult("Expected quoted '<path>' after POST");
@@ -664,13 +664,13 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		if (path.empty() || path[0] != '/') {
 			return ParserExtensionParseResult("GraphQL route path must be absolute (start with '/')");
 		}
-		rest = QuackapiTrim(rest.substr(path_end + 1));
+		rest = QuackapiDdlTrim(rest.substr(path_end + 1));
 		// FROM
 		auto rest_u = StringUtil::Upper(rest);
 		if (!StringUtil::StartsWith(rest_u, "FROM") || !(rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]))) {
 			return ParserExtensionParseResult("Expected FROM <table> [, …] after path");
 		}
-		rest = QuackapiTrim(rest.substr(4));
+		rest = QuackapiDdlTrim(rest.substr(4));
 		vector<string> tables;
 		string err;
 		if (!ParseTableListUntilKeywords(rest, tables, err)) {
@@ -680,14 +680,14 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		idx_t limit = QUACKAPI_GRAPHQL_DEFAULT_LIMIT;
 		bool has_limit = false;
 		for (int round = 0; round < 4; round++) {
-			rest = QuackapiTrim(rest);
+			rest = QuackapiDdlTrim(rest);
 			if (rest.empty()) {
 				break;
 			}
 			rest_u = StringUtil::Upper(rest);
 			if (StringUtil::StartsWith(rest_u, "REQUIRE") &&
 			    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
-				rest = QuackapiTrim(rest.substr(7));
+				rest = QuackapiDdlTrim(rest.substr(7));
 				idx_t te = 0;
 				while (te < rest.size() && !StringUtil::CharacterIsSpace(rest[te])) {
 					te++;
@@ -696,12 +696,12 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 					return ParserExtensionParseResult("REQUIRE expects an auth name");
 				}
 				require_auth = rest.substr(0, te);
-				rest = QuackapiTrim(rest.substr(te));
+				rest = QuackapiDdlTrim(rest.substr(te));
 				continue;
 			}
 			if (StringUtil::StartsWith(rest_u, "LIMIT") &&
 			    (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
-				rest = QuackapiTrim(rest.substr(5));
+				rest = QuackapiDdlTrim(rest.substr(5));
 				idx_t te = 0;
 				while (te < rest.size() && !StringUtil::CharacterIsSpace(rest[te])) {
 					te++;
@@ -724,7 +724,7 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 					return ParserExtensionParseResult("LIMIT must be between 1 and 100000");
 				}
 				has_limit = true;
-				rest = QuackapiTrim(rest.substr(te));
+				rest = QuackapiDdlTrim(rest.substr(te));
 				continue;
 			}
 			return ParserExtensionParseResult("Unexpected trailing content after GRAPHQL ROUTE: " + rest);
@@ -758,7 +758,7 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = QuackapiTrim(q.substr(pos));
+	auto rest = QuackapiDdlTrim(q.substr(pos));
 	if (rest.empty()) {
 		return ParserExtensionParseResult(is_drop ? "DROP GRAPHQL FOR TABLE expects at least one table name"
 		                                          : "CREATE GRAPHQL FOR TABLE expects at least one table name");

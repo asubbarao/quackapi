@@ -15,6 +15,19 @@ namespace duckdb {
 //! Trim whitespace and trailing ';'.
 string QuackapiTrim(const string &input);
 
+//! Comment-aware QuackapiTrim for hand-rolled DDL grammars: also skips leading
+//! '--' line comments and nestable '/* */' block comments before the next
+//! keyword is matched. Every quackapi ParserExtension::parse_function receives
+//! the *raw* split-out statement text — DuckDB tokenizes the whole script to
+//! find statement boundaries (comment-aware) but only whitespace-trims each
+//! resulting segment before handing it to the extension (see SplitQueries in
+//! duckdb/src/parser/parser.cpp), so a comment sitting at a clause boundary is
+//! still attached. A grammar that only calls QuackapiTrim there misses its
+//! keyword and silently declines the statement, and DuckDB then reports its own
+//! confusing syntax error instead. Use this wherever a DDL grammar advances past
+//! whitespace to the next token.
+string QuackapiDdlTrim(const string &input);
+
 //! JSON string escape including control bytes as \u00XX (auth + OpenAPI + responses).
 string QuackapiJsonEscape(const string &input);
 
