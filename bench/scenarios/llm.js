@@ -23,6 +23,17 @@ const outTokens = new Counter('out_tokens');
 const ok = new Rate('logical_success');
 const timingInvalid = new Rate('timing_invalid');
 
+// Without these the checks below are decoration: k6 exits 0 with every check
+// failed. Latency is deliberately absent -- ollama is the shared bottleneck and
+// a slow response is the model, not a failure -- but correctness is not.
+const thresholds = {
+  checks: ['rate==1'],
+  logical_success: ['rate==1'],
+  http_req_failed: ['rate==0'],
+};
+// timing_invalid only takes samples on the generation route.
+if (API === 'ask') { thresholds.timing_invalid = ['rate==0']; }
+
 export const options = {
   scenarios: {
     load: {
@@ -32,8 +43,7 @@ export const options = {
       gracefulStop: '60s',
     },
   },
-  // Ollama is the shared bottleneck; a slow response is the model, not a failure.
-  thresholds: {},
+  thresholds,
 };
 
 const PROMPTS = [
@@ -55,8 +65,8 @@ export default function () {
   const res = http.post(url, null, { timeout: '600s' });
   const e2e = Date.now() - started;
 
-  const statusOk = res.status >= 200 && res.status < 300;
-  const good = check(res, { 'status 2xx': () => statusOk });
+  const statusOk = res.status === 200;
+  const good = check(res, { 'status 200': () => statusOk });
 
   let logical = false;
   if (good) {
@@ -70,6 +80,7 @@ export default function () {
         logical = body && typeof body.response === 'string';
         const t = Number(body && body.ollama_total_ms);
         if (Number.isFinite(t) && t > 0) {
+          timingInvalid.add(0);
           ollamaTime.add(t);
           // Keep the signed residual. Clamping a negative value hides clock,
           // serialization, or upstream timing inconsistencies.

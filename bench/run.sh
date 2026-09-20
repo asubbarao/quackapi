@@ -22,6 +22,7 @@ RESULTS="${RESULTS_ROOT}/${RUN_ID}"
 UPSTREAM_CHECKOUT="${WORK_ROOT}/upstream"
 UPSTREAM_APP="${UPSTREAM_CHECKOUT}/docs_src/bigger_applications/app_an_py310"
 SERVER_PID=""
+GATE_FAILURES=""
 
 export DUCKDB_BIN QUACKAPI_EXT BENCH_VENV QUACKAPI_PORT FASTAPI_PORT
 
@@ -40,6 +41,14 @@ require_file() {
     echo "error: required file not found: $1" >&2
     exit 1
   fi
+}
+
+# Record a failing bench program instead of swallowing it: the remaining levels
+# and the report still run, and the recorded gate makes the final exit nonzero.
+gate() {
+  local label="$1"
+  shift
+  "$@" || GATE_FAILURES="${GATE_FAILURES}${label}"$'\n'
 }
 
 wait_ready() {
@@ -119,11 +128,13 @@ run_stack_trial() {
   [[ "${stack}" == "fastapi" ]] && port="${FASTAPI_PORT}"
   start_server "${stack}" "trial${trial}"
   if [[ "${trial}" == "1" ]]; then
-    "${BENCH_VENV}/bin/python" "${BENCH_DIR}/conformance.py" --stack "${stack}" --port "${port}" >>"${RESULTS}/conformance.jsonl"
+    gate "conformance:${stack}" \
+      "${BENCH_VENV}/bin/python" "${BENCH_DIR}/conformance.py" --stack "${stack}" --port "${port}" >>"${RESULTS}/conformance.jsonl"
   fi
   for concurrency in ${CONCURRENCY_LEVELS}; do
     raw="${RESULTS}/raw/${stack}__trial${trial}__c${concurrency}.csv.gz"
-    "${BENCH_VENV}/bin/python" "${BENCH_DIR}/loadgen.py" \
+    gate "loadgen:${stack}:trial${trial}:c${concurrency}" \
+      "${BENCH_VENV}/bin/python" "${BENCH_DIR}/loadgen.py" \
       --url "http://127.0.0.1:${port}/users/rick?token=jessica" \
       --stack "${stack}" --trial "${trial}" --concurrency "${concurrency}" \
       --duration "${DURATION_SEC}" --warmup "${WARMUP_SEC}" --timeout "${REQUEST_TIMEOUT_SEC}" \
@@ -133,10 +144,14 @@ run_stack_trial() {
 }
 
 run_crash_case() {
-  local stack="$1" port="${QUACKAPI_PORT}" client_json acknowledged survived
+  local stack="$1" durability="$2" port="${QUACKAPI_PORT}" client_json acknowledged survived
+  local client_status=0
   [[ "${stack}" == "fastapi" ]] && port="${FASTAPI_PORT}"
   start_server "${stack}" crash
-  client_json="$("${BENCH_VENV}/bin/python" "${BENCH_DIR}/crash_client.py" --port "${port}" --jobs "${CRASH_JOBS}" --delay-ms "${CRASH_DELAY_MS}")"
+  client_json="$("${BENCH_VENV}/bin/python" "${BENCH_DIR}/crash_client.py" --port "${port}" --jobs "${CRASH_JOBS}" --delay-ms "${CRASH_DELAY_MS}")" || client_status=$?
+  if [[ "${client_status}" != "0" ]]; then
+    GATE_FAILURES="${GATE_FAILURES}crash_client:${stack}"$'\n'
+  fi
   acknowledged="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["acknowledged"])' <<<"${client_json}")"
   kill -KILL "${SERVER_PID}"
   wait "${SERVER_PID}" 2>/dev/null || true
@@ -150,11 +165,10 @@ run_crash_case() {
       survived="$(wc -l <"${RESULTS}/fastapi_survivors.txt" | tr -d ' ')"
     fi
   fi
-  python3 - "${stack}" "${CRASH_JOBS}" "${acknowledged}" "${survived}" "${client_json}" <<'PY' >>"${RESULTS}/crash.jsonl"
-import json, sys
-stack, attempted, acknowledged, survived, raw = sys.argv[1:]
-print(json.dumps({"stack": stack, "attempted": int(attempted), "acknowledged": int(acknowledged), "survived": int(survived), "client": json.loads(raw)}, separators=(",", ":")))
-PY
+  gate "crash:${stack}" python3 "${BENCH_DIR}/crash_check.py" \
+    --stack "${stack}" --durability "${durability}" --attempted "${CRASH_JOBS}" \
+    --acknowledged "${acknowledged}" --survived "${survived}" --client-json "${client_json}" \
+    >>"${RESULTS}/crash.jsonl"
 }
 
 prepare
@@ -175,10 +189,15 @@ while [[ "${trial}" -le "${TRIALS}" ]]; do
   trial=$((trial + 1))
 done
 
-run_crash_case quackapi
-run_crash_case fastapi
+run_crash_case quackapi durable
+run_crash_case fastapi volatile
 (
   cd "${RESULTS}"
   "${DUCKDB_BIN}" -no-init -box <"${BENCH_DIR}/report.sql" | tee report.txt
 )
 echo "results=${RESULTS}"
+
+if [[ -n "${GATE_FAILURES}" ]]; then
+  printf 'FAIL: the run violated its own contract:\n%s' "${GATE_FAILURES}" >&2
+  exit 1
+fi

@@ -9,6 +9,7 @@ import gzip
 import json
 import math
 from pathlib import Path
+import sys
 import time
 from urllib.parse import urlsplit
 
@@ -44,6 +45,12 @@ async def read_response(reader: asyncio.StreamReader) -> tuple[int, bytes, bool]
     return status, body, headers.get("connection", "").lower() == "close"
 
 
+# Overload is answered with 503 rather than a dropped socket (quackapi_server.cpp),
+# so a shed response is a load measurement. Every other departure from the
+# contracted 200 body is a correctness failure and fails the run.
+SHED_STATUS = 503
+
+
 def percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -77,7 +84,7 @@ async def phase(host: str, port: int, target: str, concurrency: int, duration: f
                     contract_ok = status == 200 and json.loads(body) == expected
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
-                attempts.append({"latency_ms": elapsed_ms, "status": status, "ok": contract_ok, "error": "" if contract_ok else "contract"})
+                attempts.append({"latency_ms": elapsed_ms, "status": status, "ok": contract_ok, "error": "" if contract_ok else ("shed" if status == SHED_STATUS else "contract")})
                 if close:
                     writer.close()
                     await writer.wait_closed()
@@ -133,6 +140,7 @@ async def run(args: argparse.Namespace) -> dict:
         writer.writeheader()
         writer.writerows(attempts)
     contract_failures = errors.pop("contract", 0)
+    sheds = errors.pop("shed", 0)
     timeouts = errors.pop("timeout", 0)
     resets = errors.pop("reset", 0)
     eofs = errors.pop("eof", 0)
@@ -144,7 +152,7 @@ async def run(args: argparse.Namespace) -> dict:
         "p50_ms": percentile(successful, 0.50), "p99_ms": percentile(successful, 0.99),
         "max_ms": max(successful) if successful else None,
         "all_response_max_ms": max(response_latencies) if response_latencies else None,
-        "http_statuses": dict(statuses), "contract_failures": contract_failures,
+        "http_statuses": dict(statuses), "contract_failures": contract_failures, "shed": sheds,
         "timeouts": timeouts, "resets": resets, "eofs": eofs,
         "other_no_response": sum(errors.values()), "other_errors": dict(errors), "raw": str(args.raw),
     }
@@ -162,7 +170,16 @@ def main() -> None:
     parser.add_argument("--expect-json", required=True)
     parser.add_argument("--raw", type=Path, required=True)
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(run(args)), separators=(",", ":")))
+    summary = asyncio.run(run(args))
+    print(json.dumps(summary, separators=(",", ":")))
+    reasons = []
+    if summary["contract_failures"]:
+        reasons.append(f"{summary['contract_failures']} responses were not the contracted 200 body")
+    if not summary["successful"]:
+        reasons.append(f"no request of {summary['attempted']} completed the contract")
+    if reasons:
+        print(f"FAIL: {args.stack} c{args.concurrency} trial{args.trial}: {'; '.join(reasons)}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ SELECT
   round(median(p99_ms), 3) AS median_p99_ms,
   round(max(max_ms), 3) AS worst_max_ms,
   sum(contract_failures) AS contract_failures,
+  sum(shed) AS shed,
   sum(timeouts) AS timeouts,
   sum(resets) AS resets,
   sum(eofs) AS eofs,
