@@ -87,7 +87,9 @@ bool ExtractParenGroup(const string &rest, idx_t start, string &inner, idx_t &en
 bool ParseColList(const string &inner, vector<string> &names, vector<string> &types, string &err) {
 	names.clear();
 	types.clear();
-	string s = QuackapiTrim(inner);
+	// A leading comment right after the opening '(' would otherwise reach
+	// IsIdentStart() as raw '-'/'/' and fail with "expected column name".
+	string s = QuackapiDdlTrim(inner);
 	if (s.empty()) {
 		err = "column list must not be empty";
 		return false;
@@ -270,12 +272,12 @@ struct PolicyDdlParseData : public ParserExtensionParseData {
 };
 
 ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	// ---- DROP ROW ACCESS POLICY / DROP MASKING POLICY ----
 	if (StringUtil::StartsWith(upper, "DROP ROW ACCESS POLICY ")) {
-		auto name = QuackapiTrim(q.substr(23));
+		auto name = QuackapiDdlTrim(q.substr(23));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP ROW ACCESS POLICY expects a single policy name");
 		}
@@ -285,7 +287,7 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 		return ParserExtensionParseResult(std::move(data));
 	}
 	if (StringUtil::StartsWith(upper, "DROP MASKING POLICY ")) {
-		auto name = QuackapiTrim(q.substr(20));
+		auto name = QuackapiDdlTrim(q.substr(20));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP MASKING POLICY expects a single policy name");
 		}
@@ -317,19 +319,19 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 	}
 
 	if (is_create_row) {
-		auto rest = QuackapiTrim(q.substr(pos));
+		auto rest = QuackapiDdlTrim(q.substr(pos));
 		idx_t name_len = 0;
 		auto name = NextToken(rest, name_len);
 		if (name.empty() || name_len >= rest.size()) {
 			return ParserExtensionParseResult(
 			    "CREATE ROW ACCESS POLICY <name> AS (<cols>) RETURNS BOOLEAN USING (<expr>)");
 		}
-		rest = QuackapiTrim(rest.substr(name_len));
+		rest = QuackapiDdlTrim(rest.substr(name_len));
 		auto ru = StringUtil::Upper(rest);
 		if (!StringUtil::StartsWith(ru, "AS")) {
 			return ParserExtensionParseResult("Expected AS (<cols>) after policy name");
 		}
-		rest = QuackapiTrim(rest.substr(2));
+		rest = QuackapiDdlTrim(rest.substr(2));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("Expected AS (<cols>)");
 		}
@@ -343,23 +345,23 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 		if (!ParseColList(col_inner, cols, types, err)) {
 			return ParserExtensionParseResult("ROW ACCESS POLICY AS (...): " + err);
 		}
-		rest = QuackapiTrim(rest.substr(after_cols));
+		rest = QuackapiDdlTrim(rest.substr(after_cols));
 		ru = StringUtil::Upper(rest);
 		// RETURNS BOOLEAN
 		if (!StringUtil::StartsWith(ru, "RETURNS")) {
 			return ParserExtensionParseResult("Expected RETURNS BOOLEAN after AS (...)");
 		}
-		rest = QuackapiTrim(rest.substr(7));
+		rest = QuackapiDdlTrim(rest.substr(7));
 		ru = StringUtil::Upper(rest);
 		if (!StringUtil::StartsWith(ru, "BOOLEAN")) {
 			return ParserExtensionParseResult("ROW ACCESS POLICY must RETURNS BOOLEAN");
 		}
-		rest = QuackapiTrim(rest.substr(7));
+		rest = QuackapiDdlTrim(rest.substr(7));
 		ru = StringUtil::Upper(rest);
 		if (!StringUtil::StartsWith(ru, "USING")) {
 			return ParserExtensionParseResult("Expected USING (<expr>) after RETURNS BOOLEAN");
 		}
-		rest = QuackapiTrim(rest.substr(5));
+		rest = QuackapiDdlTrim(rest.substr(5));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("Expected USING (<expr>)");
 		}
@@ -368,11 +370,13 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 		if (!ExtractParenGroup(rest, 0, expr, after_expr)) {
 			return ParserExtensionParseResult("Unterminated USING (...) expression");
 		}
-		expr = QuackapiTrim(expr);
+		// A leading comment right after the opening '(' would otherwise be stored
+		// as part of the policy's expression text and re-emitted into generated SQL.
+		expr = QuackapiDdlTrim(expr);
 		if (expr.empty()) {
 			return ParserExtensionParseResult("USING expression must not be empty");
 		}
-		rest = QuackapiTrim(rest.substr(after_expr));
+		rest = QuackapiDdlTrim(rest.substr(after_expr));
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after USING (...)");
 		}
@@ -387,13 +391,13 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 	}
 
 	if (is_create_mask) {
-		auto rest = QuackapiTrim(q.substr(pos));
+		auto rest = QuackapiDdlTrim(q.substr(pos));
 		idx_t name_len = 0;
 		auto name = NextToken(rest, name_len);
 		if (name.empty() || name_len >= rest.size()) {
 			return ParserExtensionParseResult("CREATE MASKING POLICY <name> ON <type> USING (<expr>)");
 		}
-		rest = QuackapiTrim(rest.substr(name_len));
+		rest = QuackapiDdlTrim(rest.substr(name_len));
 		auto ru = StringUtil::Upper(rest);
 		if (!StringUtil::StartsWith(ru, "ON")) {
 			return ParserExtensionParseResult("Expected ON <type> after masking policy name");
@@ -405,7 +409,7 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 				return ParserExtensionParseResult("Expected ON <type> USING (<expr>)");
 			}
 		}
-		rest = QuackapiTrim(rest.substr(2));
+		rest = QuackapiDdlTrim(rest.substr(2));
 		idx_t type_len = 0;
 		auto vtype = StringUtil::Upper(NextToken(rest, type_len));
 		if (vtype.empty() || type_len >= rest.size()) {
@@ -420,12 +424,12 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 		} else if (vtype == "REAL") {
 			vtype = "FLOAT";
 		}
-		rest = QuackapiTrim(rest.substr(type_len));
+		rest = QuackapiDdlTrim(rest.substr(type_len));
 		ru = StringUtil::Upper(rest);
 		if (!StringUtil::StartsWith(ru, "USING")) {
 			return ParserExtensionParseResult("Expected USING (<expr>) after ON <type>");
 		}
-		rest = QuackapiTrim(rest.substr(5));
+		rest = QuackapiDdlTrim(rest.substr(5));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("Expected USING (<expr>)");
 		}
@@ -434,11 +438,13 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 		if (!ExtractParenGroup(rest, 0, expr, after_expr)) {
 			return ParserExtensionParseResult("Unterminated USING (...) expression");
 		}
-		expr = QuackapiTrim(expr);
+		// A leading comment right after the opening '(' would otherwise be stored
+		// as part of the policy's expression text and re-emitted into generated SQL.
+		expr = QuackapiDdlTrim(expr);
 		if (expr.empty()) {
 			return ParserExtensionParseResult("USING expression must not be empty");
 		}
-		rest = QuackapiTrim(rest.substr(after_expr));
+		rest = QuackapiDdlTrim(rest.substr(after_expr));
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after USING (...)");
 		}
@@ -453,7 +459,7 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 
 	// ---- ALTER TABLE … ----
 	if (StringUtil::StartsWith(upper, "ALTER TABLE ")) {
-		auto rest = QuackapiTrim(q.substr(12));
+		auto rest = QuackapiDdlTrim(q.substr(12));
 		// table name
 		string table;
 		if (rest.empty()) {
@@ -471,7 +477,7 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 						continue;
 					}
 					table = result;
-					rest = QuackapiTrim(rest.substr(i + 1));
+					rest = QuackapiDdlTrim(rest.substr(i + 1));
 					break;
 				}
 				result += rest[i];
@@ -489,19 +495,19 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 				return ParserExtensionParseResult();
 			}
 			table = rest.substr(0, i);
-			rest = QuackapiTrim(rest.substr(i));
+			rest = QuackapiDdlTrim(rest.substr(i));
 		}
 		auto ru = StringUtil::Upper(rest);
 
 		// ADD [OR REPLACE] ROW ACCESS POLICY <p> ON (<cols>)
 		bool add_or_replace = false;
 		if (StringUtil::StartsWith(ru, "ADD OR REPLACE ROW ACCESS POLICY ")) {
-			rest = QuackapiTrim(rest.substr(33));
+			rest = QuackapiDdlTrim(rest.substr(33));
 			add_or_replace = true;
 		} else if (StringUtil::StartsWith(ru, "ADD ROW ACCESS POLICY ")) {
-			rest = QuackapiTrim(rest.substr(22));
+			rest = QuackapiDdlTrim(rest.substr(22));
 		} else if (StringUtil::StartsWith(ru, "DROP ROW ACCESS POLICY ")) {
-			auto pname = QuackapiTrim(rest.substr(23));
+			auto pname = QuackapiDdlTrim(rest.substr(23));
 			if (pname.empty() || pname.find(' ') != string::npos) {
 				return ParserExtensionParseResult("ALTER TABLE … DROP ROW ACCESS POLICY expects a policy name");
 			}
@@ -512,7 +518,7 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 			return ParserExtensionParseResult(std::move(data));
 		} else if (StringUtil::StartsWith(ru, "MODIFY COLUMN ") || StringUtil::StartsWith(ru, "ALTER COLUMN ")) {
 			idx_t skip = StringUtil::StartsWith(ru, "MODIFY COLUMN ") ? 14 : 13;
-			rest = QuackapiTrim(rest.substr(skip));
+			rest = QuackapiDdlTrim(rest.substr(skip));
 			// column name
 			string col;
 			idx_t ci = 0;
@@ -526,10 +532,10 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 				ci++;
 			}
 			col = rest.substr(0, ci);
-			rest = QuackapiTrim(rest.substr(ci));
+			rest = QuackapiDdlTrim(rest.substr(ci));
 			ru = StringUtil::Upper(rest);
 			if (StringUtil::StartsWith(ru, "SET MASKING POLICY ")) {
-				auto pname = QuackapiTrim(rest.substr(19));
+				auto pname = QuackapiDdlTrim(rest.substr(19));
 				if (pname.empty() || pname.find(' ') != string::npos) {
 					return ParserExtensionParseResult("SET MASKING POLICY expects a policy name");
 				}
@@ -562,12 +568,12 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 		if (pname.empty()) {
 			return ParserExtensionParseResult("ADD ROW ACCESS POLICY expects a policy name");
 		}
-		rest = pname_len >= rest.size() ? string() : QuackapiTrim(rest.substr(pname_len));
+		rest = pname_len >= rest.size() ? string() : QuackapiDdlTrim(rest.substr(pname_len));
 		ru = StringUtil::Upper(rest);
 		if (!StringUtil::StartsWith(ru, "ON")) {
 			return ParserExtensionParseResult("Expected ON (<cols>) after policy name");
 		}
-		rest = QuackapiTrim(rest.substr(2));
+		rest = QuackapiDdlTrim(rest.substr(2));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("Expected ON (<cols>)");
 		}
@@ -581,7 +587,7 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 		if (!ParseColList(col_inner, cols, types, err)) {
 			return ParserExtensionParseResult("ON (...): " + err);
 		}
-		rest = QuackapiTrim(rest.substr(after));
+		rest = QuackapiDdlTrim(rest.substr(after));
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after ON (...)");
 		}
@@ -625,6 +631,8 @@ vector<string> SplitCsv(const string &csv) {
 		while (j < csv.size() && csv[j] != ',') {
 			j++;
 		}
+		// Runtime CSV blob already serialized from the parsed statement — not
+		// parse-time grammar, so no comment awareness needed.
 		out.push_back(QuackapiTrim(csv.substr(i, j - i)));
 		i = j < csv.size() ? j + 1 : j;
 	}

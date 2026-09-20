@@ -93,11 +93,11 @@ struct MiddlewareDdlParseData : public ParserExtensionParseData {
 //!   CREATE [OR REPLACE] MIDDLEWARE <name> BEFORE|AFTER [GROUP <name>] AS <sql>
 //!   DROP MIDDLEWARE <name>
 ParserExtensionParseResult MiddlewareDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	if (StringUtil::StartsWith(upper, "DROP MIDDLEWARE ")) {
-		auto name = QuackapiTrim(q.substr(16));
+		auto name = QuackapiDdlTrim(q.substr(16));
 		if (!IsMiddlewareName(name)) {
 			return ParserExtensionParseResult("DROP MIDDLEWARE expects a single name ([A-Za-z0-9_-], max 128 bytes)");
 		}
@@ -123,7 +123,7 @@ ParserExtensionParseResult MiddlewareDdlParse(ParserExtensionInfo *, const strin
 	if (as_pos == string::npos) {
 		return ParserExtensionParseResult("CREATE MIDDLEWARE <name> BEFORE|AFTER [GROUP <name>] AS <sql>");
 	}
-	auto declaration = QuackapiTrim(q.substr(prefix_end, as_pos - prefix_end));
+	auto declaration = QuackapiDdlTrim(q.substr(prefix_end, as_pos - prefix_end));
 	auto tokens = WhitespaceTokens(declaration);
 	if (tokens.size() != 2 && tokens.size() != 4) {
 		return ParserExtensionParseResult("CREATE MIDDLEWARE expects <name> BEFORE|AFTER [GROUP <name>] before AS");
@@ -142,7 +142,7 @@ ParserExtensionParseResult MiddlewareDdlParse(ParserExtensionInfo *, const strin
 		}
 		group_name = tokens[3];
 	}
-	auto handler_sql = QuackapiTrim(q.substr(as_pos + 2));
+	auto handler_sql = QuackapiDdlTrim(q.substr(as_pos + 2));
 	if (handler_sql.empty()) {
 		return ParserExtensionParseResult("MIDDLEWARE AS requires SQL");
 	}

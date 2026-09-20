@@ -230,7 +230,7 @@ string JoinGroupPrefix(const string &prefix, const string &path) {
 
 //! Parse route IO timeout seconds: 30 | '30' | '30s' | '5m' | '1h'. Max 24h.
 bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
-	auto s = QuackapiTrim(raw);
+	auto s = QuackapiDdlTrim(raw);
 	if (s.empty()) {
 		err = "empty timeout";
 		return false;
@@ -307,7 +307,7 @@ bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
 //! TIMEOUT / WITH (timeout_sec) extends httplib read/write socket deadlines for
 //! that request only; 0 (omit) keeps quackapi_serve defaults (30s).
 ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -318,7 +318,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		pos = 24;
 		or_replace = true;
 	} else if (StringUtil::StartsWith(upper, "DROP ROUTE ")) {
-		auto name = QuackapiTrim(q.substr(11));
+		auto name = QuackapiDdlTrim(q.substr(11));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP ROUTE expects a single route name");
 		}
@@ -331,7 +331,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = QuackapiTrim(q.substr(pos));
+	auto rest = QuackapiDdlTrim(q.substr(pos));
 
 	// <name> <METHOD>
 	auto first_space = rest.find(' ');
@@ -339,7 +339,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult("CREATE ROUTE <name> <METHOD> '<pattern>' AS <select>");
 	}
 	auto name = rest.substr(0, first_space);
-	rest = QuackapiTrim(rest.substr(first_space));
+	rest = QuackapiDdlTrim(rest.substr(first_space));
 	auto second_space = rest.find(' ');
 	if (second_space == string::npos) {
 		return ParserExtensionParseResult("Expected <METHOD> '<pattern>' after route name");
@@ -349,7 +349,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult("Unknown HTTP method \"" + method +
 		                                  "\" — expected GET, POST, PUT, DELETE, PATCH or HEAD");
 	}
-	rest = QuackapiTrim(rest.substr(second_space));
+	rest = QuackapiDdlTrim(rest.substr(second_space));
 
 	// '<pattern>' — ungrouped routes must start with '/'; GROUP may use relative paths.
 	if (rest.empty() || rest[0] != '\'') {
@@ -363,7 +363,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	if (pattern.empty()) {
 		return ParserExtensionParseResult("Route pattern must not be empty");
 	}
-	rest = QuackapiTrim(rest.substr(pattern_end + 1));
+	rest = QuackapiDdlTrim(rest.substr(pattern_end + 1));
 
 	// Token boundary: first run of non-whitespace (spaces/tabs/newlines all OK).
 	auto NextTokenEnd = [](const string &s) -> idx_t {
@@ -392,7 +392,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		// [STATUS <n>]
 		if (StringUtil::StartsWith(rest_upper, "STATUS") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
-			rest = QuackapiTrim(rest.substr(6));
+			rest = QuackapiDdlTrim(rest.substr(6));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
 				return ParserExtensionParseResult("Expected AS <select> after STATUS <n>");
@@ -401,18 +401,18 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (status < 100 || status > 599) {
 				return ParserExtensionParseResult("STATUS must be a valid HTTP status code");
 			}
-			rest = QuackapiTrim(rest.substr(token_end));
+			rest = QuackapiDdlTrim(rest.substr(token_end));
 			continue;
 		}
 		// [RATE LIMIT <n> PER <seconds> [BY ip|token|key]]
 		if (StringUtil::StartsWith(rest_upper, "RATE") && rest.size() > 4 && StringUtil::CharacterIsSpace(rest[4])) {
-			string after_rate = QuackapiTrim(rest.substr(4));
+			string after_rate = QuackapiDdlTrim(rest.substr(4));
 			auto after_rate_u = StringUtil::Upper(after_rate);
 			if (!(StringUtil::StartsWith(after_rate_u, "LIMIT") &&
 			      (after_rate.size() == 5 || StringUtil::CharacterIsSpace(after_rate[5])))) {
 				return ParserExtensionParseResult("Expected RATE LIMIT <n> PER <seconds>");
 			}
-			after_rate = QuackapiTrim(after_rate.substr(5));
+			after_rate = QuackapiDdlTrim(after_rate.substr(5));
 			auto n_end = NextTokenEnd(after_rate);
 			if (n_end == 0) {
 				return ParserExtensionParseResult("RATE LIMIT expects a positive integer count");
@@ -421,13 +421,13 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (rate_limit_n <= 0) {
 				return ParserExtensionParseResult("RATE LIMIT count must be a positive integer");
 			}
-			after_rate = QuackapiTrim(after_rate.substr(n_end));
+			after_rate = QuackapiDdlTrim(after_rate.substr(n_end));
 			auto after_n_u = StringUtil::Upper(after_rate);
 			if (!(StringUtil::StartsWith(after_n_u, "PER") &&
 			      (after_rate.size() == 3 || StringUtil::CharacterIsSpace(after_rate[3])))) {
 				return ParserExtensionParseResult("Expected PER <seconds> after RATE LIMIT <n>");
 			}
-			after_rate = QuackapiTrim(after_rate.substr(3));
+			after_rate = QuackapiDdlTrim(after_rate.substr(3));
 			auto per_end = NextTokenEnd(after_rate);
 			if (per_end == 0) {
 				return ParserExtensionParseResult("RATE LIMIT PER expects a positive seconds window");
@@ -436,12 +436,12 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (rate_limit_per_sec <= 0) {
 				return ParserExtensionParseResult("RATE LIMIT window (PER seconds) must be positive");
 			}
-			after_rate = QuackapiTrim(after_rate.substr(per_end));
+			after_rate = QuackapiDdlTrim(after_rate.substr(per_end));
 			// optional BY ip|token|key
 			auto by_u = StringUtil::Upper(after_rate);
 			if (StringUtil::StartsWith(by_u, "BY") &&
 			    (after_rate.size() == 2 || StringUtil::CharacterIsSpace(after_rate[2]))) {
-				after_rate = QuackapiTrim(after_rate.substr(2));
+				after_rate = QuackapiDdlTrim(after_rate.substr(2));
 				auto by_end = NextTokenEnd(after_rate);
 				if (by_end == 0) {
 					return ParserExtensionParseResult("RATE LIMIT BY expects ip, token, or key");
@@ -453,7 +453,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				if (rate_limit_by == "key") {
 					rate_limit_by = "token";
 				}
-				after_rate = QuackapiTrim(after_rate.substr(by_end));
+				after_rate = QuackapiDdlTrim(after_rate.substr(by_end));
 			} else {
 				rate_limit_by = "ip";
 			}
@@ -463,7 +463,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		// [REQUIRE <auth-name>]
 		if (StringUtil::StartsWith(rest_upper, "REQUIRE") &&
 		    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
-			rest = QuackapiTrim(rest.substr(7));
+			rest = QuackapiDdlTrim(rest.substr(7));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
 				return ParserExtensionParseResult("Expected AS <select> after REQUIRE <auth>");
@@ -472,13 +472,13 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (require_auth.empty()) {
 				return ParserExtensionParseResult("REQUIRE expects an auth name");
 			}
-			rest = QuackapiTrim(rest.substr(token_end));
+			rest = QuackapiDdlTrim(rest.substr(token_end));
 			continue;
 		}
 		// [FORMAT json|ndjson|csv|parquet|arrow]
 		if (StringUtil::StartsWith(rest_upper, "FORMAT") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
-			rest = QuackapiTrim(rest.substr(6));
+			rest = QuackapiDdlTrim(rest.substr(6));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
 				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, parquet, or arrow");
@@ -493,13 +493,13 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				                                  fmt + "'");
 			}
 			response_format = fmt;
-			rest = QuackapiTrim(rest.substr(token_end));
+			rest = QuackapiDdlTrim(rest.substr(token_end));
 			continue;
 		}
 		// [ENVELOPE array|object]
 		if (StringUtil::StartsWith(rest_upper, "ENVELOPE") &&
 		    (rest.size() == 8 || StringUtil::CharacterIsSpace(rest[8]))) {
-			rest = QuackapiTrim(rest.substr(8));
+			rest = QuackapiDdlTrim(rest.substr(8));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
 				return ParserExtensionParseResult("ENVELOPE expects array or object");
@@ -509,19 +509,19 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				return ParserExtensionParseResult("ENVELOPE must be one of [array, object], not '" + env + "'");
 			}
 			response_envelope = env;
-			rest = QuackapiTrim(rest.substr(token_end));
+			rest = QuackapiDdlTrim(rest.substr(token_end));
 			continue;
 		}
 		// [EMPTY STATUS <n> [BODY '<json>']]
 		if (StringUtil::StartsWith(rest_upper, "EMPTY") &&
 		    (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
-			string after_empty = QuackapiTrim(rest.substr(5));
+			string after_empty = QuackapiDdlTrim(rest.substr(5));
 			auto after_empty_u = StringUtil::Upper(after_empty);
 			if (!(StringUtil::StartsWith(after_empty_u, "STATUS") &&
 			      (after_empty.size() == 6 || StringUtil::CharacterIsSpace(after_empty[6])))) {
 				return ParserExtensionParseResult("Expected EMPTY STATUS <n> [BODY '<json>']");
 			}
-			after_empty = QuackapiTrim(after_empty.substr(6));
+			after_empty = QuackapiDdlTrim(after_empty.substr(6));
 			auto status_end = NextTokenEnd(after_empty);
 			if (status_end == 0) {
 				return ParserExtensionParseResult("EMPTY STATUS expects a valid HTTP status code");
@@ -530,12 +530,12 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			if (empty_status < 100 || empty_status > 599) {
 				return ParserExtensionParseResult("EMPTY STATUS must be a valid HTTP status code");
 			}
-			after_empty = QuackapiTrim(after_empty.substr(status_end));
+			after_empty = QuackapiDdlTrim(after_empty.substr(status_end));
 			auto after_status_u = StringUtil::Upper(after_empty);
 			// Optional BODY '<…>' — not BODY SCHEMA (that clause is separate).
 			if (StringUtil::StartsWith(after_status_u, "BODY") && after_empty.size() > 4 &&
 			    StringUtil::CharacterIsSpace(after_empty[4])) {
-				string after_body = QuackapiTrim(after_empty.substr(4));
+				string after_body = QuackapiDdlTrim(after_empty.substr(4));
 				auto after_body_u = StringUtil::Upper(after_body);
 				if (StringUtil::StartsWith(after_body_u, "SCHEMA")) {
 					return ParserExtensionParseResult("EMPTY STATUS BODY expects a quoted string, not BODY SCHEMA");
@@ -561,7 +561,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					return ParserExtensionParseResult("Unterminated EMPTY STATUS BODY string");
 				}
 				empty_body = body_lit;
-				after_empty = QuackapiTrim(after_body.substr(bi + 1));
+				after_empty = QuackapiDdlTrim(after_body.substr(bi + 1));
 			}
 			rest = after_empty;
 			continue;
@@ -569,7 +569,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		// [TIMEOUT <n>|'30s'|'5m']
 		if (StringUtil::StartsWith(rest_upper, "TIMEOUT") &&
 		    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
-			rest = QuackapiTrim(rest.substr(7));
+			rest = QuackapiDdlTrim(rest.substr(7));
 			if (rest.empty()) {
 				return ParserExtensionParseResult("TIMEOUT expects a duration (e.g. 180, '3m', '30s')");
 			}
@@ -580,11 +580,11 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					return ParserExtensionParseResult("Unterminated TIMEOUT string");
 				}
 				tok = rest.substr(0, endq + 1);
-				rest = QuackapiTrim(rest.substr(endq + 1));
+				rest = QuackapiDdlTrim(rest.substr(endq + 1));
 			} else {
 				auto token_end = NextTokenEnd(rest);
 				tok = rest.substr(0, token_end);
-				rest = QuackapiTrim(rest.substr(token_end));
+				rest = QuackapiDdlTrim(rest.substr(token_end));
 			}
 			string terr;
 			int32_t sec = 0;
@@ -599,11 +599,11 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 		// [IN GROUP <name>] or [GROUP <name>]
 		if (StringUtil::StartsWith(rest_upper, "IN") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2])) {
-			string after_in = QuackapiTrim(rest.substr(2));
+			string after_in = QuackapiDdlTrim(rest.substr(2));
 			auto after_upper = StringUtil::Upper(after_in);
 			if (StringUtil::StartsWith(after_upper, "GROUP") &&
 			    (after_in.size() == 5 || StringUtil::CharacterIsSpace(after_in[5]))) {
-				after_in = QuackapiTrim(after_in.substr(5));
+				after_in = QuackapiDdlTrim(after_in.substr(5));
 				auto token_end = NextTokenEnd(after_in);
 				if (token_end == 0) {
 					return ParserExtensionParseResult("IN GROUP expects a group name");
@@ -612,13 +612,13 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					return ParserExtensionParseResult("GROUP specified more than once");
 				}
 				group_name = after_in.substr(0, token_end);
-				rest = QuackapiTrim(after_in.substr(token_end));
+				rest = QuackapiDdlTrim(after_in.substr(token_end));
 				continue;
 			}
 		}
 		if (StringUtil::StartsWith(rest_upper, "GROUP") &&
 		    (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
-			rest = QuackapiTrim(rest.substr(5));
+			rest = QuackapiDdlTrim(rest.substr(5));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
 				return ParserExtensionParseResult("GROUP expects a group name");
@@ -627,7 +627,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				return ParserExtensionParseResult("GROUP specified more than once");
 			}
 			group_name = rest.substr(0, token_end);
-			rest = QuackapiTrim(rest.substr(token_end));
+			rest = QuackapiDdlTrim(rest.substr(token_end));
 			continue;
 		}
 		break;
@@ -652,7 +652,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		if (!(StringUtil::StartsWith(rest_upper, "BODY") && rest.size() > 4 && StringUtil::CharacterIsSpace(rest[4]))) {
 			return true; // not present
 		}
-		string after_body = QuackapiTrim(rest.substr(4));
+		string after_body = QuackapiDdlTrim(rest.substr(4));
 		auto after_upper = StringUtil::Upper(after_body);
 		bool is_schema = StringUtil::StartsWith(after_upper, "SCHEMA");
 		bool is_type = StringUtil::StartsWith(after_upper, "TYPE");
@@ -668,7 +668,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 		string after_schema;
 		if (StringUtil::CharacterIsSpace(after_body[keyword_size])) {
-			after_schema = QuackapiTrim(after_body.substr(keyword_size));
+			after_schema = QuackapiDdlTrim(after_body.substr(keyword_size));
 		} else if (after_body[keyword_size] == '\'') {
 			after_schema = after_body.substr(keyword_size);
 		} else {
@@ -700,7 +700,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 		// Assign via outer body_schema — declared below before this lambda is called.
 		// (We reassign rest/rest_upper here; body_schema set by caller using schema.)
-		rest = QuackapiTrim(after_schema.substr(i + 1));
+		rest = QuackapiDdlTrim(after_schema.substr(i + 1));
 		rest_upper = StringUtil::Upper(rest);
 		err_out = string(is_schema ? "\x01" : "\x02") + schema; // success marker + payload
 		return true;
@@ -723,14 +723,14 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	// Zero or more PARAM clauses (optional defaults + constraints).
 	vector<QuackapiParamSpec> params;
 	while (StringUtil::StartsWith(rest_upper, "PARAM") && (rest.size() == 5 || StringUtil::CharacterIsSpace(rest[5]))) {
-		rest = QuackapiTrim(rest.substr(5));
+		rest = QuackapiDdlTrim(rest.substr(5));
 		if (rest.empty()) {
 			return ParserExtensionParseResult("PARAM expects a parameter name");
 		}
 		QuackapiParamSpec spec;
 		auto te = NextTokenEnd(rest);
 		spec.name = rest.substr(0, te);
-		rest = QuackapiTrim(rest.substr(te));
+		rest = QuackapiDdlTrim(rest.substr(te));
 
 		// optional type
 		if (!rest.empty()) {
@@ -747,7 +747,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				} else if (spec.type_name == "REAL") {
 					spec.type_name = "FLOAT";
 				}
-				rest = QuackapiTrim(rest.substr(te));
+				rest = QuackapiDdlTrim(rest.substr(te));
 			}
 		}
 
@@ -770,7 +770,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			} else {
 				spec.source = QuackapiParamSource::QUERY;
 			}
-			rest = QuackapiTrim(rest.substr(te));
+			rest = QuackapiDdlTrim(rest.substr(te));
 			// Optional quoted or bare wire name (not a known option keyword).
 			if (!rest.empty()) {
 				if (rest[0] == '\'') {
@@ -779,7 +779,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 						return true; // leave rest; outer will error later if needed
 					}
 					spec.external_name = rest.substr(1, endq - 1);
-					rest = QuackapiTrim(rest.substr(endq + 1));
+					rest = QuackapiDdlTrim(rest.substr(endq + 1));
 				} else {
 					te = NextTokenEnd(rest);
 					auto maybe = rest.substr(0, te);
@@ -788,7 +788,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					    mu != "MAX_LENGTH" && mu != "PARAM" && mu != "BODY" && mu != "AS" && mu != "HEADER" &&
 					    mu != "COOKIE" && mu != "QUERY" && !IsParamTypeName(maybe)) {
 						spec.external_name = maybe;
-						rest = QuackapiTrim(rest.substr(te));
+						rest = QuackapiDdlTrim(rest.substr(te));
 					}
 				}
 			}
@@ -824,7 +824,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			}
 			te = NextTokenEnd(rest);
 			auto key = StringUtil::Upper(rest.substr(0, te));
-			string after_key = QuackapiTrim(rest.substr(te));
+			string after_key = QuackapiDdlTrim(rest.substr(te));
 
 			if (key == "DEFAULT") {
 				if (after_key.empty()) {
@@ -838,11 +838,11 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					}
 					spec.default_raw = after_key.substr(1, endq - 1);
 					spec.default_is_null = false;
-					rest = QuackapiTrim(after_key.substr(endq + 1));
+					rest = QuackapiDdlTrim(after_key.substr(endq + 1));
 				} else {
 					auto lit_end = NextTokenEnd(after_key);
 					auto lit = after_key.substr(0, lit_end);
-					rest = QuackapiTrim(after_key.substr(lit_end));
+					rest = QuackapiDdlTrim(after_key.substr(lit_end));
 					if (StringUtil::Upper(lit) == "NULL") {
 						spec.default_is_null = true;
 						spec.default_raw.clear();
@@ -860,7 +860,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				}
 				auto num_end = NextTokenEnd(after_key);
 				auto num = after_key.substr(0, num_end);
-				rest = QuackapiTrim(after_key.substr(num_end));
+				rest = QuackapiDdlTrim(after_key.substr(num_end));
 				if (key == "GE") {
 					spec.has_ge = true;
 					spec.ge = atof(num.c_str());
@@ -907,7 +907,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	// Optional late TIMEOUT (after PARAM / BODY SCHEMA)
 	rest_upper = StringUtil::Upper(rest);
 	if (StringUtil::StartsWith(rest_upper, "TIMEOUT") && (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
-		rest = QuackapiTrim(rest.substr(7));
+		rest = QuackapiDdlTrim(rest.substr(7));
 		if (rest.empty()) {
 			return ParserExtensionParseResult("TIMEOUT expects a duration (e.g. 180, '3m', '30s')");
 		}
@@ -918,11 +918,11 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				return ParserExtensionParseResult("Unterminated TIMEOUT string");
 			}
 			tok = rest.substr(0, endq + 1);
-			rest = QuackapiTrim(rest.substr(endq + 1));
+			rest = QuackapiDdlTrim(rest.substr(endq + 1));
 		} else {
 			auto token_end = NextTokenEnd(rest);
 			tok = rest.substr(0, token_end);
-			rest = QuackapiTrim(rest.substr(token_end));
+			rest = QuackapiDdlTrim(rest.substr(token_end));
 		}
 		string terr;
 		int32_t sec = 0;
@@ -939,7 +939,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	// [WITH (timeout_sec [=|:=] <n>|'30s')] — may appear immediately before AS
 	if (StringUtil::StartsWith(rest_upper, "WITH") &&
 	    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '(')) {
-		rest = QuackapiTrim(rest.substr(4));
+		rest = QuackapiDdlTrim(rest.substr(4));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("Expected WITH (timeout_sec := <n>)");
 		}
@@ -947,8 +947,8 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		if (close == string::npos) {
 			return ParserExtensionParseResult("Unterminated WITH (...) options");
 		}
-		auto inner = QuackapiTrim(rest.substr(1, close - 1));
-		rest = QuackapiTrim(rest.substr(close + 1));
+		auto inner = QuackapiDdlTrim(rest.substr(1, close - 1));
+		rest = QuackapiDdlTrim(rest.substr(close + 1));
 		if (inner.empty()) {
 			return ParserExtensionParseResult("WITH (...) is empty — expected timeout_sec");
 		}
@@ -956,8 +956,8 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		idx_t part_start = 0;
 		while (part_start <= inner.size()) {
 			idx_t comma = inner.find(',', part_start);
-			auto part = QuackapiTrim(comma == string::npos ? inner.substr(part_start)
-			                                               : inner.substr(part_start, comma - part_start));
+			auto part = QuackapiDdlTrim(comma == string::npos ? inner.substr(part_start)
+			                                                  : inner.substr(part_start, comma - part_start));
 			if (!part.empty()) {
 				auto eq = part.find(":=");
 				idx_t sep_len = 2;
@@ -969,8 +969,8 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					return ParserExtensionParseResult("WITH option must be timeout_sec [=|:=] <n> — got \"" + part +
 					                                  "\"");
 				}
-				auto key = StringUtil::Lower(QuackapiTrim(part.substr(0, eq)));
-				auto val = QuackapiTrim(part.substr(eq + sep_len));
+				auto key = StringUtil::Lower(QuackapiDdlTrim(part.substr(0, eq)));
+				auto val = QuackapiDdlTrim(part.substr(eq + sep_len));
 				if (key != "timeout_sec" && key != "timeout") {
 					return ParserExtensionParseResult("Unknown WITH option \"" + key + "\" — expected timeout_sec");
 				}
@@ -997,7 +997,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	if (!(StringUtil::StartsWith(rest_upper, "AS") && rest.size() > 2 && StringUtil::CharacterIsSpace(rest[2]))) {
 		return ParserExtensionParseResult("Expected AS <select> in CREATE ROUTE");
 	}
-	auto handler = QuackapiTrim(rest.substr(2));
+	auto handler = QuackapiDdlTrim(rest.substr(2));
 	if (handler.empty()) {
 		return ParserExtensionParseResult("Empty handler after AS");
 	}
@@ -1298,7 +1298,7 @@ bool ParseQuotedString(const string &s, idx_t start, string &out, idx_t &end) {
 //! Also accepts positional-ish keywords without WITH for SPEC compatibility:
 //!   CREATE API GROUP <name> PREFIX '/p' [TAGS 't'] [REQUIRE <auth>]
 ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -1307,7 +1307,7 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 
 	// DROP forms
 	if (StringUtil::StartsWith(upper, "DROP API GROUP ")) {
-		auto name = QuackapiTrim(q.substr(15));
+		auto name = QuackapiDdlTrim(q.substr(15));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP API GROUP expects a single group name");
 		}
@@ -1317,7 +1317,7 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult(std::move(data));
 	}
 	if (StringUtil::StartsWith(upper, "DROP GROUP ")) {
-		auto name = QuackapiTrim(q.substr(11));
+		auto name = QuackapiDdlTrim(q.substr(11));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP GROUP expects a single group name");
 		}
@@ -1347,7 +1347,7 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = QuackapiTrim(q.substr(pos));
+	auto rest = QuackapiDdlTrim(q.substr(pos));
 	auto first_space = rest.find(' ');
 	if (first_space == string::npos) {
 		// bare name only is invalid
@@ -1366,7 +1366,7 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 			i++;
 		}
 		name = rest.substr(0, i);
-		rest = QuackapiTrim(rest.substr(i));
+		rest = QuackapiDdlTrim(rest.substr(i));
 	}
 	if (name.empty()) {
 		return ParserExtensionParseResult("CREATE GROUP expects a group name");
@@ -1385,7 +1385,7 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 	};
 
 	if (StringUtil::StartsWith(rest_upper, "WITH")) {
-		rest = QuackapiTrim(rest.substr(4));
+		rest = QuackapiDdlTrim(rest.substr(4));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("Expected WITH (prefix='...', ...)");
 		}
@@ -1393,8 +1393,8 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 		if (close == string::npos) {
 			return ParserExtensionParseResult("Unterminated WITH (...) options");
 		}
-		auto opts = QuackapiTrim(rest.substr(1, close - 1));
-		rest = QuackapiTrim(rest.substr(close + 1));
+		auto opts = QuackapiDdlTrim(rest.substr(1, close - 1));
+		rest = QuackapiDdlTrim(rest.substr(close + 1));
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after GROUP WITH (...)");
 		}
@@ -1464,7 +1464,7 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 		}
 	} else if (StringUtil::StartsWith(rest_upper, "PREFIX")) {
 		// SPEC form: PREFIX '/p' [TAGS 't'] [REQUIRE auth]
-		rest = QuackapiTrim(rest.substr(6));
+		rest = QuackapiDdlTrim(rest.substr(6));
 		if (rest.empty() || rest[0] != '\'') {
 			return ParserExtensionParseResult("PREFIX expects a quoted path");
 		}
@@ -1475,12 +1475,12 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 		if (group.prefix.empty() || group.prefix[0] != '/') {
 			return ParserExtensionParseResult("GROUP prefix must start with '/'");
 		}
-		rest = QuackapiTrim(rest.substr(end));
+		rest = QuackapiDdlTrim(rest.substr(end));
 		while (!rest.empty()) {
 			rest_upper = StringUtil::Upper(rest);
 			if (StringUtil::StartsWith(rest_upper, "TAGS") &&
 			    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]))) {
-				rest = QuackapiTrim(rest.substr(4));
+				rest = QuackapiDdlTrim(rest.substr(4));
 				if (rest.empty() || rest[0] != '\'') {
 					return ParserExtensionParseResult("TAGS expects a quoted string");
 				}
@@ -1488,18 +1488,18 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 				if (!ParseQuotedString(rest, 0, group.tags, tend)) {
 					return ParserExtensionParseResult("Unterminated TAGS string");
 				}
-				rest = QuackapiTrim(rest.substr(tend));
+				rest = QuackapiDdlTrim(rest.substr(tend));
 				continue;
 			}
 			if (StringUtil::StartsWith(rest_upper, "REQUIRE") &&
 			    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
-				rest = QuackapiTrim(rest.substr(7));
+				rest = QuackapiDdlTrim(rest.substr(7));
 				auto te = NextTokenEnd(rest);
 				if (te == 0) {
 					return ParserExtensionParseResult("REQUIRE expects an auth name");
 				}
 				group.require_auth = rest.substr(0, te);
-				rest = QuackapiTrim(rest.substr(te));
+				rest = QuackapiDdlTrim(rest.substr(te));
 				continue;
 			}
 			return ParserExtensionParseResult("Unexpected token in CREATE GROUP — expected TAGS or REQUIRE");

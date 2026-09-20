@@ -18,7 +18,7 @@ namespace {
 //! advances `rest` past the closing quote. Throws a parse-style error via the
 //! bool return (false) on a missing/unterminated quote.
 bool ParseQuoted(string &rest, string &out) {
-	rest = QuackapiTrim(rest);
+	rest = QuackapiDdlTrim(rest);
 	if (rest.empty() || rest[0] != '\'') {
 		return false;
 	}
@@ -27,7 +27,7 @@ bool ParseQuoted(string &rest, string &out) {
 		return false;
 	}
 	out = rest.substr(1, close - 1);
-	rest = QuackapiTrim(rest.substr(close + 1));
+	rest = QuackapiDdlTrim(rest.substr(close + 1));
 	return true;
 }
 
@@ -35,7 +35,7 @@ bool ParseQuoted(string &rest, string &out) {
 //! Bare tokens must not contain '"' (those need proper "quoting") so the
 //! statement splitter / shell never sees an unbalanced double-quote.
 bool ParseIdent(string &rest, string &out) {
-	rest = QuackapiTrim(rest);
+	rest = QuackapiDdlTrim(rest);
 	if (rest.empty()) {
 		return false;
 	}
@@ -50,7 +50,7 @@ bool ParseIdent(string &rest, string &out) {
 					continue;
 				}
 				out = result;
-				rest = QuackapiTrim(rest.substr(i + 1));
+				rest = QuackapiDdlTrim(rest.substr(i + 1));
 				return !out.empty();
 			}
 			result += rest[i];
@@ -66,7 +66,7 @@ bool ParseIdent(string &rest, string &out) {
 		return false;
 	}
 	out = tok;
-	rest = space == string::npos ? string() : QuackapiTrim(rest.substr(space));
+	rest = space == string::npos ? string() : QuackapiDdlTrim(rest.substr(space));
 	return true;
 }
 
@@ -107,7 +107,7 @@ struct TableApiParseData : public ParserExtensionParseData {
 //! Grammar:
 //!   CREATE [OR REPLACE] API FOR TABLE <table> [AT '<base>'] [KEY '<column>']
 ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -122,7 +122,7 @@ ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = QuackapiTrim(q.substr(pos));
+	auto rest = QuackapiDdlTrim(q.substr(pos));
 	if (rest.empty()) {
 		return ParserExtensionParseResult("CREATE API FOR TABLE expects a table name");
 	}

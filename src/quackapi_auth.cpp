@@ -692,7 +692,7 @@ struct AuthDdlParseData : public ParserExtensionParseData {
 //!   CREATE [OR REPLACE] AUTH <name> AS JWT ( SECRET '<secret>' [, ALGORITHM HS256 ] );
 //!   DROP AUTH <name>;
 ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &query) {
-	auto q = QuackapiTrim(query);
+	auto q = QuackapiDdlTrim(query);
 	auto upper = StringUtil::Upper(q);
 
 	bool or_replace = false;
@@ -703,7 +703,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		pos = 23;
 		or_replace = true;
 	} else if (StringUtil::StartsWith(upper, "DROP AUTH ")) {
-		auto name = QuackapiTrim(q.substr(10));
+		auto name = QuackapiDdlTrim(q.substr(10));
 		if (name.empty() || name.find(' ') != string::npos) {
 			return ParserExtensionParseResult("DROP AUTH expects a single auth name");
 		}
@@ -715,7 +715,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		return ParserExtensionParseResult();
 	}
 
-	auto rest = QuackapiTrim(q.substr(pos));
+	auto rest = QuackapiDdlTrim(q.substr(pos));
 
 	// <name>
 	auto first_space = rest.find(' ');
@@ -723,14 +723,14 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		return ParserExtensionParseResult("CREATE AUTH <name> AS API_KEY | JWT (...)");
 	}
 	auto name = rest.substr(0, first_space);
-	rest = QuackapiTrim(rest.substr(first_space));
+	rest = QuackapiDdlTrim(rest.substr(first_space));
 	auto rest_upper = StringUtil::Upper(rest);
 
 	// AS <kind>
 	if (!StringUtil::StartsWith(rest_upper, "AS ")) {
 		return ParserExtensionParseResult("Expected AS API_KEY | JWT after auth name");
 	}
-	rest = QuackapiTrim(rest.substr(3));
+	rest = QuackapiDdlTrim(rest.substr(3));
 	rest_upper = StringUtil::Upper(rest);
 
 	QuackapiAuth auth;
@@ -739,7 +739,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 	if (StringUtil::StartsWith(rest_upper, "API_KEY")) {
 		auth.kind = QuackapiAuthKind::API_KEY;
 		auth.header = "X-API-Key";
-		rest = QuackapiTrim(rest.substr(7));
+		rest = QuackapiDdlTrim(rest.substr(7));
 		rest_upper = StringUtil::Upper(rest);
 		// optional ( HEADER '<hdr>' )
 		if (!rest.empty() && rest[0] == '(') {
@@ -747,10 +747,10 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 			if (close == string::npos) {
 				return ParserExtensionParseResult("Unterminated API_KEY options");
 			}
-			auto opts = QuackapiTrim(rest.substr(1, close - 1));
+			auto opts = QuackapiDdlTrim(rest.substr(1, close - 1));
 			auto opts_upper = StringUtil::Upper(opts);
 			if (StringUtil::StartsWith(opts_upper, "HEADER ")) {
-				auto hrest = QuackapiTrim(opts.substr(7));
+				auto hrest = QuackapiDdlTrim(opts.substr(7));
 				if (hrest.size() < 2 || hrest.front() != '\'' || hrest.back() != '\'') {
 					return ParserExtensionParseResult("HEADER expects a quoted string");
 				}
@@ -761,14 +761,14 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 			} else if (!opts.empty()) {
 				return ParserExtensionParseResult("API_KEY options: expected HEADER '<name>'");
 			}
-			rest = QuackapiTrim(rest.substr(close + 1));
+			rest = QuackapiDdlTrim(rest.substr(close + 1));
 		}
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after API_KEY");
 		}
 	} else if (StringUtil::StartsWith(rest_upper, "JWT")) {
 		auth.kind = QuackapiAuthKind::JWT_HS256;
-		rest = QuackapiTrim(rest.substr(3));
+		rest = QuackapiDdlTrim(rest.substr(3));
 		if (rest.empty() || rest[0] != '(') {
 			return ParserExtensionParseResult("JWT requires ( SECRET '<secret>' [, ALGORITHM HS256 ] )");
 		}
@@ -776,7 +776,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		if (close == string::npos) {
 			return ParserExtensionParseResult("Unterminated JWT options");
 		}
-		auto opts = QuackapiTrim(rest.substr(1, close - 1));
+		auto opts = QuackapiDdlTrim(rest.substr(1, close - 1));
 		if (opts.empty()) {
 			return ParserExtensionParseResult("JWT requires SECRET '<secret>'");
 		}
@@ -831,7 +831,7 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 		if (!have_secret) {
 			return ParserExtensionParseResult("JWT requires SECRET '<secret>'");
 		}
-		rest = QuackapiTrim(rest.substr(close + 1));
+		rest = QuackapiDdlTrim(rest.substr(close + 1));
 		if (!rest.empty()) {
 			return ParserExtensionParseResult("Unexpected tokens after JWT options");
 		}
