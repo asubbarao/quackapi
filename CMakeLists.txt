@@ -34,6 +34,7 @@ set(EXTENSION_SOURCES
     src/quackapi_policy.cpp
     src/quackapi_stream.cpp
     src/quackapi_websocket.cpp
+    src/quackapi_radio.cpp
     src/quackapi_from_x.cpp
     src/quackapi_util.cpp
     src/quackapi_pg.cpp

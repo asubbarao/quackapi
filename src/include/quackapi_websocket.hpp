@@ -55,6 +55,13 @@ enum class QuackapiWsClose : uint16_t {
 //! Lower-case wire name of an opcode ("text", "ping", …) for introspection rows.
 string QuackapiWsOpcodeName(QuackapiWsOpcode opcode);
 
+//! True when these bytes are valid UTF-8, i.e. they would have been legal in a
+//! text frame (RFC 6455 §5.6). A binary frame carrying text is the only way
+//! some clients can send one — the `radio` extension's transmit queue calls
+//! ixwebsocket's sendBinary unconditionally — so a $message endpoint asks this
+//! rather than refusing every binary frame on its opcode alone.
+bool QuackapiWsPayloadIsText(const string &payload);
+
 //! Sec-WebSocket-Accept from Sec-WebSocket-Key: base64(SHA-1(key + GUID)).
 //! RFC 6455 §4.2.2 step 5.4. Throws when the key is not 16 base64-encoded bytes,
 //! because a client that sent a malformed key gets a 400, never a made-up accept.
