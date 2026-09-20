@@ -143,12 +143,12 @@ jobs:
       - name: Verify benchmark correctness gates
         run: |
           python3 bench/test_bench_config.py
-          bash bench/test_harness.sh
-          bash bench/test_report.sh
+          build/release/duckdb -no-init -f bench/test_harness.sql
+          build/release/duckdb -no-init -f bench/test_report.sql
           python3 test/conformance/test_driver.py
 
       - name: Verify real HTTP contracts
-        run: bash test/conformance/run.sh
+        run: build/release/duckdb -no-init -f test/conformance/run.sql
 
   publish-github-release:
     name: Publish GitHub Release assets

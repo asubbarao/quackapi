@@ -25,7 +25,7 @@ Same HTTP surface as FastAPI for what people actually ship:
 | Sessions / OIDC | **open** — after surpass holds |
 | Response FORMAT (CSV/NDJSON/Parquet/Arrow) | **done** — FORMAT + Accept negotiation |
 
-**Gate:** `test/conformance` 100% + `test/http/run_all.sh` green.  
+**Gate:** `test/conformance` 100%.  
 Do not invent leapfrog nouns while equivalence cells are red.
 
 ## 2. Surpass (slaughter)

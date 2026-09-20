@@ -11,7 +11,7 @@
 |----------|----------------|
 | `rg 'CREATE …' src/` + `duckdb_functions()` | 8 CREATE nouns + 18 registered `quackapi_*` functions |
 | `ls test/sql test/http test/conformance` | Versioned tests for each surface |
-| `bash test/conformance/run.sh` → `/tmp/quackapi_conformance_rerun/` | **Live** FastAPI harness: **89/89 PASS (100%)** |
+| `build/release/duckdb -no-init -f test/conformance/run.sql` → `/tmp/quackapi_conformance_rerun/` | **Live** FastAPI harness: **89/89 PASS (100%)** |
 | `/tmp/quackapi_fastapi_eq/SCORECARD.md` | **Stale** baseline: **62/89 (69.7%)** pre body/form/multipart/cookies/headers/redirect/openapi/redoc |
 | `/tmp/quackapi_corpus/{PYTHON,RUBY,GO,NODE,SPEC}.md` + IR parquets | 1576 routes · 4204 model fields · 36 repos |
 | `/tmp/quackapi_{fromfast,rails_bridge,pydantic_bridge,handler_bridge}.md` | Bridge status + fidelity |
@@ -100,7 +100,7 @@ Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.
 
 ### 2.1 Headline — old vs new
 
-| Metric | **STALE** `/tmp/quackapi_fastapi_eq/SCORECARD.md` | **REFRESHED** `test/conformance/run.sh` (this session) |
+| Metric | **STALE** `/tmp/quackapi_fastapi_eq/SCORECARD.md` | **REFRESHED** `test/conformance/run.sql` (this session) |
 |--------|----------------------------------------------------:|--------------------------------------------------------:|
 | Overall | **62 / 89 (69.7%)** | **89 / 89 (100.0%)** |
 | PASS / FAIL / N/A | 62 / 17 / 10 | **89 / 0 / 0** |
@@ -113,7 +113,7 @@ Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.
 
 ```bash
 PORT=18791 RESULTS_DIR=/tmp/quackapi_conformance_rerun \
-  bash /Users/aloksubbarao/personal/quackapi/test/conformance/run.sh
+  build/release/duckdb -no-init -f test/conformance/run.sql
 # → wrote /tmp/quackapi_conformance_rerun/{results.jsonl,summary.json}
 # python3 test/conformance/render_scorecard.py → overall 89/89 (100.0%)
 ```
@@ -301,7 +301,7 @@ Ship community-extensions `description.yml` **0.1.0** with the surface proven on
 - Conformance **89/89 (100%)** + SQL/HTTP suites under `test/`  
 - Platforms per descriptor: linux/osx amd64+arm64; **exclude** wasm + Windows until green CI  
 
-**Gate:** green `test/conformance/run.sh` + `test/http/run_all.sh` + community packaging pin.
+**Gate:** green `test/conformance/run.sql` + community packaging pin.
 
 ### v1.1 — ops + DX sugar (mostly **S**, thin C++)
 
@@ -359,7 +359,7 @@ rg 'StartsWith\(upper, "CREATE ' src/
 /Users/aloksubbarao/personal/quackapi/build/release/duckdb -unsigned -c "LOAD quackapi; SELECT function_name FROM duckdb_functions() WHERE function_name ILIKE 'quackapi%' GROUP BY 1 ORDER BY 1;"
 
 # Conformance re-run
-PORT=18791 RESULTS_DIR=/tmp/quackapi_conformance_rerun bash test/conformance/run.sh
+PORT=18791 RESULTS_DIR=/tmp/quackapi_conformance_rerun build/release/duckdb -no-init -f test/conformance/run.sql
 # → PASS 89 FAIL 0 N/A 0 · classes MATCH 88 STRONGER 1
 
 # Corpus

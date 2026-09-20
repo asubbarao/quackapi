@@ -42,9 +42,8 @@ classes: MATCH 88, STRONGER 1, BUG 0
 
 ```bash
 CMAKE_BUILD_PARALLEL_LEVEL=4 MAKEFLAGS=-j4 make release
-bash test/conformance/run.sh
+build/release/duckdb -no-init -f test/conformance/run.sql
 python3 test/conformance/render_scorecard.py
-bash test/http/run_all.sh
 ```
 
 ---
@@ -105,7 +104,7 @@ The class labels explain a result but never change its PASS/FAIL/N/A verdict.
 | CORS preflight | `test/http/cors.test.sh` |
 | openapi / docs / redoc | `test/http/redoc.test.sh` |
 
-`bash test/http/run_all.sh` must stay green.
+The `test/conformance` suite must stay green.
 
 ---
 

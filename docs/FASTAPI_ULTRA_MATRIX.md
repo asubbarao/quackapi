@@ -38,7 +38,8 @@ not trusted by default:
 - Optional extension probes are version-aware. An extension compiled for a
   different DuckDB version is `SKIP` with evidence, never a green result.
 - Throughput claims require the existing equal aggregate worker/connection
-  budget, valid k6 cells, retained latency samples, and committed-write checks.
+  budget, valid `loadgen.py` cells, retained latency samples, and
+  committed-write checks.
 
 ## Current extension composition targets
 
@@ -65,10 +66,10 @@ deterministic fuzz cases, records raw per-request rows and latency quantiles,
 then probes the locally installed optional extensions:
 
 ```sh
-bash test/ultra/run.sh
+build/release/duckdb -no-init -f test/ultra/run.sql
 ```
 
-Use `FULL=1 bash test/ultra/run.sh` to add the repository's 85-case HTTP
+Use `FULL=1 build/release/duckdb -no-init -f test/ultra/run.sql` to add the repository's 85-case HTTP
 conformance corpus and scorecard. The paired corpus is a contract gate: a
 nonzero exit means a request, response, validation, security, or transport
 expectation failed. Generated results are intentionally ignored; copy a

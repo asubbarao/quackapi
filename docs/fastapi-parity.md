@@ -6,7 +6,7 @@
 |--|--|
 | Harness | `test/conformance/` |
 | Method | Real HTTP against `quackapi_serve()` (interactive FIFO session) |
-| Re-run | `bash test/conformance/run.sh` then `python3 test/conformance/render_scorecard.py` |
+| Re-run | `build/release/duckdb -no-init -f test/conformance/run.sql` then `python3 test/conformance/render_scorecard.py` |
 | Historical write-up | [FASTAPI_PARITY.md](FASTAPI_PARITY.md) |
 
 ```

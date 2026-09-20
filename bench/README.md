@@ -56,8 +56,15 @@ connections are shed with HTTP 503 naming the binding budget, never dropped
 without a response.
 
 The load generator is `bench/loadgen.py`, implemented with Python's standard
-library. This avoids making k6 a hidden prerequisite. It preserves a gzip CSV
-of every completed/error attempt and a JSON summary for every cell.
+library, so the benchmark has no external load-generation binary to install. It
+drives GET and POST, preserves a gzip CSV of every completed/error attempt, and
+writes a JSON summary for every cell. `--check` selects what counts as an
+honoured response: `exact` compares the whole body against `--expect-json`,
+`embedding` requires a positive integer `dims`, and `generation` requires
+response text plus a positive upstream service time, from which it records a
+signed `overhead_ms` residual — end-to-end latency minus the model's own
+reported time, left signed so a negative value surfaces a timing inconsistency
+instead of hiding it.
 
 ## Run
 
@@ -65,14 +72,19 @@ From the repository root, after building the extension:
 
 ```bash
 GEN=ninja make release
-bash bench/run.sh
+build/release/duckdb -no-init -f bench/run.sql
 ```
 
-`run.sh` creates its own virtual environment, downloads and verifies the pinned
+`run.sql` creates its own virtual environment, downloads and verifies the pinned
 application files, installs pinned FastAPI/uvicorn versions, starts both
 services serially, and writes an immutable directory under `bench/results/`.
-No pgEdge, Postgres, podman, psql, k6, or service from another repository is
-used.
+No pgEdge, Postgres, podman, psql, external load generator, or service from
+another repository is used.
+
+Each measured cell is its own gate, recorded with the exit code of the program
+that produced it. A cell that violates its contract does not stop the run: the
+remaining cells are still measured and the report is still written, and `duckdb`
+then exits nonzero naming every gate that failed.
 
 Useful controls:
 
@@ -90,7 +102,7 @@ For a quick mechanical smoke:
 
 ```bash
 TRIALS=1 DURATION_SEC=0.5 WARMUP_SEC=0.1 \
-  CONCURRENCY_LEVELS="1 8 32" bash bench/run.sh
+  CONCURRENCY_LEVELS="1 8 32" build/release/duckdb -no-init -f bench/run.sql
 ```
 
 Each run preserves:
@@ -102,7 +114,9 @@ measurements.jsonl
 raw/*.csv.gz
 conformance.jsonl
 crash.jsonl
-environment.txt
+environment.csv
+sessions.csv
+run.csv
 *_server.log
 ```
 

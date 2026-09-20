@@ -12,14 +12,14 @@ Classification labels may explain failures but never turn them into passes.
 
 ```bash
 # from repo root, after make release
-bash test/conformance/run.sh
+build/release/duckdb -no-init -f test/conformance/run.sql
 python3 test/conformance/render_scorecard.py
 ```
 
 Override port/binary:
 
 ```bash
-PORT=18888 DUCKDB=./build/release/duckdb bash test/conformance/run.sh
+PORT=18888 DUCKDB=./build/release/duckdb build/release/duckdb -no-init -f test/conformance/run.sql
 ```
 
 ## Layout
@@ -29,7 +29,7 @@ PORT=18888 DUCKDB=./build/release/duckdb bash test/conformance/run.sh
 | `routes.sql` | Fixture routes (CREATE ROUTE / CREATE AUTH) |
 | `cases.jsonl` | Behavior corpus |
 | `driver.py` | Fires requests; writes `results/results.jsonl` |
-| `run.sh` | FIFO interactive serve → drive → stop |
+| `run.sql` | FIFO interactive serve → drive → stop, shelling out through shellfs |
 | `render_scorecard.py` | Headline PASS/FAIL/N/A + classes |
 
 FIFO (not `duckdb -c`) is required so parser-extension DDL after LOAD and a live serve work.

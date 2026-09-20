@@ -7,7 +7,7 @@ against a stub server -- once honest, once mutated -- and the exit codes are
 asserted. A gate that stops firing is a CI failure instead of a green run.
 
 Needs nothing but the standard library: no built extension, no venv, no
-network, no k6.
+network, and no load generator beyond loadgen.py itself.
 """
 from __future__ import annotations
 
@@ -45,7 +45,11 @@ class Stub(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)
-        if Stub.mode == "wrong_body":
+        if Stub.mode == "llm_ok":
+            status, body = 200, [{"dims": 768, "response": "hi", "ollama_total_ms": 120.0, "out_tokens": 16}]
+        elif Stub.mode == "llm_broken":
+            status, body = 200, [{"dims": 0, "response": None, "ollama_total_ms": 0}]
+        elif Stub.mode == "wrong_body":
             status, body = 200, {"detail": "constant wrong response"}
         elif Stub.mode == "shed":
             status, body = 503, {"detail": "overloaded"}
@@ -111,7 +115,7 @@ def check_configuration() -> None:
     unpinned = [name for name, digest in files.items() if len(digest) != 64 or not all(c in HEX for c in digest)]
     holds("every upstream file carries a sha256", bool(files) and not unpinned, f"unpinned: {unpinned}")
     holds(
-        "the pinned application root is the one run.sh serves",
+        "the pinned application root is the one run.sql serves",
         manifest["application_root"].endswith("bigger_applications/app_an_py310"),
         manifest["application_root"],
     )
@@ -120,27 +124,20 @@ def check_configuration() -> None:
     floating = [line for line in lines if line and not line.startswith("#") and "==" not in line]
     holds("every benchmark dependency is pinned", not floating, f"floating: {floating}")
 
-    llm = (BENCH_DIR / "scenarios" / "llm.js").read_text()
-    fanout = (BENCH_DIR / "scenarios" / "fanout.js").read_text()
-    # k6 cannot be run here, so these are source guards on the exact defect:
-    # checks with no threshold let k6 exit 0 with every check failed.
-    for scenario, text in (("llm.js", llm), ("fanout.js", fanout)):
-        holds(f"{scenario} ties its exit code to its checks", "checks: ['rate==1']" in text, "no checks threshold")
-        holds(f"{scenario} declares no empty threshold set", "thresholds: {}" not in text, "thresholds: {} is back")
-    holds("llm.js gates logical success", "logical_success: ['rate==1']" in llm, "no logical_success threshold")
+    run_sql = (BENCH_DIR / "run.sql").read_text()
+    # Every program the bench runs has to report an exit code as a gate row;
+    # a program invoked without one would fail silently and the run would pass.
+    for label in ("conformance:%s|%s", "loadgen:%s:trial%s:c%s|%s", "crash_client:%s|%s", "crash:%s|%s", "report|%s"):
+        holds(f"run.sql records {label.split('|')[0]} as a gate row", label in run_sql, f"{label} missing")
     holds(
-        "llm.js checks the status the route contracts to return",
-        "res.status === 200" in llm and "res.status < 300" not in llm,
-        "the any-2xx status check is back",
-    )
-
-    run_sh = (BENCH_DIR / "run.sh").read_text()
-    for label in ('gate "conformance:', 'gate "loadgen:', 'gate "crash:'):
-        holds(f"run.sh runs {label.split(chr(34))[1][:-1]} through the gate", label in run_sh, f"{label} missing")
-    holds(
-        "run.sh turns recorded gates into a nonzero exit",
-        'if [[ -n "${GATE_FAILURES}" ]]; then' in run_sh,
+        "run.sql turns a recorded gate into a raised error",
+        "error('FAIL: the run violated its own contract: '" in run_sql,
         "the final verdict is missing",
+    )
+    holds(
+        "the benchmark ships no shell artifact",
+        not list(BENCH_DIR.rglob("*.sh")),
+        f"shell artifacts: {[str(path) for path in BENCH_DIR.rglob('*.sh')]}",
     )
 
 
@@ -160,6 +157,21 @@ def check_gates(port: int, scratch: Path) -> None:
     # 503 is the documented overload answer, so this is the zero-success gate
     # firing on its own rather than the contract gate firing again.
     exits("loadgen.py rejects a run with no successful request", "shed", False, *loadgen)
+
+    # The checks that replaced the deleted load-generator scenarios, proven the
+    # same way as every other gate: honest answer passes, mutant answer fails.
+    def llm(check: str) -> list[str]:
+        return [
+            str(BENCH_DIR / "loadgen.py"), "--url", f"http://127.0.0.1:{port}/llm/probe?model=m&prompt=p",
+            "--method", "POST", "--check", check,
+            "--stack", "stub", "--trial", "1", "--concurrency", "2", "--duration", "0.3",
+            "--warmup", "0", "--timeout", "5", "--raw", str(scratch / f"{check}.csv.gz"),
+        ]
+
+    exits("loadgen.py accepts an embedding with positive dims", "llm_ok", True, *llm("embedding"))
+    exits("loadgen.py rejects an embedding with no dimensions", "llm_broken", False, *llm("embedding"))
+    exits("loadgen.py accepts a generation with text and upstream timing", "llm_ok", True, *llm("generation"))
+    exits("loadgen.py rejects a generation with no text and no timing", "llm_broken", False, *llm("generation"))
 
     crash_client = [str(BENCH_DIR / "crash_client.py"), "--port", str(port), "--jobs", "4", "--delay-ms", "0"]
     exits("crash_client.py accepts acknowledged jobs", "honest", True, *crash_client)

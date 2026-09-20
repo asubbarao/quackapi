@@ -491,7 +491,7 @@ that quietly does nothing.
 ```sh
 GEN=ninja make release
 make test                          # SQL unit tests
-bash test/conformance/run.sh       # real-HTTP contract suite (needs release build)
+build/release/duckdb -no-init -f test/conformance/run.sql   # real-HTTP contract suite (needs release build)
 ```
 
 ## Docs in this repo

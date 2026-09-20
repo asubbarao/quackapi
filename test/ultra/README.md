@@ -6,18 +6,18 @@ a representative FastAPI application. It has three layers:
 1. `paired_driver.py` sends the same contract cases to both live servers and
    checks status, validation locations, response filtering, headers, content
    negotiation, CORS, compression, streaming, redirects, and OpenAPI.
-2. `run_extensions.sh` discovers version-matched DuckDB extensions and probes
+2. `run_extensions.sql` discovers version-matched DuckDB extensions and probes
    `httpfs_timeout_retry`, `cache_prewarm`, `cache_httpfs`, `http_stats`,
    `finetype`, `query_condition_cache`, and `table_guard`. A version mismatch
    is recorded as `SKIP`, never as a false pass.
 3. The existing SQL suite, HTTP conformance suite, and benchmark matrix remain
-   the deeper regression and throughput gates. `run.sh` orchestrates all of
+   the deeper regression and throughput gates. `run.sql` orchestrates all of
    them when `FULL=1`.
 
 ## Run the paired matrix
 
 ```bash
-bash test/ultra/run_pair.sh
+build/release/duckdb -no-init -f test/ultra/run_pair.sql
 ```
 
 The result directory contains `results.jsonl`, `summary.json`, and both server
@@ -27,19 +27,21 @@ path, integer, malformed-body, null, extra-field, and list-boundary cases.
 ## Run the extension probes
 
 ```bash
-bash test/ultra/run_extensions.sh
+build/release/duckdb -no-init -f test/ultra/run_extensions.sql
 ```
 
-The script selects a DuckDB binary whose version matches the locally installed
-optional extensions. This matters because DuckDB rejects loading an extension
-compiled for another engine version. The probe records the settings and
+It selects a DuckDB binary by asking each candidate to load
+`httpfs_timeout_retry` and `cache_prewarm` and keeping the first that can. This
+matters because DuckDB rejects loading an extension compiled for another engine
+version, and asking the binary is exact where reconstructing the extension
+directory path by hand is a guess. The probe records the settings and
 function signatures so a future run can compare the actual extension surface.
 
 ## What this matrix measures
 
 | Dimension | Paired cases | Production follow-up |
 |---|---|---|
-| Routing | path captures, 404/405/Allow, HEAD | fixed and concurrent k6 cells |
+| Routing | path captures, 404/405/Allow, HEAD | fixed and concurrent `loadgen.py` cells |
 | Validation | typed path/query/body values, null/missing/extra fields, bounds, malformed JSON | SQLLogicTest aggregate-error and overflow corpus |
 | Security | bearer/API-key behavior, response-field filtering | row policies, masking, JWT claims, rate limits, queue fencing |
 | Responses | JSON objects/lists, HTML, text, CSV, NDJSON, SSE, redirects | content caps, compression, disconnect cancellation |

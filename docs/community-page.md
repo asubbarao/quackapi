@@ -311,7 +311,7 @@ Repo workflow: `duckdb/extension-ci-tools` `@v1.5-variegata`,
 **Feasibility:** high for the non-excluded platforms — pure CMake extension
 template shape, no exotic system libraries. Blocker before first signed publish:
 clean release tag with **no merge-conflict markers** in `src/`, green
-`make release` + `test/http/run_all.sh` on at least one host arch.
+`make release` + `test/conformance` on at least one host arch.
 
 ---
 

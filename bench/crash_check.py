@@ -2,7 +2,7 @@
 """Reconcile the crash case: what the client was told is durable against what
 survived SIGKILL.
 
-This lived inline in run.sh, where it could only ever write a row. It is a
+This lived inline in the bench runner, where it could only ever write a row. It is a
 program so the reconciliation has an exit code of its own and can be exercised
 directly by bench/test_bench_config.py.
 """
