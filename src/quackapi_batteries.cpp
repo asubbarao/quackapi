@@ -1,5 +1,6 @@
 #include "quackapi_server.hpp"
 #include "quackapi_http_fetch.hpp"
+#include "quackapi_events.hpp"
 #include "quackapi_imports.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -317,6 +318,21 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		                                     "receiver; a Collector is the answer beyond local)",
 		                                     endpoint.state, endpoint.uri.empty() ? "<none>" : endpoint.uri,
 		                                     endpoint.catalog.empty() ? "<none>" : endpoint.catalog));
+	}
+
+	// --- Per-request observability: events owns the handler ---
+	// WHY: quackapi_otlp reports spans from inside this process. The events
+	// extension reports the same request's query and transaction lifecycle —
+	// including transaction_rollback — to a program outside it, which is the
+	// only account that survives the process. enforce=true: a configured
+	// handler quackapi cannot honour is a refusal to serve, not a silent sink.
+	{
+		QuackapiEventsSink sink;
+		QuackapiEventsReconcile(*context.db, &context, /*enforce=*/true, sink);
+		applied.push_back(StringUtil::Format(
+		    "events=%s destination=%s async=%s (WHY: query and transaction lifecycle to a program "
+		    "outside the process; there is no row or CDC event here)",
+		    sink.state, sink.destination.empty() ? "<none>" : sink.destination, sink.async ? "true" : "false"));
 	}
 
 	// Transport knobs are applied in QuackapiHttpServer ctor (httplib SERVER).

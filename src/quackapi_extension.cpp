@@ -21,6 +21,7 @@
 
 #include "quackapi_auth.hpp"
 #include "quackapi_ddl.hpp"
+#include "quackapi_events.hpp"
 #include "quackapi_from_x.hpp"
 #include "quackapi_graphql.hpp"
 #include "quackapi_http_fetch.hpp"
@@ -1078,6 +1079,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Companions quackapi composes: otlp (observability) + cronjob (queue drain).
 	// Settings and quackapi_otlp() / quackapi_queue_worker() live there.
 	RegisterQuackapiImportFunctions(loader);
+
+	// events (per-request observability outside the process). Settings and
+	// quackapi_events() live there; nothing is applied until a handler is
+	// configured, so LOAD quackapi neither needs nor spawns anything.
+	RegisterQuackapiEventsFunctions(loader);
 
 	// OTLP on LOAD, locally, loudly: default-create the loopback receiver when
 	// the otlp extension is loaded, and say what is (not) collecting either way.

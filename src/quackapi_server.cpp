@@ -28,6 +28,7 @@
 #include "duckdb/parser/parser.hpp"
 
 #include "quackapi_auth.hpp"
+#include "quackapi_events.hpp"
 #include "quackapi_graphql.hpp"
 #include "quackapi_openapi.hpp"
 #include "quackapi_pg.hpp"
@@ -3519,6 +3520,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// TLS has been destroyed, causing a shutdown use-after-free.
 		// TEMP/SET and prepared plans also remain strictly request-local.
 		Connection con(*db);
+		// Name the connection with the request id before the handler runs, so
+		// every event this request emits carries it — a request that fails
+		// answers with a body that says nothing, and its rollback would
+		// otherwise correlate with no request at all. No-op unless a handler
+		// is configured.
+		QuackapiEventsStampRequest(con, request_id);
 		const auto elapsed_ms =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 		QuackapiQueryDeadline deadline(con, std::max<int64_t>(1, options.query_timeout_ms - elapsed_ms));
