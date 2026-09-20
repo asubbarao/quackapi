@@ -19,6 +19,7 @@ dist/
 test/conformance/results/
 test/conformance/__pycache__/
 test/integration/__pycache__/
+test/conformance/.venv/
 test/ultra/results/
 test/ultra/__pycache__/
 
