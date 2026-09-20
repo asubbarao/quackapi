@@ -11,6 +11,12 @@ const WARMUP = __ENV.WARMUP_DURATION || '2s';
 const MEASURE = __ENV.MEASURE_DURATION || '8s';
 export const options = {
   discardResponseBodies: false,
+  // Without these the checks below are decoration: k6 exits 0 with every check
+  // failed.
+  thresholds: {
+    checks: ['rate==1'],
+    http_req_failed: ['rate==0'],
+  },
   scenarios: {
     warmup:  { executor: 'constant-vus', vus: VUS, duration: WARMUP, startTime: '0s', tags: { stage: 'warmup' }, exec: 'fan' },
     measure: { executor: 'constant-vus', vus: VUS, duration: MEASURE, startTime: WARMUP, tags: { stage: 'measure' }, exec: 'fan' },

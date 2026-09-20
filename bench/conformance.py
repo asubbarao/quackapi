@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import sys
 
 
 CASES = [
@@ -45,6 +46,10 @@ def main() -> None:
             connection.close()
     passed = sum(case["passed"] for case in results)
     print(json.dumps({"stack": args.stack, "passed": passed, "total": len(results), "cases": results}, separators=(",", ":")))
+    failed = [case["name"] for case in results if not case["passed"]]
+    if failed:
+        print(f"FAIL: {args.stack} violated the response contract: {', '.join(failed)}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

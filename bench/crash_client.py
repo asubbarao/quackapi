@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
+import sys
 
 
 def send(port: int, job_id: int, delay_ms: int) -> dict:
@@ -31,6 +32,11 @@ def main() -> None:
         results = list(pool.map(lambda job_id: send(args.port, job_id, args.delay_ms), range(1, args.jobs + 1)))
     acknowledged = [row["id"] for row in results if row.get("status") == 202]
     print(json.dumps({"attempted": args.jobs, "acknowledged": len(acknowledged), "acknowledged_ids": acknowledged, "failures": [row for row in results if row.get("status") != 202]}, separators=(",", ":")))
+    if not acknowledged:
+        # With nothing acknowledged there is no durability claim to survive the
+        # kill, so the crash case measures nothing and must not report success.
+        print(f"FAIL: none of the {args.jobs} jobs was acknowledged with 202", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
