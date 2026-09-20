@@ -1,4 +1,5 @@
 #include "quackapi_websocket.hpp"
+#include "quackapi_radio.hpp"
 
 #include <string.h>
 
@@ -104,6 +105,10 @@ string QuackapiWsOpcodeName(QuackapiWsOpcode opcode) {
 	default:
 		return "unknown";
 	}
+}
+
+bool QuackapiWsPayloadIsText(const string &payload) {
+	return Utf8Proc::IsValid(payload.data(), payload.size());
 }
 
 string QuackapiWsAcceptKey(const string &client_key) {
@@ -941,6 +946,10 @@ void RegisterQuackapiWebsocketFunctions(ExtensionLoader &loader) {
 	connect.named_parameters["max_frames"] = LogicalType::BIGINT;
 	connect.named_parameters["idle_timeout_ms"] = LogicalType::BIGINT;
 	loader.RegisterFunction(connect);
+
+	// The topic broker behind a `CREATE STREAM … WS` endpoint, which is what
+	// makes a remote DuckDB running the `radio` client a subscriber.
+	RegisterQuackapiRadioFunctions(loader);
 }
 
 } // namespace duckdb

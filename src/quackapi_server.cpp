@@ -2671,8 +2671,13 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 				running = ping_if_quiet();
 				continue;
 			}
-			if (inbound.opcode == QuackapiWsOpcode::BINARY) {
-				conn.SendClose(QuackapiWsClose::UNSUPPORTED_DATA, "this endpoint binds $message from text frames only");
+			// An opcode alone does not say whether a frame carries text. The
+			// `radio` extension's transmit queue calls ixwebsocket sendBinary
+			// unconditionally, so refusing on BINARY refuses the only DuckDB
+			// WebSocket client there is. Ask the bytes instead (RFC 6455 §5.6).
+			if (inbound.opcode == QuackapiWsOpcode::BINARY && !QuackapiWsPayloadIsText(inbound.payload)) {
+				conn.SendClose(QuackapiWsClose::UNSUPPORTED_DATA,
+				               "this endpoint binds $message from text, and this binary frame is not UTF-8");
 				break;
 			}
 			BoundParameterData bound;
