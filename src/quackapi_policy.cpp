@@ -18,6 +18,7 @@
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/tableref/list.hpp"
 
 #include "quackapi_state.hpp"
@@ -269,7 +270,7 @@ struct PolicyDdlParseData : public ParserExtensionParseData {
 	}
 };
 
-ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult PolicyDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -597,6 +598,11 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 	return ParserExtensionParseResult();
 }
 
+ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(PolicyDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 //===--------------------------------------------------------------------===//
 // Apply table function
 //===--------------------------------------------------------------------===//
@@ -632,7 +638,7 @@ vector<string> SplitCsv(const string &csv) {
 }
 
 unique_ptr<FunctionData> ApplyPolicyBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyPolicyBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -766,7 +772,7 @@ struct PoliciesGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> PoliciesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -916,9 +922,10 @@ string CurrentCatalog(Connection &con) {
 
 PolicyTableIdentity IdentityFromBaseRef(const BaseTableRef &ref, const string &default_catalog) {
 	PolicyTableIdentity identity;
-	identity.catalog = ref.catalog_name.empty() ? default_catalog : ref.catalog_name;
-	identity.schema = ref.schema_name.empty() ? "main" : ref.schema_name;
-	identity.table = ref.table_name;
+	auto &qualified = ref.GetQualifiedName();
+	identity.catalog = qualified.Catalog().empty() ? default_catalog : qualified.Catalog().GetIdentifierName();
+	identity.schema = qualified.Schema().empty() ? "main" : qualified.Schema().GetIdentifierName();
+	identity.table = qualified.Name().GetIdentifierName();
 	return identity;
 }
 
@@ -1070,7 +1077,7 @@ bool RewritePolicyExpression(ParsedExpression &expression, PolicyRewriteContext 
 	try {
 		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 			auto &subquery = expression.Cast<SubqueryExpression>();
-			if (!subquery.subquery || !RewritePolicySelect(*subquery.subquery, ctx)) {
+			if (!subquery.Subquery() || !RewritePolicySelect(*subquery.SubqueryMutable(), ctx)) {
 				if (ctx.error.empty()) {
 					ctx.Reject("policy enforcement could not inspect a nested subquery");
 				}
@@ -1217,7 +1224,7 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 			ctx.Reject("policy enforcement could not construct a secure subquery");
 			return false;
 		}
-		string alias = ref->alias.empty() ? base.table_name : ref->alias;
+		auto alias = ref->alias.empty() ? base.GetQualifiedName().Name() : ref->alias;
 		auto replacement = make_uniq<SubqueryRef>(std::move(secure_query), alias);
 		ref->CopyProperties(*replacement);
 		replacement->alias = alias;
@@ -1270,7 +1277,7 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 
 bool RewritePolicyQueryNode(QueryNode &node, PolicyRewriteContext &ctx) {
 	for (auto &entry : node.cte_map.map) {
-		if (!entry.second || !entry.second->query || !RewritePolicySelect(*entry.second->query, ctx)) {
+		if (!entry.second || !entry.second->query_node || !RewritePolicyQueryNode(*entry.second->query_node, ctx)) {
 			ctx.Reject("policy enforcement could not inspect a common table expression");
 			return false;
 		}
@@ -1324,7 +1331,7 @@ bool InspectPolicyExpressionList(vector<unique_ptr<ParsedExpression>> &expressio
 
 bool InspectPolicyCteMap(CommonTableExpressionMap &cte_map, PolicyRewriteContext &ctx) {
 	for (auto &entry : cte_map.map) {
-		if (!entry.second || !entry.second->query || !RewritePolicySelect(*entry.second->query, ctx)) {
+		if (!entry.second || !entry.second->query_node || !RewritePolicyQueryNode(*entry.second->query_node, ctx)) {
 			ctx.Reject("policy enforcement could not inspect a common table expression");
 			return false;
 		}
@@ -1348,11 +1355,9 @@ bool InspectUnrewritableStatement(SQLStatement &statement, PolicyRewriteContext 
 	case StatementType::SELECT_STATEMENT:
 		return RewritePolicySelect(statement.Cast<SelectStatement>(), ctx);
 	case StatementType::INSERT_STATEMENT: {
-		auto &insert = statement.Cast<InsertStatement>();
+		auto &insert = *statement.Cast<InsertStatement>().node;
 		auto target = make_uniq<BaseTableRef>();
-		target->catalog_name = insert.catalog;
-		target->schema_name = insert.schema;
-		target->table_name = insert.table;
+		target->SetQualifiedName(insert.qualified_name);
 		unique_ptr<TableRef> target_ref = std::move(target);
 		if (!InspectPolicyCteMap(insert.cte_map, ctx) || !RewritePolicyTableRef(target_ref, ctx)) {
 			return false;
@@ -1372,7 +1377,7 @@ bool InspectUnrewritableStatement(SQLStatement &statement, PolicyRewriteContext 
 		return InspectPolicyExpressionList(insert.returning_list, ctx);
 	}
 	case StatementType::UPDATE_STATEMENT: {
-		auto &update = statement.Cast<UpdateStatement>();
+		auto &update = *statement.Cast<UpdateStatement>().node;
 		if (!InspectPolicyCteMap(update.cte_map, ctx) || !RewritePolicyTableRef(update.table, ctx)) {
 			return false;
 		}
@@ -1386,7 +1391,7 @@ bool InspectUnrewritableStatement(SQLStatement &statement, PolicyRewriteContext 
 		return InspectPolicyExpressionList(update.returning_list, ctx);
 	}
 	case StatementType::DELETE_STATEMENT: {
-		auto &remove = statement.Cast<DeleteStatement>();
+		auto &remove = *statement.Cast<DeleteStatement>().node;
 		if (!InspectPolicyCteMap(remove.cte_map, ctx) || !RewritePolicyTableRef(remove.table, ctx)) {
 			return false;
 		}

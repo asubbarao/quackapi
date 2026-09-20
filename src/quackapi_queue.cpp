@@ -42,7 +42,7 @@ string SqlQuote(const string &s) {
 	return out;
 }
 
-void CheckQuery(unique_ptr<MaterializedQueryResult> &res, const string &ctx) {
+void CheckQuery(unique_ptr<QueryResult> &res, const string &ctx) {
 	if (res->HasError()) {
 		throw InvalidInputException("quackapi queue %s: %s", ctx, res->GetError());
 	}
@@ -190,7 +190,7 @@ struct QueueDdlParseData : public ParserExtensionParseData {
 //!   CREATE [OR REPLACE] QUEUE <name>
 //!     [WITH ( max_attempts=<n> , visibility_timeout='30s'|30 , backoff_base_seconds=<n> )]
 //!   DROP QUEUE <name>
-ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult QueueDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -358,6 +358,11 @@ ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const string &qu
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult QueueDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(QueueDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 struct ApplyQueueBindData : public TableFunctionData {
 	string action;
 	bool or_replace = false;
@@ -369,7 +374,7 @@ struct ApplyQueueBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyQueueBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyQueueBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -484,8 +489,8 @@ void EnqueueScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		args.data[2].ToUnifiedFormat(args.size(), mdata);
 	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<int64_t>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto out = FlatVector::GetDataMutable<int64_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto pi = pdata.sel->get_index(i);
@@ -521,7 +526,7 @@ struct DequeueGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> DequeueBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
 	auto bind_data = make_uniq<DequeueBindData>();
 	bind_data->queue_name = input.inputs[0].GetValue<string>();
 	if (input.inputs.size() > 1 && !input.inputs[1].IsNull()) {
@@ -579,7 +584,7 @@ void RecoverExpiredJobs(Connection &con, const string &queue_name) {
 	CheckQuery(retry, "dequeue expiry sweep");
 }
 
-unique_ptr<MaterializedQueryResult> ClaimPendingJob(Connection &con, const string &queue_name,
+unique_ptr<QueryResult> ClaimPendingJob(Connection &con, const string &queue_name,
                                                     int32_t visibility_timeout_sec) {
 	string sql =
 	    StringUtil::Format("UPDATE quackapi_jobs SET "
@@ -601,7 +606,7 @@ unique_ptr<MaterializedQueryResult> ClaimPendingJob(Connection &con, const strin
 	                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error, "
 	                       "delivery_generation",
 	                       visibility_timeout_sec, SqlQuote(queue_name));
-	unique_ptr<MaterializedQueryResult> res;
+	unique_ptr<QueryResult> res;
 	for (int attempt = 0; attempt < 8; attempt++) {
 		res = con.Query(sql);
 		if (!res->HasError()) {
@@ -688,8 +693,8 @@ void AckScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	args.data[1].ToUnifiedFormat(args.size(), idata);
 	args.data[2].ToUnifiedFormat(args.size(), gdata);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<bool>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto out = FlatVector::GetDataMutable<bool>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto ii = idata.sel->get_index(i);
@@ -797,8 +802,8 @@ void NackScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		args.data[4].ToUnifiedFormat(args.size(), edata);
 	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<string_t>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto out = FlatVector::GetDataMutable<string_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto ii = idata.sel->get_index(i);
@@ -858,8 +863,8 @@ void RenewScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	args.data[1].ToUnifiedFormat(args.size(), idata);
 	args.data[2].ToUnifiedFormat(args.size(), gdata);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto out = FlatVector::GetData<bool>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto out = FlatVector::GetDataMutable<bool>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto ii = idata.sel->get_index(i);
@@ -891,7 +896,7 @@ struct QueuesGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> QueuesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                    vector<string> &names) {
+                                    vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT, LogicalType::BIGINT,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER};
 	names = {"name", "depth", "in_flight", "dead", "max_attempts", "visibility_timeout_sec", "backoff_base_sec"};
@@ -992,6 +997,10 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
 	                                       {LogicalType::VARCHAR, LogicalType::JSON(), LogicalType::INTEGER},
 	                                       LogicalType::BIGINT, EnqueueScalar));
+	// Every queue scalar runs SQL and reports a bad queue or job through
+	// CheckQuery. A scalar function that can raise must say so, or the error
+	// reaches the caller as an INTERNAL Error.
+	enqueue_set.SetFallible();
 	loader.RegisterFunction(enqueue_set);
 
 	// dequeue(queue) / dequeue(queue, n)
@@ -1005,9 +1014,10 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 
 	// Delivery ownership is mandatory. The retired two-argument form could let
 	// an expired worker complete a newer delivery of the same job.
-	loader.RegisterFunction(ScalarFunction("quackapi_ack",
-	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                       LogicalType::BOOLEAN, AckScalar));
+	ScalarFunction ack("quackapi_ack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                   LogicalType::BOOLEAN, AckScalar);
+	ack.SetFallible();
+	loader.RegisterFunction(ack);
 
 	// nack(queue, job_id, delivery_generation [, requeue [, error]])
 	ScalarFunctionSet nack_set("quackapi_nack");
@@ -1021,12 +1031,14 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	    "quackapi_nack",
 	    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::VARCHAR},
 	    LogicalType::VARCHAR, NackScalar));
+	nack_set.SetFallible();
 	loader.RegisterFunction(nack_set);
 
 	// renew(queue, job_id, delivery_generation) → bool
-	loader.RegisterFunction(ScalarFunction("quackapi_renew",
-	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                       LogicalType::BOOLEAN, RenewScalar));
+	ScalarFunction renew("quackapi_renew", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                     LogicalType::BOOLEAN, RenewScalar);
+	renew.SetFallible();
+	loader.RegisterFunction(renew);
 
 	// queues() inspection
 	loader.RegisterFunction(TableFunction("quackapi_queues", {}, QueuesExec, QueuesBind, QueuesInit));

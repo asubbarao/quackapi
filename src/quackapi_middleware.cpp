@@ -92,7 +92,7 @@ struct MiddlewareDdlParseData : public ParserExtensionParseData {
 //! Grammar:
 //!   CREATE [OR REPLACE] MIDDLEWARE <name> BEFORE|AFTER [GROUP <name>] AS <sql>
 //!   DROP MIDDLEWARE <name>
-ParserExtensionParseResult MiddlewareDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult MiddlewareDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -160,6 +160,11 @@ ParserExtensionParseResult MiddlewareDdlParse(ParserExtensionInfo *, const strin
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult MiddlewareDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(MiddlewareDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 struct ApplyMiddlewareBindData : public TableFunctionData {
 	string action;
 	bool or_replace = false;
@@ -168,7 +173,7 @@ struct ApplyMiddlewareBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyMiddlewareBind(ClientContext &, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyMiddlewareBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -248,7 +253,7 @@ struct MiddlewaresGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> MiddlewaresBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                         vector<string> &names) {
+                                         vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -332,10 +337,10 @@ void SetMiddlewareFailure(QuackapiMiddlewareContext &context, int32_t status = 5
 
 bool GetMiddlewareResultColumns(const QueryResult &result, idx_t &allow_col, idx_t &status_col, idx_t &body_col,
                                 idx_t &header_name_col, idx_t &header_value_col) {
-	auto invalid = result.names.size();
+	auto invalid = result.GetNames().size();
 	allow_col = status_col = body_col = header_name_col = header_value_col = invalid;
-	for (idx_t col = 0; col < result.names.size(); col++) {
-		auto lower = StringUtil::Lower(result.names[col]);
+	for (idx_t col = 0; col < result.GetNames().size(); col++) {
+		auto lower = StringUtil::Lower(result.GetNames()[col].GetIdentifierName());
 		idx_t *slot = nullptr;
 		if (lower == "allow") {
 			slot = &allow_col;
@@ -355,18 +360,18 @@ bool GetMiddlewareResultColumns(const QueryResult &result, idx_t &allow_col, idx
 			*slot = col;
 		}
 	}
-	if (allow_col == invalid || allow_col >= result.types.size() ||
-	    result.types[allow_col].id() != LogicalTypeId::BOOLEAN) {
+	if (allow_col == invalid || allow_col >= result.GetTypes().size() ||
+	    result.GetTypes()[allow_col].id() != LogicalTypeId::BOOLEAN) {
 		return false;
 	}
 	if ((status_col != invalid &&
-	     (status_col >= result.types.size() || result.types[status_col].id() != LogicalTypeId::INTEGER)) ||
+	     (status_col >= result.GetTypes().size() || result.GetTypes()[status_col].id() != LogicalTypeId::INTEGER)) ||
 	    (body_col != invalid &&
-	     (body_col >= result.types.size() || result.types[body_col].id() != LogicalTypeId::VARCHAR)) ||
+	     (body_col >= result.GetTypes().size() || result.GetTypes()[body_col].id() != LogicalTypeId::VARCHAR)) ||
 	    (header_name_col != invalid &&
-	     (header_name_col >= result.types.size() || result.types[header_name_col].id() != LogicalTypeId::VARCHAR)) ||
+	     (header_name_col >= result.GetTypes().size() || result.GetTypes()[header_name_col].id() != LogicalTypeId::VARCHAR)) ||
 	    (header_value_col != invalid &&
-	     (header_value_col >= result.types.size() || result.types[header_value_col].id() != LogicalTypeId::VARCHAR))) {
+	     (header_value_col >= result.GetTypes().size() || result.GetTypes()[header_value_col].id() != LogicalTypeId::VARCHAR))) {
 		return false;
 	}
 	return (header_name_col == invalid) == (header_value_col == invalid);
@@ -478,43 +483,43 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 				return false;
 			}
 
-			case_insensitive_map_t<BoundParameterData> values;
-			for (auto &entry : prepared->named_param_map) {
-				auto &name = entry.first;
+			identifier_map_t<BoundParameterData> values;
+			for (auto &entry : prepared->GetNamedParameterMap()) {
+				auto &name = entry.first.GetIdentifierName();
 				auto lower = StringUtil::Lower(name);
 				string claim_key;
 				if (IsClaimsParameter(name, claim_key)) {
 					auto claim = claims.find(claim_key);
-					values[name] =
+					values[entry.first] =
 					    claim == claims.end() ? BoundParameterData(Value()) : BoundParameterData(Value(claim->second));
 				} else if (lower == "request_id") {
-					values[name] = BoundParameterData(Value(context.request_id));
+					values[entry.first] = BoundParameterData(Value(context.request_id));
 				} else if (lower == "method") {
-					values[name] = BoundParameterData(Value(context.method));
+					values[entry.first] = BoundParameterData(Value(context.method));
 				} else if (lower == "path") {
-					values[name] = BoundParameterData(Value(context.path));
+					values[entry.first] = BoundParameterData(Value(context.path));
 				} else if (lower == "route") {
-					values[name] = BoundParameterData(Value(context.route_name));
+					values[entry.first] = BoundParameterData(Value(context.route_name));
 				} else if (lower == "group") {
-					values[name] = context.group_name.empty() ? BoundParameterData(Value())
+					values[entry.first] = context.group_name.empty() ? BoundParameterData(Value())
 					                                          : BoundParameterData(Value(context.group_name));
 				} else if (lower == "client_ip") {
-					values[name] = context.client_ip.empty() ? BoundParameterData(Value())
+					values[entry.first] = context.client_ip.empty() ? BoundParameterData(Value())
 					                                         : BoundParameterData(Value(context.client_ip));
 				} else if (lower == "auth_subject") {
-					values[name] = context.auth_subject.empty() ? BoundParameterData(Value())
+					values[entry.first] = context.auth_subject.empty() ? BoundParameterData(Value())
 					                                            : BoundParameterData(Value(context.auth_subject));
 				} else if (lower == "headers_json") {
-					values[name] = BoundParameterData(Value(context.headers_json));
+					values[entry.first] = BoundParameterData(Value(context.headers_json));
 				} else if (lower == "query_json") {
-					values[name] = BoundParameterData(Value(context.query_json));
+					values[entry.first] = BoundParameterData(Value(context.query_json));
 				} else if (lower == "body") {
-					values[name] = BoundParameterData(Value(context.request_body));
+					values[entry.first] = BoundParameterData(Value(context.request_body));
 				} else if (lower == "status") {
-					values[name] = context.status == 0 ? BoundParameterData(Value())
+					values[entry.first] = context.status == 0 ? BoundParameterData(Value())
 					                                   : BoundParameterData(Value::INTEGER(context.status));
 				} else if (lower == "elapsed_ms") {
-					values[name] = BoundParameterData(Value::BIGINT(context.elapsed_ms));
+					values[entry.first] = BoundParameterData(Value::BIGINT(context.elapsed_ms));
 				} else {
 					// A middleware cannot draw a value from the HTTP request by naming
 					// an arbitrary parameter. This avoids accidental secret exposure.
@@ -532,7 +537,7 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 				return false;
 			}
 			QuackapiQueryDeadline deadline(connection, timeout_ms);
-			auto result = prepared->Execute(values, false);
+			auto result = prepared->Execute(values);
 			if (result->HasError() || deadline.Expired()) {
 				SetMiddlewareFailure(context, deadline.Expired() ? 408 : 500);
 				return false;
@@ -571,13 +576,13 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 						SetMiddlewareFailure(context);
 						return false;
 					}
-					auto status = status_col < result->names.size() ? chunk->GetValue(status_col, row) : Value();
-					auto body = body_col < result->names.size() ? chunk->GetValue(body_col, row) : Value();
+					auto status = status_col < result->GetNames().size() ? chunk->GetValue(status_col, row) : Value();
+					auto body = body_col < result->GetNames().size() ? chunk->GetValue(body_col, row) : Value();
 					if (allow.GetValue<bool>() && (!status.IsNull() || !body.IsNull())) {
 						SetMiddlewareFailure(context);
 						return false;
 					}
-					if (header_name_col < result->names.size()) {
+					if (header_name_col < result->GetNames().size()) {
 						auto header_name = chunk->GetValue(header_name_col, row);
 						auto header_value = chunk->GetValue(header_value_col, row);
 						if (header_name.IsNull() != header_value.IsNull()) {

@@ -650,11 +650,13 @@ void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader) {
 	ScalarFunction verify("quackapi_verify_auth", {LogicalType::VARCHAR, LogicalType::VARCHAR}, VerifyAuthReturnType(),
 	                      QuackapiVerifyAuthFunction);
 	verify.SetVolatile();
+	verify.SetFallible();
 	loader.RegisterFunction(verify);
 
 	ScalarFunction authn("quackapi_authentication", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     LogicalType::BOOLEAN, QuackapiAuthenticationFunction);
 	authn.SetVolatile();
+	authn.SetFallible();
 	loader.RegisterFunction(authn);
 
 	ScalarFunction authz("quackapi_authorization", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
@@ -691,7 +693,7 @@ struct AuthDdlParseData : public ParserExtensionParseData {
 //!   CREATE [OR REPLACE] AUTH <name> AS API_KEY [ ( HEADER '<hdr>' ) ];
 //!   CREATE [OR REPLACE] AUTH <name> AS JWT ( SECRET '<secret>' [, ALGORITHM HS256 ] );
 //!   DROP AUTH <name>;
-ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult AuthDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -846,6 +848,11 @@ ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const string &que
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult AuthDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(AuthDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 struct ApplyAuthBindData : public TableFunctionData {
 	string action;
 	bool or_replace = false;
@@ -857,7 +864,7 @@ struct ApplyAuthBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyAuthBind(ClientContext &, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyAuthBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -943,7 +950,7 @@ struct AuthsBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> AuthsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -987,7 +994,7 @@ struct AddApiKeyBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> AddApiKeyBind(ClientContext &, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<AddApiKeyBindData>();
 	bind_data->auth_name = input.inputs[0].GetValue<string>();
 	bind_data->raw_key = input.inputs[1].GetValue<string>();

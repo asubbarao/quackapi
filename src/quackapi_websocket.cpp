@@ -702,7 +702,7 @@ void RecordFrame(vector<WsConnectFrame> &frames, const QuackapiWsMessage &messag
 }
 
 unique_ptr<FunctionData> WsConnectBind(ClientContext &, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<WsConnectBindData>();
 	bind_data->url = input.inputs[0].GetValue<string>();
 
@@ -931,6 +931,9 @@ void WsConnectExec(ClientContext &, TableFunctionInput &data_p, DataChunk &outpu
 
 void RegisterQuackapiWebsocketFunctions(ExtensionLoader &loader) {
 	ScalarFunction accept("quackapi_ws_accept", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WsAcceptScalar);
+	// A malformed Sec-WebSocket-Key raises. A scalar function that can raise must
+	// say so, or the error reaches the caller as an INTERNAL Error.
+	accept.SetFallible();
 	loader.RegisterFunction(accept);
 
 	TableFunction connect("quackapi_ws_connect", {LogicalType::VARCHAR}, WsConnectExec, WsConnectBind, WsConnectInit);

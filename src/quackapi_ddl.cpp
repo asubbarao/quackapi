@@ -306,7 +306,7 @@ bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
 //! GROUP expands prefix+auth at CREATE (APIRouter-style); pattern may be relative.
 //! TIMEOUT / WITH (timeout_sec) extends httplib read/write socket deadlines for
 //! that request only; 0 (omit) keeps quackapi_serve defaults (30s).
-ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult RouteDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -1026,6 +1026,11 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(RouteDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 //! Execution target for the planned DDL. All side effects happen here, at
 //! execution time — plan/bind must not touch the registry (or run SQL: the
 //! binder holds the ClientContext lock).
@@ -1037,7 +1042,7 @@ struct ApplyRouteBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyRouteBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -1297,7 +1302,7 @@ bool ParseQuotedString(const string &s, idx_t start, string &out, idx_t &end) {
 //!
 //! Also accepts positional-ish keywords without WITH for SPEC compatibility:
 //!   CREATE API GROUP <name> PREFIX '/p' [TAGS 't'] [REQUIRE <auth>]
-ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult GroupDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -1515,6 +1520,11 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(GroupDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 struct ApplyGroupBindData : public TableFunctionData {
 	string action;
 	bool or_replace = false;
@@ -1523,7 +1533,7 @@ struct ApplyGroupBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyGroupBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyGroupBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -1595,7 +1605,7 @@ struct GroupsGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> GroupsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                    vector<string> &names) {
+                                    vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);

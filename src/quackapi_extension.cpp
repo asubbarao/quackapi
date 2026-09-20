@@ -65,7 +65,7 @@ static void QuackapiEnsureSignalHandlers() {
 #endif
 
 static bool QuackapiStopRequested(ClientContext &context) {
-	return context.interrupted || quackapi_signal_stop.load();
+	return context.IsInterrupted() || quackapi_signal_stop.load();
 }
 
 //! Hold until the server on port is gone, or SIGINT/SIGTERM / query interrupt.
@@ -87,7 +87,7 @@ static void QuackapiBlockUntilStopped(ClientContext &context, int32_t port) {
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 }
@@ -156,7 +156,7 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 	auto read = [&](const string &name, int64_t fallback, int64_t maximum, bool *provided = nullptr) {
 		Value setting;
 		int64_t value = fallback;
-		auto named = input.named_parameters.find(name);
+		auto named = input.named_parameters.find(Identifier(name));
 		if (named != input.named_parameters.end()) {
 			if (named->second.IsNull()) {
 				throw InvalidInputException("%s must not be NULL", name);
@@ -165,7 +165,7 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 			if (provided) {
 				*provided = true;
 			}
-		} else if (context.TryGetCurrentSetting("quackapi_" + name, setting) && !setting.IsNull()) {
+		} else if (context.TryGetCurrentSetting(Identifier("quackapi_" + name), setting) && !setting.IsNull()) {
 			value = setting.GetValue<int64_t>();
 			if (provided) {
 				*provided = true;
@@ -186,7 +186,7 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 }
 
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ServeBindData>();
 	BindResourceLimits(context, input, bind_data->limits);
 	if (!input.inputs.empty()) {
@@ -481,7 +481,7 @@ struct StopBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> StopBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<StopBindData>();
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
@@ -553,7 +553,7 @@ struct WaitBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> WaitBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs.empty()) {
 		throw InvalidInputException("quackapi_wait(port [, timeout_ms]) requires a port");
 	}
@@ -602,7 +602,7 @@ static void WaitExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	while (true) {
 		if (QuackapiStopRequested(context)) {
 			quackapi_signal_stop.store(false);
-			if (context.interrupted) {
+			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
 			break;
@@ -644,7 +644,7 @@ struct RequestBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
 		throw InvalidInputException(
 		    "quackapi_request(method, path [, body] [, headers := MAP] [, pg_dsn := VARCHAR]) expects 2 or 3 "
@@ -733,7 +733,7 @@ struct RoutesGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                           vector<string> &names) {
+                                           vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -802,7 +802,7 @@ struct ServersGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindInput &,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("host");
 	return_types.emplace_back(LogicalType::INTEGER);
@@ -861,9 +861,9 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 // When curl_httpfs is LOADed this is typically "MultiCurl". Same underlying
 // DBConfig::GetHTTPUtil().GetName() that curl_httpfs_http_util_name() reads.
 
-static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &result) {
+static void HttpUtilNameFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
-	result.Reference(Value(QuackapiHttpFetch::ActiveHttpUtilName(db)));
+	result.Reference(Value(QuackapiHttpFetch::ActiveHttpUtilName(db)), count_t(args.size()));
 }
 
 //===--------------------------------------------------------------------===//
@@ -873,9 +873,9 @@ static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &re
 // write_timeout_sec when no route override ran, or the route timeout_sec when
 // ApplyRouteIoTimeout extended the socket deadlines. Not a registry lookup.
 
-static void LastWriteTimeoutSecFunction(DataChunk &, ExpressionState &state, Vector &result) {
+static void LastWriteTimeoutSecFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &qa = QuackapiState::Get(*state.GetContext().db);
-	result.Reference(Value::INTEGER(qa.GetLastEffectiveWriteTimeoutSec()));
+	result.Reference(Value::INTEGER(qa.GetLastEffectiveWriteTimeoutSec()), count_t(args.size()));
 }
 
 //===--------------------------------------------------------------------===//

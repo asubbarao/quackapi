@@ -100,7 +100,7 @@ struct StreamDdlParseData : public ParserExtensionParseData {
 //!     [WITH (interval='1s'|1000)]
 //!     AS <select>
 //!   DROP STREAM <name>
-ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult StreamDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -281,6 +281,11 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(StreamDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 struct ApplyStreamBindData : public TableFunctionData {
 	string action;
 	bool or_replace = false;
@@ -289,7 +294,7 @@ struct ApplyStreamBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyStreamBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyStreamBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -322,8 +327,8 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 			// $message is the inbound frame. Only a socket has one, and a socket
 			// that answers messages has nothing to poll — say so here rather than
 			// binding NULL at request time and calling it a stream.
-			for (auto &entry : prepared->named_param_map) {
-				if (StringUtil::CIEquals(entry.first, "message")) {
+			for (auto &entry : prepared->GetNamedParameterMap()) {
+				if (entry.first == "message") {
 					bind_data.stream.binds_message = true;
 					break;
 				}
@@ -399,7 +404,7 @@ struct StreamsGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> StreamsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);

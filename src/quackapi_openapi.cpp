@@ -127,7 +127,7 @@ string DuckTypeToOas(const LogicalType &type) {
 			if (i > 0) {
 				properties += ",";
 			}
-			properties += JsonString(children[i].first) + ":" + DuckTypeToOas(children[i].second);
+			properties += JsonString(children[i].first.GetIdentifierName()) + ":" + DuckTypeToOas(children[i].second);
 		}
 		return "{\"type\":\"object\",\"properties\":" + properties + "}}";
 	}
@@ -202,7 +202,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 	Connection con(db);
 
 	for (auto &route : routes) {
-		vector<string> col_names;
+		vector<Identifier> col_names;
 		vector<LogicalType> col_types;
 		case_insensitive_map_t<LogicalType> expected_types;
 		vector<string> named_params;
@@ -212,8 +212,8 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			col_names = prepared->GetNames();
 			col_types = prepared->GetTypes();
 			expected_types = prepared->GetExpectedParameterTypes();
-			for (auto &entry : prepared->named_param_map) {
-				named_params.push_back(entry.first);
+			for (auto &entry : prepared->GetNamedParameterMap()) {
+				named_params.push_back(entry.first.GetIdentifierName());
 			}
 		}
 
@@ -222,11 +222,11 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		// Filter special response columns from response schema mode.
 		vector<string> data_col_names;
 		for (auto &n : col_names) {
-			auto lower = StringUtil::Lower(n);
+			auto lower = StringUtil::Lower(n.GetIdentifierName());
 			if (lower == "location" || lower == "set_cookie" || lower == "set-cookie") {
 				continue;
 			}
-			data_col_names.push_back(n);
+			data_col_names.push_back(n.GetIdentifierName());
 		}
 		auto mode = ModeFor(data_col_names);
 
@@ -357,7 +357,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			string props = "{";
 			bool first_p = true;
 			for (idx_t i = 0; i < col_names.size(); i++) {
-				auto lower = StringUtil::Lower(col_names[i]);
+				auto lower = StringUtil::Lower(col_names[i].GetIdentifierName());
 				if (lower == "location" || lower == "set_cookie" || lower == "set-cookie") {
 					continue;
 				}
@@ -366,7 +366,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				}
 				first_p = false;
 				LogicalType t = i < col_types.size() ? col_types[i] : LogicalType::VARCHAR;
-				props += JsonString(col_names[i]) + ":" + DuckTypeToOas(t);
+				props += JsonString(col_names[i].GetIdentifierName()) + ":" + DuckTypeToOas(t);
 			}
 			props += "}";
 			if (object_envelope) {

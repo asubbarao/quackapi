@@ -22,7 +22,7 @@ The query already types the response.
 
 ## Five-line quickstart
 
-Requires **DuckDB v1.5.5** (linux, macOS, windows_amd64).
+Requires **DuckDB v2.0** (`v2.0-cyanoptera`; linux, macOS, windows_amd64).
 
 ```sql
 INSTALL quackapi FROM community;
@@ -381,9 +381,9 @@ LOAD quackapi;
 
 | Requirement | Detail |
 |-------------|--------|
-| **DuckDB** | **v1.5.5 only** |
+| **DuckDB** | **v2.0 only** (`v2.0-cyanoptera`) |
 | **CI / platforms** | linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64 |
-| **Community CDN** | `…/v1.5.5/{platform}/quackapi.duckdb_extension.gz` |
+| **Community CDN** | `…/v2.0-cyanoptera/{platform}/quackapi.duckdb_extension.gz` |
 | **Wasm** | excluded (no server sockets) |
 | **Native Postgres (`pg_dsn`)** | not in the distributed builds — source build with `-DQUACKAPI_ENABLE_LIBPQ=ON` |
 
@@ -394,15 +394,15 @@ See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
 Release assets: https://github.com/asubbarao/quackapi/releases  
 
 ```text
-quackapi-duckdb-v1.5.5-linux_amd64.duckdb_extension
-quackapi-duckdb-v1.5.5-windows_amd64.duckdb_extension
-quackapi-duckdb-v1.5.5-osx_arm64.duckdb_extension
+quackapi-duckdb-v2.0-cyanoptera-linux_amd64.duckdb_extension
+quackapi-duckdb-v2.0-cyanoptera-windows_amd64.duckdb_extension
+quackapi-duckdb-v2.0-cyanoptera-osx_arm64.duckdb_extension
 …
 ```
 
 ```sh
 curl -fsSL -o quackapi.duckdb_extension \
-  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v1.5.5-osx_arm64.duckdb_extension"
+  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v2.0-cyanoptera-osx_arm64.duckdb_extension"
 duckdb -unsigned -c "LOAD '$(pwd)/quackapi.duckdb_extension';"
 ```
 
@@ -419,7 +419,7 @@ GEN=ninja make release
 LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
-**Target DuckDB:** **v1.5.5 only.** Dependencies: C++17, DuckDB’s bundled
+**Target DuckDB:** **v2.0 only** (`v2.0-cyanoptera`). Dependencies: C++17, DuckDB’s bundled
 **httplib** + **mbedtls** only — no vcpkg, no libcurl, no libpq.
 
 The native Postgres `pg_dsn` path links `libpq`, which `find_library` resolves to
@@ -468,7 +468,7 @@ that quietly does nothing.
 
 - **Write concurrency / OLTP:** single-writer semantics; not a replacement for
   a connection-pooled app tier under heavy concurrent writes.
-- **Platform coverage:** **DuckDB v1.5.5** on linux/macOS/windows_amd64 only.
+- **Platform coverage:** **DuckDB v2.0** on linux/macOS/windows_amd64 only.
   Older DuckDB versions are unsupported — upgrade the host.
 - **Serve memory default:** `quackapi_serve` applies a 256MB `memory_limit`
   only when nothing was configured (no `memory_limit` / `quackapi_memory_limit`

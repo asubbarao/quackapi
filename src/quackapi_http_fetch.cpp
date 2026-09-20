@@ -671,7 +671,7 @@ struct FetchTableBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> PoolBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
 	names = {"client", "host", "idle", "dialed", "reused"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
 	                LogicalType::BIGINT};
@@ -721,7 +721,7 @@ struct ParallelFetchGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ParallelFetchBind(ClientContext &, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<ParallelFetchBindData>();
 	bind->url = input.inputs[0].GetValue<string>();
 	bind->n = input.inputs[1].GetValue<int32_t>();
@@ -796,16 +796,20 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	// any benchmark built on it.
 	ScalarFunctionSet fetch_set("quackapi_fetch");
 	ScalarFunction fetch1("quackapi_fetch", {LogicalType::VARCHAR}, result_type, FetchScalar);
-	fetch1.stability = FunctionStability::VOLATILE;
+	fetch1.SetStability(FunctionStability::VOLATILE);
+	fetch1.SetFallible();
 	ScalarFunction fetch2("quackapi_fetch", {LogicalType::VARCHAR, header_type}, result_type, FetchScalar);
-	fetch2.stability = FunctionStability::VOLATILE;
+	fetch2.SetStability(FunctionStability::VOLATILE);
+	fetch2.SetFallible();
 	// stall_ms: after send, wait N ms before reading (socket write-timeout test seam).
 	ScalarFunction fetch_stall("quackapi_fetch", {LogicalType::VARCHAR, LogicalType::INTEGER}, result_type,
 	                           FetchScalar);
-	fetch_stall.stability = FunctionStability::VOLATILE;
+	fetch_stall.SetStability(FunctionStability::VOLATILE);
+	fetch_stall.SetFallible();
 	ScalarFunction fetch_hdr_stall("quackapi_fetch", {LogicalType::VARCHAR, header_type, LogicalType::INTEGER},
 	                               result_type, FetchScalar);
-	fetch_hdr_stall.stability = FunctionStability::VOLATILE;
+	fetch_hdr_stall.SetStability(FunctionStability::VOLATILE);
+	fetch_hdr_stall.SetFallible();
 	fetch_set.AddFunction(fetch1);
 	fetch_set.AddFunction(fetch2);
 	fetch_set.AddFunction(fetch_stall);
@@ -830,7 +834,7 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    bind.finished = true;
 	    },
 	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-	       vector<string> &names) -> unique_ptr<FunctionData> {
+	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
 		    auto bind = make_uniq<FetchTableBindData>();
 		    if (input.inputs.empty() || input.inputs[0].IsNull()) {
 			    throw InvalidInputException("quackapi_fetch(url, stall_ms := N): url must be non-NULL");
@@ -857,16 +861,20 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 
 	ScalarFunctionSet post_set("quackapi_post");
 	ScalarFunction post2("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR}, result_type, PostScalar);
-	post2.stability = FunctionStability::VOLATILE;
+	post2.SetStability(FunctionStability::VOLATILE);
+	post2.SetFallible();
 	ScalarFunction post2j("quackapi_post", {LogicalType::VARCHAR, LogicalType::JSON()}, result_type, PostScalar);
-	post2j.stability = FunctionStability::VOLATILE;
+	post2j.SetStability(FunctionStability::VOLATILE);
+	post2j.SetFallible();
 	ScalarFunction post3("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     result_type, PostScalar);
-	post3.stability = FunctionStability::VOLATILE;
+	post3.SetStability(FunctionStability::VOLATILE);
+	post3.SetFallible();
 	ScalarFunction post4("quackapi_post",
 	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, header_type}, result_type,
 	                     PostScalar);
-	post4.stability = FunctionStability::VOLATILE;
+	post4.SetStability(FunctionStability::VOLATILE);
+	post4.SetFallible();
 	post_set.AddFunction(post2);
 	post_set.AddFunction(post2j);
 	post_set.AddFunction(post3);

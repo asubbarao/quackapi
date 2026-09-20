@@ -414,7 +414,7 @@ string ValueToJson(const Value &value) {
 			if (i > 0) {
 				result += ",";
 			}
-			result += "\"" + QuackapiJsonEscape(child_types[i].first) + "\":" + ValueToJson(children[i]);
+			result += "\"" + QuackapiJsonEscape(child_types[i].first.GetIdentifierName()) + "\":" + ValueToJson(children[i]);
 		}
 		result += "}";
 		return result;
@@ -963,12 +963,12 @@ bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, con
 	// Numeric constraints need a number.
 	double num = 0;
 	if (IsNumericType(bound.type()) || bound.type().id() == LogicalTypeId::BOOLEAN) {
-		Value dbl;
 		string cerr;
-		if (!bound.DefaultTryCastAs(LogicalType::DOUBLE, dbl, &cerr) || dbl.IsNull()) {
+		auto dbl = bound.DefaultTryCastAs(LogicalType::DOUBLE, &cerr);
+		if (!dbl || dbl->IsNull()) {
 			return true; // non-numeric bound — skip numeric constraints
 		}
-		num = dbl.GetValue<double>();
+		num = dbl->GetValue<double>();
 	} else {
 		// Try parse raw as double for VARCHAR-bound numbers
 		try {
@@ -1013,14 +1013,14 @@ bool BindParamValue(const string &raw, const LogicalType &expected, const string
 	}
 	Value raw_value(raw);
 	if (expected.id() != LogicalTypeId::VARCHAR && expected.id() != LogicalTypeId::UNKNOWN) {
-		Value casted;
 		string cast_error;
-		if (!raw_value.DefaultTryCastAs(expected, casted, &cast_error)) {
+		auto casted = raw_value.DefaultTryCastAs(expected, &cast_error);
+		if (!casted) {
 			err_json = ValidationErrorJson(loc_kind, param_name, "Input should be a valid " + expected.ToString(),
 			                               "type_error");
 			return false;
 		}
-		out = BoundParameterData(casted);
+		out = BoundParameterData(*casted);
 	} else {
 		// No concrete type from the planner — still reject non-strict ints when
 		// the raw string looks like a broken integer (contains '.' or 'e'/'E' or
@@ -1136,11 +1136,11 @@ struct StreamMatch {
 
 //! Format one SSE event from a result row. Includes `id:` when a column named
 //! `id` (case-insensitive) is present and non-null.
-string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
+string FormatSseEvent(const vector<Identifier> &names, const vector<Value> &cols) {
 	string event;
 	idx_t id_col = names.size();
 	for (idx_t c = 0; c < names.size(); c++) {
-		if (StringUtil::Lower(names[c]) == "id") {
+		if (StringUtil::Lower(names[c].GetIdentifierName()) == "id") {
 			id_col = c;
 			break;
 		}
@@ -1157,7 +1157,7 @@ string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
 			event += ",";
 		}
 		first = false;
-		event += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
+		event += "\"" + QuackapiJsonEscape(names[c].GetIdentifierName()) + "\":" + ValueToJson(cols[c]);
 	}
 	event += "}\n\n";
 	return event;
@@ -1498,7 +1498,7 @@ string ValueToCsvCell(const Value &value) {
 	return value.ToString();
 }
 
-string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &data_cols,
+string SerializeRowsJsonArray(const vector<Identifier> &names, const vector<idx_t> &data_cols,
                               const vector<vector<Value>> &rows) {
 	string body = "[";
 	bool first_row = true;
@@ -1514,7 +1514,7 @@ string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &
 				body += ",";
 			}
 			first_col = false;
-			body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
+			body += "\"" + QuackapiJsonEscape(names[col].GetIdentifierName()) + "\":" + ValueToJson(cols[col]);
 		}
 		body += "}";
 	}
@@ -1523,7 +1523,8 @@ string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &
 }
 
 //! Single-row JSON object (ENVELOPE object). Caller guarantees rows.size() == 1.
-string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &data_cols, const vector<Value> &cols) {
+string SerializeRowJsonObject(const vector<Identifier> &names, const vector<idx_t> &data_cols,
+                              const vector<Value> &cols) {
 	string body = "{";
 	bool first_col = true;
 	for (auto col : data_cols) {
@@ -1531,7 +1532,7 @@ string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &
 			body += ",";
 		}
 		first_col = false;
-		body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
+		body += "\"" + QuackapiJsonEscape(names[col].GetIdentifierName()) + "\":" + ValueToJson(cols[col]);
 	}
 	body += "}";
 	return body;
@@ -1544,7 +1545,7 @@ string EmptyResultBody(const QuackapiRoute &route) {
 	return "{\"detail\":\"Not Found\"}";
 }
 
-string SerializeRowsNdjson(const vector<string> &names, const vector<idx_t> &data_cols,
+string SerializeRowsNdjson(const vector<Identifier> &names, const vector<idx_t> &data_cols,
                            const vector<vector<Value>> &rows) {
 	string body;
 	for (auto &cols : rows) {
@@ -1555,14 +1556,14 @@ string SerializeRowsNdjson(const vector<string> &names, const vector<idx_t> &dat
 				body += ",";
 			}
 			first_col = false;
-			body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
+			body += "\"" + QuackapiJsonEscape(names[col].GetIdentifierName()) + "\":" + ValueToJson(cols[col]);
 		}
 		body += "}\n";
 	}
 	return body;
 }
 
-string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_cols,
+string SerializeRowsCsv(const vector<Identifier> &names, const vector<idx_t> &data_cols,
                         const vector<vector<Value>> &rows) {
 	string body;
 	// header
@@ -1570,7 +1571,7 @@ string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_c
 		if (i > 0) {
 			body += ",";
 		}
-		body += CsvEscapeField(names[data_cols[i]]);
+		body += CsvEscapeField(names[data_cols[i]].GetIdentifierName());
 	}
 	body += "\n";
 	for (auto &cols : rows) {
@@ -1591,7 +1592,7 @@ string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_c
 }
 
 //! Shared: TEMP table + Appender fill for binary serdes (parquet / arrow).
-void FillTempTableForSerdes(Connection &con, const string &table, const vector<string> &names,
+void FillTempTableForSerdes(Connection &con, const string &table, const vector<Identifier> &names,
                             const vector<LogicalType> &types, const vector<idx_t> &data_cols,
                             const vector<vector<Value>> &rows, const char *label) {
 	string create_sql = "CREATE TEMP TABLE " + table + " (";
@@ -1600,7 +1601,7 @@ void FillTempTableForSerdes(Connection &con, const string &table, const vector<s
 			create_sql += ", ";
 		}
 		auto c = data_cols[i];
-		create_sql += KeywordHelper::WriteOptionallyQuoted(names[c]);
+		create_sql += KeywordHelper::WriteOptionallyQuoted(names[c].GetIdentifierName());
 		create_sql += " ";
 		create_sql += types[c].ToString();
 	}
@@ -1611,7 +1612,7 @@ void FillTempTableForSerdes(Connection &con, const string &table, const vector<s
 	}
 
 	if (!rows.empty()) {
-		Appender appender(con, table);
+		Appender appender(con, Identifier(table));
 		for (auto &cols : rows) {
 			appender.BeginRow();
 			for (auto c : data_cols) {
@@ -1674,7 +1675,7 @@ string ReadAndRemoveFileBytes(Connection &con, const string &path) {
 
 //! Serialize result rows as a Parquet file body (magic "PAR1"). Uses a unique
 //! TEMP table + COPY TO (FORMAT PARQUET) + read bytes, then cleans up.
-string SerializeRowsParquet(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+string SerializeRowsParquet(Connection &con, const vector<Identifier> &names, const vector<LogicalType> &types,
                             const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
 	if (data_cols.empty()) {
 		throw InvalidInputException("parquet serialize: no data columns");
@@ -1711,7 +1712,7 @@ void RequireNanoarrow(Connection &con) {
 //! Serialize result rows as Arrow IPC stream bytes (nanoarrow FORMAT ARROWS).
 //! Magic is 0xFFFFFFFF stream continuation (not ARROW1 file). Content-Type:
 //! application/vnd.apache.arrow.stream. Same TEMP+COPY+read pattern as parquet.
-string SerializeRowsArrow(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+string SerializeRowsArrow(Connection &con, const vector<Identifier> &names, const vector<LogicalType> &types,
                           const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
 	if (data_cols.empty()) {
 		throw InvalidInputException("arrow serialize: no data columns");
@@ -2306,7 +2307,7 @@ void WriteRawHttpJson(duckdb_httplib::Stream &strm, int status, const string &re
 
 //! One result row as the JSON object a text frame carries — the same object the
 //! SSE transport puts after `data:`.
-string RowToJsonObject(const vector<string> &names, const vector<Value> &cols) {
+string RowToJsonObject(const vector<Identifier> &names, const vector<Value> &cols) {
 	string object = "{";
 	bool first = true;
 	for (idx_t c = 0; c < names.size() && c < cols.size(); c++) {
@@ -2314,7 +2315,7 @@ string RowToJsonObject(const vector<string> &names, const vector<Value> &cols) {
 			object += ",";
 		}
 		first = false;
-		object += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
+		object += "\"" + QuackapiJsonEscape(names[c].GetIdentifierName()) + "\":" + ValueToJson(cols[c]);
 	}
 	object += "}";
 	return object;
@@ -2521,10 +2522,10 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 	provided["request_id"] = request_id;
 
 	auto expected_types = prepared->GetExpectedParameterTypes();
-	case_insensitive_map_t<BoundParameterData> named_values;
+	identifier_map_t<BoundParameterData> named_values;
 	LogicalType message_type = LogicalType::VARCHAR;
-	for (auto &entry : prepared->named_param_map) {
-		auto &param_name = entry.first;
+	for (auto &entry : prepared->GetNamedParameterMap()) {
+		auto &param_name = entry.first.GetIdentifierName();
 		LogicalType expected = LogicalType::UNKNOWN;
 		auto type_it = expected_types.find(param_name);
 		if (type_it != expected_types.end()) {
@@ -2552,7 +2553,7 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 			EmitAccessLog(log_req, log_res, request_id, 0);
 			return true;
 		}
-		named_values[param_name] = bound;
+		named_values[entry.first] = bound;
 	}
 
 	string upgrade_response = "HTTP/1.1 101 Switching Protocols\r\n";
@@ -2644,7 +2645,7 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
 					cols[col] = chunk->GetValue(col, row);
 				}
-				auto frame = RowToJsonObject(result.names, cols);
+				auto frame = RowToJsonObject(result.GetNames(), cols);
 				sent_bytes += frame.size();
 				if (sent_bytes > static_cast<idx_t>(options.max_response_bytes)) {
 					conn.SendClose(QuackapiWsClose::MESSAGE_TOO_BIG, "result exceeds max_response_bytes");
@@ -2685,7 +2686,7 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 			unique_ptr<QueryResult> result;
 			{
 				QuackapiQueryDeadline exec_deadline(*con, options.query_timeout_ms);
-				result = prepared->Execute(call_values, true);
+				result = prepared->Execute(call_values);
 			}
 			if (result->HasError()) {
 				conn.SendClose(QuackapiWsClose::INTERNAL_ERROR, result->GetError());
@@ -2714,7 +2715,7 @@ bool QuackapiHttpServer::TryServeWebSocket(duckdb_httplib::Stream &strm) {
 				unique_ptr<QueryResult> result;
 				{
 					QuackapiQueryDeadline exec_deadline(*con, options.query_timeout_ms);
-					result = prepared->Execute(named_values, true);
+					result = prepared->Execute(named_values);
 				}
 				if (result->HasError()) {
 					conn.SendClose(QuackapiWsClose::INTERNAL_ERROR, result->GetError());
@@ -3284,9 +3285,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 
 			auto expected_types = prepared->GetExpectedParameterTypes();
-			case_insensitive_map_t<BoundParameterData> named_values;
-			for (auto &entry : prepared->named_param_map) {
-				auto &param_name = entry.first;
+			identifier_map_t<BoundParameterData> named_values;
+			for (auto &entry : prepared->GetNamedParameterMap()) {
+				auto &param_name = entry.first.GetIdentifierName();
 				auto type_it = expected_types.find(param_name);
 				LogicalType expected = LogicalType::UNKNOWN;
 				if (type_it != expected_types.end()) {
@@ -3296,7 +3297,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				if (it == provided.end()) {
 					// Optional last_id: missing → SQL NULL so WHERE id > $last_id works with COALESCE.
 					if (param_name == "last_id") {
-						named_values[param_name] = BoundParameterData(Value());
+						named_values[entry.first] = BoundParameterData(Value());
 						continue;
 					}
 					string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
@@ -3312,11 +3313,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					finish();
 					return;
 				}
-				named_values[param_name] = bound;
+				named_values[entry.first] = bound;
 			}
 
 			// Prove the first execute works before committing to chunked transfer.
-			auto first_result = prepared->Execute(named_values, true);
+			auto first_result = prepared->Execute(named_values);
 			if (first_result->HasError()) {
 				SetInternalError(res, first_result->GetError());
 				finish();
@@ -3326,7 +3327,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			struct SseProviderState {
 				shared_ptr<Connection> con;
 				string handler_sql;
-				case_insensitive_map_t<BoundParameterData> named_values;
+				identifier_map_t<BoundParameterData> named_values;
 				int64_t interval_ms = 0;
 				unique_ptr<PreparedStatement> prepared;
 				unique_ptr<QueryResult> result;
@@ -3363,7 +3364,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				    try {
 					    QuackapiQueryDeadline deadline(*state->con, state->query_timeout_ms);
 					    if (state->need_execute) {
-						    state->result = state->prepared->Execute(state->named_values, true);
+						    state->result = state->prepared->Execute(state->named_values);
 						    if (state->result->HasError()) {
 							    fprintf(stderr, "quackapi stream execute error: %s\n",
 							            state->result->GetError().c_str());
@@ -3397,7 +3398,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						    return true;
 					    }
 
-					    auto &names = state->result->names;
+					    auto &names = state->result->GetNames();
 					    string buf;
 					    for (idx_t row = 0; row < chunk->size(); row++) {
 						    vector<Value> cols(chunk->ColumnCount());
@@ -3830,23 +3831,23 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// (never 422 for a missing claim).
 		// PARAM … DEFAULT makes a query/path param optional (bind default/NULL).
 		auto expected_types = prepared->GetExpectedParameterTypes();
-		case_insensitive_map_t<BoundParameterData> named_values;
+		identifier_map_t<BoundParameterData> named_values;
 		vector<QuackapiValidationIssue> validation_issues;
 		// Track raw strings for execute-time conversion error → param name recovery.
 		case_insensitive_map_t<std::pair<string, string>> bound_raw; // name -> (loc, raw)
 
-		for (auto &entry : prepared->named_param_map) {
-			auto &param_name = entry.first;
+		for (auto &entry : prepared->GetNamedParameterMap()) {
+			auto &param_name = entry.first.GetIdentifierName();
 
 			string claim_key;
 			if (IsClaimsParam(param_name, claim_key)) {
 				auto cit = auth_result.claims.find(claim_key);
 				if (cit == auth_result.claims.end()) {
 					// Absent claim → SQL NULL (do NOT 422).
-					named_values[param_name] = BoundParameterData(Value());
+					named_values[entry.first] = BoundParameterData(Value());
 				} else {
 					// Claims bind as VARCHAR; non-string/nested already JSON-encoded.
-					named_values[param_name] = BoundParameterData(Value(cit->second));
+					named_values[entry.first] = BoundParameterData(Value(cit->second));
 				}
 				continue;
 			}
@@ -3906,7 +3907,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				if (spec && spec->has_default) {
 					from_default = true;
 					if (spec->default_is_null) {
-						named_values[param_name] = BoundParameterData(Value());
+						named_values[entry.first] = BoundParameterData(Value());
 						// Constraints on absent optional NULL: skip (FastAPI).
 						continue;
 					}
@@ -3929,7 +3930,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						                             "Input should be a valid " + expected.ToString(), "type_error"});
 						continue;
 					}
-					named_values[param_name] = BoundParameterData(Value());
+					named_values[entry.first] = BoundParameterData(Value());
 					continue;
 				}
 				raw = it->second.second;
@@ -3954,9 +3955,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				// ("abc") still reach execute and become 422 with the real name.
 				if (!raw.empty() && !IsStrictIntegerString(raw, true)) {
 					Value probe(raw);
-					Value as_int;
 					string cerr;
-					if (probe.DefaultTryCastAs(LogicalType::INTEGER, as_int, &cerr)) {
+					if (probe.DefaultTryCastAs(LogicalType::INTEGER, &cerr)) {
 						// Would cast — only reject number-like non-integers
 						// (contain digit and non-digit). Pure text like "abc"
 						// fails TryCast and is left for later.
@@ -3994,18 +3994,18 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					}
 				}
 				if (typed_body.type() != expected) {
-					Value casted;
 					string cast_error;
-					if (!typed_body.DefaultTryCastAs(expected, casted, &cast_error)) {
+					auto casted = typed_body.DefaultTryCastAs(expected, &cast_error);
+					if (!casted) {
 						SetJson(res, 422,
 						        ValidationErrorJson("body", "body", "BODY TYPE does not match handler parameter type",
 						                            "type_error"));
 						finish();
 						return;
 					}
-					typed_body = casted;
+					typed_body = *casted;
 				}
-				named_values[param_name] = BoundParameterData(typed_body);
+				named_values[entry.first] = BoundParameterData(typed_body);
 				continue;
 			}
 
@@ -4031,7 +4031,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				Value constraint_val;
 				if (expected.id() != LogicalTypeId::UNKNOWN && expected.id() != LogicalTypeId::VARCHAR) {
 					string cerr;
-					Value(raw).DefaultTryCastAs(expected, constraint_val, &cerr);
+					constraint_val = Value(raw).DefaultTryCastAs(expected, &cerr).value_or(Value());
 				} else {
 					constraint_val = Value(raw);
 				}
@@ -4041,7 +4041,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				}
 			}
 
-			named_values[param_name] = bound;
+			named_values[entry.first] = bound;
 			bound_raw[param_name] = {loc_kind, raw};
 			(void)from_default;
 		}
@@ -4051,7 +4051,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		auto result = prepared->Execute(named_values, false);
+		auto result = prepared->Execute(named_values);
 		if (result->HasError()) {
 			// Client-input failures must never surface as 500.
 			// - Conversion errors → 422 with recovered param name (not "_")
@@ -4118,7 +4118,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		auto &names = result->names;
+		auto &names = result->GetNames();
 		// Identify special response columns (FastAPI RedirectResponse / response cookies).
 		// `location` → Location header; `set_cookie` / `set-cookie` → Set-Cookie.
 		// These are stripped from the JSON/HTML/TEXT body.
@@ -4127,7 +4127,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		idx_t location_col = names.size(); // invalid sentinel
 		idx_t set_cookie_col = names.size();
 		for (idx_t c = 0; c < names.size(); c++) {
-			auto lower = StringUtil::Lower(names[c]);
+			auto lower = StringUtil::Lower(names[c].GetIdentifierName());
 			if (lower == "location") {
 				is_special[c] = true;
 				location_col = c;
@@ -4185,7 +4185,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// HTML/TEXT mode uses the single remaining data column name.
 		vector<string> data_names;
 		for (auto c : data_cols) {
-			data_names.push_back(names[c]);
+			data_names.push_back(names[c].GetIdentifierName());
 		}
 		auto mode = ResponseModeFor(data_names);
 
@@ -4239,10 +4239,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			body = SerializeRowsCsv(names, data_cols, rows);
 			content_type = "text/csv; charset=utf-8";
 		} else if (body_format == BodyFormat::PARQUET) {
-			body = SerializeRowsParquet(con, names, result->types, data_cols, rows);
+			body = SerializeRowsParquet(con, names, result->GetTypes(), data_cols, rows);
 			content_type = "application/vnd.apache.parquet";
 		} else if (body_format == BodyFormat::ARROW) {
-			body = SerializeRowsArrow(con, names, result->types, data_cols, rows);
+			body = SerializeRowsArrow(con, names, result->GetTypes(), data_cols, rows);
 			// nanoarrow FORMAT ARROWS produces IPC *stream* (0xFFFFFFFF magic).
 			content_type = "application/vnd.apache.arrow.stream";
 		} else if (object_envelope) {

@@ -23,6 +23,11 @@ endif
 endif
 VCPKG_HOST_TRIPLET ?= $(VCPKG_TARGET_TRIPLET)
 
+# The stock runner trusts Catch's aggregate even when one SQLLogic file stops
+# before its high-cardinality tail. Reconcile the file set and totals instead.
+# extension-ci-tools invokes this as `python3 <script> ./build/<cfg>/test/unittest`.
+TEST_RUNNER_SCRIPT := ${PROJ_DIR}scripts/run_sql_tests.py
+
 # The release matrix supplies its own already-bootstrapped toolchain. Local
 # source builds bootstrap the pinned toolchain so `make release` has one path.
 include extension-ci-tools/makefiles/vcpkg.Makefile
@@ -33,8 +38,3 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 ifneq ($(strip $(VCPKG_BOOTSTRAP_TARGET)),)
 release debug reldebug relassert: $(VCPKG_BOOTSTRAP_TARGET)
 endif
-
-# The stock target trusts Catch's aggregate even when one SQLLogic file stops
-# before its high-cardinality tail. Reconcile the file set and totals after it.
-test_release_internal:
-	python3 scripts/run_sql_tests.py build/release/test/unittest

@@ -371,20 +371,20 @@ string SelectTableJson(Connection &con, const string &source_sql, const vector<s
 		err = prepared->GetError();
 		return {};
 	}
-	case_insensitive_map_t<BoundParameterData> values;
-	for (auto &entry : prepared->named_param_map) {
-		auto param = entry.first;
+	identifier_map_t<BoundParameterData> values;
+	for (auto &entry : prepared->GetNamedParameterMap()) {
+		auto &param = entry.first.GetIdentifierName();
 		if (!StringUtil::StartsWith(StringUtil::Lower(param), "claims_")) {
 			err = "unexpected parameter in GraphQL query";
 			return {};
 		}
 		string claim_name = param.substr(7);
 		if (!options.claims) {
-			values[param] = BoundParameterData(Value());
+			values[entry.first] = BoundParameterData(Value());
 			continue;
 		}
 		auto claim = options.claims->find(claim_name);
-		values[param] =
+		values[entry.first] =
 		    claim == options.claims->end() ? BoundParameterData(Value()) : BoundParameterData(Value(claim->second));
 	}
 	auto res = prepared->Execute(values);
@@ -596,7 +596,7 @@ bool ParseTableListUntilKeywords(string &rest, vector<string> &tables, string &e
 //!   CREATE [OR REPLACE] GRAPHQL ROUTE <name> POST '<path>' FROM <tables>
 //!        [REQUIRE <auth>] [LIMIT <n>]
 //!   DROP GRAPHQL ROUTE <name>
-ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult GraphqlDdlParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -777,6 +777,11 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(GraphqlDdlParseText(statement.query), statement.consumed_tokens);
+}
+
 struct ApplyGraphqlBindData : public TableFunctionData {
 	string action;
 	bool or_replace = false;
@@ -790,7 +795,7 @@ struct ApplyGraphqlBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyGraphqlBind(ClientContext &, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyGraphqlBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -999,7 +1004,7 @@ struct GraphqlTablesGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> GraphqlTablesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                           vector<string> &names) {
+                                           vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("mode");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -1255,7 +1260,7 @@ struct GraphqlRoutesGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> GraphqlRoutesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                           vector<string> &names) {
+                                           vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);

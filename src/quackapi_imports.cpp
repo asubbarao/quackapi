@@ -125,7 +125,7 @@ struct OtlpGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> OtlpBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("uri");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -176,7 +176,7 @@ struct QueueWorkerGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> QueueWorkerBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<QueueWorkerBindData>();
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw InvalidInputException("quackapi_queue_worker(queue): queue must be non-NULL");

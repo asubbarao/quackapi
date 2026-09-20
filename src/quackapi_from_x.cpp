@@ -135,13 +135,13 @@ struct FromXGlobalState : public GlobalTableFunctionState {
 	}
 };
 
-void SetRouteReturnTypes(vector<LogicalType> &return_types, vector<string> &names) {
+void SetRouteReturnTypes(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,  LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::UINTEGER, LogicalType::VARCHAR};
 	names = {"method", "path", "handler_name", "file", "start_line", "evidence"};
 }
 
-void SetModelReturnTypes(vector<LogicalType> &return_types, vector<string> &names) {
+void SetModelReturnTypes(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UINTEGER};
@@ -150,7 +150,7 @@ void SetModelReturnTypes(vector<LogicalType> &return_types, vector<string> &name
 }
 
 unique_ptr<FunctionData> FromXBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
 	auto &info = input.info->Cast<FromXFunctionInfo>();
 	auto data = make_uniq<FromXBindData>();
 	data->framework = info.framework;
@@ -219,7 +219,7 @@ unique_ptr<GlobalTableFunctionState> FromXInit(ClientContext &context, TableFunc
 	// Expected column counts for coercion.
 	const idx_t ncol = bind.is_routes ? 6 : 9;
 	vector<LogicalType> want_types;
-	vector<string> want_names;
+	vector<Identifier> want_names;
 	if (bind.is_routes) {
 		SetRouteReturnTypes(want_types, want_names);
 	} else {
@@ -266,7 +266,7 @@ void FromXExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 }
 
 TableFunction MakeFromXFunction(const string &name, const string &framework, const string &kind) {
-	TableFunction tf(name, {LogicalType::VARCHAR}, FromXExec, FromXBind, FromXInit);
+	TableFunction tf(Identifier(name), {LogicalType::VARCHAR}, FromXExec, FromXBind, FromXInit);
 	tf.function_info = make_shared_ptr<FromXFunctionInfo>(framework, kind);
 	return tf;
 }
@@ -321,10 +321,16 @@ void RegisterQuackapiFromXFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(MakeFromXFunction("quack_from_gin_models", "gin", "models"));
 
 	// Embed drift helpers
-	loader.RegisterFunction(ScalarFunction("quack_from_x_sql", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, FromXSqlScalar));
-	loader.RegisterFunction(ScalarFunction("quack_from_x_sql_relpath", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, FromXSqlRelpathScalar));
+	// Both raise on an unknown framework/kind. A scalar function that can raise
+	// must say so, or the error reaches the caller as an INTERNAL Error.
+	ScalarFunction from_x_sql("quack_from_x_sql", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                          FromXSqlScalar);
+	from_x_sql.SetFallible();
+	loader.RegisterFunction(from_x_sql);
+	ScalarFunction from_x_sql_relpath("quack_from_x_sql_relpath", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                  LogicalType::VARCHAR, FromXSqlRelpathScalar);
+	from_x_sql_relpath.SetFallible();
+	loader.RegisterFunction(from_x_sql_relpath);
 }
 
 } // namespace duckdb

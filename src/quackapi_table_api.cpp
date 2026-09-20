@@ -106,7 +106,7 @@ struct TableApiParseData : public ParserExtensionParseData {
 
 //! Grammar:
 //!   CREATE [OR REPLACE] API FOR TABLE <table> [AT '<base>'] [KEY '<column>']
-ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &query) {
+ParserExtensionParseResult TableApiParseText(const string &query) {
 	auto q = QuackapiTrim(query);
 	auto upper = StringUtil::Upper(q);
 
@@ -167,6 +167,11 @@ ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const string &qu
 	return ParserExtensionParseResult(std::move(data));
 }
 
+ParserExtensionParseResult TableApiParse(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	auto statement = QuackapiStatementFromTokens(tokens);
+	return QuackapiClaimTokens(TableApiParseText(statement.query), statement.consumed_tokens);
+}
+
 struct ApplyApiBindData : public TableFunctionData {
 	bool or_replace = false;
 	string table;
@@ -176,7 +181,7 @@ struct ApplyApiBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyApiBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyApiBindData>();
 	bind_data->or_replace = input.inputs[0].GetValue<bool>();
 	bind_data->table = input.inputs[1].GetValue<string>();
