@@ -978,20 +978,31 @@ TableFunction GetApplyQueueFunction() {
 	return MakeApplyQueueFunction();
 }
 
+namespace {
+
+ScalarFunction MakeQueueMutationScalar(const string &name, vector<LogicalType> arguments, LogicalType return_type,
+                                       scalar_function_t function) {
+	ScalarFunction result(name, std::move(arguments), std::move(return_type), std::move(function));
+	result.SetVolatile();
+	return result;
+}
+
+} // namespace
+
 void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	// enqueue(queue, payload) / enqueue(queue, payload, max_attempts)
 	ScalarFunctionSet enqueue_set("quackapi_enqueue");
-	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::BIGINT, EnqueueScalar));
-	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
-	                                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
-	                                       LogicalType::BIGINT, EnqueueScalar));
+	enqueue_set.AddFunction(MakeQueueMutationScalar("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                                 LogicalType::BIGINT, EnqueueScalar));
+	enqueue_set.AddFunction(MakeQueueMutationScalar(
+	    "quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::BIGINT,
+	    EnqueueScalar));
 	// JSON payload overload (JSON is a logical type alias of VARCHAR storage)
-	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::JSON()},
-	                                       LogicalType::BIGINT, EnqueueScalar));
-	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
-	                                       {LogicalType::VARCHAR, LogicalType::JSON(), LogicalType::INTEGER},
-	                                       LogicalType::BIGINT, EnqueueScalar));
+	enqueue_set.AddFunction(MakeQueueMutationScalar("quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::JSON()},
+	                                                 LogicalType::BIGINT, EnqueueScalar));
+	enqueue_set.AddFunction(MakeQueueMutationScalar(
+	    "quackapi_enqueue", {LogicalType::VARCHAR, LogicalType::JSON(), LogicalType::INTEGER}, LogicalType::BIGINT,
+	    EnqueueScalar));
 	loader.RegisterFunction(enqueue_set);
 
 	// dequeue(queue) / dequeue(queue, n)
@@ -1005,28 +1016,28 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 
 	// Delivery ownership is mandatory. The retired two-argument form could let
 	// an expired worker complete a newer delivery of the same job.
-	loader.RegisterFunction(ScalarFunction("quackapi_ack",
-	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                       LogicalType::BOOLEAN, AckScalar));
+	loader.RegisterFunction(MakeQueueMutationScalar(
+	    "quackapi_ack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::BOOLEAN,
+	    AckScalar));
 
 	// nack(queue, job_id, delivery_generation [, requeue [, error]])
 	ScalarFunctionSet nack_set("quackapi_nack");
-	nack_set.AddFunction(ScalarFunction("quackapi_nack",
-	                                    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                    LogicalType::VARCHAR, NackScalar));
-	nack_set.AddFunction(ScalarFunction(
+	nack_set.AddFunction(MakeQueueMutationScalar(
+	    "quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::VARCHAR,
+	    NackScalar));
+	nack_set.AddFunction(MakeQueueMutationScalar(
 	    "quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BOOLEAN},
 	    LogicalType::VARCHAR, NackScalar));
-	nack_set.AddFunction(ScalarFunction(
+	nack_set.AddFunction(MakeQueueMutationScalar(
 	    "quackapi_nack",
 	    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::VARCHAR},
 	    LogicalType::VARCHAR, NackScalar));
 	loader.RegisterFunction(nack_set);
 
 	// renew(queue, job_id, delivery_generation) → bool
-	loader.RegisterFunction(ScalarFunction("quackapi_renew",
-	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                       LogicalType::BOOLEAN, RenewScalar));
+	loader.RegisterFunction(MakeQueueMutationScalar(
+	    "quackapi_renew", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::BOOLEAN,
+	    RenewScalar));
 
 	// queues() inspection
 	loader.RegisterFunction(TableFunction("quackapi_queues", {}, QueuesExec, QueuesBind, QueuesInit));
