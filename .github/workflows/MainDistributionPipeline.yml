@@ -123,6 +123,14 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -Isrc/include test/cpp/quackapi_thread_join_test.cpp -o /tmp/quackapi-thread-join-test
           /tmp/quackapi-thread-join-test
 
+      - name: Verify outbound POST is never retried
+        run: |
+          c++ -std=c++11 -pthread -Wall -Wextra -Wno-unused-parameter \
+            -I duckdb/src/include -I duckdb/third_party -I third_party/httplib -I src/include \
+            test/cpp/quackapi_no_post_retry_test.cpp -Lbuild/release/src -lduckdb \
+            -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-no-post-retry-test
+          /tmp/quackapi-no-post-retry-test "$PWD/build/release/extension/quackapi/quackapi.duckdb_extension"
+
       - name: Verify build without libpq
         run: c++ -std=c++17 -fsyntax-only -isystem duckdb/src/include -Isrc/include src/quackapi_pg.cpp
 

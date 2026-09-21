@@ -467,6 +467,11 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 			headers.Insert("Content-Type", content_type);
 		}
 		InsertExtraHeaders(headers, extra_headers);
+		// HTTPUtil retries request errors and retryable statuses by default. A POST
+		// may have reached and mutated the remote service before the connection
+		// failed, so replaying it would duplicate the mutation. curl_httpfs uses
+		// this same HTTPParams retry budget; it has no independent POST replay loop.
+		params.retries = 0;
 		PostRequestInfo request(url, headers, params, const_data_ptr_cast(body.data()), body.size());
 		request.try_request = true;
 		return FromResponse(http_util.Request(request, client));
