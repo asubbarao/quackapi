@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := …, block := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, tune := …, http_client := …, block := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `tune BOOLEAN` (default **false**), `wire_quack_auth BOOLEAN` (default **false**), `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -37,9 +37,19 @@ SELECT * FROM quackapi_serve(8000, block := true);
 With `block := true`, the query emits `listen_url` then waits until `quackapi_stop`
 (or SIGINT/SIGTERM / query interrupt). Prefer this over shell `sleep` / `lsof` keepalive loops.
 
-**Memory limit precedence:** named param → `SET quackapi_memory_limit` → leave non-default DuckDB `memory_limit` alone → else safe default **256MB**.
+**Shared DuckDB settings:** default `tune := false` leaves the shared
+`DatabaseInstance` unchanged. This includes `memory_limit`,
+`preserve_insertion_order`, `enable_http_metadata_cache`, `pg_use_ctid_scan`,
+DuckDB logging, and the outbound HTTP client. Pass `tune := true` for the
+whole battery, or name one setting to opt into just that change. Named tuning
+parameters retain precedence.
 
-**Outbound HTTP client:** default `auto` INSTALL/LOADs community `curl_httpfs` and sets
+**Memory limit precedence:** named param → `SET quackapi_memory_limit` → leave
+DuckDB `memory_limit` alone. The safe default **256MB** applies only under
+`tune := true` while DuckDB is still at its system default.
+
+**Outbound HTTP client:** default `auto` is inert unless `http_client` is named
+or `tune := true`; then it INSTALL/LOADs community `curl_httpfs` and sets
 `httpfs_client_implementation='curl'` (connection pool, HTTP/2, async). If unavailable
 (Windows/WASM/offline), logs `quackapi.http_client=httplib reason=curl_httpfs_unavailable`
 and continues. Override with `http_client := 'httplib'` or `SET quackapi_http_client`.

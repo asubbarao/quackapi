@@ -106,10 +106,15 @@ struct ServeBindData : public TableFunctionData {
 	string log_level = "info";
 	bool access_log = true;
 	bool enable_logging = false;
+	bool enable_logging_set = false;
 	bool health_routes = true;
 	string threads;
+	//! Opt in to instance-global DuckDB SETs below. Default false.
+	bool tune = false;
 	bool preserve_insertion_order = false;
+	bool preserve_insertion_order_set = false;
 	bool enable_http_metadata_cache = true;
+	bool enable_http_metadata_cache_set = false;
 	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
 	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
@@ -121,6 +126,9 @@ struct ServeBindData : public TableFunctionData {
 	idx_t compression_min_bytes = 256;
 	//! Outbound HTTP client preference: auto|curl|httplib (default auto).
 	string http_client = "auto";
+	bool http_client_set = false;
+	//! Point quack's auth callbacks at quackapi's bridges. Default false.
+	bool wire_quack_auth = false;
 	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
 	string pg_dsn;
 	//! When true, hold the query open after listen_url until stop / SIGINT / SIGTERM.
@@ -213,6 +221,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto enlog_entry = input.named_parameters.find("enable_logging");
 	if (enlog_entry != input.named_parameters.end()) {
 		bind_data->enable_logging = enlog_entry->second.GetValue<bool>();
+		bind_data->enable_logging_set = true;
 	}
 	auto health_entry = input.named_parameters.find("health_routes");
 	if (health_entry != input.named_parameters.end()) {
@@ -227,13 +236,23 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->threads = threads_entry->second.ToString();
 		}
 	}
+	auto tune_entry = input.named_parameters.find("tune");
+	if (tune_entry != input.named_parameters.end()) {
+		bind_data->tune = tune_entry->second.GetValue<bool>();
+	}
+	auto wire_auth_entry = input.named_parameters.find("wire_quack_auth");
+	if (wire_auth_entry != input.named_parameters.end()) {
+		bind_data->wire_quack_auth = wire_auth_entry->second.GetValue<bool>();
+	}
 	auto pio_entry = input.named_parameters.find("preserve_insertion_order");
 	if (pio_entry != input.named_parameters.end()) {
 		bind_data->preserve_insertion_order = pio_entry->second.GetValue<bool>();
+		bind_data->preserve_insertion_order_set = true;
 	}
 	auto http_meta_entry = input.named_parameters.find("enable_http_metadata_cache");
 	if (http_meta_entry != input.named_parameters.end()) {
 		bind_data->enable_http_metadata_cache = http_meta_entry->second.GetValue<bool>();
+		bind_data->enable_http_metadata_cache_set = true;
 	}
 	auto wt_entry = input.named_parameters.find("worker_threads");
 	if (wt_entry != input.named_parameters.end()) {
@@ -297,13 +316,27 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto hc_entry = input.named_parameters.find("http_client");
 	if (hc_entry != input.named_parameters.end()) {
 		bind_data->http_client = hc_entry->second.GetValue<string>();
+		bind_data->http_client_set = true;
 	} else {
 		Value setting;
 		if (context.TryGetCurrentSetting("quackapi_http_client", setting) && !setting.IsNull()) {
 			auto s = setting.GetValue<string>();
-			if (!s.empty()) {
+			// The extension option's default is "auto"; only a change from it
+			// is an operator request that may alter the shared HTTP client.
+			if (!s.empty() && s != "auto") {
 				bind_data->http_client = s;
+				bind_data->http_client_set = true;
 			}
+		}
+	}
+	// Reject invalid client preferences during bind, before serve can return a
+	// listen URL that implies the setting was accepted.
+	{
+		auto pref = StringUtil::Lower(bind_data->http_client);
+		StringUtil::Trim(pref);
+		if (pref != "auto" && pref != "curl" && pref != "httplib") {
+			throw InvalidInputException("http_client must be one of [auto, curl, httplib], not '%s'",
+			                            bind_data->http_client);
 		}
 	}
 	auto block_entry = input.named_parameters.find("block");
@@ -354,8 +387,10 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 		bind_data.finished = true;
 		return;
 	}
-	// Compose with quack's auth settings when present (no-op if quack unloaded).
-	ComposeQuackAuthSettings(context);
+	// Compose with quack's auth settings only on an explicit process-wide opt-in.
+	if (bind_data.wire_quack_auth) {
+		ComposeQuackAuthSettings(context);
+	}
 
 	// Batteries-included serve options (all ON / server-optimal by default).
 	QuackapiServeOptions opts = bind_data.limits;
@@ -365,20 +400,27 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
 	opts.access_log = bind_data.access_log;
 	opts.enable_logging = bind_data.enable_logging;
+	opts.enable_logging_set = bind_data.enable_logging_set;
 	opts.health_routes = bind_data.health_routes;
 	opts.threads = bind_data.threads;
+	opts.tune = bind_data.tune;
 	opts.preserve_insertion_order = bind_data.preserve_insertion_order;
+	opts.preserve_insertion_order_set = bind_data.preserve_insertion_order_set;
 	opts.enable_http_metadata_cache = bind_data.enable_http_metadata_cache;
+	opts.enable_http_metadata_cache_set = bind_data.enable_http_metadata_cache_set;
 	opts.worker_threads = bind_data.worker_threads;
 	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
 	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
 	opts.read_timeout_sec = bind_data.read_timeout_sec;
 	opts.write_timeout_sec = bind_data.write_timeout_sec;
 	opts.http_client = bind_data.http_client;
+	opts.http_client_set = bind_data.http_client_set;
+	opts.wire_quack_auth = bind_data.wire_quack_auth;
 	opts.pg_dsn = bind_data.pg_dsn;
 
-	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
-	// Outbound client: auto prefers curl_httpfs (loud fallback); curl requires it.
+	// Apply opt-in DuckDB SETs / logging / resource guards (never unsafe).
+	// Outbound client: explicit auto/tune prefers curl_httpfs (loud fallback);
+	// curl requires it.
 	ApplyQuackapiServerDefaults(context, opts);
 	// Compose request_id source: community tsid if LOADable, else core uuidv7.
 	ProbeQuackapiRequestIdSource(*context.db, opts);
@@ -807,13 +849,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Default 256. Overridden by compression_min_bytes named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
 	// SET quackapi_http_client = 'auto' | 'curl' | 'httplib'
-	// Default auto: INSTALL+LOAD curl_httpfs; fall back to httplib with loud reason.
+	// Default auto is inert for an untuned serve; explicit auto or tune:=true
+	// INSTALLs+LOADs curl_httpfs and falls back to httplib with loud reason.
 	// curl: REQUIRE curl_httpfs — fail serve if INSTALL/LOAD fails (no silent fallback).
 	// httplib: force stock client. Serve-time http_client := '…' wins.
 	// Inbound server remains httplib regardless.
 	config.AddExtensionOption("quackapi_http_client",
 	                          "Outbound HTTP client for httpfs/route fetches: auto|curl|httplib. "
-	                          "Default auto prefers curl_httpfs (pool, HTTP/2, async) and falls back "
+	                          "Default auto is inert for untuned serve; explicit auto/tune prefers curl_httpfs "
+	                          "(pool, HTTP/2, async) and falls back "
 	                          "to httplib with http_client_reason on /healthz when unavailable. "
 	                          "curl fails serve if curl_httpfs cannot INSTALL/LOAD. Overridden by "
 	                          "http_client named parameter. Does not change the inbound HTTP server.",
@@ -848,6 +892,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
 	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
 	serve.named_parameters["threads"] = LogicalType::VARCHAR;
+	serve.named_parameters["tune"] = LogicalType::BOOLEAN;
+	serve.named_parameters["wire_quack_auth"] = LogicalType::BOOLEAN;
 	serve.named_parameters["preserve_insertion_order"] = LogicalType::BOOLEAN;
 	serve.named_parameters["enable_http_metadata_cache"] = LogicalType::BOOLEAN;
 	serve.named_parameters["worker_threads"] = LogicalType::INTEGER;

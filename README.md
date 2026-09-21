@@ -203,7 +203,7 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', block := false, …)` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, memory_limit := …, tune := false, http_client := 'auto'\|'curl'\|'httplib', block := false, …)` | `listen_url` |
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format` |
@@ -218,12 +218,21 @@ Built-in OpenAPI (not listed in `quackapi_routes()`):
 - `GET /docs` — Swagger UI  
 - `GET /redoc` — ReDoc  
 
+**Serve shared settings** are opt-in because each DuckDB `SET` reaches the
+shared `DatabaseInstance` and every connection in the process. A bare
+`quackapi_serve()` leaves `memory_limit`, `preserve_insertion_order`,
+`enable_http_metadata_cache`, `pg_use_ctid_scan`, DuckDB logging, and the
+outbound HTTP client unchanged. Use `tune := true` for the battery, or name a
+single setting such as `memory_limit := '4GB'` or
+`preserve_insertion_order := false`.
+
 **Serve memory limit** (never silently clobbers an operator setting):
 
 1. `memory_limit := '…'` named parameter on `quackapi_serve` wins  
 2. else `SET quackapi_memory_limit = '…'`  
-3. else if DuckDB already has a **non-default** `memory_limit` → leave it alone  
-4. else apply the safe default of **256MB**
+3. else leave DuckDB's `memory_limit` alone
+4. under `tune := true` only: apply the safe default of **256MB**, and only
+   while `memory_limit` is still at DuckDB's system default
 
 ```sql
 -- App that needs headroom (PDF/HTML workloads, large joins, etc.)
@@ -353,7 +362,9 @@ Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, an
 | `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
 
 Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
-`quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async).
+`quackapi_serve` uses the process's existing HTTP client by default. The
+`auto` preference installs and selects `curl_httpfs` only when passed explicitly
+or when `tune := true` (pool + HTTP/2 + async).
 `http_client := 'auto'` falls back to httplib with a loud `http_client_reason` on
 `/healthz` / `quackapi_servers()`; `http_client := 'curl'` **fails serve** if
 curl_httpfs cannot INSTALL/LOAD — see [`docs/curl_httpfs.md`](docs/curl_httpfs.md).

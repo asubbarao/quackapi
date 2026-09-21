@@ -1,0 +1,156 @@
+# name: test/sql/quackapi_serve_defaults.test
+# description: bare serve preserves shared DuckDB settings; tuning is explicit
+# group: [sql]
+
+require quackapi
+
+# Set nondefault shared values before serve. A bare serve must preserve every
+# value, including settings the batteries historically changed.
+statement ok
+SET memory_limit = '1GB';
+
+statement ok
+SET threads = 2;
+
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+SET enable_http_metadata_cache = false;
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET enable_http_logging = true;
+
+statement ok
+CREATE TEMP TABLE settings_before AS
+SELECT name, value
+FROM duckdb_settings()
+WHERE name IN ('memory_limit', 'threads', 'preserve_insertion_order',
+               'enable_http_metadata_cache', 'enable_logging', 'enable_http_logging');
+
+query I
+SELECT * FROM quackapi_serve(29310, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29310
+
+query I
+SELECT count(*)
+FROM (
+  (SELECT name, value FROM settings_before
+   EXCEPT ALL
+   SELECT name, value FROM duckdb_settings()
+   WHERE name IN ('memory_limit', 'threads', 'preserve_insertion_order',
+                  'enable_http_metadata_cache', 'enable_logging', 'enable_http_logging'))
+  UNION ALL
+  (SELECT name, value FROM duckdb_settings()
+   WHERE name IN ('memory_limit', 'threads', 'preserve_insertion_order',
+                  'enable_http_metadata_cache', 'enable_logging', 'enable_http_logging')
+   EXCEPT ALL
+   SELECT name, value FROM settings_before)
+);
+----
+0
+
+query II
+SELECT http_client, http_client_reason FROM quackapi_servers() WHERE port = 29310;
+----
+httplib	untuned
+
+query I
+SELECT * FROM quackapi_stop(29310);
+----
+Stopped quackapi server on port 29310
+
+# An explicitly named setting still applies without enabling the whole battery.
+query I
+SELECT * FROM quackapi_serve(29311, host := '127.0.0.1', access_log := false,
+                             memory_limit := '4GB', threads := 3,
+                             preserve_insertion_order := false,
+                             enable_http_metadata_cache := true,
+                             enable_logging := false, http_client := 'httplib');
+----
+http://127.0.0.1:29311
+
+query I
+SELECT current_setting('memory_limit');
+----
+3.7 GiB
+
+query I
+SELECT current_setting('threads');
+----
+3
+
+query III
+SELECT current_setting('preserve_insertion_order'),
+       current_setting('enable_http_metadata_cache'),
+       current_setting('enable_logging');
+----
+false	true	0
+
+query I
+SELECT * FROM quackapi_stop(29311);
+----
+Stopped quackapi server on port 29311
+
+# The whole battery is also explicit. A nondefault memory limit remains
+# non-clobbered while the throughput/cache/logging defaults are applied.
+statement ok
+SET memory_limit = '1GB';
+
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+SET enable_http_metadata_cache = false;
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+CREATE TEMP TABLE tune_memory_before AS SELECT current_setting('memory_limit') AS value;
+
+query I
+SELECT * FROM quackapi_serve(29312, host := '127.0.0.1', access_log := false,
+                             tune := true, http_client := 'httplib');
+----
+http://127.0.0.1:29312
+
+query I
+SELECT current_setting('memory_limit') = (SELECT value FROM tune_memory_before);
+----
+true
+
+query III
+SELECT current_setting('preserve_insertion_order'),
+       current_setting('enable_http_metadata_cache'),
+       current_setting('enable_logging');
+----
+false	true	0
+
+query I
+SELECT * FROM quackapi_stop(29312);
+----
+Stopped quackapi server on port 29312
+
+# Leave this SQLLogic connection unsurprising for any runner that reuses it.
+statement ok
+RESET memory_limit;
+
+statement ok
+RESET threads;
+
+statement ok
+RESET preserve_insertion_order;
+
+statement ok
+RESET enable_http_metadata_cache;
+
+statement ok
+SET enable_logging = false;
+
+statement ok
+SET enable_http_logging = false;

@@ -8,9 +8,9 @@ and unchanged by this document.
 via `QuackapiHttpFetch`) goes through DuckDB’s shared `HTTPUtil` layer — never
 the `curl` CLI.
 
-## Batteries default: `curl_httpfs`
+## Explicit pooled client: `curl_httpfs`
 
-On every `quackapi_serve()`, batteries **prefer** the community
+When requested, batteries use the community
 [curl_httpfs](https://github.com/dentiny/duckdb-curl-filesystem) extension as
 the outbound HTTP client:
 
@@ -51,13 +51,16 @@ Named param wins over the SET.
 
 | Value | Behavior |
 |---|---|
-| **`auto`** | Prefer curl_httpfs. If INSTALL/LOAD fails, **fall back to httplib** and report **loudly**: stderr line, `/healthz` `http_client` + `http_client_reason`, `quackapi_servers()`. |
+| **`auto`** | When named or used with `tune := true`, prefer curl_httpfs. If INSTALL/LOAD fails, **fall back to httplib** and report **loudly**: stderr line, `/healthz` `http_client` + `http_client_reason`, `quackapi_servers()`. A bare serve leaves the existing client alone. |
 | **`curl`** | **Require** curl_httpfs. If INSTALL/LOAD fails, **serve fails** (no silent fallback). Production guarantee. |
 | **`httplib`** | Skip curl_httpfs install; force stock client. Logs `reason=operator_forced`. |
 
 ```sql
--- Default (prefer curl_httpfs; loud fallback if unavailable)
+-- Bare serve: do not install or select a process-wide client
 SELECT * FROM quackapi_serve(8000);
+
+-- Explicit auto: prefer curl_httpfs; loud fallback if unavailable
+SELECT * FROM quackapi_serve(8000, http_client := 'auto');
 
 -- Production: require curl_httpfs or refuse to serve
 SELECT * FROM quackapi_serve(8000, http_client := 'curl');
@@ -153,7 +156,7 @@ the built-in util is active, POST fails fast with a message to load curl_httpfs.
 
 ## Load order
 
-1. `LOAD quackapi` then `quackapi_serve` (batteries prefer curl_httpfs for you), **or**
+1. `LOAD quackapi` then `quackapi_serve(…, tune := true)` (batteries prefer curl_httpfs for you), **or**
 2. `LOAD curl_httpfs` then `LOAD quackapi` then serve
 
 Either order works for SQL handlers as long as the curl client is active before
