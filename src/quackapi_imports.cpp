@@ -287,7 +287,7 @@ void QuackapiRequireExtensionSetting(DatabaseInstance &db, const string &extensi
 
 void QuackapiOtlpReconcile(DatabaseInstance &db, optional_ptr<ClientContext> context, bool enforce) {
 	auto &state = QuackapiState::Get(db);
-	const auto configured = SettingText(db, context, "quackapi_otlp", "local");
+	const auto configured = SettingText(db, context, "quackapi_otlp", "off");
 	const auto mode = StringUtil::Lower(configured);
 
 	QuackapiOtlpEndpoint endpoint;
@@ -323,7 +323,7 @@ void QuackapiOtlpReconcile(DatabaseInstance &db, optional_ptr<ClientContext> con
 	}
 
 	// otlp_serve owns the receiver, the OTLP schema and the DuckLake/Iceberg
-	// write path. quackapi only decides that a local one exists by default.
+	// write path. quackapi starts it only after the operator opts in.
 	string sql = "SELECT * FROM otlp_serve(" + SqlLiteral(endpoint.uri) + ", create_tables := true";
 	if (!endpoint.catalog.empty()) {
 		sql += ", catalog := " + SqlLiteral(endpoint.catalog);
@@ -353,15 +353,14 @@ void RegisterQuackapiImportFunctions(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(db);
 
 	// SET quackapi_otlp = 'local' | 'off' | 'otlp:host:port'
-	// 'local' default-creates the loopback receiver on LOAD when the otlp
-	// extension is loaded; an explicit URI makes otlp mandatory at serve.
+	// A shared DuckDB process starts telemetry only when its operator opts in.
 	config.AddExtensionOption("quackapi_otlp",
 	                          "OTLP/HTTP endpoint quackapi creates through the otlp extension: "
-	                          "'local' (default, " +
+	                          "'off' (default), 'local' (" +
 	                              string(OTLP_LOCAL_URI) +
-	                              "), 'off', or an explicit otlp: URI. An explicit URI is "
+	                              "), or an explicit otlp: URI. An explicit URI is "
 	                              "required at quackapi_serve and fails when otlp is missing.",
-	                          LogicalType::VARCHAR, Value("local"));
+	                          LogicalType::VARCHAR, Value("off"));
 	// SET quackapi_otlp_catalog = 'my_ducklake' — durable ingest target.
 	config.AddExtensionOption("quackapi_otlp_catalog",
 	                          "DuckLake or Iceberg catalog otlp_serve writes spans/metrics/logs into. "

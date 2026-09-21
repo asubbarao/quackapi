@@ -35,8 +35,7 @@ void QuackapiRequireExtensionSetting(DatabaseInstance &db, const string &extensi
 //! DBConfig alone sees the database default, never the caller's SET. Null at
 //! LOAD, where no session exists and the defaults are all there is.
 //! enforce: an explicitly configured endpoint is mandatory and a missing otlp
-//! throws. LOAD quackapi may not fail over a missing companion, so the local
-//! default reports on stderr instead.
+//! throws. The default is off, so LOAD quackapi requires no telemetry companion.
 void QuackapiOtlpReconcile(DatabaseInstance &db, optional_ptr<ClientContext> context, bool enforce);
 
 //! quackapi_otlp() and quackapi_queue_worker().

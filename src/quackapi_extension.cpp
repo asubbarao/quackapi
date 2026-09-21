@@ -1085,11 +1085,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// configured, so LOAD quackapi neither needs nor spawns anything.
 	RegisterQuackapiEventsFunctions(loader);
 
-	// OTLP on LOAD, locally, loudly: default-create the loopback receiver when
-	// the otlp extension is loaded, and say what is (not) collecting either way.
-	// No session exists yet, so the settings are still their defaults.
-	// enforce=false — a missing companion may not fail LOAD quackapi; an
-	// explicitly configured endpoint is enforced at quackapi_serve instead.
+	// Initialize telemetry status without starting an unsolicited listener.
+	// Explicit endpoints are enforced when the operator starts serving.
 	QuackapiOtlpReconcile(db, nullptr, /*enforce=*/false);
 }
 

@@ -1,5 +1,5 @@
 # name: test/sql/quackapi_companions.test
-# description: the imported companions doing the work — otlp serving the default endpoint, cronjob running the queue drain
+# description: explicitly enabled otlp serving locally, cronjob running the queue drain
 # group: [sql]
 
 require quackapi
@@ -17,9 +17,7 @@ INSTALL httpfs;
 statement ok
 LOAD httpfs;
 
-# A per-test extension directory: an otlp installed here cannot leak into the
-# databases of the other files, where LOAD quackapi would then default-create a
-# second receiver on the same port.
+# Keep companion installation isolated from other test databases.
 statement ok
 SET extension_directory = '__TEST_DIR__/companions';
 
@@ -29,9 +27,9 @@ INSTALL otlp FROM community;
 statement ok
 LOAD otlp;
 
-# LOAD quackapi ran before otlp existed. The next quackapi_otlp() reconciles and
-# default-creates the local receiver — quackapi decides there is one, otlp_serve
-# owns the OTLP wire format, the schema and the DuckLake/Iceberg write path.
+statement ok
+SET quackapi_otlp = 'local';
+
 query IIII
 SELECT uri, catalog = '' AS no_catalog, state, detail FROM quackapi_otlp();
 ----

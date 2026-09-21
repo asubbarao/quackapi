@@ -4,6 +4,11 @@
 
 require quackapi
 
+query II
+SELECT current_setting('quackapi_otlp'), state FROM quackapi_otlp();
+----
+off	off
+
 # --- httpfs_timeout_retry owns the outbound timeout and retry knobs ----------
 # serve requires it the way it requires curl_httpfs. The per-operation settings
 # it registers are the active thing: quackapi no longer pins a ceiling of its
@@ -27,10 +32,10 @@ SELECT * FROM quackapi_stop(29420);
 statement ok
 SET extension_directory = '__TEST_DIR__/no-companions';
 
-# --- otlp: default-created locally, never downloaded ------------------------
-# LOAD quackapi asks for the loopback receiver. Without the otlp extension it
-# reports what is missing instead of installing it, and quackapi keeps no
-# request history of its own to fall back on.
+# --- otlp: explicitly enabled locally, never downloaded ---------------------
+statement ok
+SET quackapi_otlp = 'local';
+
 query III
 SELECT uri, catalog = '' AS no_catalog, state FROM quackapi_otlp();
 ----

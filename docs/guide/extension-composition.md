@@ -269,7 +269,8 @@ receiver inside the same process and lands spans, metrics and logs as tables.
 ```sql
 INSTALL otlp FROM community;   -- one-time setup
 LOAD otlp;
-LOAD quackapi;                 -- default-creates otlp:localhost:4318 and says so
+LOAD quackapi;
+SET quackapi_otlp = 'local';
 
 SELECT uri, catalog, state, detail FROM quackapi_otlp();
 -- otlp:localhost:4318  (empty)  serving  otlp_serve
@@ -279,12 +280,12 @@ SELECT * FROM read_otlp_traces();
 
 | Knob | Effect |
 |------|--------|
-| `SET quackapi_otlp = 'local'` | default — loopback receiver when `otlp` is loaded |
-| `SET quackapi_otlp = 'off'` | create nothing |
+| `SET quackapi_otlp = 'local'` | opt in to the loopback receiver |
+| `SET quackapi_otlp = 'off'` | default — create nothing |
 | `SET quackapi_otlp = 'otlp:0.0.0.0:4318'` | explicit endpoint; **`quackapi_serve` fails** if `otlp` is missing |
 | `SET quackapi_otlp_catalog = 'my_ducklake'` | durable ingest into a DuckLake or Iceberg catalog instead of local tables |
 
-The default binds loopback on purpose. **Beyond this box, an OpenTelemetry
+The local endpoint binds loopback on purpose. **Beyond this box, an OpenTelemetry
 Collector is the answer** — point it at the endpoint, or at your backend, and let
 it do the fan-out, batching and retention a database should not.
 
