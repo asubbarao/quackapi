@@ -1646,9 +1646,9 @@ string SerializeRowsArrow(Connection &con, const vector<string> &names, const ve
 }
 
 void SetInternalError(duckdb_httplib::Response &res, const string &server_side_detail) {
-	// Never leak SQL/relation/path text to clients; log full detail server-side.
+	// Return DuckDB's diagnostic so clients can diagnose route execution failures.
 	fprintf(stderr, "quackapi: internal error: %s\n", server_side_detail.c_str());
-	SetJson(res, 500, "{\"detail\":\"Internal Server Error\"}");
+	SetJson(res, 500, "{\"detail\":\"" + QuackapiJsonEscape(server_side_detail) + "\"}");
 }
 
 //! Collect request headers into a case-insensitive map (first value wins).
@@ -3383,11 +3383,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		auto result = prepared->Execute(named_values, false);
 		if (result->HasError()) {
-			// Client-input failures must never surface as 500.
+			// Preserve the status mapping while returning DuckDB's diagnostic so clients can fix bad input.
 			// - Conversion errors → 422 with recovered param name (not "_")
 			// - LIMIT/OFFSET negative → empty 200 [] (FastAPI unconstrained int)
 			// - Other binder/invalid-input from values → 422
-			// - True handler bugs → 500 sanitized
+			// - True handler bugs → 500 with DuckDB's diagnostic
 			auto err = result->GetError();
 			auto err_lower = StringUtil::Lower(err);
 			bool conversion = StringUtil::Contains(err_lower, "conversion error") ||
@@ -3422,8 +3422,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					pname = bound_raw.begin()->first;
 					loc_kind = bound_raw.begin()->second.first;
 				}
-				SetJson(res, 422,
-				        ValidationErrorJson(loc_kind, pname, "Invalid input for parameter type", "type_error"));
+				SetJson(res, 422, ValidationErrorJson(loc_kind, pname, err, "type_error"));
 			} else if (StringUtil::Contains(err_lower, "invalid input") ||
 			           StringUtil::Contains(err_lower, "binder error") ||
 			           StringUtil::Contains(err_lower, "out of range")) {
@@ -3440,7 +3439,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						loc_kind = kv.second.first;
 					}
 				}
-				SetJson(res, 422, ValidationErrorJson(loc_kind, pname, "Invalid input for parameter", "value_error"));
+				SetJson(res, 422, ValidationErrorJson(loc_kind, pname, err, "value_error"));
 			} else {
 				SetInternalError(res, err);
 			}

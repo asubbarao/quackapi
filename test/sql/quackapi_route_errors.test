@@ -1,0 +1,31 @@
+# name: test/sql/quackapi_route_errors.test
+# description: Route execution errors preserve DuckDB diagnostics
+# group: [sql]
+
+require quackapi
+
+query I
+CREATE OR REPLACE ROUTE sql POST '/sql' AS SELECT * FROM query($sql);
+----
+Route sql: POST /sql
+
+query II
+SELECT status,
+       contains(decode(body), 'Conversion Error') AND
+       contains(decode(body), 'nope')
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT CAST(''nope'' AS INTEGER)"}');
+----
+422	true
+
+query II
+SELECT status,
+       contains(decode(body), 'nowhere') AND
+       contains(decode(body), 'Table with name')
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT nope FROM nowhere"}');
+----
+500	true
+
+query I
+DROP ROUTE sql;
+----
+Dropped route sql
