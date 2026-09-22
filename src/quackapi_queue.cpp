@@ -992,6 +992,10 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	enqueue_set.AddFunction(ScalarFunction("quackapi_enqueue",
 	                                       {LogicalType::VARCHAR, LogicalType::JSON(), LogicalType::INTEGER},
 	                                       LogicalType::BIGINT, EnqueueScalar));
+	// Queue mutations execute once per input row. Folding would mutate during planning.
+	for (auto &function : enqueue_set.functions) {
+		function.stability = FunctionStability::VOLATILE;
+	}
 	loader.RegisterFunction(enqueue_set);
 
 	// dequeue(queue) / dequeue(queue, n)
@@ -1005,9 +1009,10 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 
 	// Delivery ownership is mandatory. The retired two-argument form could let
 	// an expired worker complete a newer delivery of the same job.
-	loader.RegisterFunction(ScalarFunction("quackapi_ack",
-	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                       LogicalType::BOOLEAN, AckScalar));
+	ScalarFunction ack("quackapi_ack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                   LogicalType::BOOLEAN, AckScalar);
+	ack.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(ack);
 
 	// nack(queue, job_id, delivery_generation [, requeue [, error]])
 	ScalarFunctionSet nack_set("quackapi_nack");
@@ -1021,12 +1026,16 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	    "quackapi_nack",
 	    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::VARCHAR},
 	    LogicalType::VARCHAR, NackScalar));
+	for (auto &function : nack_set.functions) {
+		function.stability = FunctionStability::VOLATILE;
+	}
 	loader.RegisterFunction(nack_set);
 
 	// renew(queue, job_id, delivery_generation) → bool
-	loader.RegisterFunction(ScalarFunction("quackapi_renew",
-	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                       LogicalType::BOOLEAN, RenewScalar));
+	ScalarFunction renew("quackapi_renew", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                     LogicalType::BOOLEAN, RenewScalar);
+	renew.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(renew);
 
 	// queues() inspection
 	loader.RegisterFunction(TableFunction("quackapi_queues", {}, QueuesExec, QueuesBind, QueuesInit));

@@ -15,17 +15,18 @@ cmake --build build/system --target quackapi_loadable_extension -j 4
 
 Serving requires compatible `curl_httpfs` and `httpfs_timeout_retry` extensions.
 Install or stage those separately; no download occurs inside a request. The
-runtime smoke accepts an explicitly staged timeout companion and uses the
-engine's installed curl companion:
+runtime smoke receives both companions as explicit artifacts. It does not read
+the user's extension directory or startup file:
 
 ```text
-python3 test/integration/test_system_runtime.py --duckdb /opt/homebrew/bin/duckdb --extension build/system/extension/quackapi/quackapi.duckdb_extension --httpfs-timeout-retry build/dependencies/httpfs_timeout_retry.duckdb_extension
+bash scripts/system_runtime_smoke.sh --duckdb /opt/homebrew/bin/duckdb --extension build/system/extension/quackapi/quackapi.duckdb_extension --curl-httpfs build/dependencies/curl_httpfs.duckdb_extension --httpfs-timeout-retry build/dependencies/httpfs_timeout_retry.duckdb_extension
 ```
 
-The test starts an isolated ephemeral DuckDB process on a selected loopback
-port and cleans it up afterward. Its client always uses that port and never
-replays requests. It bypasses the user's startup file and allows the explicitly
-built unsigned artifact while keeping engine/extension compatibility checks.
+The Bash/SQL smoke starts an isolated ephemeral DuckDB process on a selected
+loopback port and cleans it up afterward. Its client always uses that port and
+never replays requests. It bypasses the user's startup file and allows the
+explicitly built unsigned artifacts while keeping engine/extension compatibility
+checks. Its JSON receipt includes SHA-256 values for every loaded artifact.
 
 Verified on DuckDB v1.5.5: `tune := false` retains the configured 20 GiB buffer
 limit, 12 database threads, default insertion ordering, and disabled logging.
