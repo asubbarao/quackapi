@@ -107,41 +107,6 @@ void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
 	qa_state.SetLastEffectiveWriteTimeoutSec(static_cast<int32_t>(timeout_sec));
 }
 
-//! Per-worker-thread DuckDB connection.
-//! httplib's ThreadPool runs each request on a worker thread. Connection
-//! construction is avoided only within a single request; each new request
-//! gets a fresh Connection so TEMP tables / SET / session state cannot leak
-//! across keep-alive or in-process calls on the same worker.
-//!
-//! Do NOT cache serialized JSON bodies by SQL alone: zero-parameter handlers
-//! still read tables and call volatile functions (uuid/random/now) — a SQL-only
-//! key freezes the first response forever on that worker.
-//! Do NOT cache PreparedStatement by SQL alone across requests: session reset
-//! drops the connection, and VIEW/MACRO identity is not part of the SQL text.
-struct ThreadRequestCache {
-	DatabaseInstance *db = nullptr;
-	unique_ptr<Connection> con;
-
-	//! Start of a request: always a new Connection (clears TEMP/SET).
-	Connection &BeginRequest(DatabaseInstance &instance) {
-		con = make_uniq<Connection>(instance);
-		db = &instance;
-		return *con;
-	}
-
-	Connection &GetConnection(DatabaseInstance &instance) {
-		if (!con || db != &instance) {
-			return BeginRequest(instance);
-		}
-		return *con;
-	}
-};
-
-ThreadRequestCache &TlsRequestCache() {
-	thread_local ThreadRequestCache cache;
-	return cache;
-}
-
 //! Content-Encoding choice after Accept-Encoding negotiation.
 enum class NegotiatedEncoding { IDENTITY, ZSTD, GZIP };
 
@@ -2006,7 +1971,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			string version = "unknown";
 			bool ready = false;
 			try {
-				auto &con = TlsRequestCache().GetConnection(*db);
+				Connection con(*db);
 				auto resq = con.Query("SELECT version()");
 				if (!resq->HasError()) {
 					auto chunk = resq->Fetch();
@@ -2647,9 +2612,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 
 	try {
-		auto &tls = TlsRequestCache();
-		// Fresh Connection per request — TEMP/SET must not survive to the next call.
-		auto &con = tls.BeginRequest(*db);
+		// Request-scoped: TEMP/SET must not survive to the next call, and a
+		// Connection held past the request (e.g. thread_local) pins the database
+		// to the lifetime of a worker or scheduler thread that the database owns.
+		// Do not cache PreparedStatements or bodies by SQL text either: VIEW/MACRO
+		// identity and volatile functions are not part of the SQL.
+		Connection con(*db);
 
 		// Request params: path captures shadow query params of the same name.
 		// Body fields (JSON / form / multipart) fill remaining names with loc=body.
