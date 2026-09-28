@@ -19,6 +19,7 @@ namespace duckdb {
 
 QuackapiState::~QuackapiState() {
 	StopAllServers();
+	JoinServerCleanupThreads();
 }
 
 QuackapiState &QuackapiState::Get(DatabaseInstance &db) {
@@ -390,7 +391,7 @@ void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int po
 bool QuackapiState::StopServer(int port) {
 	// Mirrors QuackStorageExtensionInfo::StopServer (duckdb-quack
 	// src/quack_storage.cpp): under lock move out of map; StopAccepting
-	// (socket only); full destroy on a detached thread so httplib worker-pool
+	// (socket only); full destroy on an owned cleanup thread so httplib worker-pool
 	// join never runs under servers_mutex or on a request-handler thread.
 	unique_ptr<QuackapiHttpServer> to_destroy;
 	{
@@ -412,10 +413,14 @@ bool QuackapiState::StopServer(int port) {
 	to_destroy->StopAccepting();
 	// Brief delay so a self-stop from inside a route can finish its response
 	// before ~Server joins the thread pool.
-	std::thread([srv = std::move(to_destroy)]() mutable {
+	std::thread cleanup_thread([srv = std::move(to_destroy)]() mutable {
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		srv.reset();
-	}).detach();
+	});
+	{
+		std::lock_guard<std::mutex> lock(servers_mutex);
+		server_cleanup_threads.emplace_back(std::move(cleanup_thread));
+	}
 	return true;
 }
 
@@ -428,7 +433,9 @@ void QuackapiState::StopAllServers() {
 		}
 		servers.clear();
 	}
-	// Same as StopServer: drain free-list before joining httplib workers.
+	// Same as StopServer: drain free-list before joining httplib workers. Cleanup
+	// threads are retained so the state destructor can join them before DuckDB
+	// tears down the database allocator.
 	QuackapiHttpFetch::ResetPool();
 	for (auto &srv : to_destroy) {
 		if (srv) {
@@ -436,10 +443,25 @@ void QuackapiState::StopAllServers() {
 		}
 	}
 	for (auto &srv : to_destroy) {
-		std::thread([s = std::move(srv)]() mutable {
+		std::thread cleanup_thread([s = std::move(srv)]() mutable {
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			s.reset();
-		}).detach();
+		});
+		std::lock_guard<std::mutex> lock(servers_mutex);
+		server_cleanup_threads.emplace_back(std::move(cleanup_thread));
+	}
+}
+
+void QuackapiState::JoinServerCleanupThreads() {
+	vector<std::thread> cleanup_threads;
+	{
+		std::lock_guard<std::mutex> lock(servers_mutex);
+		cleanup_threads.swap(server_cleanup_threads);
+	}
+	for (auto &cleanup_thread : cleanup_threads) {
+		if (cleanup_thread.joinable()) {
+			cleanup_thread.join();
+		}
 	}
 }
 

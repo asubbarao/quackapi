@@ -365,6 +365,7 @@ public:
 private:
 	void PublishRoutes();
 	void PublishStreams();
+	void JoinServerCleanupThreads();
 
 	std::atomic<int32_t> last_effective_write_timeout_sec {0};
 
@@ -407,6 +408,7 @@ private:
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;
+	vector<std::thread> server_cleanup_threads;
 };
 
 } // namespace duckdb
