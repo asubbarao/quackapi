@@ -145,10 +145,10 @@ def evaluate(case: dict, status: int, headers: Dict[str, str], body: bytes) -> T
     notes: List[str] = []
     if case.get("force_na"):
         return "N/A", case.get("notes") or "feature not built", []
-    if case.get("skip_run") and case.get("force_pass_stronger"):
-        return "PASS", case.get("notes") or "documented stronger behavior", []
     if case.get("skip_run"):
         return "N/A", case.get("notes") or "skipped", []
+    if status == 0:
+        return "FAIL", "HTTP request failed", [body.decode("utf-8", errors="replace")]
 
     text = body.decode("utf-8", errors="replace")
     j = parse_json(body)
@@ -160,9 +160,7 @@ def evaluate(case: dict, status: int, headers: Dict[str, str], body: bytes) -> T
 
     if case.get("expect_body_empty"):
         if body and len(body) > 0:
-            # HEAD may report Content-Length but empty entity
-            if case.get("method") != "HEAD":
-                failures.append(f"body not empty: {text[:80]!r}")
+            failures.append(f"body not empty: {text[:80]!r}")
 
     for frag in case.get("expect_body_contains") or []:
         if frag not in text:
@@ -230,6 +228,11 @@ def evaluate(case: dict, status: int, headers: Dict[str, str], body: bytes) -> T
 
     if case.get("notes"):
         notes.append(case["notes"])
+
+    # Descriptive special cases may explain a result, but cannot erase failed
+    # status, payload, or header assertions from the declared contract.
+    if failures:
+        return "FAIL", "; ".join(notes + failures), failures
 
     # Special: HEAD_EXPLICIT — if we registered HEAD /health, 200 is PASS
     if case.get("id") == "explicit_head" and status == 200:
@@ -366,7 +369,7 @@ def main() -> int:
         if case.get("jwt"):
             headers["Authorization"] = f"Bearer {jwt_token}"
 
-        if case.get("force_na") or (case.get("skip_run") and not case.get("force_pass_stronger")):
+        if case.get("force_na") or case.get("skip_run"):
             status, hdrs, body = 0, {}, b""
             verdict = "N/A"
             notes = case.get("notes") or "not built"

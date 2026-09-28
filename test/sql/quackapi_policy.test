@@ -96,6 +96,97 @@ CREATE ROUTE public_orders GET '/public_orders' AS
 ----
 Route public_orders: GET /public_orders
 
+# Parsed policy enforcement covers schema-qualified base tables. Views and
+# table macros are deliberately rejected while a bound expansion is unavailable,
+# rather than leaking their protected dependencies.
+statement ok
+CREATE VIEW policy_orders_view AS SELECT * FROM policy_orders;
+
+statement ok
+CREATE MACRO policy_orders_macro() AS TABLE SELECT * FROM policy_orders;
+
+query I
+CREATE ROUTE list_orders_qualified GET '/orders-qualified' REQUIRE jwt_pol AS
+  SELECT id, tenant_id, amount FROM main.policy_orders ORDER BY id;
+----
+Route list_orders_qualified: GET /orders-qualified
+
+query I
+CREATE ROUTE public_orders_view GET '/public_orders_view' AS
+  SELECT id, tenant_id FROM policy_orders_view;
+----
+Route public_orders_view: GET /public_orders_view
+
+query I
+CREATE ROUTE public_orders_macro GET '/public_orders_macro' AS
+  SELECT id, tenant_id FROM policy_orders_macro();
+----
+Route public_orders_macro: GET /public_orders_macro
+
+# Nested scalar expressions and CTEs must be walked by the policy rewriter;
+# a relation hidden outside the top-level FROM is not a safe bypass. The CTE
+# deliberately shadows the bound table name while its body uses a qualified
+# alias for the actual catalog table.
+query I
+CREATE ROUTE public_users_scalar GET '/public_users_scalar' AS
+  SELECT (SELECT email FROM policy_users ORDER BY id LIMIT 1) AS email;
+----
+Route public_users_scalar: GET /public_users_scalar
+
+query I
+CREATE ROUTE list_users_scalar GET '/users-scalar' REQUIRE jwt_pol AS
+  SELECT (SELECT email FROM policy_users WHERE tenant_id = $claims_tenant ORDER BY id LIMIT 1) AS email;
+----
+Route list_users_scalar: GET /users-scalar
+
+query I
+CREATE ROUTE list_users_cte GET '/users-cte' REQUIRE jwt_pol AS
+  WITH policy_users AS (
+    SELECT p.id, p.email, p.tenant_id FROM main.policy_users AS p
+  )
+  SELECT u.email FROM policy_users AS u ORDER BY u.id;
+----
+Route list_users_cte: GET /users-cte
+
+# Table macros remain an indirect relation source for all callers until a
+# bound expansion exists; authenticated credentials do not make it safe.
+query I
+CREATE ROUTE auth_orders_macro GET '/auth_orders_macro' REQUIRE jwt_pol AS
+  SELECT id, tenant_id FROM policy_orders_macro();
+----
+Route auth_orders_macro: GET /auth_orders_macro
+
+# Policy enforcement is read-only today. Reject protected-table mutations
+# rather than executing an update without a row-level write policy.
+query I
+CREATE ROUTE mutate_orders POST '/mutate_orders' REQUIRE jwt_pol AS
+  UPDATE policy_orders SET amount = 0 WHERE id = 1 RETURNING id;
+----
+Route mutate_orders: POST /mutate_orders
+
+query I
+CREATE STREAM policy_orders_sse GET '/policy-orders-sse' AS
+  SELECT id, tenant_id FROM policy_orders;
+----
+Stream policy_orders_sse: GET /policy-orders-sse SSE
+
+query I
+CREATE GRAPHQL ROUTE policy_orders_gql POST '/orders-gql' FROM policy_orders REQUIRE jwt_pol;
+----
+GraphQL route policy_orders_gql: POST /orders-gql FROM policy_orders REQUIRE jwt_pol LIMIT 100
+
+query I
+CREATE GRAPHQL ROUTE policy_users_gql POST '/users-gql' FROM policy_users REQUIRE jwt_pol;
+----
+GraphQL route policy_users_gql: POST /users-gql FROM policy_users REQUIRE jwt_pol LIMIT 100
+
+# This registration must never turn a policy-protected table into a public
+# built-in GraphQL endpoint.
+query I
+CREATE GRAPHQL FOR TABLE policy_orders;
+----
+GraphQL registered: policy_orders (allowlist mode on POST /graphql)
+
 statement ok
 SET VARIABLE jwt_acme_user = (
   SELECT rtrim(content, E'\n\r ') FROM read_text('test/sql/fixtures/jwt_pol_acme_user.txt')
@@ -144,6 +235,17 @@ FROM quackapi_request(
 ----
 200	[{"id":1,"tenant_id":"acme","amount":100},{"id":2,"tenant_id":"beta","amount":200},{"id":3,"tenant_id":"acme","amount":150}]
 
+# A qualified direct table reference is rewritten from the parsed base-table
+# identity, not a bare-name text match.
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/orders-qualified',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+200	[{"id":1,"tenant_id":"acme","amount":100},{"id":3,"tenant_id":"acme","amount":150}]
+
 # ---------------------------------------------------------------------------
 # Masking policy — column masked unless claims permit
 # ---------------------------------------------------------------------------
@@ -167,6 +269,57 @@ FROM quackapi_request(
 ----
 200	[{"id":1,"email":"alice@acme.test","tenant_id":"acme"},{"id":2,"email":"bob@beta.test","tenant_id":"beta"}]
 
+# Scalar subqueries and CTE bodies are parsed and rewritten recursively. The
+# first verifies authenticated RAP/masking; the second verifies a public
+# scalar source fails closed rather than reading the underlying table.
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/users-scalar',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+200	[{"email":"***"}]
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/users-cte',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+200	[{"email":"***"}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/public_users_scalar');
+----
+403	{"detail":"Policy denies unauthenticated access"}
+
+# Indirect table macros and protected-table writes are denied even after JWT
+# verification. Confirm the rejected mutation left the table unchanged.
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'GET', '/auth_orders_macro',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+403	{"detail":"Policy denies unauthenticated access"}
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request(
+  'POST', '/mutate_orders',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+403	{"detail":"Policy denies unauthenticated access"}
+
+query I
+SELECT amount FROM policy_orders WHERE id = 1;
+----
+100
+
 # ---------------------------------------------------------------------------
 # Fail closed — unauthenticated request to policied table → 403 (not open)
 # ---------------------------------------------------------------------------
@@ -175,11 +328,88 @@ SELECT status, decode(body) FROM quackapi_request('GET', '/public_orders');
 ----
 403	{"detail":"Policy denies unauthenticated access"}
 
+# Views and table macros are indirect sources. They fail closed instead of
+# bypassing a policy bound to policy_orders.
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/public_orders_view');
+----
+403	{"detail":"Policy denies unauthenticated access"}
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/public_orders_macro');
+----
+403	{"detail":"Policy denies unauthenticated access"}
+
+# Streams have no auth/claims contract yet, so a protected source must not
+# become an unauthenticated SSE bypass.
+query I
+SELECT status FROM quackapi_request('GET', '/policy-orders-sse');
+----
+403
+
 # REQUIRE without credentials still 401 (auth before policy)
 query II
 SELECT status, decode(body) FROM quackapi_request('GET', '/orders');
 ----
 401	{"detail":"Not authenticated"}
+
+# Named GraphQL applies the same RAP/masking expansion and verified claims as
+# REST. Built-in GraphQL remains unauthenticated and therefore cannot read a
+# registered protected table.
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/orders-gql',
+  '{"query":"{ policy_orders { id tenant_id amount } }"}',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+200	{"data":{"policy_orders":[{"id":1,"tenant_id":"acme","amount":100},{"id":3,"tenant_id":"acme","amount":150}]}}
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/users-gql',
+  '{"query":"{ policy_users { id email tenant_id } }"}',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+200	{"data":{"policy_users":[{"id":1,"email":"***","tenant_id":"acme"}]}}
+
+query I
+SELECT status FROM quackapi_request(
+  'POST', '/orders-gql',
+  '{"query":"{ policy_orders { id } }"}'
+);
+----
+401
+
+query II
+SELECT status, decode(body) FROM quackapi_request(
+  'POST', '/graphql',
+  '{"query":"{ policy_orders { id } }"}'
+);
+----
+200	{"errors":[{"message":"access denied by table policy"}]}
+
+# Schema discovery uses the same named-route auth gate and does not expose a
+# registered protected table through the unauthenticated built-in schema.
+query I
+SELECT status FROM quackapi_request('GET', '/orders-gql/schema');
+----
+401
+
+query I
+SELECT status FROM quackapi_request(
+  'GET', '/orders-gql/schema',
+  headers := MAP {'Authorization': 'Bearer ' || getvariable('jwt_acme_user')}
+);
+----
+200
+
+query II
+SELECT status, contains(decode(body), 'policy_orders')
+FROM quackapi_request('GET', '/graphql/schema');
+----
+200	false
 
 # ---------------------------------------------------------------------------
 # Bad grammar / missing policy
@@ -203,6 +433,26 @@ does not exist
 # Cleanup
 # ---------------------------------------------------------------------------
 query I
+DROP GRAPHQL ROUTE policy_orders_gql;
+----
+Dropped GraphQL route policy_orders_gql
+
+query I
+DROP GRAPHQL ROUTE policy_users_gql;
+----
+Dropped GraphQL route policy_users_gql
+
+query I
+DROP GRAPHQL FOR TABLE policy_orders;
+----
+GraphQL unregistered: policy_orders (allowlist empty → catalog closed)
+
+query I
+DROP STREAM policy_orders_sse;
+----
+Dropped stream policy_orders_sse
+
+query I
 DROP ROUTE list_orders;
 ----
 Dropped route list_orders
@@ -218,6 +468,46 @@ DROP ROUTE public_orders;
 Dropped route public_orders
 
 query I
+DROP ROUTE list_orders_qualified;
+----
+Dropped route list_orders_qualified
+
+query I
+DROP ROUTE public_orders_view;
+----
+Dropped route public_orders_view
+
+query I
+DROP ROUTE public_orders_macro;
+----
+Dropped route public_orders_macro
+
+query I
+DROP ROUTE public_users_scalar;
+----
+Dropped route public_users_scalar
+
+query I
+DROP ROUTE list_users_scalar;
+----
+Dropped route list_users_scalar
+
+query I
+DROP ROUTE list_users_cte;
+----
+Dropped route list_users_cte
+
+query I
+DROP ROUTE auth_orders_macro;
+----
+Dropped route auth_orders_macro
+
+query I
+DROP ROUTE mutate_orders;
+----
+Dropped route mutate_orders
+
+query I
 DROP AUTH jwt_pol;
 ----
 Dropped auth jwt_pol
@@ -231,6 +521,12 @@ query I
 DROP ROW ACCESS POLICY tenant_isolation;
 ----
 Dropped row access policy tenant_isolation
+
+statement ok
+DROP MACRO policy_orders_macro;
+
+statement ok
+DROP VIEW policy_orders_view;
 
 statement ok
 DROP TABLE policy_orders;

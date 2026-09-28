@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "quackapi_extension.hpp"
+#include "quackapi_middleware.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -93,6 +94,7 @@ static void QuackapiBlockUntilStopped(ClientContext &context, int32_t port) {
 //===--------------------------------------------------------------------===//
 
 struct ServeBindData : public TableFunctionData {
+	QuackapiServeOptions limits;
 	string host = "127.0.0.1";
 	int32_t port = 8000;
 	string static_dir;
@@ -129,9 +131,33 @@ struct ServeBindData : public TableFunctionData {
 	bool finished = false;
 };
 
+static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
+	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
+		Value setting;
+		int64_t value = fallback;
+		auto named = input.named_parameters.find(name);
+		if (named != input.named_parameters.end()) {
+			if (named->second.IsNull()) {
+				throw InvalidInputException("%s must not be NULL", name);
+			}
+			value = named->second.GetValue<int64_t>();
+		} else if (context.TryGetCurrentSetting("quackapi_" + name, setting) && !setting.IsNull()) {
+			value = setting.GetValue<int64_t>();
+		}
+		if (value <= 0 || value > maximum) {
+			throw InvalidInputException("%s must be between 1 and %lld", name, maximum);
+		}
+		return value;
+	};
+	opts.query_timeout_ms = read("query_timeout_ms", 30000, 86400000);
+	opts.max_response_bytes = read("max_response_bytes", 16 * 1024 * 1024, 1024LL * 1024 * 1024);
+	opts.max_pending_requests = static_cast<int32_t>(read("max_pending_requests", 256, 100000));
+}
+
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<ServeBindData>();
+	BindResourceLimits(context, input, bind_data->limits);
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
 	}
@@ -332,7 +358,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	ComposeQuackAuthSettings(context);
 
 	// Batteries-included serve options (all ON / server-optimal by default).
-	QuackapiServeOptions opts;
+	QuackapiServeOptions opts = bind_data.limits;
 	opts.static_dir = bind_data.static_dir;
 	opts.cors_origins = bind_data.cors_origins;
 	opts.memory_limit = bind_data.memory_limit;
@@ -509,6 +535,7 @@ static void WaitExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 //===--------------------------------------------------------------------===//
 
 struct RequestBindData : public TableFunctionData {
+	QuackapiServeOptions limits;
 	string method;
 	string path;
 	string body;
@@ -526,6 +553,7 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 		    "positional args");
 	}
 	auto bind_data = make_uniq<RequestBindData>();
+	BindResourceLimits(context, input, bind_data->limits);
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw InvalidInputException("quackapi_request: method and path must be non-NULL");
 	}
@@ -577,7 +605,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	string content_type;
 	unordered_map<string, string> resp_headers;
 	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
-	                         &bind_data.req_headers, &resp_headers, bind_data.pg_dsn);
+	                         &bind_data.req_headers, &resp_headers, bind_data.pg_dsn, &bind_data.limits);
 	output.SetValue(0, 0, Value::INTEGER(status));
 	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
 	output.SetValue(2, 0, Value(content_type));
@@ -798,6 +826,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "parameter on quackapi_serve / quackapi_request.",
 	                          LogicalType::VARCHAR, Value(""));
 
+	config.AddExtensionOption("quackapi_query_timeout_ms", "Maximum query execution time in milliseconds",
+	                          LogicalType::BIGINT, Value::BIGINT(30000));
+	config.AddExtensionOption("quackapi_max_response_bytes", "Maximum uncompressed response bytes", LogicalType::BIGINT,
+	                          Value::BIGINT(16 * 1024 * 1024));
+	config.AddExtensionOption("quackapi_max_pending_requests", "Maximum queued HTTP connections", LogicalType::BIGINT,
+	                          Value::BIGINT(256));
+	config.AddExtensionOption("quackapi_graphql_allow_all", "Explicit legacy opt-in to public GraphQL catalog exposure",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
 	// Also carries compression + compression_min_bytes + http_client.
@@ -824,6 +860,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
 	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	serve.named_parameters["block"] = LogicalType::BOOLEAN;
+	serve.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
+	serve.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
+	serve.named_parameters["max_pending_requests"] = LogicalType::BIGINT;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);
@@ -854,11 +893,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
 	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
+	request2.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
+	request2.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
 	request_set.AddFunction(request2);
 	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       RequestExec, RequestBind);
 	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
+	request3.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
+	request3.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
 	request_set.AddFunction(request3);
 	loader.RegisterFunction(request_set);
 
@@ -898,6 +941,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Durable broker-less job queue (CREATE QUEUE + enqueue/dequeue/ack/nack).
 	// Backing store is the plain quackapi_jobs table; worker = compose cronjob.
 	RegisterQuackapiQueueFunctions(loader);
+	loader.RegisterFunction(GetApplyMiddlewareFunction());
+	loader.RegisterFunction(GetQuackapiMiddlewaresFunction());
 
 	// quack_from_{fastapi,rails,express,gin}[+_models]: sitting_duck extractors
 	// that turn a real web-app source tree into route/model IR rows.
@@ -913,6 +958,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(QueueDdlParserExtension());
+	ExtensionCallbackManager::Get(db).Register(MiddlewareDdlParserExtension());
 	// CREATE ROW ACCESS / MASKING POLICY + ALTER TABLE policy bind
 	ExtensionCallbackManager::Get(db).Register(PolicyDdlParserExtension());
 	// CREATE STREAM (SSE)

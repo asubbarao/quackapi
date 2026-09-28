@@ -1,0 +1,84 @@
+# Final benchmark smoke — 2026-09-07
+
+This record distinguishes the controlled benchmark evidence from the dated
+[benchmark review](REVIEW_2026_09_07.md). It uses an isolated PostgreSQL
+database at `127.0.0.1:29389/quackbench`; it does not touch the shared pgEdge
+instance. The runner records source and binary hashes, dependency versions,
+worker budgets, raw k6 CSV, summaries, server logs, and row-level write checks
+in each immutable result directory.
+
+## Harness remediation
+
+- Both w1 and w8 stacks receive 32 aggregate HTTP workers and 32 aggregate
+  PostgreSQL pool slots. The w8 configuration is eight processes with four
+  HTTP workers and four pool slots per process.
+- The runner waits for all requested worker PIDs, refuses occupied ports, and
+  only stops the process group it created.
+- The FastAPI launcher filters Uvicorn's spawn helper from its worker set and
+  accepts the helper when older Uvicorn versions do not expose worker command
+  lines; every requested worker-related process must still be alive.
+- Report rows correlate raw k6 samples through the runner's `export_name`
+  manifest rather than parsing routing fields from a filename. A cell is valid
+  only when the measurement request count, successful count, raw latency count,
+  HTTP/check results, and (for writes) committed/acknowledged counts agree.
+- Write warmup drains before measurement begins. The write workload emits an
+  explicit measurement-success counter and the row check excludes warmup rows.
+
+## Focused write regression
+
+The post-remediation eight-worker QuackAPI write run is preserved at
+`bench/results/20260907T083838Z-39076`.
+
+| Stack | VUs | Measurement requests | Successful writes | Committed rows | p50 | p99 | Result |
+|---|---:|---:|---:|---:|---:|---:|---|
+| quackapi-w8 | 8 | 58,237 | 58,237 | 58,237 | 0.158 ms | 1.246 ms | valid |
+
+The measurement window was three seconds after a one-second warmup and a
+two-second warmup drain. Four requests had a roughly ten-second tail. This
+matches QuackAPI's current httplib transport: a worker owns an accepted socket
+until its ten-second keep-alive timeout, while each w8 process has four worker
+threads. Four idle reused connections can therefore strand later accepts in one
+SO_REUSEPORT process's queue. The delayed requests completed successfully and
+are included in the row-level acknowledgement check. The write-only 30-second
+k6 graceful stop prevents a server-side commit after client-side cancellation
+from being misreported as data loss. The head-of-line blocking is a production
+limitation to address with bounded connection lifecycle or nonblocking
+keep-alive handling; it is not a throughput claim.
+
+## Next performance priority
+
+Keep the reuse baseline unchanged. The next design iteration should move idle
+keep-alive sockets off request-worker threads, with bounded per-connection
+state and explicit admission when the active request queue is full. Validate it
+with both the existing closed-loop VU matrix and fixed arrival-rate workloads
+that report offered versus achieved rate, queue delay, timeouts, and per-worker
+connection distribution. That work is necessary before treating the current
+reuse-path numbers as production performance parity.
+
+## Final comparison
+
+The consolidated run is preserved at
+`bench/results/20260908T051111Z-81854`. It covered 24 cells (four stacks ×
+`hello`, `item`, `rows`, `write`; `item` and `write` at 1 and 8 VUs). Every
+cell was valid: zero HTTP failures, zero check failures, k6 exit 0, and write
+acknowledgements exactly matched committed rows. The measurement was 1 second
+warmup, 3 seconds, and a 2 second write drain. The source tree was dirty because
+the smoke ran before this documentation update; the exact source SHA, binary
+SHA-256 values, dependency versions, budgets, and trial order are in that run's
+`env.txt`.
+
+Representative 8-VU results (successful requests per second; p50/p99 in ms):
+
+| Stack | hello | item | rows | write |
+|---|---:|---:|---:|---:|
+| quackapi-w1 | 46,305; 0.132/0.660 | 43,083; 0.142/0.791 | 3,346; 1.499/2.127 | 29,687; 0.211/0.931 |
+| quackapi-w8 | 33,131; 0.092/0.620 | 29,676; 0.104/0.753 | 1,808; 1.493/8.593 | 19,686; 0.155/1.104 |
+| fastapi-w1 | 8,624; 0.877/1.438 | 5,436; 1.407/2.254 | 594; 12.405/21.414 | 5,153; 1.474/2.465 |
+| fastapi-w8 | 19,314; 0.388/0.785 | 14,895; 0.477/1.197 | 2,041; 3.238/9.918 | 11,342; 0.630/1.373 |
+
+These short closed-loop numbers are directional evidence, not a production
+parity claim. QuackAPI leads this run on these PostgreSQL-backed routes, but its
+eight-worker write cell has a 10,027.811 ms maximum caused by the documented
+per-connection worker head-of-line behavior. The raw samples and all 1-VU cells
+remain in the preserved result directory; report generation excludes no valid
+cell.

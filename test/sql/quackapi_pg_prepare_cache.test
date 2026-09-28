@@ -16,7 +16,7 @@ statement ok
 SET threads = 1;
 
 statement ok
-SET quackapi_pg_dsn = 'postgresql://quackapi_pg_cache:qa_pg_cache_test@/quackapi_pg_cache_test?host=/tmp';
+SET quackapi_pg_dsn = '${QUACKAPI_TEST_PG_DSN}';
 
 # ---------------------------------------------------------------------------
 # PQprepare was keyed only by pg_sql. Missing: catalog type OID identity.
@@ -49,6 +49,42 @@ query II
 SELECT status, decode(body) FROM quackapi_request('GET', '/qa_pg_cast/5');
 ----
 200	[{"v":5,"id":5}]
+
+# A PostgreSQL execution failure is authoritative once the native path has
+# dispatched it. It must not silently replay the route against DuckDB.
+statement ok
+CREATE OR REPLACE ROUTE qa_pg_no_replay GET '/qa_pg_no_replay' AS
+  SELECT current_setting('quackapi_missing_setting') AS v;
+
+query I
+SELECT status FROM quackapi_request('GET', '/qa_pg_no_replay');
+----
+502
+
+# Native libpq I/O and the backend statement both inherit the request deadline.
+# The response must terminate as a timeout rather than falling through to the
+# DuckDB path after PostgreSQL has accepted the command.
+statement ok
+CREATE OR REPLACE ROUTE qa_pg_deadline GET '/qa_pg_deadline' AS
+  SELECT pg_sleep(0.25) AS delayed;
+
+query I
+SELECT status FROM quackapi_request('GET', '/qa_pg_deadline', query_timeout_ms := 100);
+----
+504
+
+# Wire text must retain its declared SQL type and SQL rewriting must leave
+# literals/comments alone. Explicit parameter casts must survive translation.
+statement ok
+CREATE OR REPLACE ROUTE qa_pg_types GET '/qa_pg_types/:id' AS
+SELECT '0012'::TEXT AS code, true AS enabled, false AS disabled,
+       'pg.$phantom postgres_query'::TEXT AS literal,
+       $id::INTEGER AS id, NULL::TEXT AS missing; -- $comment pg.nope
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/qa_pg_types/7');
+----
+200	[{"code":"0012","enabled":true,"disabled":false,"literal":"pg.$phantom postgres_query","id":7,"missing":null}]
 
 # Redefine domain (new OID, same SQL text for the cast route).
 query II

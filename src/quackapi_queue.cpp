@@ -75,9 +75,21 @@ void EnsureQuackapiJobsTable(DatabaseInstance &db) {
 	       "created_at TIMESTAMP NOT NULL, "
 	       "updated_at TIMESTAMP NOT NULL, "
 	       "last_error VARCHAR, "
+	       "delivery_generation BIGINT NOT NULL DEFAULT 0, "
 	       "worker_id VARCHAR"
 	       ")",
 	       "create table");
+	// Existing durable queue tables predate delivery fencing. The generation is
+	// intentionally persisted with the job: a process restart must not make a
+	// stale worker's completion valid again.
+	RunSQL(db,
+	       "ALTER TABLE quackapi_jobs "
+	       // DuckDB cannot ADD COLUMN with a NOT NULL constraint. New tables use
+	       // the constraint above; old durable tables are safely backfilled here.
+	       "ADD COLUMN IF NOT EXISTS delivery_generation BIGINT DEFAULT 0",
+	       "migrate delivery generation");
+	RunSQL(db, "UPDATE quackapi_jobs SET delivery_generation = 0 WHERE delivery_generation IS NULL",
+	       "backfill delivery generation");
 	RunSQL(db,
 	       "CREATE INDEX IF NOT EXISTS idx_quackapi_jobs_ready "
 	       "ON quackapi_jobs (queue, status, visible_at, id)",
@@ -521,30 +533,50 @@ unique_ptr<FunctionData> DequeueBind(ClientContext &, TableFunctionBindInput &in
 	if (bind_data->n > 1000) {
 		throw InvalidInputException("quackapi_dequeue: n max is 1000");
 	}
-	return_types = {LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR,
-	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::TIMESTAMP, LogicalType::VARCHAR};
-	names = {"id", "queue", "payload", "status", "attempts", "max_attempts", "visible_at", "last_error"};
+	return_types = {LogicalType::BIGINT,    LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,   LogicalType::INTEGER, LogicalType::INTEGER,
+	                LogicalType::TIMESTAMP, LogicalType::VARCHAR, LogicalType::BIGINT};
+	names = {"id",         "queue",      "payload",
+	         "status",     "attempts",   "max_attempts",
+	         "visible_at", "last_error", "delivery_generation"};
 	return std::move(bind_data);
 }
 
-bool HasLiveLocalLease(unordered_map<string, unordered_map<int64_t, int64_t>> &leases, const string &queue_name,
-                       int64_t now_micros) {
-	auto it = leases.find(queue_name);
-	if (it == leases.end()) {
-		return false;
-	}
-	for (auto jit = it->second.begin(); jit != it->second.end();) {
-		if (jit->second > now_micros) {
-			++jit;
-		} else {
-			jit = it->second.erase(jit);
-		}
-	}
-	if (it->second.empty()) {
-		leases.erase(it);
-		return false;
-	}
-	return true;
+//! Recover every expired delivery in a queue. This deliberately does not use
+//! a queue-wide "live lease" gate: one active job must never delay recovery of
+//! another job whose lease already expired.
+void RecoverExpiredJobs(Connection &con, const string &queue_name) {
+	// A legacy database can contain an exhausted pending row from the old expiry
+	// path. Dead-letter it before claiming so an upgrade cannot create attempt
+	// max_attempts + 1.
+	string exhausted_pending_sql =
+	    StringUtil::Format("UPDATE quackapi_jobs SET status = 'dead', visible_at = now()::TIMESTAMP, "
+	                       "updated_at = now()::TIMESTAMP, worker_id = NULL, "
+	                       "last_error = COALESCE(last_error, 'attempt limit reached before delivery') "
+	                       "WHERE queue = %s AND status = 'pending' AND attempts >= max_attempts",
+	                       SqlQuote(queue_name));
+	auto exhausted_pending = con.Query(exhausted_pending_sql);
+	CheckQuery(exhausted_pending, "dequeue exhausted-pending sweep");
+
+	// A timed-out final delivery is terminal. Other timed-out deliveries become
+	// pending atomically with the state transition and can be claimed below.
+	string exhausted_running_sql =
+	    StringUtil::Format("UPDATE quackapi_jobs SET status = 'dead', visible_at = now()::TIMESTAMP, "
+	                       "updated_at = now()::TIMESTAMP, worker_id = NULL, "
+	                       "last_error = 'visibility lease expired after maximum attempts' "
+	                       "WHERE queue = %s AND status = 'running' "
+	                       "AND visible_at <= now()::TIMESTAMP AND attempts >= max_attempts",
+	                       SqlQuote(queue_name));
+	auto exhausted_running = con.Query(exhausted_running_sql);
+	CheckQuery(exhausted_running, "dequeue exhausted-running sweep");
+
+	string retry_sql = StringUtil::Format("UPDATE quackapi_jobs SET status = 'pending', visible_at = now()::TIMESTAMP, "
+	                                      "updated_at = now()::TIMESTAMP, worker_id = NULL "
+	                                      "WHERE queue = %s AND status = 'running' "
+	                                      "AND visible_at <= now()::TIMESTAMP AND attempts < max_attempts",
+	                                      SqlQuote(queue_name));
+	auto retry = con.Query(retry_sql);
+	CheckQuery(retry, "dequeue expiry sweep");
 }
 
 unique_ptr<MaterializedQueryResult> ClaimPendingJob(Connection &con, const string &queue_name,
@@ -553,18 +585,21 @@ unique_ptr<MaterializedQueryResult> ClaimPendingJob(Connection &con, const strin
 	    StringUtil::Format("UPDATE quackapi_jobs SET "
 	                       "status = 'running', "
 	                       "attempts = attempts + 1, "
+	                       "delivery_generation = delivery_generation + 1, "
 	                       "visible_at = now()::TIMESTAMP + to_seconds(%d), "
 	                       "updated_at = now()::TIMESTAMP, "
-	                       "worker_id = 'dequeue' "
+	                       "worker_id = NULL "
 	                       "WHERE id = ("
 	                       "  SELECT id FROM quackapi_jobs "
 	                       "  WHERE queue = %s "
 	                       "    AND status = 'pending' "
+	                       "    AND attempts < max_attempts "
 	                       "    AND visible_at <= now()::TIMESTAMP "
 	                       "  ORDER BY id LIMIT 1"
 	                       ") "
 	                       "AND status = 'pending' "
-	                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error",
+	                       "RETURNING id, queue, payload, status, attempts, max_attempts, visible_at, last_error, "
+	                       "delivery_generation",
 	                       visibility_timeout_sec, SqlQuote(queue_name));
 	unique_ptr<MaterializedQueryResult> res;
 	for (int attempt = 0; attempt < 8; attempt++) {
@@ -589,41 +624,23 @@ unique_ptr<GlobalTableFunctionState> DequeueInit(ClientContext &context, TableFu
 	auto q = RequireQueue(*context.db, bind.queue_name);
 	EnsureQuackapiJobsTable(*context.db);
 
-	// Gate lives on QuackapiState (one per DatabaseInstance) so static and
-	// loadable extension copies share the same mutex + lease map.
+	// The gate lives on QuackapiState (one per DatabaseInstance) so static and
+	// loadable extension copies serialize claims, expiry recovery, and delivery
+	// transitions through the same mutex.
 	auto &qa = QuackapiState::Get(*context.db);
 	std::lock_guard<std::mutex> claim_lock(qa.DequeueClaimMutex());
-	auto &leases = qa.DequeueLeases();
 
 	Connection con(*context.db);
 	for (int32_t i = 0; i < bind.n; i++) {
-		const int64_t now_micros = Timestamp::GetCurrentTimestamp().value;
-		const bool live_lease = HasLiveLocalLease(leases, bind.queue_name, now_micros);
-
-		// Pending-only claim first. While an in-process lease is live, do NOT
-		// sweep: a visibility-window reclaim mid claim-storm is what produces
-		// winner_ids=[3,3] under the mutex (attempts 1 then 2).
+		RecoverExpiredJobs(con, bind.queue_name);
 		auto res = ClaimPendingJob(con, bind.queue_name, q.visibility_timeout_sec);
-		if (res->RowCount() == 0 && !live_lease) {
-			string sweep_sql =
-			    StringUtil::Format("UPDATE quackapi_jobs SET status = 'pending', worker_id = NULL, "
-			                       "updated_at = now()::TIMESTAMP "
-			                       "WHERE queue = %s AND status = 'running' AND visible_at <= now()::TIMESTAMP",
-			                       SqlQuote(bind.queue_name));
-			auto sweep = con.Query(sweep_sql);
-			CheckQuery(sweep, "dequeue-sweep");
-			res = ClaimPendingJob(con, bind.queue_name, q.visibility_timeout_sec);
-		}
 		if (res->RowCount() == 0) {
 			break;
 		}
 		vector<Value> row;
-		for (idx_t c = 0; c < 8; c++) {
+		for (idx_t c = 0; c < 9; c++) {
 			row.push_back(res->GetValue(c, 0));
 		}
-		const int64_t job_id = row[0].GetValue<int64_t>();
-		leases[bind.queue_name][job_id] =
-		    Timestamp::GetCurrentTimestamp().value + int64_t(q.visibility_timeout_sec) * 1000000LL;
 		state->rows.push_back(std::move(row));
 	}
 	return std::move(state);
@@ -634,7 +651,7 @@ void DequeueExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output)
 	idx_t row = 0;
 	while (state.offset < state.rows.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &r = state.rows[state.offset];
-		for (idx_t c = 0; c < 8; c++) {
+		for (idx_t c = 0; c < 9; c++) {
 			output.SetValue(c, row, r[c]);
 		}
 		row++;
@@ -644,17 +661,20 @@ void DequeueExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output)
 }
 
 //===--------------------------------------------------------------------===//
-// quackapi_ack(queue, job_id) → BOOLEAN
+// quackapi_ack(queue, job_id, delivery_generation) → BOOLEAN
 //===--------------------------------------------------------------------===//
 
-bool AckJob(DatabaseInstance &db, const string &queue_name, int64_t job_id) {
+bool AckJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, int64_t delivery_generation) {
 	RequireQueue(db, queue_name);
+	auto &qa = QuackapiState::Get(db);
+	std::lock_guard<std::mutex> lock(qa.DequeueClaimMutex());
 	EnsureQuackapiJobsTable(db);
-	string sql =
-	    StringUtil::Format("UPDATE quackapi_jobs SET status = 'done', updated_at = now()::TIMESTAMP, worker_id = NULL "
-	                       "WHERE id = %lld AND queue = %s AND status = 'running' "
-	                       "RETURNING id",
-	                       static_cast<long long>(job_id), SqlQuote(queue_name));
+	string sql = StringUtil::Format(
+	    "UPDATE quackapi_jobs SET status = 'done', updated_at = now()::TIMESTAMP, worker_id = NULL "
+	    "WHERE id = %lld AND queue = %s AND status = 'running' "
+	    "AND delivery_generation = %lld AND visible_at > now()::TIMESTAMP "
+	    "RETURNING id",
+	    static_cast<long long>(job_id), SqlQuote(queue_name), static_cast<long long>(delivery_generation));
 	Connection con(db);
 	auto res = con.Query(sql);
 	CheckQuery(res, "ack");
@@ -663,43 +683,52 @@ bool AckJob(DatabaseInstance &db, const string &queue_name, int64_t job_id) {
 
 void AckScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
-	UnifiedVectorFormat qdata, idata;
+	UnifiedVectorFormat qdata, idata, gdata;
 	args.data[0].ToUnifiedFormat(args.size(), qdata);
 	args.data[1].ToUnifiedFormat(args.size(), idata);
+	args.data[2].ToUnifiedFormat(args.size(), gdata);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto out = FlatVector::GetData<bool>(result);
 	auto &validity = FlatVector::Validity(result);
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto ii = idata.sel->get_index(i);
-		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii)) {
+		auto gi = gdata.sel->get_index(i);
+		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii) || !gdata.validity.RowIsValid(gi)) {
 			validity.SetInvalid(i);
 			continue;
 		}
 		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
 		auto jid = UnifiedVectorFormat::GetData<int64_t>(idata)[ii];
-		out[i] = AckJob(db, qn, jid);
+		auto generation = UnifiedVectorFormat::GetData<int64_t>(gdata)[gi];
+		out[i] = AckJob(db, qn, jid, generation);
 	}
 }
 
 //===--------------------------------------------------------------------===//
-// quackapi_nack(queue, job_id [, requeue [, error]]) → VARCHAR status
+// quackapi_nack(queue, job_id, delivery_generation [, requeue [, error]]) → VARCHAR status
 //===--------------------------------------------------------------------===//
 
-string NackJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, bool requeue, const string &error) {
+string NackJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, int64_t delivery_generation,
+               bool requeue, const string &error) {
 	auto q = RequireQueue(db, queue_name);
+	auto &qa = QuackapiState::Get(db);
+	std::lock_guard<std::mutex> lock(qa.DequeueClaimMutex());
 	EnsureQuackapiJobsTable(db);
 
-	// Read current attempts/max for decision; single-writer so this is safe.
+	// The shared delivery lock keeps this read and conditional transition one
+	// queue operation. The generation + unexpired-lease predicate is repeated in
+	// the UPDATE so the ownership proof remains explicit in the SQL itself.
 	string read_sql = StringUtil::Format("SELECT attempts, max_attempts FROM quackapi_jobs "
-	                                     "WHERE id = %lld AND queue = %s AND status = 'running'",
-	                                     static_cast<long long>(job_id), SqlQuote(queue_name));
+	                                     "WHERE id = %lld AND queue = %s AND status = 'running' "
+	                                     "AND delivery_generation = %lld AND visible_at > now()::TIMESTAMP",
+	                                     static_cast<long long>(job_id), SqlQuote(queue_name),
+	                                     static_cast<long long>(delivery_generation));
 	Connection con(db);
 	auto read = con.Query(read_sql);
 	CheckQuery(read, "nack read");
 	if (read->RowCount() == 0) {
-		throw InvalidInputException("quackapi_nack: job %lld not running on queue \"%s\"",
-		                            static_cast<long long>(job_id), queue_name);
+		return "stale";
 	}
 	int32_t attempts = read->GetValue(0, 0).GetValue<int32_t>();
 	int32_t max_att = read->GetValue(1, 0).GetValue<int32_t>();
@@ -730,39 +759,42 @@ string NackJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, b
 		                         "visible_at = now()::TIMESTAMP, "
 		                         "last_error = %s, updated_at = now()::TIMESTAMP, worker_id = NULL "
 		                         "WHERE id = %lld AND queue = %s AND status = 'running' "
+		                         "AND delivery_generation = %lld AND visible_at > now()::TIMESTAMP "
 		                         "RETURNING status",
 		                         SqlQuote(error.empty() ? "nack" : error), static_cast<long long>(job_id),
-		                         SqlQuote(queue_name));
+		                         SqlQuote(queue_name), static_cast<long long>(delivery_generation));
 	} else {
 		sql = StringUtil::Format("UPDATE quackapi_jobs SET status = 'pending', "
 		                         "visible_at = now()::TIMESTAMP + to_seconds(%d), "
 		                         "last_error = %s, updated_at = now()::TIMESTAMP, worker_id = NULL "
 		                         "WHERE id = %lld AND queue = %s AND status = 'running' "
+		                         "AND delivery_generation = %lld AND visible_at > now()::TIMESTAMP "
 		                         "RETURNING status",
 		                         backoff, SqlQuote(error.empty() ? "nack" : error), static_cast<long long>(job_id),
-		                         SqlQuote(queue_name));
+		                         SqlQuote(queue_name), static_cast<long long>(delivery_generation));
 	}
 	auto res = con.Query(sql);
 	CheckQuery(res, "nack");
 	if (res->RowCount() == 0) {
-		throw InvalidInputException("quackapi_nack: job %lld disappeared", static_cast<long long>(job_id));
+		return "stale";
 	}
 	return res->GetValue(0, 0).GetValue<string>();
 }
 
-//! nack(queue, job_id [, requeue [, error]]) — one body, optional args by arity.
+//! nack(queue, job_id, delivery_generation [, requeue [, error]]) — one body, optional args by arity.
 void NackScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
-	UnifiedVectorFormat qdata, idata, rdata, edata;
+	UnifiedVectorFormat qdata, idata, gdata, rdata, edata;
 	args.data[0].ToUnifiedFormat(args.size(), qdata);
 	args.data[1].ToUnifiedFormat(args.size(), idata);
-	const bool has_requeue = args.ColumnCount() >= 3;
-	const bool has_error = args.ColumnCount() >= 4;
+	args.data[2].ToUnifiedFormat(args.size(), gdata);
+	const bool has_requeue = args.ColumnCount() >= 4;
+	const bool has_error = args.ColumnCount() >= 5;
 	if (has_requeue) {
-		args.data[2].ToUnifiedFormat(args.size(), rdata);
+		args.data[3].ToUnifiedFormat(args.size(), rdata);
 	}
 	if (has_error) {
-		args.data[3].ToUnifiedFormat(args.size(), edata);
+		args.data[4].ToUnifiedFormat(args.size(), edata);
 	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto out = FlatVector::GetData<string_t>(result);
@@ -770,12 +802,14 @@ void NackScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto qi = qdata.sel->get_index(i);
 		auto ii = idata.sel->get_index(i);
-		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii)) {
+		auto gi = gdata.sel->get_index(i);
+		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii) || !gdata.validity.RowIsValid(gi)) {
 			validity.SetInvalid(i);
 			continue;
 		}
 		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
 		auto jid = UnifiedVectorFormat::GetData<int64_t>(idata)[ii];
+		auto generation = UnifiedVectorFormat::GetData<int64_t>(gdata)[gi];
 		bool requeue = true;
 		if (has_requeue) {
 			auto ri = rdata.sel->get_index(i);
@@ -790,8 +824,54 @@ void NackScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 				err = UnifiedVectorFormat::GetData<string_t>(edata)[ei].GetString();
 			}
 		}
-		auto st = NackJob(db, qn, jid, requeue, err);
+		auto st = NackJob(db, qn, jid, generation, requeue, err);
 		out[i] = StringVector::AddString(result, st);
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// quackapi_renew(queue, job_id, delivery_generation) → BOOLEAN
+//===--------------------------------------------------------------------===//
+
+bool RenewJob(DatabaseInstance &db, const string &queue_name, int64_t job_id, int64_t delivery_generation) {
+	auto q = RequireQueue(db, queue_name);
+	auto &qa = QuackapiState::Get(db);
+	std::lock_guard<std::mutex> lock(qa.DequeueClaimMutex());
+	EnsureQuackapiJobsTable(db);
+	string sql = StringUtil::Format("UPDATE quackapi_jobs SET visible_at = now()::TIMESTAMP + to_seconds(%d), "
+	                                "updated_at = now()::TIMESTAMP "
+	                                "WHERE id = %lld AND queue = %s AND status = 'running' "
+	                                "AND delivery_generation = %lld AND visible_at > now()::TIMESTAMP "
+	                                "RETURNING id",
+	                                q.visibility_timeout_sec, static_cast<long long>(job_id), SqlQuote(queue_name),
+	                                static_cast<long long>(delivery_generation));
+	Connection con(db);
+	auto res = con.Query(sql);
+	CheckQuery(res, "renew");
+	return res->RowCount() > 0;
+}
+
+void RenewScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &db = *state.GetContext().db;
+	UnifiedVectorFormat qdata, idata, gdata;
+	args.data[0].ToUnifiedFormat(args.size(), qdata);
+	args.data[1].ToUnifiedFormat(args.size(), idata);
+	args.data[2].ToUnifiedFormat(args.size(), gdata);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetData<bool>(result);
+	auto &validity = FlatVector::Validity(result);
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto qi = qdata.sel->get_index(i);
+		auto ii = idata.sel->get_index(i);
+		auto gi = gdata.sel->get_index(i);
+		if (!qdata.validity.RowIsValid(qi) || !idata.validity.RowIsValid(ii) || !gdata.validity.RowIsValid(gi)) {
+			validity.SetInvalid(i);
+			continue;
+		}
+		auto qn = UnifiedVectorFormat::GetData<string_t>(qdata)[qi].GetString();
+		auto jid = UnifiedVectorFormat::GetData<int64_t>(idata)[ii];
+		auto generation = UnifiedVectorFormat::GetData<int64_t>(gdata)[gi];
+		out[i] = RenewJob(db, qn, jid, generation);
 	}
 }
 
@@ -923,21 +1003,30 @@ void RegisterQuackapiQueueFunctions(ExtensionLoader &loader) {
 	dequeue_set.AddFunction(dequeue2);
 	loader.RegisterFunction(dequeue_set);
 
-	// ack(queue, job_id) → bool
-	loader.RegisterFunction(
-	    ScalarFunction("quackapi_ack", {LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::BOOLEAN, AckScalar));
+	// Delivery ownership is mandatory. The retired two-argument form could let
+	// an expired worker complete a newer delivery of the same job.
+	loader.RegisterFunction(ScalarFunction("quackapi_ack",
+	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                                       LogicalType::BOOLEAN, AckScalar));
 
-	// nack(queue, job_id) / nack(queue, job_id, requeue) / nack(queue, job_id, requeue, error)
+	// nack(queue, job_id, delivery_generation [, requeue [, error]])
 	ScalarFunctionSet nack_set("quackapi_nack");
-	nack_set.AddFunction(
-	    ScalarFunction("quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR, NackScalar));
 	nack_set.AddFunction(ScalarFunction("quackapi_nack",
-	                                    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN},
+	                                    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
 	                                    LogicalType::VARCHAR, NackScalar));
 	nack_set.AddFunction(ScalarFunction(
-	    "quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::VARCHAR},
+	    "quackapi_nack", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BOOLEAN},
+	    LogicalType::VARCHAR, NackScalar));
+	nack_set.AddFunction(ScalarFunction(
+	    "quackapi_nack",
+	    {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::VARCHAR},
 	    LogicalType::VARCHAR, NackScalar));
 	loader.RegisterFunction(nack_set);
+
+	// renew(queue, job_id, delivery_generation) → bool
+	loader.RegisterFunction(ScalarFunction("quackapi_renew",
+	                                       {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                                       LogicalType::BOOLEAN, RenewScalar));
 
 	// queues() inspection
 	loader.RegisterFunction(TableFunction("quackapi_queues", {}, QueuesExec, QueuesBind, QueuesInit));

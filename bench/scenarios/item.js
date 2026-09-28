@@ -45,7 +45,7 @@ export const options = {
 export function item() {
   // bench_rows has ids 0..99999 — stay in range so this is a real lookup hit,
   // not a near-universal miss on an id that was never seeded.
-  const id = Math.floor(Math.random() * 100_000);
+  const id = (__VU * 1009 + __ITER) % 100_000;
   // name tag collapses high-cardinality /items/<id> URLs into one series.
   const res = http.get(`${BASE_URL}/items/${id}`, {
     tags: { name: 'GET /items/:id' },
@@ -66,8 +66,10 @@ export function item() {
   } catch (_) {
     shapeOk = false;
   }
+  const statusOk = res.status >= 200 && res.status < 300;
   check(res, {
-    'status 2xx': (r) => r.status >= 200 && r.status < 300,
+    'status 2xx': () => statusOk,
     'body shape [{id,name}]': () => shapeOk,
+    'request contract': () => statusOk && shapeOk,
   });
 }

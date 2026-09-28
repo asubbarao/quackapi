@@ -1,15 +1,16 @@
 """FastAPI as an LLM API gateway -- stack B for the ollama/pgEdge suite.
 
 Mirrors bench/llm_routes.sql exactly: inbound request -> call ollama -> durably
-log the VERBATIM upstream body -> respond, with logging kept off the response
-path. FastAPI's idiomatic way to do that is BackgroundTasks + a pooled asyncpg
-insert into the same pgEdge sink quackapi's drainer writes to.
+log the VERBATIM upstream body -> respond. The default mode awaits the pooled
+asyncpg insert so it matches quackapi's durable enqueue-before-response
+contract; an explicitly selected ``LLM_DURABILITY_MODE=deferred`` mode uses
+BackgroundTasks for a lower-latency but lossy comparison.
 
-Worth naming, because it is the architectural difference the suite exists to
-show: BackgroundTasks is NOT durable. If the process dies between responding and
+BackgroundTasks is NOT durable. If the process dies between responding and
 draining, those log rows are gone -- there is no on-disk job record to retry
 from. quackapi's queue is a WAL-backed table, so the same crash is recoverable.
-Both stacks are measured on latency here; durability is a property, not a number.
+The benchmark must label deferred and durable modes separately; durability is a
+property, not a latency number.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import os
 
 import asyncpg
 import httpx
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 PG_DSN = os.environ.get(
@@ -28,6 +29,7 @@ PG_DSN = os.environ.get(
 app = FastAPI()
 client: httpx.AsyncClient | None = None
 pool: asyncpg.Pool | None = None
+DURABILITY_MODE = os.environ.get("LLM_DURABILITY_MODE", "durable")
 
 INSERT_SQL = """
 INSERT INTO llm_calls (host, source, api, model, request, raw)
@@ -62,29 +64,56 @@ async def _log(api: str, model: str, request: dict, raw: str) -> None:
         )
 
 
+async def _record(bg: BackgroundTasks, api: str, model: str, request: dict, raw: str) -> None:
+    # The default matches quackapi's durable enqueue-before-response contract.
+    # Deferred logging is available for an explicitly named, lower-latency mode
+    # but must never be presented as an apples-to-apples durability comparison.
+    if DURABILITY_MODE == "deferred":
+        bg.add_task(_log, api, model, request, raw)
+    else:
+        await _log(api, model, request, raw)
+
+
 @app.post("/llm/embed")
 async def embed(bg: BackgroundTasks, model: str, prompt: str):
     assert client is not None
     req = {"model": model, "prompt": prompt}
-    r = await client.post(f"{OLLAMA}/api/embeddings", json=req)
+    try:
+        r = await client.post(f"{OLLAMA}/api/embeddings", json=req)
+        r.raise_for_status()
+        d = r.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="ollama embedding request failed") from exc
+    embedding = d.get("embedding") if isinstance(d, dict) else None
+    if not isinstance(embedding, list) or not embedding:
+        raise HTTPException(status_code=502, detail="ollama embedding response is invalid")
     raw = r.text
-    bg.add_task(_log, "embeddings", model, req, raw)
-    return {"dims": len(json.loads(raw).get("embedding") or [])}
+    await _record(bg, "embeddings", model, req, raw)
+    return {"dims": len(embedding)}
 
 
 @app.post("/llm/ask")
 async def ask(bg: BackgroundTasks, model: str, prompt: str, num_predict: int = 16):
     assert client is not None
     req = {"model": model, "prompt": prompt}
-    r = await client.post(
-        f"{OLLAMA}/api/generate",
-        json={**req, "stream": False, "options": {"num_predict": num_predict}},
-    )
+    try:
+        r = await client.post(
+            f"{OLLAMA}/api/generate",
+            json={**req, "stream": False, "options": {"num_predict": num_predict}},
+        )
+        r.raise_for_status()
+        d = r.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="ollama generation request failed") from exc
     raw = r.text
-    d = json.loads(raw)
-    bg.add_task(_log, "generate", model, req, raw)
+    if not isinstance(d, dict) or not isinstance(d.get("response"), str):
+        raise HTTPException(status_code=502, detail="ollama generation response is invalid")
+    total_duration = d.get("total_duration")
+    if not isinstance(total_duration, (int, float)) or total_duration <= 0:
+        raise HTTPException(status_code=502, detail="ollama generation timing is invalid")
+    await _record(bg, "generate", model, req, raw)
     return {
         "response": d.get("response"),
-        "ollama_total_ms": (d.get("total_duration") or 0) / 1e6,
+        "ollama_total_ms": total_duration / 1e6,
         "out_tokens": d.get("eval_count"),
     }

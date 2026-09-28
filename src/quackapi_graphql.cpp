@@ -1,5 +1,7 @@
 #include "quackapi_graphql.hpp"
 
+#include <algorithm>
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -7,9 +9,12 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
+#include "quackapi_limits.hpp"
+#include "quackapi_policy.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
 
@@ -94,10 +99,23 @@ struct GraphqlDocument {
 	string error;
 };
 
+bool ContainsGraphqlName(const vector<string> &names, const string &name) {
+	for (auto &existing : names) {
+		if (existing == name) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! Parse only: [query [Name]] { Field { Name+ }+ }
 //! Field must have a nested selection set of leaf column names (no deeper nest).
 GraphqlDocument ParseThinGraphql(const string &doc) {
 	GraphqlDocument out;
+	if (doc.size() > QUACKAPI_GRAPHQL_MAX_DOCUMENT_BYTES) {
+		out.error = "GraphQL document exceeds the 64 KiB limit";
+		return out;
+	}
 	idx_t i = 0;
 	SkipWs(doc, i);
 	if (i >= doc.size()) {
@@ -186,13 +204,39 @@ GraphqlDocument ParseThinGraphql(const string &doc) {
 				out.error = "field arguments are not supported in GraphQL v0";
 				return out;
 			}
+			if (ContainsGraphqlName(field.columns, col)) {
+				out.error = "duplicate column '" + col + "' in " + field_name;
+				return out;
+			}
 			field.columns.push_back(col);
+			if (field.columns.size() > QUACKAPI_GRAPHQL_MAX_COLUMNS_PER_FIELD) {
+				out.error = "selection for " + field_name + " exceeds the column limit";
+				return out;
+			}
 		}
 		if (field.columns.empty()) {
 			out.error = "selection set for " + field_name + " must list at least one column";
 			return out;
 		}
+		for (auto &existing : out.roots) {
+			if (existing.name == field.name) {
+				out.error = "duplicate root field '" + field.name + "' is not supported in GraphQL v0";
+				return out;
+			}
+		}
 		out.roots.push_back(std::move(field));
+		if (out.roots.size() > QUACKAPI_GRAPHQL_MAX_ROOT_FIELDS) {
+			out.error = "GraphQL document exceeds the root-field limit";
+			return out;
+		}
+		idx_t total_fields = 0;
+		for (auto &root : out.roots) {
+			total_fields += root.columns.size();
+		}
+		if (total_fields > QUACKAPI_GRAPHQL_MAX_TOTAL_FIELDS) {
+			out.error = "GraphQL document exceeds the total-field limit";
+			return out;
+		}
 	}
 
 	SkipWs(doc, i);
@@ -207,31 +251,101 @@ GraphqlDocument ParseThinGraphql(const string &doc) {
 	return out;
 }
 
-bool TableExists(Connection &con, const string &table) {
-	// Catalog truth — schema main, non-internal. Case-sensitive match on stored name.
-	auto res = con.Query("SELECT 1 FROM duckdb_tables() WHERE schema_name = 'main' AND NOT internal "
-	                     "AND table_name = ? LIMIT 1",
-	                     Value(table));
+struct GraphqlCatalogObject {
+	string database_name;
+	string schema_name;
+	string object_name;
+	vector<string> columns;
+};
+
+//! Built-in GraphQL is deliberately scoped to the current database's main
+//! schema. The catalog identity is kept with every object and reused in the
+//! generated SELECT, so an attached catalog or a same-named temporary object
+//! cannot be selected after validation.
+bool LoadGraphqlCatalog(Connection &con, unordered_map<string, GraphqlCatalogObject> &objects, string &err) {
+	objects.clear();
+	auto res = con.Query(
+	    "WITH objects AS ("
+	    "  SELECT database_name, schema_name, table_name AS object_name FROM duckdb_tables() "
+	    "  WHERE database_name = current_database() AND schema_name = 'main' AND NOT internal AND NOT temporary "
+	    "  UNION ALL "
+	    "  SELECT database_name, schema_name, view_name AS object_name FROM duckdb_views() "
+	    "  WHERE database_name = current_database() AND schema_name = 'main' AND NOT internal AND NOT temporary"
+	    "), cols AS ("
+	    "  SELECT database_name, schema_name, table_name, column_name, column_index FROM duckdb_columns() "
+	    "  WHERE database_name = current_database() AND schema_name = 'main' AND NOT internal"
+	    ") "
+	    "SELECT o.database_name, o.schema_name, o.object_name, "
+	    "       coalesce(list(c.column_name ORDER BY c.column_index), []) AS columns "
+	    "FROM objects o LEFT JOIN cols c "
+	    "  ON c.database_name = o.database_name AND c.schema_name = o.schema_name AND c.table_name = o.object_name "
+	    "GROUP BY ALL ORDER BY o.object_name");
 	if (res->HasError()) {
+		err = res->GetError();
 		return false;
 	}
-	auto chunk = res->Fetch();
-	return chunk && chunk->size() > 0;
+	while (true) {
+		auto chunk = res->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			GraphqlCatalogObject object;
+			object.database_name = chunk->GetValue(0, row).ToString();
+			object.schema_name = chunk->GetValue(1, row).ToString();
+			object.object_name = chunk->GetValue(2, row).ToString();
+			auto cols = chunk->GetValue(3, row);
+			if (!cols.IsNull() && cols.type().id() == LogicalTypeId::LIST) {
+				for (auto &column : ListValue::GetChildren(cols)) {
+					if (!column.IsNull()) {
+						object.columns.push_back(column.ToString());
+					}
+				}
+			}
+			objects.emplace(object.object_name, std::move(object));
+		}
+	}
+	return true;
+}
+
+bool TableExists(Connection &con, const string &table) {
+	unordered_map<string, GraphqlCatalogObject> objects;
+	string err;
+	return LoadGraphqlCatalog(con, objects, err) && objects.find(table) != objects.end();
 }
 
 bool ColumnExists(Connection &con, const string &table, const string &column) {
-	auto res = con.Query("SELECT 1 FROM duckdb_columns() WHERE schema_name = 'main' AND NOT internal "
-	                     "AND table_name = ? AND column_name = ? LIMIT 1",
-	                     Value(table), Value(column));
-	if (res->HasError()) {
+	unordered_map<string, GraphqlCatalogObject> objects;
+	string err;
+	if (!LoadGraphqlCatalog(con, objects, err)) {
 		return false;
 	}
-	auto chunk = res->Fetch();
-	return chunk && chunk->size() > 0;
+	auto object = objects.find(table);
+	return object != objects.end() && ContainsGraphqlName(object->second.columns, column);
 }
 
-//! SELECT cols… FROM table LIMIT n → JSON array of row objects via DuckDB JSON.
-string SelectTableJson(Connection &con, const string &table, const vector<string> &columns, idx_t limit, string &err) {
+string QuoteGraphqlObject(const GraphqlCatalogObject &object) {
+	return QuoteIdent(object.database_name) + "." + QuoteIdent(object.schema_name) + "." +
+	       QuoteIdent(object.object_name);
+}
+
+bool GraphqlLegacyOpenEnabled(Connection &con) {
+	auto result = con.Query("SELECT current_setting('quackapi_graphql_allow_all')");
+	if (result->HasError()) {
+		return false;
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	return StringUtil::Lower(chunk->GetValue(0, 0).ToString()) == "true";
+}
+
+//! Execute a prevalidated source SELECT as a JSON array. Claims are only bound
+//! to named parameters generated by the policy rewriter; GraphQL input never
+//! becomes SQL text other than quoted catalog identifiers from the snapshot.
+string SelectTableJson(Connection &con, const string &source_sql, const vector<string> &columns,
+                       const GraphqlExecOptions &options, string &err) {
 	string select_list;
 	for (idx_t c = 0; c < columns.size(); c++) {
 		if (c > 0) {
@@ -249,21 +363,45 @@ string SelectTableJson(Connection &con, const string &table, const vector<string
 	}
 	json_obj += ")";
 
-	string sql = "SELECT coalesce(json_group_array(" + json_obj +
-	             "), '[]'::JSON)::VARCHAR FROM ("
-	             "SELECT " +
-	             select_list + " FROM " + QuoteIdent(table) + " LIMIT " + std::to_string(limit) + ") _gql";
-
-	auto res = con.Query(sql);
+	string sql =
+	    "SELECT coalesce(json_group_array(" + json_obj + "), '[]'::JSON)::VARCHAR FROM (" + source_sql + ") _gql";
+	QuackapiQueryDeadline deadline(con, options.query_timeout_ms);
+	auto prepared = con.Prepare(sql);
+	if (prepared->HasError()) {
+		err = prepared->GetError();
+		return {};
+	}
+	case_insensitive_map_t<BoundParameterData> values;
+	for (auto &entry : prepared->named_param_map) {
+		auto param = entry.first;
+		if (!StringUtil::StartsWith(StringUtil::Lower(param), "claims_")) {
+			err = "unexpected parameter in GraphQL query";
+			return {};
+		}
+		string claim_name = param.substr(7);
+		if (!options.claims) {
+			values[param] = BoundParameterData(Value());
+			continue;
+		}
+		auto claim = options.claims->find(claim_name);
+		values[param] =
+		    claim == options.claims->end() ? BoundParameterData(Value()) : BoundParameterData(Value(claim->second));
+	}
+	auto res = prepared->Execute(values);
 	if (res->HasError()) {
-		err = res->GetError();
+		err = deadline.Expired() ? "query deadline exceeded" : res->GetError();
 		return {};
 	}
 	auto chunk = res->Fetch();
 	if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).IsNull()) {
 		return "[]";
 	}
-	return chunk->GetValue(0, 0).ToString();
+	auto json = chunk->GetValue(0, 0).ToString();
+	if (json.size() > options.max_response_bytes) {
+		err = "GraphQL response exceeds configured byte limit";
+		return {};
+	}
+	return json;
 }
 
 //===--------------------------------------------------------------------===//
@@ -577,7 +715,11 @@ ParserExtensionParseResult GraphqlDdlParse(ParserExtensionInfo *, const string &
 						return ParserExtensionParseResult("LIMIT expects a positive integer");
 					}
 				}
-				limit = (idx_t)std::stoull(lim_s);
+				try {
+					limit = (idx_t)std::stoull(lim_s);
+				} catch (...) {
+					return ParserExtensionParseResult("LIMIT expects a positive integer");
+				}
 				if (limit == 0 || limit > 100000) {
 					return ParserExtensionParseResult("LIMIT must be between 1 and 100000");
 				}
@@ -689,7 +831,7 @@ void ApplyGraphqlExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 
 	if (bind_data.action == "CLEAR") {
 		state.ClearGraphqlTables();
-		EmitOneShotStatus(output, bind_data.finished, "GraphQL allowlist cleared (open catalog mode)");
+		EmitOneShotStatus(output, bind_data.finished, "GraphQL allowlist cleared (catalog closed)");
 		return;
 	}
 
@@ -794,8 +936,8 @@ void ApplyGraphqlExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 			}
 			msg += dropped[i];
 		}
-		if (!state.GraphqlAllowlistActive()) {
-			msg += " (allowlist empty → open catalog mode)";
+		if (state.SnapshotGraphqlTables().empty()) {
+			msg += " (allowlist empty → catalog closed)";
 		}
 		if (!missing.empty()) {
 			msg += "; not registered: ";
@@ -851,8 +993,9 @@ struct GraphqlTablesBindData : public TableFunctionData {};
 struct GraphqlTablesGlobalState : public GlobalTableFunctionState {
 	vector<string> tables;
 	bool allowlist_active = false;
+	bool legacy_open = false;
 	idx_t offset = 0;
-	bool emitted_open = false;
+	bool emitted_mode = false;
 };
 
 unique_ptr<FunctionData> GraphqlTablesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
@@ -868,21 +1011,23 @@ unique_ptr<GlobalTableFunctionState> GraphqlTablesInit(ClientContext &context, T
 	auto state = make_uniq<GraphqlTablesGlobalState>();
 	auto &api = QuackapiState::Get(*context.db);
 	state->tables = api.SnapshotGraphqlTables();
-	state->allowlist_active = !state->tables.empty();
+	Connection con(*context.db);
+	state->legacy_open = GraphqlLegacyOpenEnabled(con);
+	state->allowlist_active = !state->legacy_open && !state->tables.empty();
 	return std::move(state);
 }
 
 void GraphqlTablesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<GraphqlTablesGlobalState>();
 	if (!state.allowlist_active) {
-		// One informational row: open mode, no table_name.
-		if (state.emitted_open) {
+		// One informational row: explicit legacy open or secure closed mode.
+		if (state.emitted_mode) {
 			return;
 		}
-		output.SetValue(0, 0, Value("open"));
+		output.SetValue(0, 0, Value(state.legacy_open ? "open" : "disabled"));
 		output.SetValue(1, 0, Value());
 		output.SetCardinality(1);
-		state.emitted_open = true;
+		state.emitted_mode = true;
 		return;
 	}
 	idx_t row = 0;
@@ -944,12 +1089,23 @@ string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, const Grap
 	if (limit == 0) {
 		limit = QUACKAPI_GRAPHQL_DEFAULT_LIMIT;
 	}
+	limit = std::min(limit, QUACKAPI_GRAPHQL_MAX_TOTAL_ROWS / doc.roots.size());
 
 	auto &state = QuackapiState::Get(db);
 	const bool route_mode = options.allowed_tables != nullptr;
-	const bool global_allowlist = !route_mode && state.GraphqlAllowlistActive();
-
 	Connection con(db);
+	const bool legacy_open = !route_mode && GraphqlLegacyOpenEnabled(con);
+	const auto global_tables = state.SnapshotGraphqlTables();
+	const bool global_allowlist = !route_mode && !legacy_open;
+	unordered_map<string, GraphqlCatalogObject> catalog;
+	string catalog_error;
+	QuackapiQueryDeadline catalog_deadline(con, options.query_timeout_ms);
+	if (!LoadGraphqlCatalog(con, catalog, catalog_error)) {
+		return GraphqlError("schema catalog query failed: " + catalog_error);
+	}
+	if (catalog_deadline.Expired()) {
+		return GraphqlError("schema catalog query deadline exceeded");
+	}
 	string data = "{";
 	bool first = true;
 	for (auto &field : doc.roots) {
@@ -958,20 +1114,36 @@ string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, const Grap
 				return GraphqlError("table '" + field.name +
 				                    "' is not on this GraphQL route — CREATE GRAPHQL ROUTE … FROM " + field.name);
 			}
-		} else if (global_allowlist && !state.IsGraphqlTableAllowed(field.name)) {
+		} else if (global_allowlist && !TableInList(global_tables, field.name)) {
 			return GraphqlError("table '" + field.name + "' is not registered for GraphQL — CREATE GRAPHQL FOR TABLE " +
 			                    field.name);
 		}
-		if (!TableExists(con, field.name)) {
+		auto object = catalog.find(field.name);
+		if (object == catalog.end()) {
 			return GraphqlError("unknown table '" + field.name + "' (main schema catalog only)");
 		}
 		for (auto &col : field.columns) {
-			if (!ColumnExists(con, field.name, col)) {
+			if (!ContainsGraphqlName(object->second.columns, col)) {
 				return GraphqlError("unknown column '" + col + "' on table '" + field.name + "'");
 			}
 		}
+		string source_sql = "SELECT ";
+		for (idx_t c = 0; c < field.columns.size(); c++) {
+			if (c > 0) {
+				source_sql += ", ";
+			}
+			source_sql += QuoteIdent(field.columns[c]);
+		}
+		source_sql += " FROM " + QuoteGraphqlObject(object->second) + " LIMIT " + std::to_string(limit);
+		bool deny_unauthenticated = false;
+		string policy_error;
+		source_sql =
+		    RewriteHandlerWithPolicies(db, source_sql, options.authenticated, deny_unauthenticated, policy_error);
+		if (deny_unauthenticated || !policy_error.empty()) {
+			return GraphqlError("access denied by table policy");
+		}
 		string err;
-		string rows_json = SelectTableJson(con, field.name, field.columns, limit, err);
+		string rows_json = SelectTableJson(con, source_sql, field.columns, options, err);
 		if (!err.empty()) {
 			return GraphqlError("query failed for '" + field.name + "': " + err);
 		}
@@ -980,6 +1152,9 @@ string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, const Grap
 		}
 		first = false;
 		data += "\"" + QuackapiJsonEscape(field.name) + "\":" + rows_json;
+		if (data.size() > options.max_response_bytes) {
+			return GraphqlError("GraphQL response exceeds configured byte limit");
+		}
 	}
 	data += "}";
 	return "{\"data\":" + data + "}";
@@ -987,7 +1162,8 @@ string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, const Grap
 
 string GraphqlSchemaNote() {
 	return "GraphQL v0 catalog-only schema. Full __schema introspection not implemented. "
-	       "CREATE GRAPHQL FOR TABLE registers an allowlist for POST /graphql; empty = open. "
+	       "CREATE GRAPHQL FOR TABLE registers an allowlist for POST /graphql; empty = closed. "
+	       "SET GLOBAL quackapi_graphql_allow_all = true restores legacy open catalog mode. "
 	       "CREATE GRAPHQL ROUTE mounts named paths with per-route tables.";
 }
 
@@ -995,7 +1171,8 @@ string BuildGraphqlSchema(DatabaseInstance &db, const GraphqlExecOptions &option
 	Connection con(db);
 	auto &state = QuackapiState::Get(db);
 	const bool route_mode = options.allowed_tables != nullptr;
-	const bool allowlist = !route_mode && state.GraphqlAllowlistActive();
+	const bool legacy_open = !route_mode && GraphqlLegacyOpenEnabled(con);
+	const bool allowlist = !route_mode && !legacy_open;
 	vector<string> allowed;
 	if (route_mode) {
 		allowed = *options.allowed_tables;
@@ -1003,24 +1180,21 @@ string BuildGraphqlSchema(DatabaseInstance &db, const GraphqlExecOptions &option
 		allowed = state.SnapshotGraphqlTables();
 	}
 
-	// Group columns per table in main schema. Views included (duckdb_tables covers both).
-	auto res = con.Query("SELECT t.table_name, "
-	                     "coalesce(list(c.column_name ORDER BY c.column_index), []) AS cols "
-	                     "FROM duckdb_tables() t "
-	                     "LEFT JOIN duckdb_columns() c "
-	                     "  ON c.schema_name = t.schema_name AND c.table_name = t.table_name AND NOT c.internal "
-	                     "WHERE t.schema_name = 'main' AND NOT t.internal "
-	                     "GROUP BY ALL "
-	                     "ORDER BY t.table_name");
-	if (res->HasError()) {
-		return GraphqlError("schema catalog query failed: " + res->GetError());
+	unordered_map<string, GraphqlCatalogObject> catalog;
+	string catalog_error;
+	QuackapiQueryDeadline catalog_deadline(con, options.query_timeout_ms);
+	if (!LoadGraphqlCatalog(con, catalog, catalog_error)) {
+		return GraphqlError("schema catalog query failed: " + catalog_error);
+	}
+	if (catalog_deadline.Expired()) {
+		return GraphqlError("schema catalog query deadline exceeded");
 	}
 
 	string mode;
 	if (route_mode) {
 		mode = options.mode.empty() ? "route" : options.mode;
 	} else {
-		mode = allowlist ? "allowlist" : "open";
+		mode = legacy_open ? "open" : (allowed.empty() ? "disabled" : "allowlist");
 	}
 
 	string body = "{\"mode\":\"" + mode + "\"";
@@ -1029,36 +1203,35 @@ string BuildGraphqlSchema(DatabaseInstance &db, const GraphqlExecOptions &option
 	}
 	body += ",\"tables\":{";
 	bool first_table = true;
-	while (true) {
-		auto chunk = res->Fetch();
-		if (!chunk || chunk->size() == 0) {
-			break;
+	vector<string> names;
+	for (auto &entry : catalog) {
+		names.push_back(entry.first);
+	}
+	std::sort(names.begin(), names.end());
+	for (auto &table : names) {
+		if ((route_mode || allowlist) && !TableInList(allowed, table)) {
+			continue;
 		}
-		for (idx_t r = 0; r < chunk->size(); r++) {
-			auto table = chunk->GetValue(0, r).ToString();
-			if (route_mode || allowlist) {
-				if (!TableInList(allowed, table)) {
-					continue;
-				}
-			}
-			if (!first_table) {
+		// Schema discovery follows the same policy gate as execution. A public
+		// GraphQL endpoint must not reveal a protected table or view name.
+		if (!options.authenticated &&
+		    HandlerTouchesPoliciedTable(db, "SELECT * FROM " + QuoteGraphqlObject(catalog[table]))) {
+			continue;
+		}
+		if (!first_table) {
+			body += ",";
+		}
+		first_table = false;
+		body += "\"" + QuackapiJsonEscape(table) + "\":[";
+		for (idx_t c = 0; c < catalog[table].columns.size(); c++) {
+			if (c > 0) {
 				body += ",";
 			}
-			first_table = false;
-			body += "\"" + QuackapiJsonEscape(table) + "\":[";
-			auto cols_val = chunk->GetValue(1, r);
-			if (!cols_val.IsNull() && cols_val.type().id() == LogicalTypeId::LIST) {
-				auto &children = ListValue::GetChildren(cols_val);
-				for (idx_t c = 0; c < children.size(); c++) {
-					if (c > 0) {
-						body += ",";
-					}
-					if (!children[c].IsNull()) {
-						body += "\"" + QuackapiJsonEscape(children[c].ToString()) + "\"";
-					}
-				}
-			}
-			body += "]";
+			body += "\"" + QuackapiJsonEscape(catalog[table].columns[c]) + "\"";
+		}
+		body += "]";
+		if (body.size() > options.max_response_bytes) {
+			return GraphqlError("GraphQL response exceeds configured byte limit");
 		}
 	}
 	body += "},\"note\":\"" + QuackapiJsonEscape(GraphqlSchemaNote()) + "\"}";

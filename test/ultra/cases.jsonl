@@ -1,0 +1,50 @@
+{"id":"health","group":"routing","method":"GET","path":"/matrix/health","headers":{},"expect_status":200,"semantic":"json_object","expect":{"status":"ok"}}
+{"id":"health_head","group":"routing","method":"HEAD","path":"/matrix/health","headers":{},"expect_status":200,"semantic":"empty"}
+{"id":"health_post_405","group":"routing","method":"POST","path":"/matrix/health","headers":{"Content-Type":"application/json"},"body":"{}","expect_status":405,"semantic":"allow"}
+{"id":"missing_route","group":"routing","method":"GET","path":"/matrix/no-such-route","headers":{},"expect_status":404,"semantic":"error"}
+{"id":"item_one","group":"params","method":"GET","path":"/matrix/items/1","headers":{},"expect_status":200,"semantic":"json_object","expect":{"id":1,"name":"alice"}}
+{"id":"item_missing","group":"params","method":"GET","path":"/matrix/items/999","headers":{},"expect_status":404,"semantic":"error"}
+{"id":"item_bad_int","group":"validation","method":"GET","path":"/matrix/items/not-an-int","headers":{},"expect_status":422,"semantic":"validation","loc0":"path","loc1":"item_id"}
+{"id":"item_decimal","group":"validation","method":"GET","path":"/matrix/items/1.5","headers":{},"expect_status":422,"semantic":"validation","loc0":"path","loc1":"item_id"}
+{"id":"item_scientific","group":"validation","method":"GET","path":"/matrix/items/1e2","headers":{},"expect_status":422,"semantic":"validation","loc0":"path","loc1":"item_id"}
+{"id":"item_overflow","group":"validation","method":"GET","path":"/matrix/items/999999999999999999999999","headers":{},"expect_status":422,"status_by_stack":{"quackapi":422,"fastapi":404},"semantic":"validation","loc0":"path","loc1":"item_id","known_gap":"integer_overflow_semantics"}
+{"id":"item_leading_zero","group":"params","method":"GET","path":"/matrix/items/01","headers":{},"expect_status":200,"semantic":"json_object","expect":{"id":1}}
+{"id":"create_valid","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\",\"price\":3.5,\"tags\":[\"new\"]}","expect_status":201,"semantic":"json_object","expect":{"id":100,"name":"dave","price":3.5}}
+{"id":"create_default_tags","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\",\"price\":3.5}","expect_status":201,"semantic":"json_object","expect":{"id":100,"name":"dave","tags":[]}}
+{"id":"create_missing_name","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"price\":3.5}","expect_status":422,"semantic":"validation","loc0":"body","loc1":"name"}
+{"id":"create_missing_price","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\"}","expect_status":422,"semantic":"validation","loc0":"body","loc1":"price"}
+{"id":"create_negative_price","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\",\"price\":-1}","expect_status":422,"semantic":"validation","loc0":"body","loc1":"price"}
+{"id":"create_price_too_high","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\",\"price\":10001}","expect_status":422,"semantic":"validation","loc0":"body","loc1":"price"}
+{"id":"create_empty_name","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"\",\"price\":3.5}","expect_status":422,"semantic":"validation","loc0":"body","loc1":"name"}
+{"id":"create_extra","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\",\"price\":3.5,\"secret\":true}","expect_status":422,"semantic":"validation","loc0":"body"}
+{"id":"create_wrong_price","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\",\"price\":\"nope\"}","expect_status":422,"semantic":"validation","loc0":"body","loc1":"price"}
+{"id":"create_null","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"null","expect_status":422,"semantic":"validation","loc0":"body"}
+{"id":"create_malformed","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{not json}","expect_status":422,"semantic":"validation","loc0":"body"}
+{"id":"create_trailing","group":"body","method":"POST","path":"/matrix/items","headers":{"Content-Type":"application/json"},"body":"{\"name\":\"dave\",\"price\":3.5} trailing","expect_status":422,"semantic":"validation","loc0":"body"}
+{"id":"search_happy","group":"query","method":"GET","path":"/matrix/search?q=al","headers":{},"expect_status":200,"semantic":"json_list","expect_len":1}
+{"id":"search_empty","group":"query","method":"GET","path":"/matrix/search?q=","headers":{},"expect_status":422,"semantic":"validation","loc0":"query","loc1":"q"}
+{"id":"search_missing","group":"query","method":"GET","path":"/matrix/search","headers":{},"expect_status":422,"semantic":"validation","loc0":"query","loc1":"q"}
+{"id":"search_default_limit","group":"query","method":"GET","path":"/matrix/search?q=a","headers":{},"expect_status":200,"semantic":"json_list","expect_len":2}
+{"id":"search_limit_max","group":"query","method":"GET","path":"/matrix/search?q=a&limit=100","headers":{},"expect_status":200,"semantic":"json_list","expect_len":2}
+{"id":"search_limit_too_high","group":"query","method":"GET","path":"/matrix/search?q=a&limit=101","headers":{},"expect_status":422,"semantic":"validation","loc0":"query","loc1":"limit"}
+{"id":"search_limit_bad","group":"query","method":"GET","path":"/matrix/search?q=a&limit=1.5","headers":{},"expect_status":422,"semantic":"validation","loc0":"query","loc1":"limit"}
+{"id":"search_limit_negative","group":"query","method":"GET","path":"/matrix/search?q=a&limit=-1","headers":{},"expect_status":422,"semantic":"validation","loc0":"query","loc1":"limit"}
+{"id":"headers_both","group":"headers","method":"GET","path":"/matrix/headers","headers":{"X-Token":"abc","Cookie":"session=sess-1"},"expect_status":200,"semantic":"json_object","expect":{"token":"abc","session":"sess-1"}}
+{"id":"headers_missing","group":"headers","method":"GET","path":"/matrix/headers","headers":{},"expect_status":200,"semantic":"json_object","expect":{"token":null,"session":null}}
+{"id":"auth_valid","group":"auth","method":"GET","path":"/matrix/auth","headers":{"Authorization":"Bearer matrix-secret"},"expect_status":200,"semantic":"json_object","expect":{"subject":"matrix-user"}}
+{"id":"auth_missing","group":"auth","method":"GET","path":"/matrix/auth","headers":{},"expect_status":401,"semantic":"auth_error"}
+{"id":"auth_malformed","group":"auth","method":"GET","path":"/matrix/auth","headers":{"Authorization":"Bearer"},"expect_status":401,"semantic":"auth_error"}
+{"id":"auth_wrong","group":"auth","method":"GET","path":"/matrix/auth","headers":{"Authorization":"Bearer wrong"},"expect_status":401,"semantic":"auth_error"}
+{"id":"redirect","group":"responses","method":"GET","path":"/matrix/redirect","headers":{},"expect_status":307,"semantic":"redirect","location":"/matrix/health"}
+{"id":"html","group":"responses","method":"GET","path":"/matrix/html","headers":{},"expect_status":200,"semantic":"text","content_type":"text/html","body_contains":"<h1>quack</h1>"}
+{"id":"text","group":"responses","method":"GET","path":"/matrix/text","headers":{},"expect_status":200,"semantic":"text","content_type":"text/plain","body_contains":"quack"}
+{"id":"object_missing","group":"responses","method":"GET","path":"/matrix/object/999","headers":{},"expect_status":404,"semantic":"error"}
+{"id":"empty_missing","group":"responses","method":"GET","path":"/matrix/empty/999","headers":{},"expect_status":404,"semantic":"error"}
+{"id":"response_filter","group":"responses","method":"GET","path":"/matrix/response-filter","headers":{},"expect_status":200,"semantic":"json_object","expect":{"id":1,"name":"alice"},"body_absent":"secret"}
+{"id":"compressed","group":"transport","method":"GET","path":"/matrix/compressed","headers":{"Accept-Encoding":"gzip"},"expect_status":200,"semantic":"json_object","expect":{"payload_prefix":"xxxxxxxx"},"content_encoding":"gzip"}
+{"id":"ndjson","group":"transport","method":"GET","path":"/matrix/ndjson","headers":{},"expect_status":200,"semantic":"ndjson","content_type":"application/x-ndjson","expect_lines":3}
+{"id":"stream","group":"transport","method":"GET","path":"/matrix/stream","headers":{},"expect_status":200,"semantic":"sse","content_type":"text/event-stream","expect_lines":3}
+{"id":"csv","group":"transport","method":"GET","path":"/matrix/csv","headers":{},"expect_status":200,"semantic":"csv","content_type":"text/csv","expect_lines":3}
+{"id":"problem","group":"errors","method":"GET","path":"/matrix/problem","headers":{},"expect_status":418,"semantic":"error"}
+{"id":"cors_preflight","group":"transport","method":"OPTIONS","path":"/matrix/health","headers":{"Origin":"http://example.test","Access-Control-Request-Method":"GET"},"expect_status":200,"status_by_stack":{"quackapi":204,"fastapi":200},"semantic":"cors","cors_origin":"http://example.test","known_gap":"cors_preflight_status"}
+{"id":"openapi","group":"docs","method":"GET","path":"/openapi.json","headers":{},"expect_status":200,"semantic":"openapi"}

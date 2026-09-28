@@ -72,17 +72,49 @@ true
 # --- VOLATILE ----------------------------------------------------------------
 # Without FunctionStability::VOLATILE, DuckDB constant-folds a literal-argument
 # call and range(N) would issue ONE request while reporting N rows. Assert the
-# server actually saw every one of them by watching the reuse counter climb.
+# server actually saw every one of them by watching TOTAL requests (dialed +
+# reused) climb.
+#
+# Total, not `reused` alone: a chunk carrying N independent calls fans them out
+# concurrently, so the burst DIALS up to the fan-out width instead of reusing one
+# socket N times sequentially. Which counter moves is an artefact of the execution
+# model; the invariant this test exists to defend is that N rows issue N requests.
 statement ok
 CREATE OR REPLACE TEMP TABLE before AS
-  SELECT reused AS n FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301';
+  SELECT dialed + reused AS n FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301';
 
 statement ok
 SELECT (quackapi_fetch('http://127.0.0.1:29301/ping')).status AS s FROM range(10) t(i);
 
 query I
-SELECT (SELECT reused FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301')
+SELECT (SELECT dialed + reused FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301')
        - (SELECT n FROM before) >= 10;
+----
+true
+
+# --- fan-out: one chunk, many concurrent calls --------------------------------
+# A chunk carrying N independent calls issues them concurrently rather than one
+# blocking round trip at a time. Asserted on RESULTS, not elapsed time: a
+# "finishes within X ms" check would be measuring the machine under CI load, not
+# this code. What must hold is that concurrency loses nothing — every row gets
+# its own correct answer, none are dropped, none error, and the total request
+# count still matches the row count.
+statement ok
+CREATE OR REPLACE TEMP TABLE fanout_before AS
+  SELECT dialed + reused AS n FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301';
+
+query III
+SELECT count(*) AS n,
+       count(CASE WHEN (r).status = 200 THEN 1 END) AS ok,
+       count(CASE WHEN (r).error IS NOT NULL THEN 1 END) AS errs
+FROM (SELECT quackapi_fetch('http://127.0.0.1:29301/ping') AS r FROM range(64) t(i));
+----
+64	64	0
+
+# Every one of the 64 rows became a real request (no folding, no coalescing).
+query I
+SELECT (SELECT dialed + reused FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29301')
+       - (SELECT n FROM fanout_before) = 64;
 ----
 true
 

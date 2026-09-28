@@ -284,7 +284,7 @@ bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
 //!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
 //!     [ENVELOPE array|object] [EMPTY STATUS <n> [BODY '<json>']]
 //!     [TIMEOUT <n>|'30s'|'5m'] [GROUP <name> | IN GROUP <name>]
-//!     [BODY SCHEMA '<json-schema>']
+//!     [BODY SCHEMA '<json-schema>'] [BODY TYPE '<duckdb-json-structure>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
 //!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
 //!     [WITH (timeout_sec [=|:=] <n>|'30s')]
@@ -635,7 +635,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		return ParserExtensionParseResult("Route pattern must start with '/'");
 	}
 
-	// [BODY SCHEMA '<json-schema>'] — may appear before PARAM or after PARAM blocks.
+	// [BODY SCHEMA '<json-schema>'] / [BODY TYPE '<duckdb-json-structure>'] —
+	// may appear before PARAM or after PARAM blocks. BODY TYPE is DuckDB's
+	// json_transform structure syntax, not a second application-model language.
 	// Returns false and sets err on syntax error; true when clause absent or consumed.
 	auto TryConsumeBodySchema = [&](string &err_out) -> bool {
 		if (!(StringUtil::StartsWith(rest_upper, "BODY") && rest.size() > 4 && StringUtil::CharacterIsSpace(rest[4]))) {
@@ -643,25 +645,29 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 		string after_body = QuackapiTrim(rest.substr(4));
 		auto after_upper = StringUtil::Upper(after_body);
-		if (!StringUtil::StartsWith(after_upper, "SCHEMA")) {
-			err_out = "Expected BODY SCHEMA '<json-schema>'";
+		bool is_schema = StringUtil::StartsWith(after_upper, "SCHEMA");
+		bool is_type = StringUtil::StartsWith(after_upper, "TYPE");
+		if (!is_schema && !is_type) {
+			err_out = "Expected BODY SCHEMA '<json-schema>' or BODY TYPE '<duckdb-json-structure>'";
 			return false;
 		}
-		if (after_body.size() == 6) {
-			err_out = "BODY SCHEMA expects a quoted JSON schema string";
+		const idx_t keyword_size = is_schema ? 6 : 4;
+		const string clause_name = is_schema ? "BODY SCHEMA" : "BODY TYPE";
+		if (after_body.size() == keyword_size) {
+			err_out = clause_name + " expects a quoted JSON string";
 			return false;
 		}
 		string after_schema;
-		if (StringUtil::CharacterIsSpace(after_body[6])) {
-			after_schema = QuackapiTrim(after_body.substr(6));
-		} else if (after_body[6] == '\'') {
-			after_schema = after_body.substr(6);
+		if (StringUtil::CharacterIsSpace(after_body[keyword_size])) {
+			after_schema = QuackapiTrim(after_body.substr(keyword_size));
+		} else if (after_body[keyword_size] == '\'') {
+			after_schema = after_body.substr(keyword_size);
 		} else {
-			err_out = "Expected BODY SCHEMA '<json-schema>'";
+			err_out = "Expected " + clause_name + " '<json>'";
 			return false;
 		}
 		if (after_schema.empty() || after_schema[0] != '\'') {
-			err_out = "BODY SCHEMA expects a quoted JSON schema string";
+			err_out = clause_name + " expects a quoted JSON string";
 			return false;
 		}
 		// Quoted string with SQL '' escape.
@@ -680,18 +686,19 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			i++;
 		}
 		if (i >= after_schema.size() || after_schema[i] != '\'') {
-			err_out = "Unterminated BODY SCHEMA string";
+			err_out = "Unterminated " + clause_name + " string";
 			return false;
 		}
 		// Assign via outer body_schema — declared below before this lambda is called.
 		// (We reassign rest/rest_upper here; body_schema set by caller using schema.)
 		rest = QuackapiTrim(after_schema.substr(i + 1));
 		rest_upper = StringUtil::Upper(rest);
-		err_out = string("\x01") + schema; // success marker + payload
+		err_out = string(is_schema ? "\x01" : "\x02") + schema; // success marker + payload
 		return true;
 	};
 
 	string body_schema;
+	string body_type;
 	{
 		string bs_err;
 		if (!TryConsumeBodySchema(bs_err)) {
@@ -699,6 +706,8 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 		if (!bs_err.empty() && bs_err[0] == '\x01') {
 			body_schema = bs_err.substr(1);
+		} else if (!bs_err.empty() && bs_err[0] == '\x02') {
+			body_type = bs_err.substr(1);
 		}
 	}
 
@@ -873,14 +882,16 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		rest_upper = StringUtil::Upper(rest);
 	}
 
-	// BODY SCHEMA after PARAM blocks (if not already set)
-	if (body_schema.empty()) {
+	// BODY SCHEMA / BODY TYPE after PARAM blocks (if not already set)
+	if (body_schema.empty() || body_type.empty()) {
 		string bs_err;
 		if (!TryConsumeBodySchema(bs_err)) {
 			return ParserExtensionParseResult(bs_err);
 		}
 		if (!bs_err.empty() && bs_err[0] == '\x01') {
 			body_schema = bs_err.substr(1);
+		} else if (!bs_err.empty() && bs_err[0] == '\x02') {
+			body_type = bs_err.substr(1);
 		}
 	}
 
@@ -993,6 +1004,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.require_auth = require_auth;
 	data->route.params = std::move(params);
 	data->route.body_schema = std::move(body_schema);
+	data->route.body_type = std::move(body_type);
 	data->route.group_name = group_name;
 	data->route.rate_limit_n = rate_limit_n;
 	data->route.rate_limit_per_sec = rate_limit_per_sec;
@@ -1031,6 +1043,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	}
 	if (input.inputs.size() > 9 && !input.inputs[9].IsNull()) {
 		bind_data->route.body_schema = input.inputs[9].GetValue<string>();
+	}
+	if (input.inputs.size() > 19 && !input.inputs[19].IsNull()) {
+		bind_data->route.body_type = input.inputs[19].GetValue<string>();
 	}
 	if (input.inputs.size() > 10 && !input.inputs[10].IsNull()) {
 		bind_data->route.group_name = input.inputs[10].GetValue<string>();
@@ -1135,14 +1150,14 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyRouteFunction() {
 	// action, or_replace, name, method, pattern, handler, status, require_auth,
 	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format,
-	// envelope, empty_status, empty_body, timeout_sec
-	return MakeApplyDdlFunction("quackapi_apply_route",
-	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER},
-	                            ApplyRouteExec, ApplyRouteBind);
+	// envelope, empty_status, empty_body, timeout_sec, body_type
+	return MakeApplyDdlFunction(
+	    "quackapi_apply_route",
+	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	     LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	     LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	     LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
+	    ApplyRouteExec, ApplyRouteBind);
 }
 
 ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -1169,6 +1184,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::INTEGER(data.route.empty_status));
 	result.parameters.push_back(Value(data.route.empty_body));
 	result.parameters.push_back(Value::INTEGER(data.route.timeout_sec));
+	result.parameters.push_back(Value(data.route.body_type));
 	FinishDdlPlan(result);
 	return result;
 }

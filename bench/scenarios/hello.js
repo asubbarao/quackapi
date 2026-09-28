@@ -63,8 +63,10 @@ export function hello() {
   } catch (_) {
     shapeOk = false;
   }
+  const statusOk = res.status >= 200 && res.status < 300;
   check(res, {
-    'status 2xx': (r) => r.status >= 200 && r.status < 300,
+    'status 2xx': () => statusOk,
     'body shape [{"msg":"world"}]': () => shapeOk,
+    'request contract': () => statusOk && shapeOk,
   });
 }

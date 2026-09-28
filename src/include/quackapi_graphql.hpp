@@ -2,6 +2,7 @@
 
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser_extension.hpp"
@@ -12,13 +13,26 @@ class DatabaseInstance;
 
 //! Default row cap for thin GraphQL table selections (v0).
 static constexpr idx_t QUACKAPI_GRAPHQL_DEFAULT_LIMIT = 100;
+static constexpr idx_t QUACKAPI_GRAPHQL_MAX_ROOT_FIELDS = 16;
+static constexpr idx_t QUACKAPI_GRAPHQL_MAX_COLUMNS_PER_FIELD = 64;
+static constexpr idx_t QUACKAPI_GRAPHQL_MAX_TOTAL_FIELDS = 128;
+static constexpr idx_t QUACKAPI_GRAPHQL_MAX_TOTAL_ROWS = 10000;
+static constexpr idx_t QUACKAPI_GRAPHQL_MAX_DOCUMENT_BYTES = 64 * 1024;
 
 //! Options for ExecuteGraphqlQuery / BuildGraphqlSchema.
-//! When allowed_tables is null: built-in global allowlist rules (open or FOR TABLE).
+//! When allowed_tables is null: built-in global allowlist rules. It is closed
+//! when no table is registered unless the explicit legacy setting is enabled.
 //! When non-null: only those tables (named CREATE GRAPHQL ROUTE mount).
 struct GraphqlExecOptions {
 	const vector<string> *allowed_tables = nullptr;
 	idx_t limit = QUACKAPI_GRAPHQL_DEFAULT_LIMIT;
+	//! Whether the caller completed a named-route authentication check.
+	bool authenticated = false;
+	//! Verified claim name -> string form, bound only to $claims_* policy params.
+	const unordered_map<string, string> *claims = nullptr;
+	//! Request-wide deadline and response cap propagated by the HTTP server.
+	int64_t query_timeout_ms = 30000;
+	idx_t max_response_bytes = 16 * 1024 * 1024;
 	//! Schema JSON "mode": "open" | "allowlist" | "route"
 	string mode;
 	//! Optional route name for schema note when mode is "route".
@@ -39,7 +53,9 @@ struct GraphqlExecOptions {
 //! No mutations, nested joins, fragments, arguments, aliases, or full grammar.
 //! Schema source is the DuckDB catalog only.
 //!
-//! Allowlist (optional): CREATE GRAPHQL FOR TABLE … for built-in POST /graphql.
+//! Allowlist: CREATE GRAPHQL FOR TABLE … for built-in POST /graphql. An empty
+//! registration is closed by default. `SET GLOBAL quackapi_graphql_allow_all = true`
+//! explicitly restores legacy open-catalog behavior for migrations.
 //! Named mounts: CREATE GRAPHQL ROUTE … POST '/path' FROM …
 string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query,
                            const GraphqlExecOptions &options = GraphqlExecOptions {});

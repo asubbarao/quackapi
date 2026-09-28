@@ -67,7 +67,7 @@ void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 			*it = route;
 			PublishRoutes();
 			// OR REPLACE is a new registration — do not inherit spent rate-limit windows.
-			QuackapiClearRouteRateLimit(route.name);
+			ClearRouteRateLimit(route.name);
 			return;
 		}
 	}
@@ -77,7 +77,7 @@ void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
 	}
 	routes.push_back(route);
 	PublishRoutes();
-	QuackapiClearRouteRateLimit(route.name);
+	ClearRouteRateLimit(route.name);
 }
 
 bool QuackapiState::DropRoute(const string &name) {
@@ -86,7 +86,7 @@ bool QuackapiState::DropRoute(const string &name) {
 		if (it->name == name) {
 			routes.erase(it);
 			PublishRoutes();
-			QuackapiClearRouteRateLimit(name);
+			ClearRouteRateLimit(name);
 			return true;
 		}
 	}
@@ -412,10 +412,13 @@ bool QuackapiState::StopServer(int port) {
 	to_destroy->StopAccepting();
 	// Brief delay so a self-stop from inside a route can finish its response
 	// before ~Server joins the thread pool.
-	std::thread([srv = std::move(to_destroy)]() mutable {
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		srv.reset();
-	}).detach();
+	std::thread(
+	    [](unique_ptr<QuackapiHttpServer> srv) {
+		    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		    srv.reset();
+	    },
+	    std::move(to_destroy))
+	    .detach();
 	return true;
 }
 
@@ -436,10 +439,13 @@ void QuackapiState::StopAllServers() {
 		}
 	}
 	for (auto &srv : to_destroy) {
-		std::thread([s = std::move(srv)]() mutable {
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			s.reset();
-		}).detach();
+		std::thread(
+		    [](unique_ptr<QuackapiHttpServer> s) {
+			    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			    s.reset();
+		    },
+		    std::move(srv))
+		    .detach();
 	}
 }
 
