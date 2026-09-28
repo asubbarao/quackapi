@@ -187,6 +187,10 @@ bool ParseJsonObjectClaims(DatabaseInstance &db, const string &json, unordered_m
 	if (fields_res->HasError()) {
 		return false;
 	}
+	// JWT objects must not contain duplicate claim names. JSON objects are
+	// commonly represented as maps, where a duplicate would otherwise be
+	// silently overwritten and change the signed token's meaning.
+	unordered_map<string, bool> seen_keys;
 	while (true) {
 		auto chunk = fields_res->Fetch();
 		if (!chunk || chunk->size() == 0) {
@@ -198,6 +202,10 @@ bool ParseJsonObjectClaims(DatabaseInstance &db, const string &json, unordered_m
 				continue;
 			}
 			string key = key_v.GetValue<string>();
+			if (seen_keys.find(key) != seen_keys.end()) {
+				return false;
+			}
+			seen_keys[key] = true;
 			auto val_v = chunk->GetValue(1, row);
 			if (val_v.IsNull()) {
 				null_claims[key] = true;
