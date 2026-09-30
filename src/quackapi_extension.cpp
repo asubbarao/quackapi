@@ -104,7 +104,7 @@ struct ServeBindData : public TableFunctionData {
 	string memory_limit;
 	//! Batteries defaults — all correct-by-default for servers; overridable.
 	string log_level = "info";
-	bool access_log = true;
+	string access_log = "true";
 	bool enable_logging = false;
 	bool health_routes = true;
 	string threads;
@@ -130,6 +130,32 @@ struct ServeBindData : public TableFunctionData {
 	bool started = false;
 	bool finished = false;
 };
+
+static void ParseAccessLogString(const string &raw, bool &enabled, string &table) {
+	auto value = StringUtil::Lower(raw);
+	if (value == "true") {
+		enabled = true;
+		table.clear();
+	} else if (value == "false") {
+		enabled = false;
+		table.clear();
+	} else if (!raw.empty()) {
+		enabled = true;
+		table = raw;
+	} else {
+		throw InvalidInputException("quackapi_serve: access_log must be true, false, or a table name");
+	}
+}
+
+static string AccessLogValueString(const Value &value) {
+	if (value.IsNull()) {
+		throw InvalidInputException("quackapi_serve: access_log must not be NULL");
+	}
+	if (value.type().id() == LogicalTypeId::VARCHAR) {
+		return value.GetValue<string>();
+	}
+	return value.ToString();
+}
 
 static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
 	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
@@ -208,7 +234,10 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	}
 	auto access_entry = input.named_parameters.find("access_log");
 	if (access_entry != input.named_parameters.end()) {
-		bind_data->access_log = access_entry->second.GetValue<bool>();
+		bind_data->access_log = AccessLogValueString(access_entry->second);
+		bool enabled;
+		string table;
+		ParseAccessLogString(bind_data->access_log, enabled, table);
 	}
 	auto enlog_entry = input.named_parameters.find("enable_logging");
 	if (enlog_entry != input.named_parameters.end()) {
@@ -363,7 +392,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.cors_origins = bind_data.cors_origins;
 	opts.memory_limit = bind_data.memory_limit;
 	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
-	opts.access_log = bind_data.access_log;
+	ParseAccessLogString(bind_data.access_log, opts.access_log, opts.access_log_table);
 	opts.enable_logging = bind_data.enable_logging;
 	opts.health_routes = bind_data.health_routes;
 	opts.threads = bind_data.threads;
@@ -542,6 +571,8 @@ struct RequestBindData : public TableFunctionData {
 	unordered_map<string, string> req_headers;
 	//! Optional libpq DSN for this request (named param wins over SET quackapi_pg_dsn).
 	string pg_dsn;
+	//! Empty (default) keeps in-process requests quiet. Otherwise true, false, or a table name.
+	string access_log;
 	bool finished = false;
 };
 
@@ -582,6 +613,13 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 			bind_data->pg_dsn = setting.GetValue<string>();
 		}
 	}
+	auto access_entry = input.named_parameters.find("access_log");
+	if (access_entry != input.named_parameters.end()) {
+		bind_data->access_log = AccessLogValueString(access_entry->second);
+		bool enabled;
+		string table;
+		ParseAccessLogString(bind_data->access_log, enabled, table);
+	}
 	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
 	// "Invalid unicode" on Value(string). JSON/text clients: decode(body).
 	return_types.emplace_back(LogicalType::INTEGER);
@@ -604,8 +642,13 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	string body;
 	string content_type;
 	unordered_map<string, string> resp_headers;
+	QuackapiServeOptions opts = bind_data.limits;
+	opts.access_log = false;
+	if (!bind_data.access_log.empty()) {
+		ParseAccessLogString(bind_data.access_log, opts.access_log, opts.access_log_table);
+	}
 	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
-	                         &bind_data.req_headers, &resp_headers, bind_data.pg_dsn, &bind_data.limits);
+	                         &bind_data.req_headers, &resp_headers, bind_data.pg_dsn, &opts);
 	output.SetValue(0, 0, Value::INTEGER(status));
 	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
 	output.SetValue(2, 0, Value(content_type));
@@ -844,7 +887,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
 	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
 	serve.named_parameters["log_level"] = LogicalType::VARCHAR;
-	serve.named_parameters["access_log"] = LogicalType::BOOLEAN;
+	serve.named_parameters["access_log"] = LogicalType::ANY;
 	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
 	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
 	serve.named_parameters["threads"] = LogicalType::VARCHAR;
@@ -892,6 +935,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunctionSet request_set("quackapi_request");
 	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
 	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request2.named_parameters["access_log"] = LogicalType::ANY;
 	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request2.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request2.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
@@ -899,6 +943,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       RequestExec, RequestBind);
 	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	request3.named_parameters["access_log"] = LogicalType::ANY;
 	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request3.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request3.named_parameters["max_response_bytes"] = LogicalType::BIGINT;

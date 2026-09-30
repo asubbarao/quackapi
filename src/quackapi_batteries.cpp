@@ -384,9 +384,11 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	                                     opts.worker_threads));
 	applied.push_back(StringUtil::Format("http payload_max_length=%llu (WHY: body size DoS guard — 413 above cap)",
 	                                     (unsigned long long)QUACKAPI_PAYLOAD_MAX_LENGTH));
-	applied.push_back(StringUtil::Format("access_log=%s log_level=%s (WHY: every request → structured stderr line "
+	const string access_log_destination =
+	    opts.access_log_table.empty() ? (opts.access_log ? "stderr" : "off") : opts.access_log_table;
+	applied.push_back(StringUtil::Format("access_log=%s log_level=%s (WHY: every request → structured access log "
 	                                     "for correlation with X-Request-ID)",
-	                                     opts.access_log ? "true" : "false", LogLevelDuckDBName(opts.log_level)));
+	                                     access_log_destination, LogLevelDuckDBName(opts.log_level)));
 	applied.push_back(StringUtil::Format("health_routes=%s (WHY: /health liveness + /healthz readiness out of the box)",
 	                                     opts.health_routes ? "true" : "false"));
 
