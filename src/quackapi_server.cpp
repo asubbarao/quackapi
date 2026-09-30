@@ -1840,7 +1840,7 @@ public:
 		bool fallback;
 		{
 			std::lock_guard<std::mutex> lock(mutex);
-			fallback = failed;
+			fallback = failed && std::chrono::steady_clock::now() < retry_at;
 			if (!fallback) {
 				pending.push_back(std::move(entry));
 				if (pending.size() >= 100) {
@@ -1867,6 +1867,9 @@ private:
 	}
 
 	void FlushBatch(const vector<QuackapiAccessLogEntry> &batch) {
+		if (table_parts.empty()) {
+			table_parts = SplitAccessLogTable(table);
+		}
 		std::lock_guard<std::mutex> write_lock(quackapi_access_log_flush_mutex);
 		auto db = db_ptr.lock();
 		if (!db) {
@@ -1905,12 +1908,23 @@ private:
 
 	void MarkFailed(const string &reason) {
 		std::lock_guard<std::mutex> lock(mutex);
-		if (failed) {
+		if (!failed) {
+			failed = true;
+			fprintf(stderr, "quackapi: access_log table \"%s\" failed; falling back to stderr: %s\n", table.c_str(),
+			        reason.c_str());
+		}
+		retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(retry_delay_seconds);
+		retry_delay_seconds = std::min<int64_t>(retry_delay_seconds * 2, 60);
+	}
+
+	void MarkRecovered() {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!failed) {
 			return;
 		}
-		failed = true;
-		fprintf(stderr, "quackapi: access_log table \"%s\" failed; falling back to stderr: %s\n", table.c_str(),
-		        reason.c_str());
+		failed = false;
+		retry_delay_seconds = 1;
+		fprintf(stderr, "quackapi: access_log table \"%s\" recovered; resuming table logging\n", table.c_str());
 	}
 
 	void Run() {
@@ -1936,11 +1950,12 @@ private:
 			bool use_stderr;
 			{
 				std::lock_guard<std::mutex> lock(mutex);
-				use_stderr = failed;
+				use_stderr = failed && std::chrono::steady_clock::now() < retry_at;
 			}
 			if (!use_stderr) {
 				try {
 					FlushBatch(batch);
+					MarkRecovered();
 				} catch (std::exception &ex) {
 					MarkFailed(ex.what());
 					use_stderr = true;
@@ -1966,6 +1981,8 @@ private:
 	std::thread worker;
 	bool stopping = false;
 	bool failed = false;
+	std::chrono::steady_clock::time_point retry_at;
+	int64_t retry_delay_seconds = 1;
 };
 
 string SanitizeClientRequestId(const string &s);
