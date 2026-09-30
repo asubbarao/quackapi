@@ -10,7 +10,7 @@
 |---------|----------------|
 | `CREATE ROUTE … RATE LIMIT n PER s [BY ip\|token\|key]` → 429 | Built (`quackapi_ddl` / server) |
 | `FORMAT json\|ndjson\|csv` + Accept negotiation | Built |
-| Response `gzip` / `zstd` via `Accept-Encoding` | Built in `quackapi_server.cpp` (`compression` serve knobs) — **FEATURE_STATUS.md is stale** on gzip |
+| Response `gzip` / `zstd` via `Accept-Encoding` | Built in `quackapi_server.cpp` (`compression := 'auto'|'gzip'|'zstd'|'off'`, `compression_min_bytes`) |
 | `CREATE STREAM … GET` SSE | Built; **WS rejected** (httplib) |
 | `CREATE QUEUE` + workers | Built |
 | `CREATE AUTH` JWT / API_KEY | Built; **OIDC browser code-flow not** |
@@ -182,9 +182,9 @@ Status vocabulary:
 |-------|--------|
 | **Status** | **ALREADY_IN_QUACKAPI** |
 | **extension_name(s)** | none required — miniz/zstd in DuckDB; quackapi negotiates `Accept-Encoding` (prefer zstd, then gzip) |
-| **Compose** | `quackapi_serve(..., compression := true, …)` — document knobs; no community ext |
+| **Compose** | `quackapi_serve(..., compression := 'auto', compression_min_bytes := 1024, …)` — no community ext |
 | **Sample** | (product code, not catalog) |
-| **Ship as** | **Docs / FEATURE_STATUS fix**. Catalog has no gzip HTTP extension because core already covers it. |
+| **Ship as** | **Shipped**. Catalog has no gzip HTTP extension because core already covers it. |
 
 ---
 
@@ -216,7 +216,7 @@ Status vocabulary:
 | 10 | Zero-copy HTTP host | NOT_IN_CATALOG | do not build |
 | 11 | Code → routes | EXISTS_PARTIAL / ALREADY | sitting_duck bridges + parser_tools |
 | 12 | Outbound HTTP | EXISTS_COMPOSE / ALREADY | curl_httpfs + http_client recipes |
-| 13 | gzip/zstd | ALREADY_IN_QUACKAPI | document; fix FEATURE_STATUS |
+| 13 | gzip/zstd | ALREADY_IN_QUACKAPI | shipped; see the compression guide |
 | 14 | Cron / jobs | EXISTS_COMPOSE / ALREADY | cronjob + QUEUE recipe |
 
 ---
@@ -256,7 +256,7 @@ Honorable mentions (also not in composition.md): `shellfs`, `webbed`, `crawler`,
 4. **`jwt` claims in handlers** — `jwt_decode_payload` on `$headers` / token column; compose without waiting for full OIDC.  
 5. **`FORMAT parquet` then `FORMAT arrow` (nanoarrow)** — only thin serdes C++; catalog already has IPC writers/`to_arrow_ipc`.
 
-*(Close sixth: fix FEATURE_STATUS on gzip + document serve compression knobs — already implemented.)*
+*(Close sixth: document the shipped gzip/zstd serve compression knobs.)*
 
 ---
 

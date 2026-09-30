@@ -259,7 +259,7 @@ Twenty feasibility studies under `/tmp/quackapi_spec_*/SPEC.md`.
 | 2 | `spec_background_tasks` | AFTER-response / durable workers | **S** (docs) | **HAVE-EXT(`cronjob`)** + job table; SKIP `AFTER AS` | **Partial** — **`CREATE QUEUE`** is the durable path |
 | 3 | `spec_body_partial` | PATCH partial / allowlist without model forks | **S** | **HAVE-EXT(`json_schema`)** + `json_merge_patch`; SKIP include/exclude C++ | **Partial** — BODY SCHEMA + SQL recipes |
 | 4 | `spec_cache_etag` | `CACHE TTL` + ETag / If-None-Match → 304 | **M** | THIN-GLUE C++ + CORE table/hash | **No** |
-| 5 | `spec_gzip` | `Accept-Encoding: gzip` response compress | **S** | THIN-GLUE (miniz already in DuckDB) | **No** |
+| 5 | `spec_gzip` | `Accept-Encoding: gzip` / `zstd` response compression | **S** | THIN-GLUE (miniz/zstd already in DuckDB) | **Yes** — shipped in `quackapi_server.cpp` |
 | 6 | `spec_health` | Liveness/readiness probes | **S** | **SKIP `CREATE PROBE`** — TRIVIAL-SQL routes | **Recipes only** (no DDL) |
 | 7 | `spec_lifespan` | `on_start` / `on_stop` / drain on serve/stop | **S** | THIN-GLUE on serve/stop; HAVE-CORE scripts/ATTACH | **No** (script-before-serve works) |
 | 8 | `spec_middleware` | `CREATE MIDDLEWARE … BEFORE\|AFTER` SQL hooks | **M** | THIN-GLUE registry in HandleRequest | **No** |
@@ -308,7 +308,6 @@ Ship community-extensions `description.yml` **0.1.0** with the surface proven on
 |---------|:------:|-----|
 | Request ID + access_log table | S | Ops baseline |
 | Rate limit (table counters → 429) | S | Production table stakes |
-| GZip responses | S | miniz already in tree |
 | Health/readiness **recipes** (no CREATE PROBE) | S | docs + HTTP composition tests |
 | Pagination recipes (+ optional Link column) | S | HAVE-CORE |
 | Static prefix + file/blob disposition | S | complete StaticFiles story |

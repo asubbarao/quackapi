@@ -213,7 +213,7 @@ LOAD quackapi;
 - **JWT** — HS256 only today (no RS256 / OIDC browser flow yet).
 - **`CREATE API FOR TABLE`** — read routes only (list + get by key).
 - **WebSocket** — not supported on the HTTP transport; use [SSE streams](guide/stream.md).
-- **Response gzip / access logging batteries** — [coming / in progress](guide/coming-soon.md).
+- **Response gzip / zstd** — [compression guide](guide/compression.md); access logging is shipped.
 - Registry (routes, auth, groups, queues, streams) lives on the **database instance**. Re-run DDL after reopen. Queue **jobs** (`quackapi_jobs`) are normal tables and survive restart.
 
 ---

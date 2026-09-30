@@ -35,7 +35,7 @@ exec 3>"$FIFO"
 
 printf "LOAD '%s';\n" "${EXT//\'/\'\'}" >&3
 cat "${ROOT}/test/ultra/routes.sql" >&3
-printf "SELECT * FROM quackapi_serve(%s, host := '%s', health_routes := false, access_log := false, enable_logging := false, compression := true, cors_origins := 'http://example.test');\n" "$PORT" "$HOST" >&3
+printf "SELECT * FROM quackapi_serve(%s, host := '%s', health_routes := false, access_log := false, enable_logging := false, compression := 'auto', cors_origins := 'http://example.test');\n" "$PORT" "$HOST" >&3
 
 ready=0
 for _ in $(seq 1 120); do
@@ -57,4 +57,3 @@ fi
 
 echo "quackapi ultra server ready on http://${HOST}:${PORT} (pid=${DPID})"
 wait "$DPID"
-

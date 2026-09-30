@@ -129,7 +129,8 @@ double ParseEncodingQ(const string &token) {
 			auto qstr = p.substr(2);
 			StringUtil::Trim(qstr);
 			try {
-				return std::stod(qstr);
+				auto q = std::stod(qstr);
+				return q >= 0.0 && q <= 1.0 ? q : 0.0;
 			} catch (...) {
 				return 0.0;
 			}
@@ -138,9 +139,9 @@ double ParseEncodingQ(const string &token) {
 	return 1.0;
 }
 
-//! Negotiate Content-Encoding: prefer zstd, then gzip, then identity.
+//! Negotiate Content-Encoding: choose the highest q-value, preferring zstd on ties.
 //! Missing Accept-Encoding → identity. q=0 rejects a coding. `*` accepts any.
-NegotiatedEncoding NegotiateContentEncoding(const duckdb_httplib::Request &req) {
+NegotiatedEncoding NegotiateContentEncoding(const duckdb_httplib::Request &req, QuackapiCompressionMode mode) {
 	auto it = req.headers.find("Accept-Encoding");
 	if (it == req.headers.end() || it->second.empty()) {
 		return NegotiatedEncoding::IDENTITY;
@@ -177,20 +178,26 @@ NegotiatedEncoding NegotiateContentEncoding(const duckdb_httplib::Request &req) 
 			star_q = q;
 		}
 	}
-	auto accepted = [](double explicit_q, double star) -> bool {
+	auto accepted = [](double explicit_q, double star) -> double {
 		if (explicit_q >= 0.0) {
-			return explicit_q > 0.0;
+			return explicit_q;
 		}
 		if (star >= 0.0) {
-			return star > 0.0;
+			return star;
 		}
-		return false;
+		return 0.0;
 	};
-	// Owner default: zstd first whenever the client accepts it.
-	if (accepted(zstd_q, star_q)) {
+	double zstd_quality = accepted(zstd_q, star_q);
+	double gzip_quality = accepted(gzip_q, star_q);
+	if (mode == QuackapiCompressionMode::GZIP) {
+		zstd_quality = 0.0;
+	} else if (mode == QuackapiCompressionMode::ZSTD) {
+		gzip_quality = 0.0;
+	}
+	if (zstd_quality > 0.0 && zstd_quality >= gzip_quality) {
 		return NegotiatedEncoding::ZSTD;
 	}
-	if (accepted(gzip_q, star_q)) {
+	if (gzip_quality > 0.0) {
 		return NegotiatedEncoding::GZIP;
 	}
 	(void)identity_q;
@@ -1809,7 +1816,7 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 		opts = *request_options;
 	}
 	opts.access_log = false;
-	opts.compression = false;
+	opts.compression = QuackapiCompressionMode::OFF;
 	opts.health_routes = true;
 	opts.pg_dsn = pg_dsn;
 	// No TCP — Dispatch only.
@@ -1982,7 +1989,7 @@ void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, du
 }
 
 void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
-	if (!compression) {
+	if (compression == QuackapiCompressionMode::OFF) {
 		return;
 	}
 	// No entity / no point compressing tiny payloads.
@@ -2001,7 +2008,11 @@ void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &re
 	if (IsAlreadyCompressedContentType(content_type)) {
 		return;
 	}
-	auto encoding = NegotiateContentEncoding(req);
+	// This response was eligible for negotiation, even when the client selects
+	// identity. Keep caches from sharing the identity representation with an
+	// encoded representation.
+	res.set_header("Vary", "Accept-Encoding");
+	auto encoding = NegotiateContentEncoding(req, compression);
 	if (encoding == NegotiatedEncoding::IDENTITY) {
 		return;
 	}
@@ -2028,8 +2039,6 @@ void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &re
 	res.set_header("Content-Encoding", encoding_name);
 	// Content-Length is recomputed by httplib from body; strip any stale value.
 	res.headers.erase("Content-Length");
-	// Advertise negotiation variance (may coexist with Vary: Origin from CORS).
-	res.set_header("Vary", "Accept-Encoding");
 }
 
 // In-process sliding fixed-window rate limiter (no Redis). Keyed by

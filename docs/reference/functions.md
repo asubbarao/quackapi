@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, http_client := …, block := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, compression := …, compression_min_bytes := …, http_client := …, block := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus batteries knobs (`log_level`, `compression`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `compression VARCHAR` (`auto`\|`gzip`\|`zstd`\|`off`, default `auto`), `compression_min_bytes BIGINT` (default `1024`), `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus other batteries knobs |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql

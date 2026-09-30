@@ -87,6 +87,9 @@ CREATE ROUTE matrix_response_filter GET '/matrix/response-filter'
 CREATE ROUTE matrix_compressed GET '/matrix/compressed'
   AS SELECT repeat('x', 4096) AS payload;
 
+CREATE ROUTE matrix_small GET '/matrix/small'
+  AS SELECT 'small' AS payload;
+
 CREATE ROUTE matrix_ndjson GET '/matrix/ndjson' FORMAT ndjson
   AS SELECT id, name, price, tags FROM matrix_items ORDER BY id;
 
