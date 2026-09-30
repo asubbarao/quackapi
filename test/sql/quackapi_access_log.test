@@ -140,6 +140,23 @@ SELECT * FROM quackapi_stop(29461);
 ----
 Stopped quackapi server on port 29461
 
+# The existing readiness surface reports table-writer overflow state.
+query I
+SELECT * FROM quackapi_serve(29231, host := '127.0.0.1', access_log := 'access_log');
+----
+http://127.0.0.1:29231
+
+query I
+SELECT contains(body, '"access_log_overflow_count":0')
+FROM quackapi_fetch('http://127.0.0.1:29231/healthz');
+----
+true
+
+query I
+SELECT * FROM quackapi_stop(29231);
+----
+Stopped quackapi server on port 29231
+
 # A missing operator table must not fail the in-process request.
 query I
 SELECT status

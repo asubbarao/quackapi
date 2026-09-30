@@ -1824,6 +1824,7 @@ static void EmitAccessLogStderr(const QuackapiAccessLogEntry &entry) {
 static constexpr const char *QUACKAPI_STATIC_LOG_MARKER = "X-Quackapi-Static-Access-Log";
 static constexpr const char *QUACKAPI_STATIC_LOG_STARTED = "X-Quackapi-Static-Started";
 static constexpr const char *QUACKAPI_STATIC_LOG_RECEIVED = "X-Quackapi-Static-Received";
+static constexpr idx_t QUACKAPI_ACCESS_LOG_QUEUE_CAPACITY = 10000;
 
 class QuackapiAccessLogWriter {
 public:
@@ -1838,19 +1839,44 @@ public:
 
 	void Enqueue(QuackapiAccessLogEntry entry) {
 		bool fallback;
+		bool overflow = false;
+		bool warn_overflow = false;
+		idx_t overflow_count_snapshot = 0;
 		{
 			std::lock_guard<std::mutex> lock(mutex);
 			fallback = failed && std::chrono::steady_clock::now() < retry_at;
 			if (!fallback) {
-				pending.push_back(std::move(entry));
-				if (pending.size() >= 100) {
-					condition.notify_one();
+				if (pending.size() >= QUACKAPI_ACCESS_LOG_QUEUE_CAPACITY) {
+					overflow = true;
+					overflow_count_snapshot = ++overflow_count;
+					if (!overflow_warning_emitted) {
+						overflow_warning_emitted = true;
+						warn_overflow = true;
+					}
+				} else {
+					pending.push_back(std::move(entry));
+					if (pending.size() >= 100) {
+						condition.notify_one();
+					}
 				}
 			}
 		}
-		if (fallback) {
+		if (overflow) {
+			if (warn_overflow) {
+				fprintf(stderr,
+				        "quackapi: access_log table \"%s\" queue full; falling back to stderr "
+				        "(overflow_count=%llu)\n",
+				        table.c_str(), (unsigned long long)overflow_count_snapshot);
+			}
+			EmitAccessLogStderr(entry);
+		} else if (fallback) {
 			EmitAccessLogStderr(entry);
 		}
+	}
+
+	idx_t OverflowCount() {
+		std::lock_guard<std::mutex> lock(mutex);
+		return overflow_count;
 	}
 
 private:
@@ -1910,8 +1936,10 @@ private:
 		std::lock_guard<std::mutex> lock(mutex);
 		if (!failed) {
 			failed = true;
-			fprintf(stderr, "quackapi: access_log table \"%s\" failed; falling back to stderr: %s\n", table.c_str(),
-			        reason.c_str());
+			fprintf(stderr,
+			        "quackapi: access_log table \"%s\" failed; falling back to stderr "
+			        "(overflow_count=%llu): %s\n",
+			        table.c_str(), (unsigned long long)overflow_count, reason.c_str());
 		}
 		retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(retry_delay_seconds);
 		retry_delay_seconds = std::min<int64_t>(retry_delay_seconds * 2, 60);
@@ -1983,6 +2011,8 @@ private:
 	bool failed = false;
 	std::chrono::steady_clock::time_point retry_at;
 	int64_t retry_delay_seconds = 1;
+	idx_t overflow_count = 0;
+	bool overflow_warning_emitted = false;
 };
 
 string SanitizeClientRequestId(const string &s);
@@ -2522,6 +2552,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 			auto uptime_sec =
 			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count();
+			auto access_log_overflow_count = access_log_writer ? access_log_writer->OverflowCount() : 0;
 			if (ready) {
 				// Surface active outbound HTTP client + reason so operators /
 				// readiness probes can confirm batteries applied. auto fallback
@@ -2533,10 +2564,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				    StringUtil::Format(
 				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
 				        "\"request_id_source\":\"%s\",\"http_client\":\"%s\","
-				        "\"http_client_reason\":\"%s\"}",
+				        "\"http_client_reason\":\"%s\",\"access_log_overflow_count\":%llu}",
 				        QuackapiJsonEscape(version), (long long)uptime_sec,
 				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
-				        QuackapiJsonEscape(http_client), QuackapiJsonEscape(options.http_client_reason)));
+				        QuackapiJsonEscape(http_client), QuackapiJsonEscape(options.http_client_reason),
+				        (unsigned long long)access_log_overflow_count));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
 			}
