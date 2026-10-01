@@ -6,7 +6,7 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, request_ring := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)`
 
 | | |
 |--|--|
@@ -50,6 +50,26 @@ Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
 stderr and counted as `access_log_overflow_count` in `/healthz`. A failed table
 flush falls back to stderr, retries with 1-second-to-60-second backoff, emits one
 warning per failure episode, and logs a recovery line when the table works again.
+
+`request_ring BIGINT` defaults to `10000`; `0` disables the in-memory ring.
+
+### `quackapi_requests([port])`
+
+| | |
+|--|--|
+| **Kind** | Table function |
+| **Args** | `port INTEGER` optional; required when multiple servers are running |
+| **Returns** | `request_id`, `received_at`, `method`, `path`, `route_name`, `route_path`, `status`, `duration_ms`, `sql_prepare_ms`, `sql_execute_ms`, `rows_out`, `bytes_in`, `bytes_out`, `client_ip`, `user_agent`, `http_version`, `error_type`, `error_message`, `trace_id`, `span_id`, `parent_span_id`, `sampled` |
+
+Returns recent TCP requests oldest-first from a bounded in-memory ring. It
+returns no rows when no server is running; unknown optional fields are NULL.
+The ring is independent of `access_log`, so it records requests even when
+access-log output is disabled or filtered.
+
+```sql
+FROM quackapi_requests() WHERE status >= 500;
+FROM quackapi_requests(8000) ORDER BY received_at;
+```
 
 **Compression:** `auto` negotiates `Accept-Encoding` q-values, preferring zstd on
 ties. `gzip` and `zstd` restrict the selected coding, `off` disables compression,
@@ -398,6 +418,7 @@ not application-facing functions.
 | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | CORS allow list; empty = off |
 | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | Serve memory preference when named param omitted |
 | `SET quackapi_log_level = 'silent' \| 'error' \| 'warn' \| 'info' \| 'debug'` | Serve log verbosity; default `info` |
+| `SET quackapi_request_ring = N` | Recent TCP requests retained by `quackapi_requests()`; default `10000`, `0` disables |
 | `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | Response compression; default `auto` |
 | `SET quackapi_compression_min_bytes = N` | Minimum response size; default `1024` |
 | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | Outbound httpfs client preference (default `auto` → curl_httpfs) |

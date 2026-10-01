@@ -2080,6 +2080,9 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	}
 
 	server = make_uniq<QuackapiHttplibServer>();
+	if (options.request_ring > 0) {
+		request_ring = make_uniq<QuackapiRequestRing>(static_cast<size_t>(options.request_ring));
+	}
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
 	// requests before route handlers, so API routes always win over files.
@@ -2096,13 +2099,10 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 			request_id = NextRequestId(*db);
 		}
 		res.set_header("X-Request-ID", request_id);
-		if (options.access_log && options.log_level != QuackapiLogLevel::SILENT) {
-			res.set_header(QUACKAPI_STATIC_LOG_MARKER, "1");
-			res.set_header(
-			    QUACKAPI_STATIC_LOG_STARTED,
-			    std::to_string(static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count())));
-			res.set_header(QUACKAPI_STATIC_LOG_RECEIVED, std::to_string(Timestamp::GetCurrentTimestamp().value));
-		}
+		res.set_header(QUACKAPI_STATIC_LOG_MARKER, "1");
+		res.set_header(QUACKAPI_STATIC_LOG_STARTED, std::to_string(static_cast<int64_t>(
+		                                                std::chrono::steady_clock::now().time_since_epoch().count())));
+		res.set_header(QUACKAPI_STATIC_LOG_RECEIVED, std::to_string(Timestamp::GetCurrentTimestamp().value));
 	});
 	server->set_post_routing_handler([this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 		auto marker = res.headers.find(QUACKAPI_STATIC_LOG_MARKER);
@@ -2429,6 +2429,9 @@ static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &re
 }
 
 void QuackapiHttpServer::EmitAccessLog(const QuackapiRequestRecord &entry) {
+	if (request_ring) {
+		request_ring->Push(entry);
+	}
 	if (!options.access_log) {
 		return;
 	}
@@ -2457,6 +2460,10 @@ void QuackapiHttpServer::EmitAccessLog(const QuackapiRequestRecord &entry) {
 		// and block-buffered when piped; fflush-per-request serializes all workers.
 		EmitAccessLogStderr(entry);
 	}
+}
+
+std::vector<QuackapiRequestRecord> QuackapiHttpServer::SnapshotRequests() const {
+	return request_ring ? request_ring->Snapshot() : std::vector<QuackapiRequestRecord>();
 }
 
 void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {

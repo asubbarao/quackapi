@@ -1,0 +1,154 @@
+# name: test/sql/quackapi_requests_ring.test
+# description: Recent TCP requests retained by quackapi_requests()
+# group: [sql]
+
+require quackapi
+
+# No listener means the built-in ring surface is an empty relation.
+query I
+SELECT count(*) FROM quackapi_requests();
+----
+0
+
+statement ok
+CREATE OR REPLACE ROUTE ring_first GET '/ring/first' AS SELECT 'first' AS result;
+
+statement ok
+CREATE OR REPLACE ROUTE ring_second GET '/ring/second' AS SELECT 'second' AS result;
+
+statement ok
+CREATE OR REPLACE ROUTE ring_fail GET '/ring/fail' AS SELECT * FROM query($sql);
+
+# Access-log output is disabled, but the ring still records every request.
+query I
+SELECT * FROM quackapi_serve(29561, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29561
+
+query I
+SELECT quackapi_fetch('http://127.0.0.1:29561/ring/first').status;
+----
+200
+
+query I
+SELECT quackapi_fetch('http://127.0.0.1:29561/ring/missing').status;
+----
+404
+
+query I
+SELECT quackapi_fetch('http://127.0.0.1:29561/ring/second').status;
+----
+200
+
+query II
+SELECT status, path FROM quackapi_requests() ORDER BY received_at;
+----
+200	/ring/first
+404	/ring/missing
+200	/ring/second
+
+query I
+SELECT * FROM quackapi_stop(29561);
+----
+Stopped quackapi server on port 29561
+
+# The ring keeps only the newest two records, in oldest-first order.
+query I
+SELECT * FROM quackapi_serve(29562, host := '127.0.0.1', access_log := false, request_ring := 2);
+----
+http://127.0.0.1:29562
+
+statement ok
+SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-one').status;
+
+statement ok
+SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-two').status;
+
+statement ok
+SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-three').status;
+
+query I
+SELECT count(*) FROM quackapi_requests(29562);
+----
+2
+
+query I
+SELECT string_agg(path, ',' ORDER BY received_at) FROM quackapi_requests(29562);
+----
+/ring/two-two,/ring/two-three
+
+query I
+SELECT * FROM quackapi_stop(29562);
+----
+Stopped quackapi server on port 29562
+
+# A zero-sized ring does not retain requests.
+query I
+SELECT * FROM quackapi_serve(29563, host := '127.0.0.1', access_log := false, request_ring := 0);
+----
+http://127.0.0.1:29563
+
+statement ok
+SELECT quackapi_fetch('http://127.0.0.1:29563/ring/zero-one').status;
+
+statement ok
+SELECT quackapi_fetch('http://127.0.0.1:29563/ring/zero-two').status;
+
+query I
+SELECT count(*) FROM quackapi_requests(29563);
+----
+0
+
+query I
+SELECT * FROM quackapi_stop(29563);
+----
+Stopped quackapi server on port 29563
+
+# The SET option applies when the named parameter is omitted.
+statement ok
+SET quackapi_request_ring = 1;
+
+query I
+SELECT * FROM quackapi_serve(29565, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29565
+
+statement ok
+SELECT quackapi_fetch('http://127.0.0.1:29565/ring/setting-one').status;
+
+statement ok
+SELECT quackapi_fetch('http://127.0.0.1:29565/ring/setting-two').status;
+
+query I
+SELECT count(*) FROM quackapi_requests(29565);
+----
+1
+
+query I
+SELECT * FROM quackapi_stop(29565);
+----
+Stopped quackapi server on port 29565
+
+statement ok
+RESET quackapi_request_ring;
+
+# Failed requests remain queryable for SQL error filtering.
+query I
+SELECT * FROM quackapi_serve(29564, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29564
+
+query I
+SELECT quackapi_fetch('http://127.0.0.1:29564/ring/fail?sql=SELECT%20nope%20FROM%20nowhere').status;
+----
+500
+
+query II
+SELECT status, path FROM quackapi_requests(29564) WHERE status >= 500;
+----
+500	/ring/fail
+
+query I
+SELECT * FROM quackapi_stop(29564);
+----
+Stopped quackapi server on port 29564

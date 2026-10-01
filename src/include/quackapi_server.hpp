@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -75,6 +76,9 @@ struct QuackapiServeOptions {
 	bool enable_logging = false;
 	//! True when the operator supplied the enable_logging named parameter.
 	bool enable_logging_explicit = false;
+	//! Number of completed TCP requests retained for quackapi_requests().
+	//! Zero disables the ring and its allocation.
+	int64_t request_ring = 10000;
 
 	// --- Batteries: health routes (ON by default) ---
 	//! Auto-register GET /health + GET /healthz. Default true.
@@ -164,6 +168,46 @@ struct QuackapiRequestRecord {
 	bool sampled = true;
 };
 
+//! Fixed storage keeps request recording bounded while the mutex makes snapshots
+//! safe without holding the request path behind a reader's work.
+class QuackapiRequestRing {
+public:
+	explicit QuackapiRequestRing(size_t capacity) : records(capacity) {
+	}
+
+	void Push(const QuackapiRequestRecord &record) {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (records.empty()) {
+			return;
+		}
+		records[head] = record;
+		head = (head + 1) % records.size();
+		if (count < records.size()) {
+			count++;
+		}
+	}
+
+	std::vector<QuackapiRequestRecord> Snapshot() const {
+		std::lock_guard<std::mutex> lock(mutex);
+		std::vector<QuackapiRequestRecord> result;
+		result.reserve(count);
+		if (records.empty()) {
+			return result;
+		}
+		const auto first = count == records.size() ? head : 0;
+		for (size_t i = 0; i < count; i++) {
+			result.push_back(records[(first + i) % records.size()]);
+		}
+		return result;
+	}
+
+private:
+	std::vector<QuackapiRequestRecord> records;
+	mutable std::mutex mutex;
+	size_t head = 0;
+	size_t count = 0;
+};
+
 //! Parse log_level named param / setting. Accepts silent|error|warn|info|debug
 //! (case-insensitive). Unknown → INFO.
 QuackapiLogLevel ParseQuackapiLogLevel(const string &raw);
@@ -213,6 +257,8 @@ public:
 	const QuackapiServeOptions &Options() const {
 		return options;
 	}
+	//! Copy the retained records oldest-first while holding only the ring lock.
+	std::vector<QuackapiRequestRecord> SnapshotRequests() const;
 	//! True while the TCP listener thread is alive (false after StopAccepting).
 	bool IsRunning() const {
 		return is_running.load();
@@ -241,6 +287,7 @@ private:
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
+	unique_ptr<QuackapiRequestRing> request_ring;
 	unique_ptr<QuackapiAccessLogWriter> access_log_writer;
 };
 
