@@ -20,6 +20,7 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
+class QuackapiAccessLogWriter;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
@@ -62,6 +63,9 @@ struct QuackapiServeOptions {
 	QuackapiLogLevel log_level = QuackapiLogLevel::INFO;
 	//! Emit one structured access-log line per request (stderr, JSON). Default true.
 	bool access_log = true;
+	//! When non-empty, append access-log rows to this operator-created table instead
+	//! of stderr. The writer falls back to stderr if the table cannot be used.
+	string access_log_table;
 	//! Enable DuckDB built-in QueryLog at serve (CALL enable_logging). Default
 	//! **false** — per-handler QueryLog to stdout destroys HTTP throughput.
 	//! Opt in with enable_logging:=true for debugging; use access_log for ops.
@@ -193,7 +197,8 @@ private:
 	void ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 	string NextRequestId(DatabaseInstance &db);
 	void EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
-	                   const string &request_id, double latency_ms);
+	                   const string &request_id, const string &route_name, double latency_ms,
+	                   int64_t received_at_micros);
 	void MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
 	weak_ptr<DatabaseInstance> db_ptr;
@@ -207,6 +212,7 @@ private:
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
+	unique_ptr<QuackapiAccessLogWriter> access_log_writer;
 };
 
 //! In-process HTTP-shape invoke (no TCP). Builds a Request, runs Dispatch, returns

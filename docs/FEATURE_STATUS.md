@@ -180,7 +180,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **In-process TestClient** `quackapi_request` | **shipped** — `quackapi_request(method, path [, body])` → status/body/content_type (no TCP) | `test/sql/quackapi_request.test` |
 | **Rate limit (HTTP)** | **shipped** — `RATE LIMIT n PER s [BY ip\|token]` → 429 | `rate_limit.test.sh` |
 | **ETag-304 / CACHE TTL** | not built (outbound `cache_httpfs` is separate) | SPEC cache_etag |
-| **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor, SQL bind, stderr access log | `request_id.test.sh` |
+| **X-Request-ID + access log + `$request_id`** | **shipped** — uuidv7 mint, client header honor, SQL bind, stderr or operator-table access log | `quackapi_request_id.test`, `quackapi_access_log.test` |
 | **curl_httpfs guarantee** | **shipped** — `http_client:='curl'` fails serve if missing; auto loud fallback | batteries + `curl_httpfs_client.test.sh` |
 | **RFC 9457 problem+json** | FastAPI-shaped 422 only | `/tmp/quackapi_spec_problem_details/SPEC.md` |
 | **Envelope** default JSON **array of rows**; `ENVELOPE object` + `EMPTY STATUS` shipped | array stays default; object/404 opt-in | `docs/reference/ddl.md`; `quackapi_envelope.test` |

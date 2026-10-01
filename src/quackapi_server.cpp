@@ -1,9 +1,11 @@
 #include "quackapi_server.hpp"
 
+#include <condition_variable>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -18,6 +20,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -1709,11 +1712,326 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 } // namespace
 
+struct QuackapiAccessLogEntry {
+	string request_id;
+	int64_t received_at_micros;
+	string method;
+	string path;
+	string route_name;
+	int status;
+	double duration_ms;
+	int64_t bytes_out;
+	string client_ip;
+	string user_agent;
+};
+
+enum class QuackapiAccessLogColumn : uint8_t {
+	REQUEST_ID,
+	RECEIVED_AT,
+	METHOD,
+	PATH,
+	ROUTE_NAME,
+	STATUS,
+	DURATION_MS,
+	BYTES_OUT,
+	CLIENT_IP,
+	USER_AGENT,
+};
+
+static constexpr const char *QUACKAPI_ACCESS_LOG_COLUMNS[] = {"request_id", "received_at", "method",      "path",
+                                                              "route_name", "status",      "duration_ms", "bytes_out",
+                                                              "client_ip",  "user_agent"};
+
+static std::mutex quackapi_access_log_flush_mutex;
+
+static Value AccessLogValue(const QuackapiAccessLogEntry &entry, QuackapiAccessLogColumn column) {
+	switch (column) {
+	case QuackapiAccessLogColumn::REQUEST_ID:
+		return Value(entry.request_id);
+	case QuackapiAccessLogColumn::RECEIVED_AT:
+		return Value::TIMESTAMP(timestamp_t(entry.received_at_micros));
+	case QuackapiAccessLogColumn::METHOD:
+		return Value(entry.method);
+	case QuackapiAccessLogColumn::PATH:
+		return Value(entry.path);
+	case QuackapiAccessLogColumn::ROUTE_NAME:
+		return entry.route_name.empty() ? Value() : Value(entry.route_name);
+	case QuackapiAccessLogColumn::STATUS:
+		return Value::INTEGER(entry.status);
+	case QuackapiAccessLogColumn::DURATION_MS:
+		return Value::DOUBLE(entry.duration_ms);
+	case QuackapiAccessLogColumn::BYTES_OUT:
+		return Value::BIGINT(entry.bytes_out);
+	case QuackapiAccessLogColumn::CLIENT_IP:
+		return Value(entry.client_ip);
+	case QuackapiAccessLogColumn::USER_AGENT:
+		return Value(entry.user_agent);
+	}
+	throw InternalException("unknown quackapi access-log column");
+}
+
+static vector<string> SplitAccessLogTable(const string &table) {
+	vector<string> parts = StringUtil::Split(table, '.');
+	for (auto &part : parts) {
+		StringUtil::Trim(part);
+	}
+	if (parts.empty() || parts.size() > 3) {
+		throw InvalidInputException("access_log table must be a table, schema.table, or database.schema.table");
+	}
+	for (auto &part : parts) {
+		if (part.empty()) {
+			throw InvalidInputException("access_log table name contains an empty identifier");
+		}
+	}
+	return parts;
+}
+
+static unique_ptr<TableDescription> AccessLogTableInfo(Connection &con, const vector<string> &parts) {
+	if (parts.size() == 1) {
+		return con.TableInfo(parts[0]);
+	}
+	if (parts.size() == 2) {
+		return con.TableInfo(parts[0], parts[1]);
+	}
+	return con.TableInfo(parts[0], parts[1], parts[2]);
+}
+
+static unique_ptr<Appender> AccessLogAppender(Connection &con, const vector<string> &parts) {
+	if (parts.size() == 1) {
+		return make_uniq<Appender>(con, parts[0]);
+	}
+	if (parts.size() == 2) {
+		return make_uniq<Appender>(con, parts[0], parts[1]);
+	}
+	return make_uniq<Appender>(con, parts[0], parts[1], parts[2]);
+}
+
+static void EmitAccessLogStderr(const QuackapiAccessLogEntry &entry) {
+	string path_esc;
+	path_esc.reserve(entry.path.size() + 8);
+	for (unsigned char c : entry.path) {
+		if (c == '"' || c == '\\') {
+			path_esc += '\\';
+			path_esc += static_cast<char>(c);
+		} else if (c < 0x20) {
+			char buf[8];
+			snprintf(buf, sizeof(buf), "\\u%04x", c);
+			path_esc += buf;
+		} else {
+			path_esc += static_cast<char>(c);
+		}
+	}
+	fprintf(stderr,
+	        "{\"type\":\"access\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,"
+	        "\"latency_ms\":%.3f,\"request_id\":\"%s\",\"bytes\":%llu}\n",
+	        entry.method.c_str(), path_esc.c_str(), entry.status, entry.duration_ms, entry.request_id.c_str(),
+	        (unsigned long long)entry.bytes_out);
+}
+
+static constexpr const char *QUACKAPI_STATIC_LOG_MARKER = "X-Quackapi-Static-Access-Log";
+static constexpr const char *QUACKAPI_STATIC_LOG_STARTED = "X-Quackapi-Static-Started";
+static constexpr const char *QUACKAPI_STATIC_LOG_RECEIVED = "X-Quackapi-Static-Received";
+static constexpr idx_t QUACKAPI_ACCESS_LOG_QUEUE_CAPACITY = 10000;
+
+class QuackapiAccessLogWriter {
+public:
+	QuackapiAccessLogWriter(DatabaseInstance &db, string table_p)
+	    : db_ptr(db.shared_from_this()), table(std::move(table_p)) {
+		worker = std::thread(&QuackapiAccessLogWriter::Run, this);
+	}
+
+	~QuackapiAccessLogWriter() {
+		Shutdown();
+	}
+
+	void Enqueue(QuackapiAccessLogEntry entry) {
+		bool fallback;
+		bool overflow = false;
+		bool warn_overflow = false;
+		idx_t overflow_count_snapshot = 0;
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			fallback = failed && std::chrono::steady_clock::now() < retry_at;
+			if (!fallback) {
+				if (pending.size() >= QUACKAPI_ACCESS_LOG_QUEUE_CAPACITY) {
+					overflow = true;
+					overflow_count_snapshot = ++overflow_count;
+					if (!overflow_warning_emitted) {
+						overflow_warning_emitted = true;
+						warn_overflow = true;
+					}
+				} else {
+					pending.push_back(std::move(entry));
+					if (pending.size() >= 100) {
+						condition.notify_one();
+					}
+				}
+			}
+		}
+		if (overflow) {
+			if (warn_overflow) {
+				fprintf(stderr,
+				        "quackapi: access_log table \"%s\" queue full; falling back to stderr "
+				        "(overflow_count=%llu)\n",
+				        table.c_str(), (unsigned long long)overflow_count_snapshot);
+			}
+			EmitAccessLogStderr(entry);
+		} else if (fallback) {
+			EmitAccessLogStderr(entry);
+		}
+	}
+
+	idx_t OverflowCount() {
+		std::lock_guard<std::mutex> lock(mutex);
+		return overflow_count;
+	}
+
+private:
+	void Shutdown() {
+		if (!worker.joinable()) {
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			stopping = true;
+		}
+		condition.notify_one();
+		worker.join();
+	}
+
+	void FlushBatch(const vector<QuackapiAccessLogEntry> &batch) {
+		if (table_parts.empty()) {
+			table_parts = SplitAccessLogTable(table);
+		}
+		std::lock_guard<std::mutex> write_lock(quackapi_access_log_flush_mutex);
+		auto db = db_ptr.lock();
+		if (!db) {
+			throw InvalidInputException("database is shutting down");
+		}
+		Connection con(*db);
+		auto info = AccessLogTableInfo(con, table_parts);
+		if (!info) {
+			throw CatalogException("access_log table \"%s\" does not exist", table);
+		}
+		auto appender = AccessLogAppender(con, table_parts);
+		appender->ClearColumns();
+
+		vector<QuackapiAccessLogColumn> selected;
+		for (idx_t i = 0; i < sizeof(QUACKAPI_ACCESS_LOG_COLUMNS) / sizeof(QUACKAPI_ACCESS_LOG_COLUMNS[0]); i++) {
+			for (auto &column : info->columns) {
+				if (!column.Generated() && StringUtil::CIEquals(column.Name(), QUACKAPI_ACCESS_LOG_COLUMNS[i])) {
+					appender->AddColumn(column.Name());
+					selected.push_back(static_cast<QuackapiAccessLogColumn>(i));
+					break;
+				}
+			}
+		}
+		if (selected.empty()) {
+			throw InvalidInputException("access_log table has no recognized request columns");
+		}
+		for (auto &entry : batch) {
+			appender->BeginRow();
+			for (auto column : selected) {
+				appender->Append(AccessLogValue(entry, column));
+			}
+			appender->EndRow();
+		}
+		appender->Flush();
+	}
+
+	void MarkFailed(const string &reason) {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!failed) {
+			failed = true;
+			fprintf(stderr,
+			        "quackapi: access_log table \"%s\" failed; falling back to stderr "
+			        "(overflow_count=%llu): %s\n",
+			        table.c_str(), (unsigned long long)overflow_count, reason.c_str());
+		}
+		retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(retry_delay_seconds);
+		retry_delay_seconds = std::min<int64_t>(retry_delay_seconds * 2, 60);
+	}
+
+	void MarkRecovered() {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!failed) {
+			return;
+		}
+		failed = false;
+		retry_delay_seconds = 1;
+		fprintf(stderr, "quackapi: access_log table \"%s\" recovered; resuming table logging\n", table.c_str());
+	}
+
+	void Run() {
+		try {
+			table_parts = SplitAccessLogTable(table);
+		} catch (std::exception &ex) {
+			MarkFailed(ex.what());
+		}
+		for (;;) {
+			vector<QuackapiAccessLogEntry> batch;
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				condition.wait_for(lock, std::chrono::seconds(1), [&] { return stopping || pending.size() >= 100; });
+				batch.assign(std::make_move_iterator(pending.begin()), std::make_move_iterator(pending.end()));
+				pending.clear();
+				if (batch.empty() && stopping) {
+					break;
+				}
+			}
+			if (batch.empty()) {
+				continue;
+			}
+			bool use_stderr;
+			{
+				std::lock_guard<std::mutex> lock(mutex);
+				use_stderr = failed && std::chrono::steady_clock::now() < retry_at;
+			}
+			if (!use_stderr) {
+				try {
+					FlushBatch(batch);
+					MarkRecovered();
+				} catch (std::exception &ex) {
+					MarkFailed(ex.what());
+					use_stderr = true;
+				} catch (...) {
+					MarkFailed("unknown append error");
+					use_stderr = true;
+				}
+			}
+			if (use_stderr) {
+				for (auto &entry : batch) {
+					EmitAccessLogStderr(entry);
+				}
+			}
+		}
+	}
+
+	weak_ptr<DatabaseInstance> db_ptr;
+	string table;
+	vector<string> table_parts;
+	std::mutex mutex;
+	std::condition_variable condition;
+	vector<QuackapiAccessLogEntry> pending;
+	std::thread worker;
+	bool stopping = false;
+	bool failed = false;
+	std::chrono::steady_clock::time_point retry_at;
+	int64_t retry_delay_seconds = 1;
+	idx_t overflow_count = 0;
+	bool overflow_warning_emitted = false;
+};
+
+string SanitizeClientRequestId(const string &s);
+
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
                                        const QuackapiServeOptions &opts, bool bind_and_listen)
     : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins), options(opts),
       started_at(std::chrono::steady_clock::now()), compression(opts.compression),
       compression_min_bytes(opts.compression_min_bytes) {
+	if (!options.access_log_table.empty()) {
+		access_log_writer = make_uniq<QuackapiAccessLogWriter>(db, options.access_log_table);
+	}
 	// In-process only (quackapi_request): no TCP server object, no bind.
 	if (!bind_and_listen) {
 		is_running.store(false);
@@ -1727,6 +2045,54 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	if (!opts.static_dir.empty() && !server->set_mount_point("/", opts.static_dir)) {
 		throw IOException("quackapi: static_dir \"%s\" is not a directory", opts.static_dir);
 	}
+	server->set_file_request_handler([this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+		auto db = db_ptr.lock();
+		if (!db) {
+			return;
+		}
+		auto request_id = SanitizeClientRequestId(req.get_header_value("X-Request-ID"));
+		if (request_id.empty()) {
+			request_id = NextRequestId(*db);
+		}
+		res.set_header("X-Request-ID", request_id);
+		if (options.access_log && options.log_level >= QuackapiLogLevel::INFO) {
+			res.set_header(QUACKAPI_STATIC_LOG_MARKER, "1");
+			res.set_header(
+			    QUACKAPI_STATIC_LOG_STARTED,
+			    std::to_string(static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count())));
+			res.set_header(QUACKAPI_STATIC_LOG_RECEIVED, std::to_string(Timestamp::GetCurrentTimestamp().value));
+		}
+	});
+	server->set_post_routing_handler([this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+		auto marker = res.headers.find(QUACKAPI_STATIC_LOG_MARKER);
+		if (marker == res.headers.end()) {
+			return;
+		}
+		res.headers.erase(marker);
+		auto started = res.headers.find(QUACKAPI_STATIC_LOG_STARTED);
+		auto received = res.headers.find(QUACKAPI_STATIC_LOG_RECEIVED);
+		int64_t received_at = Timestamp::GetCurrentTimestamp().value;
+		if (received != res.headers.end()) {
+			try {
+				received_at = std::stoll(received->second);
+			} catch (...) {
+			}
+			res.headers.erase(received);
+		}
+		double latency_ms = 0;
+		if (started != res.headers.end()) {
+			try {
+				const auto started_ticks = std::stoll(started->second);
+				latency_ms =
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch() -
+				                                              std::chrono::steady_clock::duration(started_ticks))
+				        .count();
+			} catch (...) {
+			}
+			res.headers.erase(started);
+		}
+		EmitAccessLog(req, res, res.get_header_value("X-Request-ID"), "static", latency_ms, received_at);
+	});
 
 	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
 	int32_t workers =
@@ -1810,12 +2176,13 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
                               const unordered_map<string, string> *req_headers,
                               unordered_map<string, string> *headers_out, const string &pg_dsn,
                               const QuackapiServeOptions *request_options) {
-	// Quiet defaults for SQL tests: no access log, no compression (raw body).
+	// Quiet defaults for SQL tests unless request_options explicitly enables logging.
 	QuackapiServeOptions opts;
 	if (request_options) {
 		opts = *request_options;
+	} else {
+		opts.access_log = false;
 	}
-	opts.access_log = false;
 	opts.compression = QuackapiCompressionMode::OFF;
 	opts.health_routes = true;
 	opts.pg_dsn = pg_dsn;
@@ -1896,11 +2263,11 @@ string SanitizeClientRequestId(const string &s) {
 }
 
 void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
-                                       const string &request_id, double latency_ms) {
+                                       const string &request_id, const string &route_name, double latency_ms,
+                                       int64_t received_at_micros) {
 	if (!options.access_log || options.log_level < QuackapiLogLevel::INFO) {
 		return;
 	}
-	// Structured JSON (one line) — method, path, status, latency_ms, request_id, bytes.
 	size_t bytes = res.body.size();
 	// Prefer Content-Length when set; body may be empty for HEAD.
 	auto cl = res.headers.find("Content-Length");
@@ -1910,28 +2277,18 @@ void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const
 		} catch (...) {
 		}
 	}
-	// Escape path for JSON (minimal: quotes + backslash + control chars).
-	string path_esc;
-	path_esc.reserve(req.path.size() + 8);
-	for (unsigned char c : req.path) {
-		if (c == '"' || c == '\\') {
-			path_esc += '\\';
-			path_esc += static_cast<char>(c);
-		} else if (c < 0x20) {
-			char buf[8];
-			snprintf(buf, sizeof(buf), "\\u%04x", c);
-			path_esc += buf;
-		} else {
-			path_esc += static_cast<char>(c);
-		}
+	QuackapiAccessLogEntry entry {request_id,      received_at_micros,
+	                              req.method,      req.path,
+	                              route_name,      res.status,
+	                              latency_ms,      static_cast<int64_t>(bytes),
+	                              req.remote_addr, req.get_header_value("User-Agent")};
+	if (access_log_writer) {
+		access_log_writer->Enqueue(std::move(entry));
+	} else {
+		// No fflush: stderr is typically line-buffered when attached to a terminal
+		// and block-buffered when piped; fflush-per-request serializes all workers.
+		EmitAccessLogStderr(entry);
 	}
-	// No fflush: stderr is typically line-buffered when attached to a terminal
-	// and block-buffered when piped; fflush-per-request serializes all workers.
-	fprintf(stderr,
-	        "{\"type\":\"access\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,"
-	        "\"latency_ms\":%.3f,\"request_id\":\"%s\",\"bytes\":%llu}\n",
-	        req.method.c_str(), path_esc.c_str(), res.status, latency_ms, request_id.c_str(),
-	        (unsigned long long)bytes);
 }
 
 void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
@@ -2124,7 +2481,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// on the response; the access log is emitted last so its byte count
 	// reflects the (possibly compressed) final body.
 	const auto t0 = std::chrono::steady_clock::now();
+	const auto received_at_micros = Timestamp::GetCurrentTimestamp().value;
 	string request_id; // filled once db is available; may be empty on 503 shutdown
+	string route_name;
 
 	std::function<void()> after_middleware;
 	auto finish = [&]() {
@@ -2148,7 +2507,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		MaybeCompressResponse(req, res);
 		auto t1 = std::chrono::steady_clock::now();
 		double latency_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-		EmitAccessLog(req, res, request_id.empty() ? string("-") : request_id, latency_ms);
+		EmitAccessLog(req, res, request_id.empty() ? string("-") : request_id, route_name, latency_ms,
+		              received_at_micros);
 	};
 
 	auto db = db_ptr.lock();
@@ -2175,12 +2535,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// route (Starlette redirect_slashes policy — see trailing_slash.test.sh).
 	if (options.health_routes && (req.method == "GET" || req.method == "HEAD")) {
 		if (req.path == "/health") {
+			route_name = "health";
 			// Object body (not row-array) — standard k8s/load-balancer shape.
 			SetJson(res, 200, "{\"status\":\"ok\"}");
 			finish();
 			return;
 		}
 		if (req.path == "/healthz") {
+			route_name = "healthz";
 			// Readiness: verify the DB handle can run a trivial query.
 			string version = "unknown";
 			bool ready = false;
@@ -2199,6 +2561,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 			auto uptime_sec =
 			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count();
+			auto access_log_overflow_count = access_log_writer ? access_log_writer->OverflowCount() : 0;
 			if (ready) {
 				// Surface active outbound HTTP client + reason so operators /
 				// readiness probes can confirm batteries applied. auto fallback
@@ -2210,10 +2573,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				    StringUtil::Format(
 				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
 				        "\"request_id_source\":\"%s\",\"http_client\":\"%s\","
-				        "\"http_client_reason\":\"%s\"}",
+				        "\"http_client_reason\":\"%s\",\"access_log_overflow_count\":%llu}",
 				        QuackapiJsonEscape(version), (long long)uptime_sec,
 				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
-				        QuackapiJsonEscape(http_client), QuackapiJsonEscape(options.http_client_reason)));
+				        QuackapiJsonEscape(http_client), QuackapiJsonEscape(options.http_client_reason),
+				        (unsigned long long)access_log_overflow_count));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
 			}
@@ -2228,6 +2592,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		auto &gql_state = QuackapiState::Get(*db);
 		QuackapiGraphqlRoute gql_route;
 		if (req.method == "POST" && gql_state.GetGraphqlRouteByPath(req.path, req.method, gql_route)) {
+			route_name = gql_route.name;
 			QuackapiAuthResult auth_result;
 			if (!gql_route.require_auth.empty()) {
 				QuackapiRoute auth_probe;
@@ -2269,6 +2634,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		if ((req.method == "GET" || req.method == "HEAD") &&
 		    gql_state.GetGraphqlRouteBySchemaPath(req.path, gql_route)) {
+			route_name = gql_route.name + ".schema";
 			QuackapiAuthResult auth_result;
 			if (!gql_route.require_auth.empty()) {
 				QuackapiRoute auth_probe;
@@ -2309,6 +2675,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// GET  /graphql/schema — main-schema tables → column names
 	// Public in v0 (no auth). Not listed in quackapi_routes().
 	if (req.path == "/graphql" || req.path == "/graphql/") {
+		route_name = "graphql";
 		if (req.method == "POST") {
 			string gql_query;
 			string gql_err;
@@ -2350,6 +2717,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 	if ((req.method == "GET" || req.method == "HEAD") &&
 	    (req.path == "/graphql/schema" || req.path == "/graphql/schema/")) {
+		route_name = "graphql.schema";
 		try {
 			GraphqlExecOptions opts;
 			opts.query_timeout_ms = options.query_timeout_ms;
@@ -2368,6 +2736,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// FastAPI parity: GET /openapi.json + GET /docs (+ optional /redoc).
 	if (req.method == "GET" || req.method == "HEAD") {
 		if (req.path == "/openapi.json") {
+			route_name = "openapi";
 			string server_url = StringUtil::Format("http://%s:%d", host, port);
 			try {
 				auto doc = BuildOpenApiDocument(*db, server_url);
@@ -2382,12 +2751,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 		if (req.path == "/docs" || req.path == "/docs/") {
+			route_name = "docs";
 			res.status = 200;
 			res.set_content(OpenApiDocsHtml(), "text/html; charset=utf-8");
 			finish();
 			return;
 		}
 		if (req.path == "/redoc" || req.path == "/redoc/") {
+			route_name = "redoc";
 			res.status = 200;
 			res.set_content(OpenApiRedocHtml(), "text/html; charset=utf-8");
 			finish();
@@ -2583,6 +2954,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	// ---- CREATE STREAM (SSE) path — no auth schemes on streams in v1 ----
 	if (!match.matched && stream_match.matched) {
+		route_name = stream_match.stream.name;
 		try {
 			bool policy_denied = false;
 			string stream_policy_error;
@@ -2810,6 +3182,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
+	route_name = match.route.name;
 	// Public routes (require_auth empty) pass through unchanged.
 	// Auth is evaluated through the SQL surface (quackapi_verify_auth), the
 	// same EvaluateAuthQuery shape quack uses for CONNECTION_REQUEST

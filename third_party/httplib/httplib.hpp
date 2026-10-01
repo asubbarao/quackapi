@@ -8062,7 +8062,7 @@ inline bool Server::handle_file_request(const Request &req, Response &res) {
                 return true;
               });
 
-          if (req.method != "HEAD" && file_request_handler_) {
+          if (file_request_handler_) {
             file_request_handler_(req, res);
           }
 
