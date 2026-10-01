@@ -7,6 +7,9 @@ ULTRA="${ROOT}/test/ultra"
 echo "==> ultra unit checks"
 python3 -m unittest discover -s "$ULTRA" -p 'test_*.py'
 
+echo "==> curl compression checks"
+bash "${ULTRA}/test_compression.sh"
+
 echo "==> paired FastAPI/QuackAPI matrix"
 bash "${ULTRA}/run_pair.sh"
 

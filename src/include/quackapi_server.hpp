@@ -43,6 +43,9 @@ enum class QuackapiLogLevel : uint8_t {
 	DEBUG_LEVEL = 4,
 };
 
+//! Response compression policy. AUTO negotiates zstd/gzip from Accept-Encoding.
+enum class QuackapiCompressionMode : uint8_t { OFF = 0, GZIP = 1, ZSTD = 2, AUTO = 3 };
+
 //! Serve options (static files, CORS, batteries-included server defaults,
 //! response compression). Defaults are correct-by-default for a server
 //! process: logging on, health routes on, throughput-oriented DuckDB SETs
@@ -117,11 +120,11 @@ struct QuackapiServeOptions {
 	//! "tsid" only if an operator forces a future path; default is uuidv7.
 	string request_id_source;
 
-	// --- Compression (ON by default) ---
-	//! When true (default), honor Accept-Encoding: prefer zstd, then gzip.
-	bool compression = true;
-	//! Bodies smaller than this many bytes are left uncompressed (default 256).
-	idx_t compression_min_bytes = 256;
+	// --- Compression (auto by default) ---
+	//! AUTO honors Accept-Encoding; GZIP/ZSTD restrict the negotiated coding.
+	QuackapiCompressionMode compression = QuackapiCompressionMode::AUTO;
+	//! Bodies smaller than this many bytes are left uncompressed (default 1024).
+	idx_t compression_min_bytes = 1024;
 
 	// --- Native Postgres (optional; same shape as FastAPI+psycopg) ---
 	//! When non-empty, simple routes execute via libpq (thread-local conn,
@@ -204,8 +207,8 @@ private:
 	string cors_origins;
 	QuackapiServeOptions options;
 	std::chrono::steady_clock::time_point started_at;
-	bool compression = true;
-	idx_t compression_min_bytes = 256;
+	QuackapiCompressionMode compression = QuackapiCompressionMode::AUTO;
+	idx_t compression_min_bytes = 1024;
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};

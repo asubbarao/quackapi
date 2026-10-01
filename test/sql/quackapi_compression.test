@@ -1,0 +1,32 @@
+# name: test/sql/quackapi_compression.test
+# description: response compression mode and threshold configuration
+# group: [sql]
+
+require quackapi
+
+query I
+SELECT current_setting('quackapi_compression')
+----
+auto
+
+query I
+SELECT current_setting('quackapi_compression_min_bytes')
+----
+1024
+
+# The new serve-level API rejects unknown compression modes during binding.
+statement error
+SELECT * FROM quackapi_serve(29480, host := '127.0.0.1', compression := 'brotli');
+----
+compression must be one of off, gzip, zstd, auto
+
+# Legacy booleans remain accepted as aliases for auto/off.
+query I
+SELECT * FROM quackapi_serve(29480, host := '127.0.0.1', access_log := false, compression := false);
+----
+http://127.0.0.1:29480
+
+query I
+SELECT * FROM quackapi_stop(29480);
+----
+Stopped quackapi server on port 29480

@@ -115,10 +115,10 @@ struct ServeBindData : public TableFunctionData {
 	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
 	int32_t read_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	int32_t write_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
-	//! Response compression (Accept-Encoding). Default true.
-	bool compression = true;
-	//! Min body size in bytes before compression. Default 256.
-	idx_t compression_min_bytes = 256;
+	//! Response compression policy (auto|gzip|zstd|off). Default auto.
+	string compression = "auto";
+	//! Min body size in bytes before compression. Default 1024.
+	idx_t compression_min_bytes = 1024;
 	//! Outbound HTTP client preference: auto|curl|httplib (default auto).
 	string http_client = "auto";
 	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
@@ -284,17 +284,22 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	if (wrt_entry != input.named_parameters.end()) {
 		bind_data->write_timeout_sec = wrt_entry->second.GetValue<int32_t>();
 	}
-	// compression named param wins; else SET quackapi_compression (default true).
+	// compression named param wins; else SET quackapi_compression (default auto).
 	auto comp_entry = input.named_parameters.find("compression");
 	if (comp_entry != input.named_parameters.end()) {
-		bind_data->compression = comp_entry->second.GetValue<bool>();
+		if (comp_entry->second.type().id() == LogicalTypeId::BOOLEAN) {
+			// Preserve the pre-enum boolean API: true means auto, false means off.
+			bind_data->compression = comp_entry->second.GetValue<bool>() ? "auto" : "off";
+		} else {
+			bind_data->compression = comp_entry->second.GetValue<string>();
+		}
 	} else {
 		Value setting;
 		if (context.TryGetCurrentSetting("quackapi_compression", setting) && !setting.IsNull()) {
-			bind_data->compression = setting.GetValue<bool>();
+			bind_data->compression = setting.GetValue<string>();
 		}
 	}
-	// compression_min_bytes named param wins; else SET (default 256).
+	// compression_min_bytes named param wins; else SET (default 1024).
 	// pg_dsn named param wins; else SET quackapi_pg_dsn.
 	auto pg_dsn_entry = input.named_parameters.find("pg_dsn");
 	if (pg_dsn_entry != input.named_parameters.end()) {
@@ -417,7 +422,21 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	// REST listener — justified by absence of a quack path-registration hook
 	// (see /tmp/quackapi_onquack/ARCHITECTURE.md). Lifecycle mirrors
 	// HttpQuackServer / QuackStorageExtensionInfo::CreateServer.
-	opts.compression = bind_data.compression;
+	{
+		auto compression = StringUtil::Lower(bind_data.compression);
+		StringUtil::Trim(compression);
+		if (compression == "off" || compression == "false") {
+			opts.compression = QuackapiCompressionMode::OFF;
+		} else if (compression == "gzip") {
+			opts.compression = QuackapiCompressionMode::GZIP;
+		} else if (compression == "zstd") {
+			opts.compression = QuackapiCompressionMode::ZSTD;
+		} else if (compression == "auto" || compression == "true") {
+			opts.compression = QuackapiCompressionMode::AUTO;
+		} else {
+			throw InvalidInputException("quackapi_serve: compression must be one of off, gzip, zstd, auto");
+		}
+	}
 	opts.compression_min_bytes = bind_data.compression_min_bytes;
 	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, opts);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
@@ -837,18 +856,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Log verbosity for quackapi_serve: silent|error|warn|info|debug. "
 	                          "Default info. Overridden by log_level named parameter.",
 	                          LogicalType::VARCHAR, Value("info"));
-	// SET quackapi_compression = true|false — response compression (zstd/gzip).
-	// Default true. Serve-time compression := false opts out.
+	// SET quackapi_compression = 'auto'|'gzip'|'zstd'|'off'.
+	// Default auto. Legacy true/false values map to auto/off.
 	config.AddExtensionOption("quackapi_compression",
-	                          "Enable Accept-Encoding response compression on quackapi_serve "
-	                          "(zstd preferred, then gzip). Default true. Overridden by "
+	                          "Response compression mode on quackapi_serve: auto, gzip, zstd or off. "
+	                          "Default auto (zstd preferred, then gzip). Overridden by "
 	                          "compression named parameter.",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	                          LogicalType::VARCHAR, Value("auto"));
 	// SET quackapi_compression_min_bytes = N — skip compression under this size.
 	config.AddExtensionOption("quackapi_compression_min_bytes",
 	                          "Minimum response body size (bytes) before compression. "
-	                          "Default 256. Overridden by compression_min_bytes named parameter.",
-	                          LogicalType::BIGINT, Value::BIGINT(256));
+	                          "Default 1024. Overridden by compression_min_bytes named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(1024));
 	// SET quackapi_http_client = 'auto' | 'curl' | 'httplib'
 	// Default auto: INSTALL+LOAD curl_httpfs; fall back to httplib with loud reason.
 	// curl: REQUIRE curl_httpfs — fail serve if INSTALL/LOAD fails (no silent fallback).
@@ -898,7 +917,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["keep_alive_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["read_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
-	serve.named_parameters["compression"] = LogicalType::BOOLEAN;
+	serve.named_parameters["compression"] = LogicalType::ANY;
 	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
 	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
 	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
