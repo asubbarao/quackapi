@@ -222,11 +222,13 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `quackapi_serve([port], host, static_dir, cors_origins)` | table | Start listener (default `127.0.0.1:8000`) |
+| `quackapi_serve([port], host, static_dir, cors_origins, memory_limit, log_level, access_log, enable_logging, health_routes, threads, preserve_insertion_order, enable_http_metadata_cache, worker_threads, keep_alive_max_count, keep_alive_timeout_sec, read_timeout_sec, write_timeout_sec, compression, compression_min_bytes, http_client, pg_dsn, block, query_timeout_ms, max_response_bytes, max_pending_requests)` | table | Start listener (default `127.0.0.1:8000`) |
+| `quackapi_wait(port [, timeout_ms], host := …)` | table | TCP readiness probe → `ready`, `listen_url` |
 | `quackapi_stop([port])` | table | Stop one or all servers |
-| `quackapi_routes()` | table | Registry: name, method, pattern, status, handler, require_auth, group_name, tags |
-| `quackapi_servers()` | table | host, port, listen_url |
+| `quackapi_routes()` | table | Registry: name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec |
+| `quackapi_servers()` | table | host, port, listen_url, http_client, http_client_reason |
 | `quackapi_cors_origins` | setting | CORS allow-list (`*` or CSV); empty = off |
+| `quackapi_compression` / `quackapi_compression_min_bytes` | settings | Response coding (`auto`, `gzip`, `zstd`, `off`) and 1024-byte default threshold |
 
 ### Auth
 
@@ -280,6 +282,8 @@ related modules). Auto-detection on the community site will list overloads after
 | `quackapi_post(url, body[, ct[, headers]])` | scalar | Pooled outbound POST, same result shape |
 | `quackapi_http_pool()` | table | Outbound pool per origin: `host, idle, dialed, reused` |
 | `quackapi_http_util_name()` | scalar | Active outbound HTTPUtil name |
+| `quackapi_request(method, path [, body], …)` | table | In-process request → status, BLOB body, content type, headers |
+| `quackapi_middlewares()` | table | Inspect SQL middleware definitions |
 
 Internal apply helpers (`quackapi_apply_route`, `quackapi_apply_auth`, …) exist
 for the planner and are not part of the public app API.
@@ -291,7 +295,7 @@ for the planner and are not part of the public app API.
 | Item | Value |
 |------|--------|
 | Target DuckDB | **v1.5.5** (CI + submodule pin) |
-| Language / build | C++17 / **cmake** |
+| Language / build | C++11 / **cmake** |
 | Extra toolchains | **None** (no vcpkg, no Rust, no Python at build) |
 | Linked deps | DuckDB **bundled httplib** + **mbedtls** only |
 | Outbound HTTPS | Core `HTTPUtil`; optional `LOAD curl_httpfs` upgrades process-wide client |
@@ -301,7 +305,8 @@ for the planner and are not part of the public app API.
 | `linux_amd64`, `linux_arm64` | Build & sign |
 | `osx_amd64`, `osx_arm64` | Build & sign |
 | `wasm_mvp`, `wasm_eh`, `wasm_threads` | **Excluded** — no server sockets |
-| `windows_amd64`, `windows_amd64_mingw`, `windows_amd64_rtools`, `windows_arm64` | **Excluded** — unproven in repo CI (httplib is portable; re-opt-in after green MSVC) |
+| `windows_amd64` | Build & sign |
+| `windows_amd64_mingw`, `windows_amd64_rtools`, `windows_arm64` | **Excluded** — not enabled by the repository descriptor |
 
 Repo workflow: `duckdb/extension-ci-tools` `@v1.5-variegata`,
 `duckdb_version: v1.5.5`, same `exclude_archs` as `description.yml`.
@@ -320,8 +325,9 @@ clean release tag with **no merge-conflict markers** in `src/`, green
 2. **Instance-scoped registry** — routes/auth/groups/streams/queue *options*
    die with the process; re-run DDL on boot. Job **rows** in `quackapi_jobs`
    persist.
-3. **Serve memory guard** — `quackapi_serve` sets `memory_limit` to 256MB;
-   raise after serve for large PDF/HTML work.
+3. **Serve memory guard** — `quackapi_serve` applies a 256MB default only when
+   no operator or serve memory limit is configured; use `memory_limit := '4GB'`
+   or `SET quackapi_memory_limit` for large PDF/HTML work.
 4. **Body size** — 8 MiB max payload.
 5. **JWT** — HS256 only.
 6. **Table API** — read-only GET scaffold.

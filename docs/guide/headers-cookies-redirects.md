@@ -62,10 +62,13 @@ CREATE TABLE http_access_log (
 SELECT * FROM quackapi_serve(8000, access_log := 'http_access_log');
 ```
 
-Appends are batched (up to about 100 rows or one second). A missing or broken
-table never changes the response: quackapi emits one warning, falls back to
-the stderr JSON log, and continues serving. The in-process test client accepts
-the same option, for example
+Appends are batched at 100 rows or one second. The pending queue is capped at
+10,000 entries; overflow is written to stderr and counted in `/healthz` as
+`access_log_overflow_count`. A missing or broken table never changes the
+response: quackapi emits one warning for the failure episode, falls back to
+the stderr JSON log, and retries with backoff from one second to 60 seconds. A
+successful retry emits a recovery line and resumes table logging. The in-process
+test client accepts the same option, for example
 `quackapi_request('GET', '/health', access_log := 'http_access_log')`.
 
 ---

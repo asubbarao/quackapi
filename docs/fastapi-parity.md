@@ -58,7 +58,7 @@ classes: MATCH 88, STRONGER 1, BUG 0
 | 405 + `Allow` | built-in |
 | trailing slash redirect | 307 (Starlette-style) |
 | WebSocket | **not built** — use SSE |
-| OIDC / sessions / middleware hooks | not built — see [coming soon](guide/coming-soon.md) |
+| OIDC / signed sessions + CSRF | not built — see [coming soon](guide/coming-soon.md) |
 
 ---
 

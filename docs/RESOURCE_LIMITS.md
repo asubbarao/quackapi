@@ -6,7 +6,7 @@ query budget.
 
 ```sql
 SELECT * FROM quackapi_serve(
-  '127.0.0.1', 8000,
+  8000, host := '127.0.0.1',
   query_timeout_ms := 30000,
   max_response_bytes := 16777216,
   max_pending_requests := 256

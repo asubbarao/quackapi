@@ -80,19 +80,17 @@ overrides are global app state which must be reset after a test.
 - [FastAPI testing overrides](https://fastapi.tiangolo.com/advanced/testing-dependencies/)
 - [Async TestClient request #1273](https://github.com/fastapi/fastapi/issues/1273)
 
-**Verified QuackAPI gap.** `src/quackapi_extension.cpp` already exposes
+**Verified current surface.** `src/quackapi_extension.cpp` exposes
 `quackapi_request` as a no-TCP "SQLLogic TestClient" and
-`src/include/quackapi_server.hpp` calls it a test dispatch path. It is not part
-of the public README function reference, has no documented isolation or
-override scope, and offers response rows rather than first-class assertion
-helpers.
+`src/include/quackapi_server.hpp` calls it a test dispatch path. The public
+function reference now documents its response columns and named options. It
+still has no scoped override registry or first-class assertion helpers.
 
-**Recommended first slice.** Make `quackapi_request` a documented, stable
-TestClient surface and add a scoped `quackapi_test_override` registry for route
-dependencies introduced with middleware/lifespan work. Keep assertions plain
-SQL in v1: return `status`, headers, bytes, decoded body, error, and request ID
-without binding a port. Add optional `quackapi_assert_response` only if it can
-produce useful SQLLogicTest failures without a mini assertion language.
+**Remaining design slice.** Add a scoped `quackapi_test_override` registry for
+route dependencies if middleware/lifespan work requires it. Keep assertions
+plain SQL: `quackapi_request` already returns `status`, headers, bytes, and the
+decoded body can be obtained by the caller. Add an assertion helper only if it
+can produce useful SQLLogicTest failures without a mini assertion language.
 
 **DuckDB fit and risk.** It is unusually strong for QuackAPI: tests execute in
 the same ephemeral DuckDB transaction/catalog without TCP, Python, or a second

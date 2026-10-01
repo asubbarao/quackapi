@@ -44,7 +44,7 @@ SELECT quackapi_enqueue('default', $payload::VARCHAR) AS job_id;
 CREATE ROUTE drain POST '/drain' AS
 SELECT id AS job_id,
        'processed:' || payload AS result,
-       quackapi_ack('default', id) AS acked
+       quackapi_ack('default', id, delivery_generation) AS acked
 FROM quackapi_dequeue('default', 10);
 
 CREATE ROUTE results GET '/results' AS
@@ -90,14 +90,17 @@ SELECT id, payload, status, attempts
 FROM quackapi_dequeue('default', 10);
 -- claims: status=running, attempts++, visibility lease
 
-SELECT quackapi_ack('default', 1);
--- true if job was running
+SELECT quackapi_ack('default', 1, 1);
+-- true if job was running with delivery_generation 1
 
-SELECT quackapi_nack('default', 1, true, 'try_again');
+SELECT quackapi_nack('default', 1, 1, true, 'try_again');
 -- 'pending' (retry) or 'dead' at max_attempts
 
-SELECT quackapi_nack('default', 1, false, 'no_retry');
+SELECT quackapi_nack('default', 1, 1, false, 'no_retry');
 -- straight to 'dead'
+
+SELECT quackapi_renew('default', 1, 1);
+-- true if the active lease was renewed
 ```
 
 Payload is stored as **VARCHAR** (JSON text). You may also pass `JSON` when the json extension is loaded.

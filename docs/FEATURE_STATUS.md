@@ -1,15 +1,14 @@
 # quackapi — Feature Ledger (authoritative)
 
-**Version:** 0.1.0 (community `description.yml`)  
-**Tree:** `/Users/aloksubbarao/personal/quackapi` · branch `main` · HEAD `46fefed` (packaging pin `e254b43`)  
-**Binary:** `build/release/duckdb -unsigned` (DuckDB v1.5.4, built 2026-07-19)  
-**Rule:** every claim below is backed by a **command re-run this session** or a **cited report path**. No speculative status.
+**Version:** 0.1.3 (repository `description.yml`)
+**Source of truth:** the current `main` source tree and versioned tests; cited report paths are historical evidence only.
+**Rule:** shipped claims below are backed by source or tests. Design studies and external packaging notes remain explicitly labelled.
 
 **Evidence index**
 
 | Artifact | What it proves |
 |----------|----------------|
-| `rg 'CREATE …' src/` + `duckdb_functions()` | 8 CREATE nouns + 18 registered `quackapi_*` functions |
+| `rg 'CREATE …' src/` + registered functions in `src/` | 8 CREATE nouns plus the lifecycle, request, auth, queue, HTTP, GraphQL, middleware, policy, stream, and bridge functions |
 | `ls test/sql test/http test/conformance` | Versioned tests for each surface |
 | `bash test/conformance/run.sh` → `/tmp/quackapi_conformance_rerun/` | **Live** FastAPI harness: **89/89 PASS (100%)** |
 | `/tmp/quackapi_fastapi_eq/SCORECARD.md` | **Stale** baseline: **62/89 (69.7%)** pre body/form/multipart/cookies/headers/redirect/openapi/redoc |
@@ -48,10 +47,12 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 | **PARAM … HEADER / COOKIE** [wire-name] | `PARAM x HEADER` / `COOKIE` | `headers.test.sh`, `cookies.test.sh`, cases `header_param`/`cookie_param` | `Header()`, `Cookie()` |
 | **JSON body** field bind + wrong CT / malformed JSON → 422 | body binder in `quackapi_server.cpp` | `body.test.sh`, cases `post_users_json_body*` | Pydantic body model |
 | **BODY SCHEMA** JSON Schema validation (`json_schema` ext) | `BODY SCHEMA '<json>'` | `body_schema.test.sh` | Pydantic model / `json_schema_extra` |
+| **BODY TYPE** native DuckDB JSON transform validation | `BODY TYPE '<structure>'` | body-type SQL/HTTP tests | typed request body model |
 | **Form** `application/x-www-form-urlencoded` | body binder | `form.test.sh`, case `form_submit` | `Form()` |
 | **Multipart** fields + file (`$file`, `$filename`) | body binder | `multipart.test.sh`, case `multipart_upload` | `File()`, `UploadFile` |
 | **STATUS n** | `STATUS 201` etc. | conformance `status_*` | `status_code=` / `Response` |
 | **TIMEOUT / WITH (timeout_sec)** | per-request httplib read/write deadline (default = serve 30s) | `quackapi_route_timeout.test` | no first-class FastAPI equivalent (uvicorn/gunicorn worker timeouts are process-global) |
+| **RATE LIMIT** | `RATE LIMIT n PER s [BY ip\|token\|key]` → 429 + `Retry-After` | `test/sql/quackapi_rate_limit.test` | application limiter / middleware |
 | **Redirect** (3xx + `location` column) | `STATUS 307 AS SELECT '…' AS location` | `redirect.test.sh`, case `redirect_307` | `RedirectResponse` |
 | **Set-Cookie** response | `AS set_cookie` column | `redirect.test.sh` / case `set_cookie` | `Response.set_cookie` |
 | **html / text** content types | single column named `html`/`text` | conformance `ct_html`/`ct_text` | `HTMLResponse` / `PlainTextResponse` |
@@ -68,9 +69,12 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 
 | Feature | DDL / function | Versioned test | FastAPI equivalent |
 |---------|----------------|----------------|--------------------|
-| Serve / stop / inspect | `quackapi_serve([port], host, static_dir, cors_origins, memory_limit, block)`, `quackapi_wait`, `quackapi_stop`, `quackapi_servers` | `quackapi_serve_block.test`, `memory_limit` SQL test | `uvicorn` / `app` process |
+| Serve / stop / inspect | `quackapi_serve` with lifecycle, health, access-log, compression, transport, client, Postgres, and resource-limit options; `quackapi_wait`, `quackapi_stop`, `quackapi_servers` | `quackapi_serve_block.test`, resource-limit and HTTP tests | `uvicorn` / `app` process |
 | **CORS** | `cors_origins` arg / `SET quackapi_cors_origins` | `test/sql/quackapi_cors.test`, `test/http/cors.test.sh` | `CORSMiddleware` |
 | **static_dir** unrouted GETs | `quackapi_serve(…, static_dir := …)` | description.yml / README | `StaticFiles` (mount; prefix sugar still SPEC) |
+| **Health routes** | built-in `/health` and `/healthz` when `health_routes := true` | health and HTTP tests | liveness/readiness probes |
+| **Response compression** | `compression := 'auto'\|'gzip'\|'zstd'\|'off'`, `compression_min_bytes` | `quackapi_compression.test`, `test/ultra/test_compression.sh` | gzip/zstd middleware |
+| **Access log** | stderr JSON or `access_log := '<table>'` with async batching and `/healthz` overflow count | `quackapi_access_log.test` | structured access logging |
 | **OpenAPI 3.1** | built-in `GET /openapi.json` (`quackapi_openapi.cpp`) | `test/sql/quackapi_openapi.test`, case `openapi_json` | auto OpenAPI |
 | **Swagger UI** | `GET /docs` | same + case `docs_get` | `/docs` |
 | **ReDoc** | `GET /redoc` | `test/http/redoc.test.sh`, case `redoc_get` | `/redoc` |
@@ -85,10 +89,15 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 
 ```
 quackapi_ack, quackapi_add_api_key, quackapi_authentication, quackapi_authorization,
-quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_fetch, quackapi_groups,
-quackapi_http_pool, quackapi_http_util_name, quackapi_nack, quackapi_policies, quackapi_post,
-quackapi_queues, quackapi_routes, quackapi_serve, quackapi_servers, quackapi_stop,
-quackapi_streams, quackapi_verify_auth, quackapi_wait
+quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_fetch, quackapi_graphql_routes,
+quackapi_graphql_tables, quackapi_groups, quackapi_http_pool, quackapi_http_util_name,
+quackapi_last_write_timeout_sec, quackapi_middlewares, quackapi_nack, quackapi_policies,
+quackapi_parallel_fetch, quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,
+quackapi_routes, quackapi_serve, quackapi_servers, quackapi_stop, quackapi_streams,
+quackapi_verify_auth, quackapi_wait,
+quack_from_fastapi, quack_from_fastapi_models, quack_from_rails, quack_from_rails_models,
+quack_from_express, quack_from_express_models, quack_from_gin, quack_from_gin_models,
+quack_from_x_sql, quack_from_x_sql_relpath
 ```
 
 Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.
@@ -173,7 +182,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **WebSocket Upgrade** | Bundled cpp-httplib has no WS; use SSE + compose `radio` bus | stream reject string; catalog `radio` |
 | **OIDC / OAuth2 SSO** browser code flow | JWT/API_KEY only; compose `quack_oauth` / `jwt` for resource-server patterns | `/tmp/quackapi_spec_oidc/SPEC.md` |
 | **Signed cookie sessions + CSRF** | not built | `/tmp/quackapi_spec_sessions/SPEC.md` |
-| **Middleware BEFORE/AFTER SQL** | not built (use shared views/SQL preamble) | `/tmp/quackapi_spec_middleware/SPEC.md` |
+| **Middleware BEFORE/AFTER SQL** | **shipped** — `CREATE MIDDLEWARE` around ordinary routes and `quackapi_request` | `docs/MIDDLEWARE.md`, middleware tests |
 | **Response gzip/zstd** | **shipped** — Accept-Encoding negotiate; `compression` serve knobs | `quackapi_server.cpp` MaybeCompress |
 | **FORMAT / Accept** | **shipped** json/ndjson/csv/**parquet**/**arrow** (IPC stream via community nanoarrow) | format tests; Accept stream/file |
 | **GraphQL thin v0** | **shipped** — dual surface (REST + GQL → SQL); allowlist + **`CREATE GRAPHQL ROUTE`** | `quackapi_graphql.cpp`, `graphql-v0.md` |
@@ -185,7 +194,7 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **RFC 9457 problem+json** | FastAPI-shaped 422 only | `/tmp/quackapi_spec_problem_details/SPEC.md` |
 | **Envelope** default JSON **array of rows**; `ENVELOPE object` + `EMPTY STATUS` shipped | array stays default; object/404 opt-in | `docs/reference/ddl.md`; `quackapi_envelope.test` |
 | **Pydantic binder fidelity** native core shipped | field-level body `loc`, missing/null/default distinction, multi-error, typed BODY TYPE | `docs/PYDANTIC_PARITY.md` |
-| **Multi-writer OLTP / wasm / Windows** | single-writer DuckDB; platforms excluded in `description.yml` | packaging descriptor |
+| **Multi-writer OLTP / wasm / unsupported Windows variants** | single-writer DuckDB; wasm, MinGW/rtools, and Windows arm64 are excluded in `description.yml` (Windows amd64 is supported) | packaging descriptor |
 
 ---
 
@@ -248,10 +257,11 @@ From `/tmp/quackapi_handler_bridge.md` over **519** FastAPI-tagged routes:
 
 ---
 
-## 4. DESIGNED, NOT BUILT
+## 4. DESIGN STUDIES AND REMAINING GAPS
 
-Twenty feasibility studies under `/tmp/quackapi_spec_*/SPEC.md`.  
-**Note:** some peers **shipped after** the SPEC was written (GROUP, STREAM SSE, BODY SCHEMA, OpenAPI). Rows still list the SPEC intent; **shipped** column is live tree truth (this session).
+Twenty feasibility studies under `/tmp/quackapi_spec_*/SPEC.md`. The status
+column is the current tree state; several studies describe surfaces that are
+now shipped, while the remaining rows are partial or not built.
 
 | # | Spec dir | One-line what | Effort | C++ vs compose | Shipped on main? |
 |---|----------|---------------|:------:|----------------|------------------|
@@ -260,20 +270,20 @@ Twenty feasibility studies under `/tmp/quackapi_spec_*/SPEC.md`.
 | 3 | `spec_body_partial` | PATCH partial / allowlist without model forks | **S** | **HAVE-EXT(`json_schema`)** + `json_merge_patch`; SKIP include/exclude C++ | **Partial** — BODY SCHEMA + SQL recipes |
 | 4 | `spec_cache_etag` | `CACHE TTL` + ETag / If-None-Match → 304 | **M** | THIN-GLUE C++ + CORE table/hash | **No** |
 | 5 | `spec_gzip` | `Accept-Encoding: gzip` / `zstd` response compression | **S** | THIN-GLUE (miniz/zstd already in DuckDB) | **Yes** — shipped in `quackapi_server.cpp` |
-| 6 | `spec_health` | Liveness/readiness probes | **S** | **SKIP `CREATE PROBE`** — TRIVIAL-SQL routes | **Recipes only** (no DDL) |
+| 6 | `spec_health` | Liveness/readiness probes | **S** | **SKIP `CREATE PROBE`** — built-in routes | **Yes** — `/health` and `/healthz` |
 | 7 | `spec_lifespan` | `on_start` / `on_stop` / drain on serve/stop | **S** | THIN-GLUE on serve/stop; HAVE-CORE scripts/ATTACH | **No** (script-before-serve works) |
-| 8 | `spec_middleware` | `CREATE MIDDLEWARE … BEFORE\|AFTER` SQL hooks | **M** | THIN-GLUE registry in HandleRequest | **No** |
+| 8 | `spec_middleware` | `CREATE MIDDLEWARE … BEFORE\|AFTER` SQL hooks | **M** | THIN-GLUE registry in HandleRequest | **Yes** — ordinary routes and `quackapi_request` |
 | 9 | `spec_oidc` | `CREATE AUTH … OIDC` login/callback SSO | **M–L** | PARTIAL-EXT(`quack_oauth`) + HttpFetch + sessions | **No** |
 | 10 | `spec_pagination` | Offset + keyset list envelopes | **S** | **HAVE-CORE** LIMIT/OFFSET/WHERE | **Recipes** (no PAGINATE sugar) |
 | 11 | `spec_problem_details` | RFC 9457 `application/problem+json` | **S** | THIN-GLUE format switch on emitters | **No** (FastAPI-shape only) |
-| 12 | `spec_rate_limit` | RATE LIMIT + 429 + Retry-After | **S** | THIN-GLUE + CORE counter table | **No** |
-| 13 | `spec_request_id` | X-Request-ID + `$request_id` + access_log table | **S** | THIN-GLUE + CORE uuid/table | **No** |
+| 12 | `spec_rate_limit` | RATE LIMIT + 429 + Retry-After | **S** | THIN-GLUE + in-process counters | **Yes** — `RATE LIMIT … BY ip\|token\|key` |
+| 13 | `spec_request_id` | X-Request-ID + `$request_id` + access_log table | **S** | THIN-GLUE + core uuid/table | **Yes** — stderr and table-backed access logs |
 | 14 | `spec_route_groups` | APIRouter-style prefix/tags/default auth | **S** | THIN-GLUE DDL expand | **Yes** — `CREATE GROUP` / `CREATE API GROUP` |
-| 15 | `spec_serdes` | `FORMAT` JSON/NDJSON/CSV/Parquet/Arrow + Accept | **M** (S for JSON/NDJSON/CSV) | CORE writers + **HAVE-EXT(`nanoarrow`)** | **No** (json/html/text only) |
+| 15 | `spec_serdes` | `FORMAT` JSON/NDJSON/CSV/Parquet/Arrow + Accept | **M** (S for JSON/NDJSON/CSV) | CORE writers + **HAVE-EXT(`nanoarrow`)** | **Yes** — explicit formats and default Accept negotiation |
 | 16 | `spec_sessions` | Signed cookie sessions + CSRF | **M** | THIN-GLUE C++ cookie HMAC + table | **No** |
 | 17 | `spec_static_files` | `static_prefix` + file/blob download + disposition | **S** | THIN-GLUE; httplib mount/ranges exist | **Partial** — `static_dir` only |
 | 18 | `spec_streaming` | Chunked NDJSON/SSE + cancel on disconnect | **M** | THIN-GLUE ContentProvider + Interrupt | **Partial** — **`CREATE STREAM` SSE**; full NDJSON STREAM clause / cancel polish open |
-| 19 | `spec_test_client` | `quackapi_request(…)` in-process TF | **S** | THIN-GLUE extract HandleRequest | **No** |
+| 19 | `spec_test_client` | `quackapi_request(…)` in-process TF | **S** | THIN-GLUE extract HandleRequest | **Yes** |
 | 20 | `spec_websocket_sse` | Browser WS vs SSE+radio push | **M** (S if SSE-only docs) | SSE THIN-GLUE; **WS SKIP-BLOAT** on httplib; **HAVE-EXT(`radio`)** for bus | **Partial** — SSE built; **WS blocked on transport** |
 
 ### Ext adoption notes (composition, not new nouns)
@@ -290,15 +300,16 @@ Twenty feasibility studies under `/tmp/quackapi_spec_*/SPEC.md`.
 
 ### v1 — **submit now** (= BUILT set)
 
-Ship community-extensions `description.yml` **0.1.0** with the surface proven on main:
+The current built set declared by the repository's community descriptor includes:
 
 - All **8 CREATE nouns** (ROUTE, AUTH, GROUP, API FOR TABLE, QUEUE, STREAM, ROW ACCESS POLICY, MASKING POLICY)
 - Params / validation / body / form / multipart / headers / cookies / redirect / Set-Cookie  
 - CORS + OPTIONS/HEAD/405 Allow  
 - OpenAPI `/openapi.json` + `/docs` + `/redoc`  
-- `quackapi_serve` / `stop` / `routes` / `servers` + static_dir + memory_limit guard  
+- `quackapi_serve` / `stop` / `routes` / `servers` + static_dir + health routes + memory/resource guards
+- Request IDs, table-backed access logs, response compression, rate limits, SQL middleware, formats, and `quackapi_request`
 - Conformance **89/89 (100%)** + SQL/HTTP suites under `test/`  
-- Platforms per descriptor: linux/osx amd64+arm64; **exclude** wasm + Windows until green CI  
+- Platforms per descriptor: linux/osx amd64+arm64 and windows_amd64; exclude wasm, MinGW/rtools, and Windows arm64
 
 **Gate:** green `test/conformance/run.sh` + `test/http/run_all.sh` + community packaging pin.
 
@@ -306,12 +317,9 @@ Ship community-extensions `description.yml` **0.1.0** with the surface proven on
 
 | Feature | Effort | Why |
 |---------|:------:|-----|
-| Request ID + access_log table | S | Ops baseline |
-| Rate limit (table counters → 429) | S | Production table stakes |
 | Health/readiness **recipes** (no CREATE PROBE) | S | docs + HTTP composition tests |
 | Pagination recipes (+ optional Link column) | S | HAVE-CORE |
 | Static prefix + file/blob disposition | S | complete StaticFiles story |
-| `quackapi_request` TestClient TF | S | CI without ports |
 | Lifespan `on_start`/`on_stop`/`drain_ms` | S | clean shutdown |
 | Problem+json format switch | S | RFC 9457 option |
 | Pydantic custom-validator/default-factory bridge | S–M | preserve explicit unsupported boundary without a Python runtime |
@@ -320,11 +328,9 @@ Ship community-extensions `description.yml` **0.1.0** with the surface proven on
 
 | Feature | Effort | Why |
 |---------|:------:|-----|
-| Middleware BEFORE/AFTER SQL | M | hosts rate/cache/audit declaratively |
 | Sessions + CSRF | M | prerequisite for browser SSO |
 | OIDC auth-code (`CREATE AUTH … OIDC`) | M (L if +sessions same train) | PARTIAL-EXT quack_oauth + HttpFetch |
 | Cache TTL + ETag 304 | M | queryable cache table leapfrog |
-| FORMAT NDJSON/CSV then Parquet/Arrow | M | compose nanoarrow; Accept negotiation |
 | STREAM NDJSON + cancel-on-disconnect polish | M | completes streaming SPEC beyond SSE DDL |
 | radio-composed multi-node SSE bus docs/tests | S–M | HAVE-EXT radio |
 
@@ -376,4 +382,4 @@ in-repo `docs/FASTAPI_PARITY.md`, `description.yml`.
 
 ---
 
-**Ledger line:** **built ≈ 30+ first-class surfaces (8 CREATE nouns + full route/server/OpenAPI stack); designed-not-built ≈ 20 SPECs (≈12 still fully open, ≈8 partial/shipped-or-recipe); FastAPI harness parity old 62/89 (69.7%) → refreshed 89/89 (100%).**
+**Ledger line:** **The built set covers the 8 CREATE nouns plus the route/server/OpenAPI stack; 20 design studies remain, with the table above distinguishing open, partial, recipe, and shipped work.**

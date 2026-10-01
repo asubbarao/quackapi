@@ -9,16 +9,22 @@ SELECT * FROM quackapi_serve(
   compression := 'auto',          -- auto | gzip | zstd | off
   compression_min_bytes := 1024
 );
+
+-- The session-wide defaults are equivalent:
+SET quackapi_compression = 'auto';
+SET quackapi_compression_min_bytes = 1024;
 ```
 
 In `auto` mode, the server chooses the accepted coding with the highest q-value
 and prefers zstd when gzip and zstd have the same q-value. `gzip` and `zstd`
 restrict the available coding while still honoring the client’s header; `off`
-leaves responses unchanged. The default is `auto`, preserving the previous
-default-on negotiation behavior. Boolean values remain accepted for compatibility:
+leaves responses unchanged. The default is `auto`. Boolean values remain
+accepted for compatibility:
 `true` means `auto` and `false` means `off`.
 
 Bodies smaller than 1024 bytes by default, Server-Sent Events
 (`text/event-stream`), and responses that already have `Content-Encoding` are
-never compressed. Eligible responses include `Vary: Accept-Encoding`, and the
-wire `Content-Length` describes the final body.
+never compressed. Images/audio/video that are already compressed are also
+skipped. Responses eligible for compression include `Vary: Accept-Encoding`
+even when negotiation selects identity, and the wire `Content-Length` describes
+the final body.

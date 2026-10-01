@@ -59,7 +59,7 @@ Things FastAPI does not have as first-class product:
 - `CREATE QUEUE` durable jobs in the same DB  
 - `CREATE API FOR TABLE`  
 - `quack_from_openapi` / `quack_from_fastapi` migration gravity  
-- SQL middleware / ETag table cache / Arrow export  
+- ETag table cache
 
 These are **wins**, but they do not excuse a lost item@32.
 
