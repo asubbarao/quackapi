@@ -35,6 +35,39 @@ curl -i http://127.0.0.1:8000/echo-rid -H 'X-Request-ID: client-rid-deadbeef'
 Structured access log lines (when `access_log:=true`, the default) include
 `request_id` on stderr as JSON (`"type":"access",…`).
 
+### Table-backed access logs
+
+`access_log` also accepts `false` to disable logging or a table name to append
+one row per request to an operator-created table. The table writer recognizes
+these columns by name: `request_id`, `received_at`, `method`, `path`,
+`route_name`, `status`, `duration_ms`, `bytes_out`, `client_ip`, and
+`user_agent`. Other columns are left to their defaults. `route_name` is NULL
+for a 404 and `static` for a response served by `static_dir`.
+
+```sql
+CREATE TABLE http_access_log (
+  request_id VARCHAR,
+  received_at TIMESTAMP,
+  method VARCHAR,
+  path VARCHAR,
+  route_name VARCHAR,
+  status INTEGER,
+  duration_ms DOUBLE,
+  bytes_out BIGINT,
+  client_ip VARCHAR,
+  user_agent VARCHAR,
+  operator_note VARCHAR DEFAULT 'keep'
+);
+
+SELECT * FROM quackapi_serve(8000, access_log := 'http_access_log');
+```
+
+Appends are batched (up to about 100 rows or one second). A missing or broken
+table never changes the response: quackapi emits one warning, falls back to
+the stderr JSON log, and continues serving. The in-process test client accepts
+the same option, for example
+`quackapi_request('GET', '/health', access_log := 'http_access_log')`.
+
 ---
 
 ## Header parameters

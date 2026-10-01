@@ -1,0 +1,176 @@
+# name: test/sql/quackapi_access_log.test
+# description: Table-backed access logging for serve and the in-process TestClient
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE TABLE access_log (
+  request_id VARCHAR,
+  received_at TIMESTAMP,
+  method VARCHAR,
+  path VARCHAR,
+  route_name VARCHAR,
+  status INTEGER,
+  duration_ms DOUBLE,
+  bytes_out BIGINT,
+  client_ip VARCHAR,
+  user_agent VARCHAR,
+  operator_note VARCHAR DEFAULT 'kept'
+);
+
+statement ok
+CREATE ROUTE access_log_route GET '/access-log' AS SELECT 'ok' AS result;
+
+query I
+SELECT status
+FROM quackapi_request('GET', '/access-log', access_log := 'access_log');
+----
+200
+
+query I
+SELECT count(*) FROM access_log;
+----
+1
+
+query III
+SELECT route_name, status, operator_note
+FROM access_log
+WHERE path = '/access-log';
+----
+access_log_route	200	kept
+
+query I
+SELECT status
+FROM quackapi_request('GET', '/missing', access_log := 'access_log');
+----
+404
+
+query II
+SELECT route_name IS NULL, status
+FROM access_log
+WHERE path = '/missing';
+----
+true	404
+
+query I
+SELECT count(*) FROM access_log;
+----
+2
+
+# A transiently unavailable table falls back to stderr, then resumes table
+# logging after the capped retry backoff when the table is recreated.
+statement ok
+CREATE TABLE access_log_retry (
+  request_id VARCHAR,
+  received_at TIMESTAMP,
+  method VARCHAR,
+  path VARCHAR,
+  route_name VARCHAR,
+  status INTEGER,
+  duration_ms DOUBLE,
+  bytes_out BIGINT,
+  client_ip VARCHAR,
+  user_agent VARCHAR
+);
+
+query I
+SELECT * FROM quackapi_serve(29461, host := '127.0.0.1', access_log := 'access_log_retry');
+----
+http://127.0.0.1:29461
+
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+----
+200
+
+statement ok
+SELECT sleep_ms(1100);
+
+query I
+SELECT count(*) FROM access_log_retry;
+----
+1
+
+statement ok
+DROP TABLE access_log_retry;
+
+# The request still succeeds while the writer is backing off and the missing
+# table means its access row cannot be appended.
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+----
+200
+
+statement ok
+SELECT sleep_ms(1200);
+
+statement ok
+CREATE TABLE access_log_retry (
+  request_id VARCHAR,
+  received_at TIMESTAMP,
+  method VARCHAR,
+  path VARCHAR,
+  route_name VARCHAR,
+  status INTEGER,
+  duration_ms DOUBLE,
+  bytes_out BIGINT,
+  client_ip VARCHAR,
+  user_agent VARCHAR
+);
+
+statement ok
+SELECT sleep_ms(1200);
+
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+----
+200
+
+statement ok
+SELECT sleep_ms(1100);
+
+query I
+SELECT count(*) FROM access_log_retry;
+----
+1
+
+query I
+SELECT * FROM quackapi_stop(29461);
+----
+Stopped quackapi server on port 29461
+
+# The existing readiness surface reports table-writer overflow state.
+query I
+SELECT * FROM quackapi_serve(29231, host := '127.0.0.1', access_log := 'access_log');
+----
+http://127.0.0.1:29231
+
+query I
+SELECT contains(body, '"access_log_overflow_count":0')
+FROM quackapi_fetch('http://127.0.0.1:29231/healthz');
+----
+true
+
+query I
+SELECT * FROM quackapi_stop(29231);
+----
+Stopped quackapi server on port 29231
+
+# A missing operator table must not fail the in-process request.
+query I
+SELECT status
+FROM quackapi_request('GET', '/access-log', access_log := 'missing_access_log');
+----
+200
+
+query I
+SELECT status
+FROM quackapi_request('GET', '/access-log', access_log := false);
+----
+200
+
+query I
+SELECT count(*) FROM access_log;
+----
+2
