@@ -37,7 +37,7 @@ static constexpr time_t QUACKAPI_DEFAULT_IO_TIMEOUT_SEC = 30;
 //! Access-log / server log verbosity. Default INFO is informative, not silent.
 enum class QuackapiLogLevel : uint8_t {
 	SILENT = 0,
-	ERROR = 1,
+	ERROR_LEVEL = 1,
 	WARN = 2,
 	INFO = 3,
 	DEBUG_LEVEL = 4,

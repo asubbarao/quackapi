@@ -2441,7 +2441,7 @@ void QuackapiHttpServer::EmitAccessLog(const QuackapiRequestRecord &entry) {
 	case QuackapiLogLevel::WARN:
 		emit = entry.status >= 400 || entry.duration_ms >= static_cast<double>(options.slow_request_ms);
 		break;
-	case QuackapiLogLevel::ERROR:
+	case QuackapiLogLevel::ERROR_LEVEL:
 		emit = entry.status >= 500;
 		break;
 	case QuackapiLogLevel::SILENT:

@@ -20,7 +20,7 @@ QuackapiLogLevel ParseQuackapiLogLevel(const string &raw) {
 		return QuackapiLogLevel::SILENT;
 	}
 	if (lower == "error") {
-		return QuackapiLogLevel::ERROR;
+		return QuackapiLogLevel::ERROR_LEVEL;
 	}
 	if (lower == "warn" || lower == "warning") {
 		return QuackapiLogLevel::WARN;
@@ -35,7 +35,7 @@ QuackapiLogLevel ParseQuackapiLogLevel(const string &raw) {
 static const char *LogLevelDuckDBName(QuackapiLogLevel level) {
 	switch (level) {
 	case QuackapiLogLevel::SILENT:
-	case QuackapiLogLevel::ERROR:
+	case QuackapiLogLevel::ERROR_LEVEL:
 		return "ERROR";
 	case QuackapiLogLevel::WARN:
 		return "WARNING";
