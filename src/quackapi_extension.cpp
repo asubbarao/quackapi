@@ -181,10 +181,38 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 	opts.slow_request_ms = read("slow_request_ms", 1000, 86400000);
 }
 
+static void BindAccessLogPrivacy(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
+	auto headers_entry = input.named_parameters.find("log_headers");
+	if (headers_entry != input.named_parameters.end()) {
+		if (headers_entry->second.IsNull()) {
+			throw InvalidInputException("log_headers must not be NULL");
+		}
+		opts.log_headers = headers_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_log_headers", setting) && !setting.IsNull()) {
+			opts.log_headers = setting.GetValue<string>();
+		}
+	}
+	auto query_entry = input.named_parameters.find("log_query");
+	if (query_entry != input.named_parameters.end()) {
+		if (query_entry->second.IsNull()) {
+			throw InvalidInputException("log_query must not be NULL");
+		}
+		opts.log_query = query_entry->second.GetValue<bool>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_log_query", setting) && !setting.IsNull()) {
+			opts.log_query = setting.GetValue<bool>();
+		}
+	}
+}
+
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<ServeBindData>();
 	BindResourceLimits(context, input, bind_data->limits);
+	BindAccessLogPrivacy(context, input, bind_data->limits);
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
 	}
@@ -607,6 +635,7 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 	}
 	auto bind_data = make_uniq<RequestBindData>();
 	BindResourceLimits(context, input, bind_data->limits);
+	BindAccessLogPrivacy(context, input, bind_data->limits);
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw InvalidInputException("quackapi_request: method and path must be non-NULL");
 	}
@@ -877,6 +906,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Requests at or above this duration are logged at warn level. "
 	                          "Default 1000ms. Overridden by slow_request_ms named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(1000));
+	config.AddExtensionOption("quackapi_log_headers",
+	                          "Comma-separated request-header allowlist for access-log maps; empty (default) "
+	                          "avoids retaining headers. Overridden by log_headers named parameter.",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("quackapi_log_query",
+	                          "Preserve a redacted raw query string in access logs; default false. Overridden by "
+	                          "log_query named parameter.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// SET quackapi_compression = 'auto'|'gzip'|'zstd'|'off'.
 	// Default auto. Legacy true/false values map to auto/off.
 	config.AddExtensionOption("quackapi_compression",
@@ -928,6 +965,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
 	serve.named_parameters["log_level"] = LogicalType::VARCHAR;
 	serve.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
+	serve.named_parameters["log_headers"] = LogicalType::VARCHAR;
+	serve.named_parameters["log_query"] = LogicalType::BOOLEAN;
 	serve.named_parameters["access_log"] = LogicalType::ANY;
 	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
 	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
@@ -979,6 +1018,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	request2.named_parameters["access_log"] = LogicalType::ANY;
 	request2.named_parameters["log_level"] = LogicalType::VARCHAR;
 	request2.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
+	request2.named_parameters["log_headers"] = LogicalType::VARCHAR;
+	request2.named_parameters["log_query"] = LogicalType::BOOLEAN;
 	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request2.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request2.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
@@ -989,6 +1030,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	request3.named_parameters["access_log"] = LogicalType::ANY;
 	request3.named_parameters["log_level"] = LogicalType::VARCHAR;
 	request3.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
+	request3.named_parameters["log_headers"] = LogicalType::VARCHAR;
+	request3.named_parameters["log_query"] = LogicalType::BOOLEAN;
 	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request3.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request3.named_parameters["max_response_bytes"] = LogicalType::BIGINT;

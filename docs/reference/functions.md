@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, slow_request_ms := …, log_headers := …, log_query := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR` (default empty), `cors_origins VARCHAR` (default empty), `memory_limit VARCHAR` (default empty), `log_level VARCHAR` (default `info`), `slow_request_ms BIGINT` (default `1000`; at `warn`, requests this slow are logged), `access_log ANY` (default `true`: stderr JSON; `false`: off; table name: table-backed), `enable_logging BOOLEAN` (default `false`), `health_routes BOOLEAN` (default `true`), `threads VARCHAR` (default empty), `preserve_insertion_order BOOLEAN` (default `false`), `enable_http_metadata_cache BOOLEAN` (default `true`), `worker_threads INTEGER` (default `32`), `keep_alive_max_count INTEGER` (default `128`), `keep_alive_timeout_sec INTEGER` (default `10`), `read_timeout_sec INTEGER` (default `30`), `write_timeout_sec INTEGER` (default `30`), `compression ANY` (default `auto`; `true`/`false` map to `auto`/`off`), `compression_min_bytes BIGINT` (default `1024`), `http_client VARCHAR` (default `auto`; `auto`\|`curl`\|`httplib`), `pg_dsn VARCHAR` (default empty), `block BOOLEAN` (default `false`), `query_timeout_ms BIGINT` (default `30000`), `max_response_bytes BIGINT` (default `16777216`), `max_pending_requests BIGINT` (default `256`) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR` (default empty), `cors_origins VARCHAR` (default empty), `memory_limit VARCHAR` (default empty), `log_level VARCHAR` (default `info`), `slow_request_ms BIGINT` (default `1000`; at `warn`, requests this slow are logged), `log_headers VARCHAR` (default empty; comma-separated header allowlist), `log_query BOOLEAN` (default `false`; redacted raw query), `access_log ANY` (default `true`: stderr JSON; `false`: off; table name: table-backed), `enable_logging BOOLEAN` (default `false`), `health_routes BOOLEAN` (default `true`), `threads VARCHAR` (default empty), `preserve_insertion_order BOOLEAN` (default `false`), `enable_http_metadata_cache BOOLEAN` (default `true`), `worker_threads INTEGER` (default `32`), `keep_alive_max_count INTEGER` (default `128`), `keep_alive_timeout_sec INTEGER` (default `10`), `read_timeout_sec INTEGER` (default `30`), `write_timeout_sec INTEGER` (default `30`), `compression ANY` (default `auto`; `true`/`false` map to `auto`/`off`), `compression_min_bytes BIGINT` (default `1024`), `http_client VARCHAR` (default `auto`; `auto`\|`curl`\|`httplib`), `pg_dsn VARCHAR` (default empty), `block BOOLEAN` (default `false`), `query_timeout_ms BIGINT` (default `30000`), `max_response_bytes BIGINT` (default `16777216`), `max_pending_requests BIGINT` (default `256`) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -376,7 +376,7 @@ server, registry, auth, queue, and outbound HTTP surfaces above.
 
 | Function | Signature / returns |
 |----------|--------------------|
-| `quackapi_request` | `quackapi_request(method VARCHAR, path VARCHAR [, body VARCHAR], headers := MAP, access_log := ANY, pg_dsn := VARCHAR, query_timeout_ms := BIGINT, max_response_bytes := BIGINT)` → `status INTEGER, body BLOB, content_type VARCHAR, headers MAP(VARCHAR, VARCHAR)`; no TCP listener is required |
+| `quackapi_request` | `quackapi_request(method VARCHAR, path VARCHAR [, body VARCHAR], headers := MAP, access_log := ANY, log_headers := VARCHAR, log_query := BOOLEAN, pg_dsn := VARCHAR, query_timeout_ms := BIGINT, max_response_bytes := BIGINT)` → `status INTEGER, body BLOB, content_type VARCHAR, headers MAP(VARCHAR, VARCHAR)`; no TCP listener is required |
 | `quackapi_last_write_timeout_sec()` | → `INTEGER`; effective socket write timeout of the most recent request |
 | `quackapi_middlewares()` | → `name, phase, group_name, handler_sql, registration_order` |
 | `quackapi_graphql_tables()` | → `mode, table_name` |
@@ -398,6 +398,8 @@ not application-facing functions.
 | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | CORS allow list; empty = off |
 | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | Serve memory preference when named param omitted |
 | `SET quackapi_log_level = 'silent' \| 'error' \| 'warn' \| 'info' \| 'debug'` | Serve log verbosity; default `info` |
+| `SET quackapi_log_headers = 'authorization,x-tenant-id'` | Access-log request-header allowlist; default empty and denylisted values are redacted |
+| `SET quackapi_log_query = true\|false` | Preserve a redacted raw query in access logs; default `false` |
 | `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | Response compression; default `auto` |
 | `SET quackapi_compression_min_bytes = N` | Minimum response size; default `1024` |
 | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | Outbound httpfs client preference (default `auto` → curl_httpfs) |
