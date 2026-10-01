@@ -12,7 +12,7 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `access_log BOOLEAN\|VARCHAR` (`true` = stderr JSON, `false` = off, table name = table-backed), `compression VARCHAR` (`auto`\|`gzip`\|`zstd`\|`off`, default `auto`), `compression_min_bytes BIGINT` (default `1024`), `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus other batteries knobs (`log_level`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `access_log BOOLEAN\|VARCHAR` (`true` = stderr JSON, `false` = off, table name = table-backed), `compression VARCHAR` (`auto`\|`gzip`\|`zstd`\|`off`, default `auto`), `compression_min_bytes BIGINT` (default `1024`), `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `slow_request_ms BIGINT` (default `1000`), `block BOOLEAN` (default **false**), plus other batteries knobs (`log_level`, …) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql

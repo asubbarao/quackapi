@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -1712,39 +1713,40 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 } // namespace
 
-struct QuackapiAccessLogEntry {
-	string request_id;
-	int64_t received_at_micros;
-	string method;
-	string path;
-	string route_name;
-	int status;
-	double duration_ms;
-	int64_t bytes_out;
-	string client_ip;
-	string user_agent;
-};
-
 enum class QuackapiAccessLogColumn : uint8_t {
 	REQUEST_ID,
 	RECEIVED_AT,
 	METHOD,
 	PATH,
 	ROUTE_NAME,
+	ROUTE_PATH,
 	STATUS,
 	DURATION_MS,
+	SQL_PREPARE_MS,
+	SQL_EXECUTE_MS,
+	ROWS_OUT,
+	BYTES_IN,
 	BYTES_OUT,
 	CLIENT_IP,
 	USER_AGENT,
+	HTTP_VERSION,
+	ERROR_TYPE,
+	ERROR_MESSAGE,
+	TRACE_ID,
+	SPAN_ID,
+	PARENT_SPAN_ID,
+	SAMPLED,
 };
 
-static constexpr const char *QUACKAPI_ACCESS_LOG_COLUMNS[] = {"request_id", "received_at", "method",      "path",
-                                                              "route_name", "status",      "duration_ms", "bytes_out",
-                                                              "client_ip",  "user_agent"};
+static constexpr const char *QUACKAPI_ACCESS_LOG_COLUMNS[] = {
+    "request_id", "received_at", "method",         "path",           "route_name", "route_path",
+    "status",     "duration_ms", "sql_prepare_ms", "sql_execute_ms", "rows_out",   "bytes_in",
+    "bytes_out",  "client_ip",   "user_agent",     "http_version",   "error_type", "error_message",
+    "trace_id",   "span_id",     "parent_span_id", "sampled"};
 
 static std::mutex quackapi_access_log_flush_mutex;
 
-static Value AccessLogValue(const QuackapiAccessLogEntry &entry, QuackapiAccessLogColumn column) {
+static Value AccessLogValue(const QuackapiRequestRecord &entry, QuackapiAccessLogColumn column) {
 	switch (column) {
 	case QuackapiAccessLogColumn::REQUEST_ID:
 		return Value(entry.request_id);
@@ -1756,16 +1758,40 @@ static Value AccessLogValue(const QuackapiAccessLogEntry &entry, QuackapiAccessL
 		return Value(entry.path);
 	case QuackapiAccessLogColumn::ROUTE_NAME:
 		return entry.route_name.empty() ? Value() : Value(entry.route_name);
+	case QuackapiAccessLogColumn::ROUTE_PATH:
+		return entry.route_path.empty() ? Value() : Value(entry.route_path);
 	case QuackapiAccessLogColumn::STATUS:
 		return Value::INTEGER(entry.status);
 	case QuackapiAccessLogColumn::DURATION_MS:
 		return Value::DOUBLE(entry.duration_ms);
+	case QuackapiAccessLogColumn::SQL_PREPARE_MS:
+		return entry.sql_prepare_ms < 0 ? Value() : Value::DOUBLE(entry.sql_prepare_ms);
+	case QuackapiAccessLogColumn::SQL_EXECUTE_MS:
+		return entry.sql_execute_ms < 0 ? Value() : Value::DOUBLE(entry.sql_execute_ms);
+	case QuackapiAccessLogColumn::ROWS_OUT:
+		return entry.rows_out < 0 ? Value() : Value::BIGINT(entry.rows_out);
+	case QuackapiAccessLogColumn::BYTES_IN:
+		return Value::BIGINT(entry.bytes_in);
 	case QuackapiAccessLogColumn::BYTES_OUT:
 		return Value::BIGINT(entry.bytes_out);
 	case QuackapiAccessLogColumn::CLIENT_IP:
 		return Value(entry.client_ip);
 	case QuackapiAccessLogColumn::USER_AGENT:
 		return Value(entry.user_agent);
+	case QuackapiAccessLogColumn::HTTP_VERSION:
+		return entry.http_version.empty() ? Value() : Value(entry.http_version);
+	case QuackapiAccessLogColumn::ERROR_TYPE:
+		return entry.error_type.empty() ? Value() : Value(entry.error_type);
+	case QuackapiAccessLogColumn::ERROR_MESSAGE:
+		return entry.error_message.empty() ? Value() : Value(entry.error_message);
+	case QuackapiAccessLogColumn::TRACE_ID:
+		return entry.trace_id.empty() ? Value() : Value(entry.trace_id);
+	case QuackapiAccessLogColumn::SPAN_ID:
+		return entry.span_id.empty() ? Value() : Value(entry.span_id);
+	case QuackapiAccessLogColumn::PARENT_SPAN_ID:
+		return entry.parent_span_id.empty() ? Value() : Value(entry.parent_span_id);
+	case QuackapiAccessLogColumn::SAMPLED:
+		return Value::BOOLEAN(entry.sampled);
 	}
 	throw InternalException("unknown quackapi access-log column");
 }
@@ -1806,7 +1832,11 @@ static unique_ptr<Appender> AccessLogAppender(Connection &con, const vector<stri
 	return make_uniq<Appender>(con, parts[0], parts[1], parts[2]);
 }
 
-static void EmitAccessLogStderr(const QuackapiAccessLogEntry &entry) {
+static string JsonEscape(const string &value) {
+	return QuackapiJsonEscape(value);
+}
+
+static void EmitAccessLogStderr(const QuackapiRequestRecord &entry) {
 	string path_esc;
 	path_esc.reserve(entry.path.size() + 8);
 	for (unsigned char c : entry.path) {
@@ -1823,9 +1853,12 @@ static void EmitAccessLogStderr(const QuackapiAccessLogEntry &entry) {
 	}
 	fprintf(stderr,
 	        "{\"type\":\"access\",\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,"
-	        "\"latency_ms\":%.3f,\"request_id\":\"%s\",\"bytes\":%llu}\n",
-	        entry.method.c_str(), path_esc.c_str(), entry.status, entry.duration_ms, entry.request_id.c_str(),
-	        (unsigned long long)entry.bytes_out);
+	        "\"latency_ms\":%.3f,\"request_id\":\"%s\",\"bytes\":%llu,\"client_ip\":\"%s\","
+	        "\"user_agent\":\"%s\",\"route_path\":\"%s\",\"trace_id\":\"%s\"}\n",
+	        JsonEscape(entry.method).c_str(), path_esc.c_str(), entry.status, entry.duration_ms,
+	        JsonEscape(entry.request_id).c_str(), (unsigned long long)entry.bytes_out,
+	        JsonEscape(entry.client_ip).c_str(), JsonEscape(entry.user_agent).c_str(),
+	        JsonEscape(entry.route_path).c_str(), JsonEscape(entry.trace_id).c_str());
 }
 
 static constexpr const char *QUACKAPI_STATIC_LOG_MARKER = "X-Quackapi-Static-Access-Log";
@@ -1844,7 +1877,7 @@ public:
 		Shutdown();
 	}
 
-	void Enqueue(QuackapiAccessLogEntry entry) {
+	void Enqueue(QuackapiRequestRecord entry) {
 		bool fallback;
 		bool overflow = false;
 		bool warn_overflow = false;
@@ -1899,7 +1932,7 @@ private:
 		worker.join();
 	}
 
-	void FlushBatch(const vector<QuackapiAccessLogEntry> &batch) {
+	void FlushBatch(const vector<QuackapiRequestRecord> &batch) {
 		if (table_parts.empty()) {
 			table_parts = SplitAccessLogTable(table);
 		}
@@ -1969,7 +2002,7 @@ private:
 			MarkFailed(ex.what());
 		}
 		for (;;) {
-			vector<QuackapiAccessLogEntry> batch;
+			vector<QuackapiRequestRecord> batch;
 			{
 				std::unique_lock<std::mutex> lock(mutex);
 				condition.wait_for(lock, std::chrono::seconds(1), [&] { return stopping || pending.size() >= 100; });
@@ -2012,7 +2045,7 @@ private:
 	vector<string> table_parts;
 	std::mutex mutex;
 	std::condition_variable condition;
-	vector<QuackapiAccessLogEntry> pending;
+	vector<QuackapiRequestRecord> pending;
 	std::thread worker;
 	bool stopping = false;
 	bool failed = false;
@@ -2023,6 +2056,14 @@ private:
 };
 
 string SanitizeClientRequestId(const string &s);
+static void MakeTraceContext(const string &traceparent, string &trace_id, string &span_id, string &parent_span_id,
+                             bool &sampled);
+static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
+                                               const string &request_id, const string &route_name,
+                                               const string &route_path, double latency_ms, int64_t received_at_micros,
+                                               double sql_prepare_ms, double sql_execute_ms, int64_t rows_out,
+                                               const string &trace_id, const string &span_id,
+                                               const string &parent_span_id, bool sampled);
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
                                        const QuackapiServeOptions &opts, bool bind_and_listen)
@@ -2055,7 +2096,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 			request_id = NextRequestId(*db);
 		}
 		res.set_header("X-Request-ID", request_id);
-		if (options.access_log && options.log_level >= QuackapiLogLevel::INFO) {
+		if (options.access_log && options.log_level != QuackapiLogLevel::SILENT) {
 			res.set_header(QUACKAPI_STATIC_LOG_MARKER, "1");
 			res.set_header(
 			    QUACKAPI_STATIC_LOG_STARTED,
@@ -2091,7 +2132,11 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 			}
 			res.headers.erase(started);
 		}
-		EmitAccessLog(req, res, res.get_header_value("X-Request-ID"), "static", latency_ms, received_at);
+		string trace_id, span_id, parent_span_id;
+		bool sampled;
+		MakeTraceContext(req.get_header_value("traceparent"), trace_id, span_id, parent_span_id, sampled);
+		EmitAccessLog(MakeRequestRecord(req, res, res.get_header_value("X-Request-ID"), "static", string(), latency_ms,
+		                                received_at, -1, -1, -1, trace_id, span_id, parent_span_id, sampled));
 	});
 
 	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
@@ -2262,12 +2307,79 @@ string SanitizeClientRequestId(const string &s) {
 	return out;
 }
 
-void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
-                                       const string &request_id, const string &route_name, double latency_ms,
-                                       int64_t received_at_micros) {
-	if (!options.access_log || options.log_level < QuackapiLogLevel::INFO) {
-		return;
+static bool IsHexString(const string &value) {
+	for (auto c : value) {
+		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+			return false;
+		}
 	}
+	return true;
+}
+
+static bool IsAllZero(const string &value) {
+	for (auto c : value) {
+		if (c != '0') {
+			return false;
+		}
+	}
+	return true;
+}
+
+static string RandomTraceHex(idx_t length) {
+	auto raw = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
+	return length == 16 ? raw.substr(16, length) : raw.substr(0, length);
+}
+
+static void MakeTraceContext(const string &traceparent, string &trace_id, string &span_id, string &parent_span_id,
+                             bool &sampled) {
+	trace_id = RandomTraceHex(32);
+	span_id = RandomTraceHex(16);
+	parent_span_id.clear();
+	sampled = true;
+	if (traceparent.size() == 55 && traceparent[2] == '-' && traceparent[35] == '-' && traceparent[52] == '-' &&
+	    traceparent.compare(0, 2, "00") == 0) {
+		auto inbound_trace = traceparent.substr(3, 32);
+		auto inbound_parent = traceparent.substr(36, 16);
+		auto flags = traceparent.substr(53, 2);
+		if (IsHexString(inbound_trace) && IsHexString(inbound_parent) && IsHexString(flags) &&
+		    !IsAllZero(inbound_trace) && !IsAllZero(inbound_parent)) {
+			trace_id = StringUtil::Lower(inbound_trace);
+			parent_span_id = StringUtil::Lower(inbound_parent);
+			sampled = (std::strtoul(flags.c_str(), nullptr, 16) & 1U) != 0;
+		}
+	}
+}
+
+static string ErrorMessageFromResponse(const string &body) {
+	static constexpr const char *prefix = "{\"detail\":\"";
+	if (!StringUtil::StartsWith(body, prefix)) {
+		return body.substr(0, 512);
+	}
+	auto start = strlen(prefix);
+	for (idx_t i = start; i < body.size(); i++) {
+		if (body[i] == '"' && (i == start || body[i - 1] != '\\')) {
+			return body.substr(start, std::min<idx_t>(i - start, 512));
+		}
+	}
+	return body.substr(start, 512);
+}
+
+static string ErrorTypeForStatus(int status) {
+	switch (status) {
+	case 502:
+		return "upstream_error";
+	case 503:
+		return "service_unavailable";
+	case 504:
+		return "timeout";
+	case 507:
+		return "response_too_large";
+	default:
+		return status >= 500 ? "internal_error" : "http_error";
+	}
+}
+
+static int64_t ResponseBytes(const duckdb_httplib::Response &res) {
 	size_t bytes = res.body.size();
 	// Prefer Content-Length when set; body may be empty for HEAD.
 	auto cl = res.headers.find("Content-Length");
@@ -2277,13 +2389,69 @@ void QuackapiHttpServer::EmitAccessLog(const duckdb_httplib::Request &req, const
 		} catch (...) {
 		}
 	}
-	QuackapiAccessLogEntry entry {request_id,      received_at_micros,
-	                              req.method,      req.path,
-	                              route_name,      res.status,
-	                              latency_ms,      static_cast<int64_t>(bytes),
-	                              req.remote_addr, req.get_header_value("User-Agent")};
+	return static_cast<int64_t>(bytes);
+}
+
+static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
+                                               const string &request_id, const string &route_name,
+                                               const string &route_path, double latency_ms, int64_t received_at_micros,
+                                               double sql_prepare_ms, double sql_execute_ms, int64_t rows_out,
+                                               const string &trace_id, const string &span_id,
+                                               const string &parent_span_id, bool sampled) {
+	QuackapiRequestRecord entry;
+	entry.request_id = request_id;
+	entry.received_at_micros = received_at_micros;
+	entry.method = req.method;
+	entry.path = req.path;
+	entry.route_name = route_name;
+	entry.route_path = route_path;
+	entry.status = res.status;
+	entry.duration_ms = latency_ms;
+	entry.sql_prepare_ms = sql_prepare_ms;
+	entry.sql_execute_ms = sql_execute_ms;
+	entry.rows_out = rows_out;
+	entry.bytes_in = static_cast<int64_t>(req.body.size());
+	entry.bytes_out = ResponseBytes(res);
+	entry.client_ip = req.remote_addr;
+	entry.user_agent = req.get_header_value("User-Agent").substr(0, 256);
+	entry.http_version = req.version;
+	if (res.status >= 400) {
+		entry.error_type = ErrorTypeForStatus(res.status);
+		if (res.status >= 500) {
+			entry.error_message = ErrorMessageFromResponse(res.body);
+		}
+	}
+	entry.trace_id = trace_id;
+	entry.span_id = span_id;
+	entry.parent_span_id = parent_span_id;
+	entry.sampled = sampled;
+	return entry;
+}
+
+void QuackapiHttpServer::EmitAccessLog(const QuackapiRequestRecord &entry) {
+	if (!options.access_log) {
+		return;
+	}
+	bool emit = false;
+	switch (options.log_level) {
+	case QuackapiLogLevel::DEBUG_LEVEL:
+	case QuackapiLogLevel::INFO:
+		emit = true;
+		break;
+	case QuackapiLogLevel::WARN:
+		emit = entry.status >= 400 || entry.duration_ms >= static_cast<double>(options.slow_request_ms);
+		break;
+	case QuackapiLogLevel::ERROR:
+		emit = entry.status >= 500;
+		break;
+	case QuackapiLogLevel::SILENT:
+		break;
+	}
+	if (!emit) {
+		return;
+	}
 	if (access_log_writer) {
-		access_log_writer->Enqueue(std::move(entry));
+		access_log_writer->Enqueue(entry);
 	} else {
 		// No fflush: stderr is typically line-buffered when attached to a terminal
 		// and block-buffered when piped; fflush-per-request serializes all workers.
@@ -2484,6 +2652,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	const auto received_at_micros = Timestamp::GetCurrentTimestamp().value;
 	string request_id; // filled once db is available; may be empty on 503 shutdown
 	string route_name;
+	string route_path;
+	string trace_id, span_id, parent_span_id;
+	bool sampled = true;
+	double sql_prepare_ms = -1;
+	double sql_execute_ms = -1;
+	int64_t rows_out = -1;
+	MakeTraceContext(req.get_header_value("traceparent"), trace_id, span_id, parent_span_id, sampled);
 
 	std::function<void()> after_middleware;
 	auto finish = [&]() {
@@ -2507,8 +2682,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		MaybeCompressResponse(req, res);
 		auto t1 = std::chrono::steady_clock::now();
 		double latency_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-		EmitAccessLog(req, res, request_id.empty() ? string("-") : request_id, route_name, latency_ms,
-		              received_at_micros);
+		EmitAccessLog(MakeRequestRecord(req, res, request_id.empty() ? string("-") : request_id, route_name, route_path,
+		                                latency_ms, received_at_micros, sql_prepare_ms, sql_execute_ms, rows_out,
+		                                trace_id, span_id, parent_span_id, sampled));
 	};
 
 	auto db = db_ptr.lock();
@@ -2536,6 +2712,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	if (options.health_routes && (req.method == "GET" || req.method == "HEAD")) {
 		if (req.path == "/health") {
 			route_name = "health";
+			route_path = "/health";
 			// Object body (not row-array) — standard k8s/load-balancer shape.
 			SetJson(res, 200, "{\"status\":\"ok\"}");
 			finish();
@@ -2543,6 +2720,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		if (req.path == "/healthz") {
 			route_name = "healthz";
+			route_path = "/healthz";
 			// Readiness: verify the DB handle can run a trivial query.
 			string version = "unknown";
 			bool ready = false;
@@ -2593,6 +2771,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		QuackapiGraphqlRoute gql_route;
 		if (req.method == "POST" && gql_state.GetGraphqlRouteByPath(req.path, req.method, gql_route)) {
 			route_name = gql_route.name;
+			route_path = gql_route.path;
 			QuackapiAuthResult auth_result;
 			if (!gql_route.require_auth.empty()) {
 				QuackapiRoute auth_probe;
@@ -2635,6 +2814,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		if ((req.method == "GET" || req.method == "HEAD") &&
 		    gql_state.GetGraphqlRouteBySchemaPath(req.path, gql_route)) {
 			route_name = gql_route.name + ".schema";
+			route_path = gql_route.path + "/schema";
 			QuackapiAuthResult auth_result;
 			if (!gql_route.require_auth.empty()) {
 				QuackapiRoute auth_probe;
@@ -2676,6 +2856,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// Public in v0 (no auth). Not listed in quackapi_routes().
 	if (req.path == "/graphql" || req.path == "/graphql/") {
 		route_name = "graphql";
+		route_path = "/graphql";
 		if (req.method == "POST") {
 			string gql_query;
 			string gql_err;
@@ -2718,6 +2899,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	if ((req.method == "GET" || req.method == "HEAD") &&
 	    (req.path == "/graphql/schema" || req.path == "/graphql/schema/")) {
 		route_name = "graphql.schema";
+		route_path = "/graphql/schema";
 		try {
 			GraphqlExecOptions opts;
 			opts.query_timeout_ms = options.query_timeout_ms;
@@ -2737,6 +2919,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	if (req.method == "GET" || req.method == "HEAD") {
 		if (req.path == "/openapi.json") {
 			route_name = "openapi";
+			route_path = "/openapi.json";
 			string server_url = StringUtil::Format("http://%s:%d", host, port);
 			try {
 				auto doc = BuildOpenApiDocument(*db, server_url);
@@ -2752,6 +2935,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		if (req.path == "/docs" || req.path == "/docs/") {
 			route_name = "docs";
+			route_path = "/docs";
 			res.status = 200;
 			res.set_content(OpenApiDocsHtml(), "text/html; charset=utf-8");
 			finish();
@@ -2759,6 +2943,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		if (req.path == "/redoc" || req.path == "/redoc/") {
 			route_name = "redoc";
+			route_path = "/redoc";
 			res.status = 200;
 			res.set_content(OpenApiRedocHtml(), "text/html; charset=utf-8");
 			finish();
@@ -2955,6 +3140,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// ---- CREATE STREAM (SSE) path — no auth schemes on streams in v1 ----
 	if (!match.matched && stream_match.matched) {
 		route_name = stream_match.stream.name;
+		route_path = stream_match.stream.pattern;
 		try {
 			bool policy_denied = false;
 			string stream_policy_error;
@@ -2995,6 +3181,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				provided[kv.first] = kv.second;
 			}
 			provided["request_id"] = request_id;
+			provided["trace_id"] = trace_id;
+			provided["span_id"] = span_id;
 			// Last-Event-ID header → last_id (query ?last_id= wins if both set).
 			if (provided.find("last_id") == provided.end()) {
 				string last_event_id;
@@ -3183,6 +3371,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
 	route_name = match.route.name;
+	route_path = match.route.pattern;
 	// Public routes (require_auth empty) pass through unchanged.
 	// Auth is evaluated through the SQL surface (quackapi_verify_auth), the
 	// same EvaluateAuthQuery shape quack uses for CONNECTION_REQUEST
@@ -3303,6 +3492,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// Server-stamped request id — bindable as $request_id in handler SQL
 		// (and libpq path). Wins over any client query/path of the same name.
 		provided["request_id"] = {"server", request_id};
+		provided["trace_id"] = {"server", trace_id};
+		provided["span_id"] = {"server", span_id};
 
 		// ---- HEADER / COOKIE PARAMS (FastAPI Header / Cookie) ----
 		// Declared via PARAM <name> HEADER [wire] | COOKIE [wire]. Wire defaults:
@@ -3527,7 +3718,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 			handler_sql = RewriteTypedBodyParameter(handler_sql, body_sql_type);
 		}
+		auto prepare_started = std::chrono::steady_clock::now();
 		auto prepared_owned = con.Prepare(handler_sql);
+		sql_prepare_ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prepare_started).count();
 		if (prepared_owned->HasError()) {
 			SetInternalError(res, prepared_owned->GetError());
 			finish();
@@ -3763,7 +3957,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
+		auto execute_started = std::chrono::steady_clock::now();
 		auto result = prepared->Execute(named_values, false);
+		sql_execute_ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
 		if (result->HasError()) {
 			// Preserve the status mapping while returning DuckDB's diagnostic so clients can fix bad input.
 			// - Conversion errors → 422 with recovered param name (not "_")
@@ -3873,6 +4070,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				rows.push_back(std::move(cols));
 			}
 		}
+		rows_out = static_cast<int64_t>(rows.size());
 
 		// Apply Location / Set-Cookie from first (or each) row.
 		string location_value;

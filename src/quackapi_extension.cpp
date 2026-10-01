@@ -178,6 +178,7 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 	opts.query_timeout_ms = read("query_timeout_ms", 30000, 86400000);
 	opts.max_response_bytes = read("max_response_bytes", 16 * 1024 * 1024, 1024LL * 1024 * 1024);
 	opts.max_pending_requests = static_cast<int32_t>(read("max_pending_requests", 256, 100000));
+	opts.slow_request_ms = read("slow_request_ms", 1000, 86400000);
 }
 
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
@@ -592,6 +593,7 @@ struct RequestBindData : public TableFunctionData {
 	string pg_dsn;
 	//! Empty (default) keeps in-process requests quiet. Otherwise true, false, or a table name.
 	string access_log;
+	string log_level = "info";
 	bool finished = false;
 };
 
@@ -639,6 +641,19 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 		string table;
 		ParseAccessLogString(bind_data->access_log, enabled, table);
 	}
+	// log_level named param wins; otherwise use SET quackapi_log_level.
+	auto log_entry = input.named_parameters.find("log_level");
+	if (log_entry != input.named_parameters.end()) {
+		bind_data->log_level = log_entry->second.GetValue<string>();
+	} else {
+		Value setting;
+		if (context.TryGetCurrentSetting("quackapi_log_level", setting) && !setting.IsNull()) {
+			auto s = setting.GetValue<string>();
+			if (!s.empty()) {
+				bind_data->log_level = s;
+			}
+		}
+	}
 	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
 	// "Invalid unicode" on Value(string). JSON/text clients: decode(body).
 	return_types.emplace_back(LogicalType::INTEGER);
@@ -662,6 +677,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	string content_type;
 	unordered_map<string, string> resp_headers;
 	QuackapiServeOptions opts = bind_data.limits;
+	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
 	opts.access_log = false;
 	if (!bind_data.access_log.empty()) {
 		ParseAccessLogString(bind_data.access_log, opts.access_log, opts.access_log_table);
@@ -856,6 +872,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Log verbosity for quackapi_serve: silent|error|warn|info|debug. "
 	                          "Default info. Overridden by log_level named parameter.",
 	                          LogicalType::VARCHAR, Value("info"));
+	config.AddExtensionOption("quackapi_slow_request_ms",
+	                          "Requests at or above this duration are logged at warn level. "
+	                          "Default 1000ms. Overridden by slow_request_ms named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(1000));
 	// SET quackapi_compression = 'auto'|'gzip'|'zstd'|'off'.
 	// Default auto. Legacy true/false values map to auto/off.
 	config.AddExtensionOption("quackapi_compression",
@@ -906,6 +926,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
 	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
 	serve.named_parameters["log_level"] = LogicalType::VARCHAR;
+	serve.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
 	serve.named_parameters["access_log"] = LogicalType::ANY;
 	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
 	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
@@ -955,6 +976,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
 	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	request2.named_parameters["access_log"] = LogicalType::ANY;
+	request2.named_parameters["log_level"] = LogicalType::VARCHAR;
+	request2.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
 	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request2.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request2.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
@@ -963,6 +986,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                       RequestExec, RequestBind);
 	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	request3.named_parameters["access_log"] = LogicalType::ANY;
+	request3.named_parameters["log_level"] = LogicalType::VARCHAR;
+	request3.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
 	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request3.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request3.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
