@@ -17,6 +17,8 @@ The query already types the response.
 > Prior art: PostgREST, Datasette, Hasura, Oracle APEX. The novel part is one
 > **embedded OLAP** process as DB + HTTP framework + (optional) PDF/renderer,
 > driven by `CREATE ROUTE` DDL.
+>
+> **Inspiration:** quackapi was also inspired by the Query.Farm [`httpserver`](https://github.com/Query-farm/httpserver) DuckDB community extension.
 
 ---
 
@@ -203,14 +205,29 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, memory_limit := …, http_client := 'auto'\|'curl'\|'httplib', block := false, …)` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)` | `listen_url` |
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
-| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format` |
+| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
+| Setting | `SET quackapi_log_level = 'silent' \| 'error' \| 'warn' \| 'info' \| 'debug'` | default `info` |
+| Setting | `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | default `auto`; legacy booleans map to `auto`/`off` |
+| Setting | `SET quackapi_compression_min_bytes = N` | default `1024` |
 | Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | auto=prefer+loud fallback; curl=require; httplib=force stock |
+| Setting | `SET quackapi_pg_dsn = 'postgresql://…'` | empty = DuckDB handler path |
+| Setting | `SET quackapi_query_timeout_ms = N` | default `30000` |
+| Setting | `SET quackapi_max_response_bytes = N` | default `16777216` uncompressed bytes |
+| Setting | `SET quackapi_max_pending_requests = N` | default `256` |
+| Setting | `SET quackapi_graphql_allow_all = true\|false` | default `false`; legacy GraphQL open mode |
+
+`access_log` defaults to structured stderr JSON; `false` disables it and a table
+name enables asynchronous table-backed logging. Table writes batch up to 100
+rows or one second, use a 10,000-entry queue, and report overflow in
+`/healthz` as `access_log_overflow_count`. Compression defaults to `auto`,
+negotiates client q-values with zstd winning ties, skips bodies below 1024 bytes,
+and adds `Vary: Accept-Encoding` to responses eligible for compression.
 
 Built-in OpenAPI (not listed in `quackapi_routes()`):
 
@@ -410,8 +427,9 @@ GEN=ninja make release
 LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
-**Target DuckDB:** **v1.5.5 only.** Dependencies: C++17, DuckDB’s bundled
-**httplib** + **mbedtls** only — no vcpkg, no libcurl.
+**Target DuckDB:** **v1.5.5 only.** Dependencies: DuckDB’s bundled
+**httplib** + **mbedtls** only — no vcpkg, no libcurl. The extension is built as
+C++11 by the repository CMake configuration.
 
 ---
 
@@ -435,7 +453,7 @@ LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ## Security
 
 - **Default bind is `127.0.0.1`** — the server is loopback-only unless you opt
-  in with `host := '0.0.0.0'` (or `SET quackapi_host`).
+  in with `host := '0.0.0.0'`.
 - **Binding a non-loopback host exposes your SQL-backed routes to the
   network.** Anything a route's SQL can read, a caller can read. Before doing
   so, put `CREATE AUTH` (API key or JWT) plus `CREATE GROUP` / row policies in

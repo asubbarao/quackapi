@@ -6,13 +6,13 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, access_log := …, compression := …, compression_min_bytes := …, http_client := …, block := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)`
 
 | | |
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional (default in implementation if omitted — prefer passing explicitly, e.g. `8000`) |
-| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR`, `cors_origins VARCHAR`, `memory_limit VARCHAR`, `access_log BOOLEAN\|VARCHAR` (`true` = stderr JSON, `false` = off, table name = table-backed), `compression VARCHAR` (`auto`\|`gzip`\|`zstd`\|`off`, default `auto`), `compression_min_bytes BIGINT` (default `1024`), `http_client VARCHAR` (`auto`\|`curl`\|`httplib`), `block BOOLEAN` (default **false**), plus other batteries knobs (`log_level`, …) |
+| **Named** | `host VARCHAR` (default `127.0.0.1`), `static_dir VARCHAR` (default empty), `cors_origins VARCHAR` (default empty), `memory_limit VARCHAR` (default empty), `log_level VARCHAR` (default `info`), `access_log ANY` (default `true`: stderr JSON; `false`: off; table name: table-backed), `enable_logging BOOLEAN` (default `false`), `health_routes BOOLEAN` (default `true`), `threads VARCHAR` (default empty), `preserve_insertion_order BOOLEAN` (default `false`), `enable_http_metadata_cache BOOLEAN` (default `true`), `worker_threads INTEGER` (default `32`), `keep_alive_max_count INTEGER` (default `128`), `keep_alive_timeout_sec INTEGER` (default `10`), `read_timeout_sec INTEGER` (default `30`), `write_timeout_sec INTEGER` (default `30`), `compression ANY` (default `auto`; `true`/`false` map to `auto`/`off`), `compression_min_bytes BIGINT` (default `1024`), `http_client VARCHAR` (default `auto`; `auto`\|`curl`\|`httplib`), `pg_dsn VARCHAR` (default empty), `block BOOLEAN` (default `false`), `query_timeout_ms BIGINT` (default `30000`), `max_response_bytes BIGINT` (default `16777216`), `max_pending_requests BIGINT` (default `256`) |
 | **Returns** | `listen_url VARCHAR` |
 
 ```sql
@@ -44,6 +44,17 @@ With `block := true`, the query emits `listen_url` then waits until `quackapi_st
 (Windows/WASM/offline), logs `quackapi.http_client=httplib reason=curl_httpfs_unavailable`
 and continues. Override with `http_client := 'httplib'` or `SET quackapi_http_client`.
 Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
+
+**Access log:** a table destination is written asynchronously in batches of up to
+100 rows or one second. The queue holds 10,000 entries; overflow is written to
+stderr and counted as `access_log_overflow_count` in `/healthz`. A failed table
+flush falls back to stderr, retries with 1-second-to-60-second backoff, emits one
+warning per failure episode, and logs a recovery line when the table works again.
+
+**Compression:** `auto` negotiates `Accept-Encoding` q-values, preferring zstd on
+ties. `gzip` and `zstd` restrict the selected coding, `off` disables compression,
+and bodies smaller than `compression_min_bytes` are skipped. Eligible responses
+advertise `Vary: Accept-Encoding`.
 
 ---
 
@@ -94,7 +105,7 @@ SELECT * FROM quackapi_stop();
 | | |
 |--|--|
 | **Kind** | Table function |
-| **Returns** | `host`, `port`, `listen_url`, `http_client` (`curl` or `httplib`) |
+| **Returns** | `host`, `port`, `listen_url`, `http_client` (`curl` or `httplib`), `http_client_reason` |
 
 ```sql
 SELECT * FROM quackapi_servers();
@@ -108,7 +119,7 @@ SELECT * FROM quackapi_servers();
 
 | | |
 |--|--|
-| **Returns** | `name`, `method`, `pattern`, `status`, `handler`, `require_auth`, `group_name`, `tags` |
+| **Returns** | `name`, `method`, `pattern`, `status`, `handler`, `require_auth`, `group_name`, `tags`, `format`, `envelope`, `empty_status`, `timeout_sec` |
 
 ```sql
 SELECT name, method, pattern FROM quackapi_routes();
@@ -266,7 +277,7 @@ SELECT quackapi_enqueue('default', '{"task":"email"}');
 |--|--|
 | **Kind** | Table function |
 | **Args** | `queue VARCHAR`, optional `n INTEGER` (default 1, max 1000) |
-| **Returns** | `id`, `queue`, `payload`, `status`, `attempts`, `max_attempts`, `visible_at`, `last_error` |
+| **Returns** | `id`, `queue`, `payload`, `status`, `attempts`, `max_attempts`, `visible_at`, `last_error`, `delivery_generation` |
 
 ```sql
 SELECT id, payload, status FROM quackapi_dequeue('default', 10);
@@ -274,31 +285,45 @@ SELECT id, payload, status FROM quackapi_dequeue('default', 10);
 
 ---
 
-### `quackapi_ack(queue, job_id)`
+### `quackapi_ack(queue, job_id, delivery_generation)`
 
 | | |
 |--|--|
 | **Kind** | Scalar |
-| **Args** | `queue VARCHAR`, `job_id BIGINT` |
+| **Args** | `queue VARCHAR`, `job_id BIGINT`, `delivery_generation BIGINT` |
 | **Returns** | `BOOLEAN` — true if job was `running` and marked `done` |
 
 ```sql
-SELECT quackapi_ack('default', 1);  -- true
+SELECT quackapi_ack('default', 1, 1);  -- true when generation 1 is still leased
 ```
 
 ---
 
-### `quackapi_nack(queue, job_id [, requeue [, error]])`
+### `quackapi_nack(queue, job_id, delivery_generation [, requeue [, error]])`
 
 | | |
 |--|--|
 | **Kind** | Scalar |
-| **Args** | `queue VARCHAR`, `job_id BIGINT`, optional `requeue BOOLEAN` (default true), optional `error VARCHAR` |
+| **Args** | `queue VARCHAR`, `job_id BIGINT`, `delivery_generation BIGINT`, optional `requeue BOOLEAN` (default true), optional `error VARCHAR` |
 | **Returns** | `VARCHAR` new status (`pending` or `dead`) |
 
 ```sql
-SELECT quackapi_nack('default', 1, true, 'try_again');  -- pending or dead
-SELECT quackapi_nack('default', 1, false, 'no_retry');  -- dead
+SELECT quackapi_nack('default', 1, 1, true, 'try_again');  -- pending or dead
+SELECT quackapi_nack('default', 1, 1, false, 'no_retry');  -- dead
+```
+
+---
+
+### `quackapi_renew(queue, job_id, delivery_generation)`
+
+| | |
+|--|--|
+| **Kind** | Scalar |
+| **Args** | `queue VARCHAR`, `job_id BIGINT`, `delivery_generation BIGINT` |
+| **Returns** | `BOOLEAN` — true when the active lease was renewed |
+
+```sql
+SELECT quackapi_renew('default', 1, 1);
 ```
 
 ---
@@ -344,18 +369,50 @@ Outbound HTTPS for handlers that call `read_text` / httpfs uses DuckDB’s share
 
 ---
 
+## Other registered functions
+
+These public functions are registered by the extension in addition to the
+server, registry, auth, queue, and outbound HTTP surfaces above.
+
+| Function | Signature / returns |
+|----------|--------------------|
+| `quackapi_request` | `quackapi_request(method VARCHAR, path VARCHAR [, body VARCHAR], headers := MAP, access_log := ANY, pg_dsn := VARCHAR, query_timeout_ms := BIGINT, max_response_bytes := BIGINT)` → `status INTEGER, body BLOB, content_type VARCHAR, headers MAP(VARCHAR, VARCHAR)`; no TCP listener is required |
+| `quackapi_last_write_timeout_sec()` | → `INTEGER`; effective socket write timeout of the most recent request |
+| `quackapi_middlewares()` | → `name, phase, group_name, handler_sql, registration_order` |
+| `quackapi_graphql_tables()` | → `mode, table_name` |
+| `quackapi_graphql_routes()` | → `name, method, path, tables, require_auth, limit` |
+| `quackapi_parallel_fetch(url VARCHAR, n INTEGER)` | → `idx, status, body, error`; `n` is limited to 256 |
+| `quack_from_{fastapi,rails,express,gin}(path)` | route extractor → `method, path, handler_name, file, start_line, evidence` |
+| `quack_from_{fastapi,rails,express,gin}_models(path)` | model extractor → `model_name, field_name, field_type, is_required, is_optional, has_default, default_expr, file, field_line` |
+| `quack_from_x_sql(source VARCHAR, relpath VARCHAR)` / `_relpath` | → embedded SQL text for the bridge extractors |
+
+`quackapi_apply_*` planner functions are internal DDL implementation helpers,
+not application-facing functions.
+
+---
+
 ## Settings
 
 | Setting | Meaning |
 |---------|---------|
 | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | CORS allow list; empty = off |
 | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | Serve memory preference when named param omitted |
+| `SET quackapi_log_level = 'silent' \| 'error' \| 'warn' \| 'info' \| 'debug'` | Serve log verbosity; default `info` |
+| `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | Response compression; default `auto` |
+| `SET quackapi_compression_min_bytes = N` | Minimum response size; default `1024` |
 | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | Outbound httpfs client preference (default `auto` → curl_httpfs) |
+| `SET quackapi_pg_dsn = 'postgresql://…'` | Native Postgres handler DSN; empty keeps DuckDB execution |
+| `SET quackapi_query_timeout_ms = N` | Query execution budget; default `30000` |
+| `SET quackapi_max_response_bytes = N` | Uncompressed response cap; default `16777216` |
+| `SET quackapi_max_pending_requests = N` | Pending request cap; default `256` |
+| `SET quackapi_graphql_allow_all = true\|false` | Legacy global GraphQL open mode; default `false` |
 
 ```sql
 SET quackapi_cors_origins = '*';
 SET quackapi_memory_limit = '4GB';
 SET quackapi_http_client = 'auto';
+SET quackapi_compression = 'auto';
+SET quackapi_compression_min_bytes = 1024;
 ```
 
 ---
