@@ -69,9 +69,12 @@ struct QuackapiServeOptions {
 	//! of stderr. The writer falls back to stderr if the table cannot be used.
 	string access_log_table;
 	//! Enable DuckDB built-in QueryLog at serve (CALL enable_logging). Default
-	//! **false** — per-handler QueryLog to stdout destroys HTTP throughput.
-	//! Opt in with enable_logging:=true for debugging; use access_log for ops.
+	//! **false** when DuckDB logging was not already enabled — per-handler QueryLog
+	//! to stdout destroys HTTP throughput. Preserve prior operator logging unless
+	//! explicitly overridden; use access_log for ops.
 	bool enable_logging = false;
+	//! True when the operator supplied the enable_logging named parameter.
+	bool enable_logging_explicit = false;
 
 	// --- Batteries: health routes (ON by default) ---
 	//! Auto-register GET /health + GET /healthz. Default true.

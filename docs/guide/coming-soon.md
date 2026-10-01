@@ -7,9 +7,6 @@ These features are **not** documented as done. They are actively designed or bui
 | **WebSocket routes** | Browser RFC6455 duplex | **Blocked** on transport (HTTP library has no Upgrade API). Use [CREATE STREAM (SSE)](stream.md) instead |
 | **OIDC / OAuth2 browser SSO** | `CREATE AUTH … OIDC` | Designed — JWT/API_KEY only today |
 | **Signed cookie sessions + CSRF** | Browser session cookies | Designed |
-| **Middleware BEFORE/AFTER SQL** | Declarative hooks around handlers | Designed |
-| **FORMAT / Accept negotiation** | ~~CSV, NDJSON, Parquet, Arrow~~ **shipped** | see FORMAT clause + format.test.sh |
-| **In-process TestClient** | ~~`quackapi_request(…)` without a port~~ **shipped** | `quackapi_request(method, path [, body])` |
 | **Static URL prefix** | Mount `static_dir` under `/assets` | Partial — root `static_dir` only |
 
 Authoritative ledger: [FEATURE_STATUS.md](../FEATURE_STATUS.md) sections 2.5 and 4.

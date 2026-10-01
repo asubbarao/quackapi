@@ -46,7 +46,7 @@ Headline: item@32 **6.5×** faster / **5.6×** RPS; rows@32 **13×** / **8×**; 
 - Body → libpq **before** DuckDB prepare  
 - Flat JSON extract (no SQL body parse on POST)  
 - PQprepare cache per worker thread  
-- access_log / QueryLog off by default  
+- access_log on; QueryLog off by default unless the operator already enabled it
 - Rebuild **shell + loadable** or you ship a lie  
 
 If a cell loses: **fix the hot path** before adding features.
@@ -59,7 +59,7 @@ Things FastAPI does not have as first-class product:
 - `CREATE QUEUE` durable jobs in the same DB  
 - `CREATE API FOR TABLE`  
 - `quack_from_openapi` / `quack_from_fastapi` migration gravity  
-- SQL middleware / ETag table cache / Arrow export  
+- ETag table cache
 
 These are **wins**, but they do not excuse a lost item@32.
 

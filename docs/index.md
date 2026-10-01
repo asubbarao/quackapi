@@ -164,6 +164,8 @@ Handler SQL is validated at `CREATE` time. Broken SQL fails at create — not on
 11. [Static files (`static_dir`)](guide/static-files.md)  
 12. [OpenAPI, Swagger UI, ReDoc](guide/openapi.md)  
 13. [Thin GraphQL v0 (catalog tables)](guide/graphql-v0.md)
+14. [Response compression](guide/compression.md)
+15. [SQL middleware](MIDDLEWARE.md)
 
 ### Reference
 
@@ -196,14 +198,15 @@ LOAD quackapi;
 -- LOAD '/path/to/build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
-### Community (after acceptance)
+### Community
 
 ```sql
 INSTALL quackapi FROM community;
 LOAD quackapi;
 ```
 
-**Target DuckDB:** v1.5.5. Platforms: Linux/macOS amd64+arm64. wasm and Windows are excluded until CI is green.
+**Target DuckDB:** v1.5.5. Platforms: Linux/macOS amd64+arm64 and Windows
+amd64. wasm, Windows MinGW/rtools, and Windows arm64 are excluded.
 
 ---
 

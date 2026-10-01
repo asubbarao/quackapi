@@ -190,10 +190,12 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 		applied.push_back("threads=<DuckDB default=all cores> (WHY: max parallel query work for server)");
 	}
 
-	// --- DuckDB built-in logging (OFF by default) ---
+	// --- DuckDB built-in logging (OFF by default unless already enabled) ---
 	// WHY: QueryLog-per-handler-SQL to stdout is a multi-ms tax under load and
 	// serializes workers. HTTP ops use access_log (structured stderr). Opt in
-	// with enable_logging:=true when debugging query plans / errors.
+	// with enable_logging:=true when debugging query plans / errors; preserve an
+	// operator-enabled logger unless enable_logging:=false was explicit.
+	const auto log_config = context.db->GetLogManager().GetConfig();
 	if (opts.enable_logging && opts.log_level != QuackapiLogLevel::SILENT) {
 		const char *level = LogLevelDuckDBName(opts.log_level);
 		// Prefer CALL enable_logging (current DuckDB API) — sets storage + level.
@@ -217,9 +219,15 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 			applied.push_back("enable_http_logging=true (WHY: outbound HTTP client request log; "
 			                  "deprecated DuckDB setting, still effective)");
 		}
+	} else if (log_config.enabled && !opts.enable_logging_explicit) {
+		applied.push_back("enable_logging=<operator/prior> (WHY: non-clobber; left alone)");
+		if (log_config.enabled_log_types.find("QueryLog") != log_config.enabled_log_types.end()) {
+			fprintf(stderr,
+			        "quackapi: WARN DuckDB QueryLog is enabled; per-request logging can reduce HTTP throughput\n");
+		}
 	} else {
-		// Force OFF — DuckDB may ship with enable_logging true; a silent skip
-		// would leave QueryLog serializing every handler SQL under load.
+		// Force OFF when logging was not already enabled, or when the operator
+		// explicitly requested false; QueryLog serializes every handler SQL.
 		if (RunSet(con, "SET enable_logging = false", err)) {
 			applied.push_back("enable_logging=false (WHY: default — QueryLog-per-request kills HTTP RPS; "
 			                  "opt in with enable_logging:=true; use access_log for ops)");

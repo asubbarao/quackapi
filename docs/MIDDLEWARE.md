@@ -44,7 +44,7 @@ handler. `AFTER` runs after the handler produces its response. A route group's
 middleware applies only to member routes. Within a scope, creation order is
 stable and `CREATE OR REPLACE` preserves a definition's position. The full
 order is global then group for `BEFORE`, and group then global for `AFTER`.
-This first release wraps ordinary `CREATE ROUTE` handlers and their in-process
+Middleware wraps ordinary `CREATE ROUTE` handlers and their in-process
 `quackapi_request` calls. Built-in health endpoints, named GraphQL routes, the
 built-in GraphQL endpoint, and SSE streams keep their dedicated execution
 paths and do not run SQL middleware yet.
