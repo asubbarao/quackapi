@@ -242,6 +242,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto enlog_entry = input.named_parameters.find("enable_logging");
 	if (enlog_entry != input.named_parameters.end()) {
 		bind_data->enable_logging = enlog_entry->second.GetValue<bool>();
+		bind_data->limits.enable_logging_explicit = true;
 	}
 	auto health_entry = input.named_parameters.find("health_routes");
 	if (health_entry != input.named_parameters.end()) {
