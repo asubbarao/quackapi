@@ -1,0 +1,169 @@
+# name: test/sql/quackapi_telemetry_record.test
+# description: Rich request records, inbound W3C trace context, and log levels
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE TABLE telemetry_log (
+  request_id VARCHAR,
+  received_at TIMESTAMP,
+  method VARCHAR,
+  path VARCHAR,
+  route_name VARCHAR,
+  route_path VARCHAR,
+  status INTEGER,
+  duration_ms DOUBLE,
+  sql_prepare_ms DOUBLE,
+  sql_execute_ms DOUBLE,
+  rows_out BIGINT,
+  bytes_in BIGINT,
+  bytes_out BIGINT,
+  client_ip VARCHAR,
+  user_agent VARCHAR,
+  http_version VARCHAR,
+  error_type VARCHAR,
+  error_message VARCHAR,
+  trace_id VARCHAR,
+  span_id VARCHAR,
+  parent_span_id VARCHAR,
+  sampled BOOLEAN
+);
+
+statement ok
+CREATE TABLE old_log (
+  request_id VARCHAR,
+  received_at TIMESTAMP,
+  method VARCHAR,
+  path VARCHAR,
+  route_name VARCHAR,
+  status INTEGER,
+  duration_ms DOUBLE,
+  bytes_out BIGINT,
+  client_ip VARCHAR,
+  user_agent VARCHAR
+);
+
+statement ok
+CREATE TABLE warn_log (
+  request_id VARCHAR,
+  status INTEGER
+);
+
+statement ok
+CREATE OR REPLACE ROUTE telemetry_item GET '/telemetry/items/{id}' AS
+  SELECT $id::INTEGER AS id, $trace_id::VARCHAR AS trace_id, $span_id::VARCHAR AS span_id;
+
+statement ok
+CREATE OR REPLACE ROUTE telemetry_fail POST '/telemetry/fail' AS
+  SELECT * FROM query($sql);
+
+statement ok
+CREATE OR REPLACE ROUTE telemetry_ok GET '/telemetry/ok' AS
+  SELECT 'ok' AS result;
+
+# Valid W3C trace context is retained while the server creates a fresh span.
+query I
+SELECT status
+FROM quackapi_request(
+  'GET', '/telemetry/items/7',
+  headers := MAP {'traceparent': '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'},
+  access_log := 'telemetry_log'
+);
+----
+200
+
+query III
+SELECT trace_id, parent_span_id, length(span_id)
+FROM telemetry_log
+WHERE path = '/telemetry/items/7';
+----
+4bf92f3577b34da6a3ce929d0e0e4736	00f067aa0ba902b7	16
+
+# Malformed and all-zero parents start fresh traces.
+query I
+SELECT status FROM quackapi_request(
+  'GET', '/telemetry/items/8',
+  headers := MAP {'traceparent': 'not-a-traceparent'},
+  access_log := 'telemetry_log'
+);
+----
+200
+
+query I
+SELECT status FROM quackapi_request(
+  'GET', '/telemetry/items/9',
+  headers := MAP {'traceparent': '00-00000000000000000000000000000000-0000000000000000-01'},
+  access_log := 'telemetry_log'
+);
+----
+200
+
+query I
+SELECT count(*) = 2
+       AND bool_and(regexp_matches(trace_id, '^[0-9a-f]{32}$'))
+       AND bool_and(parent_span_id IS NULL)
+       AND bool_and(trace_id <> '00000000000000000000000000000000')
+FROM telemetry_log
+WHERE path IN ('/telemetry/items/8', '/telemetry/items/9');
+----
+true
+
+# Handler SQL can bind the server span context.
+query I
+SELECT decode(body) LIKE '%"trace_id":"%'
+FROM quackapi_request('GET', '/telemetry/items/10');
+----
+true
+
+# A failing route records an error type and keeps its 5xx message.
+query I
+SELECT status
+FROM quackapi_request(
+  'POST', '/telemetry/fail', '{"sql":"SELECT nope FROM nowhere"}', access_log := 'telemetry_log'
+);
+----
+500
+
+query I
+SELECT error_type IS NOT NULL AND error_message IS NOT NULL
+FROM telemetry_log
+WHERE path = '/telemetry/fail';
+----
+true
+
+# New record fields are opt-in: the original ten-column table still appends.
+query I
+SELECT status
+FROM quackapi_request('GET', '/telemetry/ok', access_log := 'old_log');
+----
+200
+
+query I
+SELECT count(*) FROM old_log WHERE path = '/telemetry/ok';
+----
+1
+
+# WARN excludes a successful request from the table sink.
+query I
+SELECT * FROM quackapi_serve(29520, host := '127.0.0.1', access_log := 'warn_log', log_level := 'warn');
+----
+http://127.0.0.1:29520
+
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29520/telemetry/ok')).status;
+----
+200
+
+statement ok
+SELECT sleep_ms(1100);
+
+query I
+SELECT count(*) FROM warn_log;
+----
+0
+
+query I
+SELECT * FROM quackapi_stop(29520);
+----
+Stopped quackapi server on port 29520

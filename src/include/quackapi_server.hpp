@@ -37,7 +37,7 @@ static constexpr time_t QUACKAPI_DEFAULT_IO_TIMEOUT_SEC = 30;
 //! Access-log / server log verbosity. Default INFO is informative, not silent.
 enum class QuackapiLogLevel : uint8_t {
 	SILENT = 0,
-	ERROR = 1,
+	ERROR_LEVEL = 1,
 	WARN = 2,
 	INFO = 3,
 	DEBUG_LEVEL = 4,
@@ -61,6 +61,8 @@ struct QuackapiServeOptions {
 	// --- Batteries: logging (ON by default) ---
 	//! Access log + server log verbosity. Default INFO.
 	QuackapiLogLevel log_level = QuackapiLogLevel::INFO;
+	//! Requests at or above this duration are included at WARN level.
+	int64_t slow_request_ms = 1000;
 	//! Emit one structured access-log line per request (stderr, JSON). Default true.
 	bool access_log = true;
 	//! When non-empty, append access-log rows to this operator-created table instead
@@ -136,6 +138,32 @@ struct QuackapiServeOptions {
 	string pg_dsn;
 };
 
+//! One completed request, shared by the stderr and table access-log sinks.
+struct QuackapiRequestRecord {
+	string request_id;
+	int64_t received_at_micros;
+	string method;
+	string path;
+	string route_name;
+	string route_path;
+	int status;
+	double duration_ms;
+	double sql_prepare_ms = -1;
+	double sql_execute_ms = -1;
+	int64_t rows_out = -1;
+	int64_t bytes_in;
+	int64_t bytes_out;
+	string client_ip;
+	string user_agent;
+	string http_version;
+	string error_type;
+	string error_message;
+	string trace_id;
+	string span_id;
+	string parent_span_id;
+	bool sampled = true;
+};
+
 //! Parse log_level named param / setting. Accepts silent|error|warn|info|debug
 //! (case-insensitive). Unknown → INFO.
 QuackapiLogLevel ParseQuackapiLogLevel(const string &raw);
@@ -199,9 +227,7 @@ private:
 	void HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 	void ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 	string NextRequestId(DatabaseInstance &db);
-	void EmitAccessLog(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
-	                   const string &request_id, const string &route_name, double latency_ms,
-	                   int64_t received_at_micros);
+	void EmitAccessLog(const QuackapiRequestRecord &entry);
 	void MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
 	weak_ptr<DatabaseInstance> db_ptr;
