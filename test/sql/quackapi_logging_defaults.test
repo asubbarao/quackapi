@@ -1,0 +1,62 @@
+# name: test/sql/quackapi_logging_defaults.test
+# description: quackapi_serve preserves prior DuckDB logging unless explicitly disabled
+# group: [sql]
+
+require quackapi
+
+# An operator-enabled logger survives the serve defaults.
+statement ok
+CALL enable_logging(storage := 'memory');
+
+query I
+SELECT * FROM quackapi_serve(29501, host := '127.0.0.1');
+----
+http://127.0.0.1:29501
+
+query I
+SELECT current_setting('enable_logging');
+----
+1
+
+query I
+SELECT * FROM quackapi_stop(29501);
+----
+Stopped quackapi server on port 29501
+
+# Without prior logging, the serve default remains off.
+statement ok
+SET enable_logging = false;
+
+query I
+SELECT * FROM quackapi_serve(29502, host := '127.0.0.1');
+----
+http://127.0.0.1:29502
+
+query I
+SELECT current_setting('enable_logging');
+----
+0
+
+query I
+SELECT * FROM quackapi_stop(29502);
+----
+Stopped quackapi server on port 29502
+
+# An explicit false still overrides an operator-enabled logger.
+statement ok
+CALL enable_logging(storage := 'memory');
+
+query I
+SELECT * FROM quackapi_serve(29503, host := '127.0.0.1', enable_logging := false);
+----
+http://127.0.0.1:29503
+
+query I
+SELECT current_setting('enable_logging');
+----
+0
+
+query I
+SELECT * FROM quackapi_stop(29503);
+----
+Stopped quackapi server on port 29503
