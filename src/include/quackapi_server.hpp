@@ -191,6 +191,7 @@ public:
 	virtual ~QuackapiTelemetrySink() = default;
 
 	virtual void Enqueue(const QuackapiRequestRecord &record) = 0;
+	virtual void FlushPending() = 0;
 	virtual void Flush() = 0;
 	virtual QuackapiTelemetryStatus Status() const = 0;
 };
@@ -272,7 +273,6 @@ public:
 	//! worker thread (httplib's listen teardown joins all workers).
 	//! Mirrors QuackServer::Close.
 	void Close();
-
 	//! Same handler path as the TCP server — for quackapi_request() tests.
 	void Dispatch(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 
@@ -292,6 +292,8 @@ public:
 	std::vector<QuackapiRequestRecord> SnapshotRequests() const;
 	//! Keep per-sink counters queryable without exposing sink ownership to the registry.
 	std::vector<QuackapiTelemetryStatus> SnapshotTelemetryStatus() const;
+	//! Flush queued telemetry without stopping the server.
+	void FlushTelemetryPending();
 	//! Compatibility counter used by /healthz.
 	idx_t AccessLogOverflowCount() const;
 	//! True while the TCP listener thread is alive (false after StopAccepting).

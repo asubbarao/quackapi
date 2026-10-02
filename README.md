@@ -208,6 +208,7 @@ the “PDF service” is a function call in the same address space — not an RP
 | `quackapi_serve` | `([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)` | `listen_url` |
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
+| `quackapi_telemetry_flush` | `([port])` — drain pending sink rows without stopping | `status` |
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
@@ -224,7 +225,8 @@ the “PDF service” is a function call in the same address space — not an RP
 
 `access_log` defaults to structured stderr JSON; `false` disables it and a table
 name enables asynchronous table-backed logging. Table writes batch up to 100
-rows or one second, use a 10,000-entry queue, and report overflow in
+rows or one second; `quackapi_telemetry_flush` drains pending rows without
+stopping the server. The queue uses 10,000 entries and reports overflow in
 `/healthz` as `access_log_overflow_count`. Compression defaults to `auto`,
 negotiates client q-values with zstd winning ties, skips bodies below 1024 bytes,
 and adds `Vary: Accept-Encoding` to responses eligible for compression.
