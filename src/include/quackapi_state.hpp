@@ -133,7 +133,8 @@ struct QuackapiRoute {
 	//! PARAM specs: optional defaults + FastAPI-style numeric/string constraints.
 	vector<QuackapiParamSpec> params;
 	//! Optional JSON Schema (draft) for the request body. Empty = no schema check.
-	//! Validated via the community `json_schema` extension at request time.
+	//! The community `json_schema` extension is resolved when the route is created;
+	//! request time only loads the already-installed extension.
 	string body_schema;
 	//! Optional DuckDB JSON transform structure for a typed request body. The
 	//! structure uses native DuckDB names (e.g. {"items":[{"id":"INTEGER"}]}),
