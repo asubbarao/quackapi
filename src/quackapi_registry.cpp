@@ -502,6 +502,26 @@ vector<QuackapiRequestRecord> QuackapiState::SnapshotRequests(int port) {
 	return {};
 }
 
+vector<QuackapiTelemetryStatus> QuackapiState::SnapshotTelemetryStatus(int port) {
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	if (port == 0) {
+		if (servers.empty()) {
+			return {};
+		}
+		if (servers.size() > 1) {
+			throw InvalidInputException(
+			    "quackapi_telemetry_status(): port is required when multiple servers are running");
+		}
+		return servers.begin()->second->SnapshotTelemetryStatus();
+	}
+	for (auto &kv : servers) {
+		if (kv.second->Port() == port) {
+			return kv.second->SnapshotTelemetryStatus();
+		}
+	}
+	return {};
+}
+
 //===--------------------------------------------------------------------===//
 // Row access + masking policies
 //===--------------------------------------------------------------------===//

@@ -12,6 +12,7 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
@@ -1891,18 +1892,55 @@ static constexpr const char *QUACKAPI_STATIC_LOG_STARTED = "X-Quackapi-Static-St
 static constexpr const char *QUACKAPI_STATIC_LOG_RECEIVED = "X-Quackapi-Static-Received";
 static constexpr idx_t QUACKAPI_ACCESS_LOG_QUEUE_CAPACITY = 10000;
 
-class QuackapiAccessLogWriter {
+static int64_t TelemetryExportAgeMs(const std::chrono::steady_clock::time_point &last_export, bool has_export) {
+	if (!has_export) {
+		return -1;
+	}
+	auto age = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_export);
+	return age.count() < 0 ? 0 : age.count();
+}
+
+class QuackapiStderrTelemetrySink final : public QuackapiTelemetrySink {
 public:
-	QuackapiAccessLogWriter(DatabaseInstance &db, string table_p)
+	void Enqueue(const QuackapiRequestRecord &entry) override {
+		// Keep the existing line writer synchronous so stderr retains its current ordering.
+		EmitAccessLogStderr(entry);
+		// Atomics, not a mutex: this runs on every request and must not serialize workers.
+		exported_total.fetch_add(1, std::memory_order_relaxed);
+		last_export_ticks.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+	}
+
+	void Flush() override {
+	}
+
+	QuackapiTelemetryStatus Status() const override {
+		QuackapiTelemetryStatus result;
+		result.sink = "stderr";
+		result.exported_total = exported_total.load(std::memory_order_relaxed);
+		auto ticks = last_export_ticks.load(std::memory_order_relaxed);
+		result.last_export_age_ms = TelemetryExportAgeMs(
+		    std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(ticks)), ticks != NO_EXPORT);
+		return result;
+	}
+
+private:
+	static constexpr int64_t NO_EXPORT = NumericLimits<int64_t>::Minimum();
+	std::atomic<idx_t> exported_total {0};
+	std::atomic<int64_t> last_export_ticks {NO_EXPORT};
+};
+
+class QuackapiTableTelemetrySink final : public QuackapiTelemetrySink {
+public:
+	QuackapiTableTelemetrySink(DatabaseInstance &db, string table_p)
 	    : db_ptr(db.shared_from_this()), table(std::move(table_p)) {
-		worker = std::thread(&QuackapiAccessLogWriter::Run, this);
+		worker = std::thread(&QuackapiTableTelemetrySink::Run, this);
 	}
 
-	~QuackapiAccessLogWriter() {
-		Shutdown();
+	~QuackapiTableTelemetrySink() override {
+		Flush();
 	}
 
-	void Enqueue(QuackapiRequestRecord entry) {
+	void Enqueue(const QuackapiRequestRecord &entry) override {
 		bool fallback;
 		bool overflow = false;
 		bool warn_overflow = false;
@@ -1919,7 +1957,7 @@ public:
 						warn_overflow = true;
 					}
 				} else {
-					pending.push_back(std::move(entry));
+					pending.push_back(entry);
 					if (pending.size() >= 100) {
 						condition.notify_one();
 					}
@@ -1939,9 +1977,21 @@ public:
 		}
 	}
 
-	idx_t OverflowCount() {
+	void Flush() override {
+		Shutdown();
+	}
+
+	QuackapiTelemetryStatus Status() const override {
 		std::lock_guard<std::mutex> lock(mutex);
-		return overflow_count;
+		QuackapiTelemetryStatus result;
+		result.sink = "table";
+		result.target = table;
+		result.queued = pending.size();
+		result.exported_total = exported_total;
+		result.dropped_total = overflow_count;
+		result.last_error = last_error;
+		result.last_export_age_ms = TelemetryExportAgeMs(last_export, has_export);
+		return result;
 	}
 
 private:
@@ -1997,8 +2047,16 @@ private:
 		appender->Flush();
 	}
 
+	void MarkExported(idx_t count) {
+		std::lock_guard<std::mutex> lock(mutex);
+		exported_total += count;
+		last_export = std::chrono::steady_clock::now();
+		has_export = true;
+	}
+
 	void MarkFailed(const string &reason) {
 		std::lock_guard<std::mutex> lock(mutex);
+		last_error = reason;
 		if (!failed) {
 			failed = true;
 			fprintf(stderr,
@@ -2048,6 +2106,7 @@ private:
 			if (!use_stderr) {
 				try {
 					FlushBatch(batch);
+					MarkExported(batch.size());
 					MarkRecovered();
 				} catch (std::exception &ex) {
 					MarkFailed(ex.what());
@@ -2068,7 +2127,7 @@ private:
 	weak_ptr<DatabaseInstance> db_ptr;
 	string table;
 	vector<string> table_parts;
-	std::mutex mutex;
+	mutable std::mutex mutex;
 	std::condition_variable condition;
 	vector<QuackapiRequestRecord> pending;
 	std::thread worker;
@@ -2077,6 +2136,10 @@ private:
 	std::chrono::steady_clock::time_point retry_at;
 	int64_t retry_delay_seconds = 1;
 	idx_t overflow_count = 0;
+	idx_t exported_total = 0;
+	string last_error;
+	std::chrono::steady_clock::time_point last_export;
+	bool has_export = false;
 	bool overflow_warning_emitted = false;
 };
 
@@ -2096,8 +2159,12 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
     : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins), options(opts),
       started_at(std::chrono::steady_clock::now()), compression(opts.compression),
       compression_min_bytes(opts.compression_min_bytes) {
-	if (!options.access_log_table.empty()) {
-		access_log_writer = make_uniq<QuackapiAccessLogWriter>(db, options.access_log_table);
+	if (options.access_log) {
+		if (options.access_log_table.empty()) {
+			telemetry_sinks.push_back(make_uniq<QuackapiStderrTelemetrySink>());
+		} else {
+			telemetry_sinks.push_back(make_uniq<QuackapiTableTelemetrySink>(db, options.access_log_table));
+		}
 	}
 	// In-process only (quackapi_request): no TCP server object, no bind.
 	if (!bind_and_listen) {
@@ -2566,17 +2633,47 @@ void QuackapiHttpServer::EmitAccessLog(const QuackapiRequestRecord &entry) {
 	if (!emit) {
 		return;
 	}
-	if (access_log_writer) {
-		access_log_writer->Enqueue(entry);
-	} else {
-		// No fflush: stderr is typically line-buffered when attached to a terminal
-		// and block-buffered when piped; fflush-per-request serializes all workers.
-		EmitAccessLogStderr(entry);
+	for (auto &sink : telemetry_sinks) {
+		sink->Enqueue(entry);
 	}
 }
 
 std::vector<QuackapiRequestRecord> QuackapiHttpServer::SnapshotRequests() const {
 	return request_ring ? request_ring->Snapshot() : std::vector<QuackapiRequestRecord>();
+}
+
+std::vector<QuackapiTelemetryStatus> QuackapiHttpServer::SnapshotTelemetryStatus() const {
+	std::vector<QuackapiTelemetryStatus> result;
+	result.reserve(telemetry_sinks.size());
+	for (auto &sink : telemetry_sinks) {
+		result.push_back(sink->Status());
+	}
+	return result;
+}
+
+idx_t QuackapiHttpServer::AccessLogOverflowCount() const {
+	idx_t result = 0;
+	for (auto &status : SnapshotTelemetryStatus()) {
+		result += status.dropped_total;
+	}
+	return result;
+}
+
+static string TelemetryHealthJson(const std::vector<QuackapiTelemetryStatus> &statuses) {
+	string result = "[";
+	for (idx_t i = 0; i < statuses.size(); i++) {
+		if (i > 0) {
+			result += ",";
+		}
+		const auto &status = statuses[i];
+		result += StringUtil::Format("{\"sink\":\"%s\",\"queued\":%llu,\"exported_total\":%llu,"
+		                             "\"dropped_total\":%llu,\"last_error\":\"%s\"}",
+		                             QuackapiJsonEscape(status.sink), (unsigned long long)status.queued,
+		                             (unsigned long long)status.exported_total,
+		                             (unsigned long long)status.dropped_total, QuackapiJsonEscape(status.last_error));
+	}
+	result += "]";
+	return result;
 }
 
 void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
@@ -2859,7 +2956,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 			auto uptime_sec =
 			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count();
-			auto access_log_overflow_count = access_log_writer ? access_log_writer->OverflowCount() : 0;
+			auto telemetry_status = SnapshotTelemetryStatus();
+			auto access_log_overflow_count = AccessLogOverflowCount();
 			if (ready) {
 				// Surface active outbound HTTP client + reason so operators /
 				// readiness probes can confirm batteries applied. auto fallback
@@ -2871,11 +2969,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				    StringUtil::Format(
 				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
 				        "\"request_id_source\":\"%s\",\"http_client\":\"%s\","
-				        "\"http_client_reason\":\"%s\",\"access_log_overflow_count\":%llu}",
+				        "\"http_client_reason\":\"%s\",\"access_log_overflow_count\":%llu,"
+				        "\"telemetry\":%s}",
 				        QuackapiJsonEscape(version), (long long)uptime_sec,
 				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
 				        QuackapiJsonEscape(http_client), QuackapiJsonEscape(options.http_client_reason),
-				        (unsigned long long)access_log_overflow_count));
+				        (unsigned long long)access_log_overflow_count, TelemetryHealthJson(telemetry_status)));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
 			}
@@ -4338,6 +4437,9 @@ void QuackapiHttpServer::Close() {
 QuackapiHttpServer::~QuackapiHttpServer() {
 	try {
 		Close();
+		for (auto &sink : telemetry_sinks) {
+			sink->Flush();
+		}
 	} catch (std::exception &) {
 	}
 }

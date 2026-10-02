@@ -1003,6 +1003,71 @@ static void RequestsExec(ClientContext &, TableFunctionInput &data_p, DataChunk 
 }
 
 //===--------------------------------------------------------------------===//
+// Keep sink health queryable without making the writer implementation public.
+//===--------------------------------------------------------------------===//
+
+struct TelemetryStatusBindData : public TableFunctionData {
+	int32_t port = 0;
+};
+
+struct TelemetryStatusGlobalState : public GlobalTableFunctionState {
+	vector<QuackapiTelemetryStatus> statuses;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> TelemetryStatusBind(ClientContext &, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<TelemetryStatusBindData>();
+	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
+	if (has_port) {
+		bind_data->port = input.inputs[0].GetValue<int32_t>();
+	}
+	if (has_port && (bind_data->port < 1 || bind_data->port > 65535)) {
+		throw InvalidInputException("quackapi_telemetry_status: port must be between 1 and 65535");
+	}
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sink");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("target");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("queued");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("exported_total");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("dropped_total");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("last_error");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("last_export_age_ms");
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> TelemetryStatusInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<TelemetryStatusGlobalState>();
+	auto &bind_data = input.bind_data->Cast<TelemetryStatusBindData>();
+	state->statuses = QuackapiState::Get(*context.db).SnapshotTelemetryStatus(bind_data.port);
+	return std::move(state);
+}
+
+static void TelemetryStatusExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+	auto &state = data_p.global_state->Cast<TelemetryStatusGlobalState>();
+	idx_t row = 0;
+	while (state.offset < state.statuses.size() && row < STANDARD_VECTOR_SIZE) {
+		auto &status = state.statuses[state.offset];
+		output.SetValue(0, row, Value(status.sink));
+		output.SetValue(1, row, Value(status.target));
+		output.SetValue(2, row, Value::BIGINT(static_cast<int64_t>(status.queued)));
+		output.SetValue(3, row, Value::BIGINT(static_cast<int64_t>(status.exported_total)));
+		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(status.dropped_total)));
+		output.SetValue(5, row, Value(status.last_error));
+		output.SetValue(6, row, Value::BIGINT(status.last_export_age_ms));
+		row++;
+		state.offset++;
+	}
+	output.SetCardinality(row);
+}
+
+//===--------------------------------------------------------------------===//
 // quackapi_http_util_name() — active outbound HTTPUtil (no curl_httpfs dep)
 //===--------------------------------------------------------------------===//
 // When curl_httpfs is LOADed this is typically "MultiCurl". Same underlying
@@ -1203,6 +1268,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	requests1.arguments.clear();
 	requests_set.AddFunction(requests1);
 	loader.RegisterFunction(requests_set);
+	TableFunctionSet telemetry_status_set("quackapi_telemetry_status");
+	TableFunction telemetry_status1("quackapi_telemetry_status", {LogicalType::INTEGER}, TelemetryStatusExec,
+	                                TelemetryStatusBind, TelemetryStatusInit);
+	telemetry_status_set.AddFunction(telemetry_status1);
+	telemetry_status1.arguments.clear();
+	telemetry_status_set.AddFunction(telemetry_status1);
+	loader.RegisterFunction(telemetry_status_set);
 	loader.RegisterFunction(GetQuackapiGroupsFunction());
 
 	// Auth inspection + API key management (secrets/hashes never exposed).

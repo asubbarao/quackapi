@@ -1,0 +1,60 @@
+# name: test/sql/quackapi_telemetry_status.test
+# description: Per-sink telemetry status and health compatibility fields
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE TABLE telemetry_status_log (
+  request_id VARCHAR,
+  received_at TIMESTAMP,
+  method VARCHAR,
+  path VARCHAR,
+  status INTEGER
+);
+
+query I
+SELECT * FROM quackapi_serve(29580, host := '127.0.0.1', access_log := 'telemetry_status_log');
+----
+http://127.0.0.1:29580
+
+query I
+SELECT quackapi_fetch('http://127.0.0.1:29580/health').status;
+----
+200
+
+statement ok
+SELECT sleep_ms(1100);
+
+query II
+SELECT sink, exported_total
+FROM quackapi_telemetry_status()
+ORDER BY sink;
+----
+table	1
+
+query I
+SELECT * FROM quackapi_stop(29580);
+----
+Stopped quackapi server on port 29580
+
+query I
+SELECT * FROM quackapi_serve(29581, host := '127.0.0.1');
+----
+http://127.0.0.1:29581
+
+query I
+SELECT sink FROM quackapi_telemetry_status();
+----
+stderr
+
+query I
+SELECT contains(body, '"telemetry"') AND contains(body, '"access_log_overflow_count"')
+FROM quackapi_fetch('http://127.0.0.1:29581/healthz');
+----
+true
+
+query I
+SELECT * FROM quackapi_stop(29581);
+----
+Stopped quackapi server on port 29581
