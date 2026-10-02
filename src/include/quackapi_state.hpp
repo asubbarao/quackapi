@@ -312,6 +312,9 @@ public:
 	bool GetServerHost(int port, string &host_out);
 	//! (host, port, http_client_active, http_client_reason) for each running server.
 	vector<std::tuple<string, int, string, string>> ListServers();
+	//! Snapshot one server's request ring; port 0 means the only running server.
+	//! A port is required when more than one server is running.
+	vector<QuackapiRequestRecord> SnapshotRequests(int port = 0);
 
 	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
 	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);
