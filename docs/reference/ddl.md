@@ -40,7 +40,7 @@ DROP ROUTE <name>;
 | **EMPTY STATUS** | When the handler returns **0 rows**, respond with this HTTP status instead of success `STATUS` + `[]`/`null`. Optional `BODY '<json>'` (default `{"detail":"Not Found"}`). Works with array or object envelope. Listed in OpenAPI responses. |
 | **TIMEOUT** / **WITH (timeout_sec)** | Per-request httplib socket read/write deadline in seconds (also `'30s'` / `'5m'` / `'1h'`, max 24h). Default omit/`0` = serve defaults (`quackapi_serve` `read_timeout_sec`/`write_timeout_sec`, usually 30). When set, the matched request extends `SocketStream` select timeouts and `SO_RCVTIMEO`/`SO_SNDTIMEO` on that connection through handler + response write. Synonyms: `TIMEOUT 180` or `WITH (timeout_sec := 180)`. |
 | **GROUP / IN GROUP** | Join group prefix + inherit auth/tags |
-| **BODY SCHEMA** | Quoted JSON Schema string; may appear before or after PARAM |
+| **BODY SCHEMA** | Quoted JSON Schema string; the `json_schema` extension is loaded when the route is created (and may be installed from community); may appear before or after PARAM |
 | **BODY TYPE** | Quoted DuckDB `json_transform` structure; native typed body validation; may appear before or after PARAM |
 | **PARAM** | Zero or more. Types: INTEGER/INT, BIGINT, VARCHAR/TEXT/STRING, BOOLEAN/BOOL, DOUBLE, FLOAT/REAL, HUGEINT, UBIGINT, UINTEGER |
 | **AS** | Any SQL returning a result; validated at CREATE time |
