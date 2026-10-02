@@ -24,7 +24,7 @@ The query already types the response.
 
 ## Five-line quickstart
 
-Requires **DuckDB v1.5.5** (linux, macOS, windows_amd64).
+Requires **DuckDB v1.5.6** (linux, macOS, windows_amd64).
 
 ```sql
 INSTALL quackapi FROM community;
@@ -392,9 +392,9 @@ LOAD quackapi;
 
 | Requirement | Detail |
 |-------------|--------|
-| **DuckDB** | **v1.5.5 only** |
+| **DuckDB** | **v1.5.6 only** |
 | **CI / platforms** | linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64 |
-| **Community CDN** | `…/v1.5.5/{platform}/quackapi.duckdb_extension.gz` |
+| **Community CDN** | `…/v1.5.6/{platform}/quackapi.duckdb_extension.gz` |
 | **Wasm** | excluded (no server sockets) |
 
 See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
@@ -404,15 +404,15 @@ See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
 Release assets: https://github.com/asubbarao/quackapi/releases  
 
 ```text
-quackapi-duckdb-v1.5.5-linux_amd64.duckdb_extension
-quackapi-duckdb-v1.5.5-windows_amd64.duckdb_extension
-quackapi-duckdb-v1.5.5-osx_arm64.duckdb_extension
+quackapi-duckdb-v1.5.6-linux_amd64.duckdb_extension
+quackapi-duckdb-v1.5.6-windows_amd64.duckdb_extension
+quackapi-duckdb-v1.5.6-osx_arm64.duckdb_extension
 …
 ```
 
 ```sh
 curl -fsSL -o quackapi.duckdb_extension \
-  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v1.5.5-osx_arm64.duckdb_extension"
+  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v1.5.6-osx_arm64.duckdb_extension"
 duckdb -unsigned -c "LOAD '$(pwd)/quackapi.duckdb_extension';"
 ```
 
@@ -429,7 +429,7 @@ GEN=ninja make release
 LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
-**Target DuckDB:** **v1.5.5 only.** Dependencies: DuckDB’s bundled
+**Target DuckDB:** **v1.5.6 only.** Dependencies: DuckDB’s bundled
 **httplib** + **mbedtls** only — no vcpkg, no libcurl. The extension is built as
 C++11 by the repository CMake configuration.
 
@@ -472,7 +472,7 @@ C++11 by the repository CMake configuration.
 
 - **Write concurrency / OLTP:** single-writer semantics; not a replacement for
   a connection-pooled app tier under heavy concurrent writes.
-- **Platform coverage:** **DuckDB v1.5.5** on linux/macOS/windows_amd64 only.
+- **Platform coverage:** **DuckDB v1.5.6** on linux/macOS/windows_amd64 only.
   Older DuckDB versions are unsupported — upgrade the host.
 - **Serve memory default:** `quackapi_serve` applies a 256MB `memory_limit`
   only when nothing was configured (no `memory_limit` / `quackapi_memory_limit`

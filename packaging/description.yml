@@ -128,7 +128,7 @@ docs:
 
     ## Platforms & build
 
-    Targets **DuckDB v1.5.5** only. C++17; depends only on DuckDB-bundled **httplib**
+    Targets **DuckDB v1.5.6** only. C++17; depends only on DuckDB-bundled **httplib**
     and **mbedtls** (no vcpkg, no libcurl). CI builds linux/macOS/windows_amd64;
     excludes wasm and Windows MinGW/rtools/arm64.
 
