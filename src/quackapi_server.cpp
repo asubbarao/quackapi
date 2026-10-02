@@ -705,18 +705,13 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 //! Validate body against BODY SCHEMA using community json_schema extension.
 //! json_schema_validate returns true on pass and THROWS on fail — wrap with try().
 bool ValidateBodySchema(Connection &con, const string &schema, const string &raw_body, string &err_json) {
-	// LOAD is idempotent; INSTALL FROM community on first failure (network).
+	// CREATE ROUTE resolves this dependency before requests start. LOAD is
+	// idempotent on the database instance; never install from a request path.
 	auto load = con.Query("LOAD json_schema");
 	if (load->HasError()) {
-		auto inst = con.Query("INSTALL json_schema FROM community");
-		if (!inst->HasError()) {
-			load = con.Query("LOAD json_schema");
-		}
-		if (load->HasError()) {
-			fprintf(stderr, "quackapi: json_schema unavailable: %s\n", load->GetError().c_str());
-			err_json = ValidationErrorJsonBody("json_schema extension unavailable", "value_error");
-			return false;
-		}
+		fprintf(stderr, "quackapi: json_schema unavailable: %s\n", load->GetError().c_str());
+		err_json = ValidationErrorJsonBody("json_schema extension unavailable", "value_error");
+		return false;
 	}
 	// try() → true on pass, NULL when the function throws (never returns false).
 	auto res = con.Query("SELECT try(json_schema_validate(?::JSON, ?::JSON))", Value(schema), Value(raw_body));

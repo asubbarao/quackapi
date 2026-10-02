@@ -1117,6 +1117,40 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 		// CREATE OR REPLACE does not leave a half-applied route on failure.
 		{
 			Connection con(*context.db);
+			if (!bind_data.route.body_schema.empty()) {
+				// BODY SCHEMA depends on the community json_schema extension. Resolve it
+				// while creating the route, outside any request deadline, so the first
+				// request cannot unexpectedly pay the installation/network cost.
+				auto load = con.Query("LOAD json_schema");
+				if (load->HasError()) {
+					auto install = con.Query("INSTALL json_schema FROM community");
+					if (install->HasError()) {
+						throw InvalidInputException("BODY SCHEMA requires the json_schema extension: %s",
+						                            install->GetError());
+					}
+					load = con.Query("LOAD json_schema");
+				}
+				if (load->HasError()) {
+					throw InvalidInputException("BODY SCHEMA requires the json_schema extension: %s", load->GetError());
+				}
+
+				// Catch malformed schema text at CREATE time rather than on the first
+				// request. TRY_CAST returns NULL for invalid JSON without throwing.
+				auto json_load = con.Query("LOAD json");
+				if (json_load->HasError()) {
+					throw InvalidInputException("BODY SCHEMA requires the json extension: %s", json_load->GetError());
+				}
+				auto schema_json =
+				    con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(bind_data.route.body_schema));
+				if (schema_json->HasError()) {
+					throw InvalidInputException("Invalid BODY SCHEMA JSON for route \"%s\": %s", bind_data.route.name,
+					                            schema_json->GetError());
+				}
+				auto chunk = schema_json->Fetch();
+				if (!chunk || chunk->size() == 0 || !chunk->GetValue(0, 0).GetValue<bool>()) {
+					throw InvalidInputException("Invalid BODY SCHEMA JSON for route \"%s\"", bind_data.route.name);
+				}
+			}
 			auto prepared = con.Prepare(bind_data.route.handler_sql);
 			if (prepared->HasError()) {
 				// Native libpq path (pg_dsn): handler SQL is Postgres dialect and may

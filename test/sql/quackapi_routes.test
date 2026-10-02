@@ -198,6 +198,14 @@ DROP ROUTE with_schema;
 ----
 Dropped route with_schema
 
+# Invalid BODY SCHEMA JSON is rejected at CREATE time
+statement error
+CREATE ROUTE invalid_schema POST '/invalid-schema'
+  BODY SCHEMA '{"type":"object"'
+  AS SELECT 1;
+----
+Invalid BODY SCHEMA JSON
+
 # Unterminated BODY SCHEMA errors
 statement error
 CREATE ROUTE bad_schema POST '/x' BODY SCHEMA '{"type":"object" AS SELECT 1;
