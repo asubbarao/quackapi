@@ -12,6 +12,7 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
@@ -1898,29 +1899,28 @@ public:
 	void Enqueue(const QuackapiRequestRecord &entry) override {
 		// Keep the existing line writer synchronous so stderr retains its current ordering.
 		EmitAccessLogStderr(entry);
-		std::lock_guard<std::mutex> lock(mutex);
-		exported_total++;
-		last_export = std::chrono::steady_clock::now();
-		has_export = true;
+		// Atomics, not a mutex: this runs on every request and must not serialize workers.
+		exported_total.fetch_add(1, std::memory_order_relaxed);
+		last_export_ticks.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 	}
 
 	void Flush() override {
 	}
 
 	QuackapiTelemetryStatus Status() const override {
-		std::lock_guard<std::mutex> lock(mutex);
 		QuackapiTelemetryStatus result;
 		result.sink = "stderr";
-		result.exported_total = exported_total;
-		result.last_export_age_ms = TelemetryExportAgeMs(last_export, has_export);
+		result.exported_total = exported_total.load(std::memory_order_relaxed);
+		auto ticks = last_export_ticks.load(std::memory_order_relaxed);
+		result.last_export_age_ms = TelemetryExportAgeMs(
+		    std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(ticks)), ticks != NO_EXPORT);
 		return result;
 	}
 
 private:
-	mutable std::mutex mutex;
-	idx_t exported_total = 0;
-	std::chrono::steady_clock::time_point last_export;
-	bool has_export = false;
+	static constexpr int64_t NO_EXPORT = NumericLimits<int64_t>::Minimum();
+	std::atomic<idx_t> exported_total {0};
+	std::atomic<int64_t> last_export_ticks {NO_EXPORT};
 };
 
 class QuackapiTableTelemetrySink final : public QuackapiTelemetrySink {
