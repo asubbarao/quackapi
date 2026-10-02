@@ -191,6 +191,7 @@ public:
 	virtual ~QuackapiTelemetrySink() = default;
 
 	virtual void Enqueue(const QuackapiRequestRecord &record) = 0;
+	virtual void FlushPending() const = 0;
 	virtual void Flush() = 0;
 	virtual QuackapiTelemetryStatus Status() const = 0;
 };

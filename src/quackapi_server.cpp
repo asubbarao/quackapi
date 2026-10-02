@@ -1910,6 +1910,9 @@ public:
 		last_export_ticks.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 	}
 
+	void FlushPending() const override {
+	}
+
 	void Flush() override {
 	}
 
@@ -1982,6 +1985,7 @@ public:
 	}
 
 	QuackapiTelemetryStatus Status() const override {
+		FlushPending();
 		std::lock_guard<std::mutex> lock(mutex);
 		QuackapiTelemetryStatus result;
 		result.sink = "table";
@@ -1995,6 +1999,15 @@ public:
 	}
 
 private:
+	void FlushPending() const override {
+		std::unique_lock<std::mutex> lock(mutex);
+		if (!pending.empty()) {
+			flush_requested = true;
+			condition.notify_one();
+		}
+		condition.wait(lock, [&] { return pending.empty() && !batch_in_flight; });
+	}
+
 	void Shutdown() {
 		if (!worker.joinable()) {
 			return;
@@ -2088,9 +2101,14 @@ private:
 			vector<QuackapiRequestRecord> batch;
 			{
 				std::unique_lock<std::mutex> lock(mutex);
-				condition.wait_for(lock, std::chrono::seconds(1), [&] { return stopping || pending.size() >= 100; });
+				condition.wait_for(lock, std::chrono::seconds(1),
+				                   [&] { return stopping || flush_requested || pending.size() >= 100; });
+				if (flush_requested) {
+					flush_requested = false;
+				}
 				batch.assign(std::make_move_iterator(pending.begin()), std::make_move_iterator(pending.end()));
 				pending.clear();
+				batch_in_flight = !batch.empty();
 				if (batch.empty() && stopping) {
 					break;
 				}
@@ -2121,6 +2139,11 @@ private:
 					EmitAccessLogStderr(entry);
 				}
 			}
+			{
+				std::lock_guard<std::mutex> lock(mutex);
+				batch_in_flight = false;
+			}
+			condition.notify_all();
 		}
 	}
 
@@ -2128,10 +2151,12 @@ private:
 	string table;
 	vector<string> table_parts;
 	mutable std::mutex mutex;
-	std::condition_variable condition;
+	mutable std::condition_variable condition;
 	vector<QuackapiRequestRecord> pending;
 	std::thread worker;
 	bool stopping = false;
+	mutable bool flush_requested = false;
+	mutable bool batch_in_flight = false;
 	bool failed = false;
 	std::chrono::steady_clock::time_point retry_at;
 	int64_t retry_delay_seconds = 1;
