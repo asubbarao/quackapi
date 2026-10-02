@@ -1067,6 +1067,43 @@ static void TelemetryStatusExec(ClientContext &, TableFunctionInput &data_p, Dat
 	output.SetCardinality(row);
 }
 
+struct TelemetryFlushBindData : public TableFunctionData {
+	int32_t port = 0;
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> TelemetryFlushBind(ClientContext &, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<TelemetryFlushBindData>();
+	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
+	if (has_port) {
+		bind_data->port = input.inputs[0].GetValue<int32_t>();
+	}
+	if (has_port && (bind_data->port < 1 || bind_data->port > 65535)) {
+		throw InvalidInputException("quackapi_telemetry_flush: port must be between 1 and 65535");
+	}
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("status");
+	return std::move(bind_data);
+}
+
+static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->CastNoConst<TelemetryFlushBindData>();
+	if (bind_data.finished) {
+		return;
+	}
+	if (!QuackapiState::Get(*context.db).FlushTelemetry(bind_data.port)) {
+		output.SetValue(0, 0, Value("No quackapi server to flush"));
+	} else if (bind_data.port == 0) {
+		output.SetValue(0, 0, Value("Flushed telemetry for all quackapi servers"));
+	} else {
+		output.SetValue(0, 0,
+		                Value(StringUtil::Format("Flushed telemetry for quackapi server on port %d", bind_data.port)));
+	}
+	output.SetCardinality(1);
+	bind_data.finished = true;
+}
+
 //===--------------------------------------------------------------------===//
 // quackapi_http_util_name() — active outbound HTTPUtil (no curl_httpfs dep)
 //===--------------------------------------------------------------------===//
@@ -1275,6 +1312,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	telemetry_status1.arguments.clear();
 	telemetry_status_set.AddFunction(telemetry_status1);
 	loader.RegisterFunction(telemetry_status_set);
+	TableFunctionSet telemetry_flush_set("quackapi_telemetry_flush");
+	TableFunction telemetry_flush1("quackapi_telemetry_flush", {LogicalType::INTEGER}, TelemetryFlushExec,
+	                               TelemetryFlushBind);
+	telemetry_flush_set.AddFunction(telemetry_flush1);
+	telemetry_flush1.arguments.clear();
+	telemetry_flush_set.AddFunction(telemetry_flush1);
+	loader.RegisterFunction(telemetry_flush_set);
 	loader.RegisterFunction(GetQuackapiGroupsFunction());
 
 	// Auth inspection + API key management (secrets/hashes never exposed).

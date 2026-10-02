@@ -522,6 +522,28 @@ vector<QuackapiTelemetryStatus> QuackapiState::SnapshotTelemetryStatus(int port)
 	return {};
 }
 
+bool QuackapiState::FlushTelemetry(int port) {
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	if (port == 0) {
+		if (servers.empty()) {
+			return false;
+		}
+		if (servers.size() > 1) {
+			throw InvalidInputException(
+			    "quackapi_telemetry_flush(): port is required when multiple servers are running");
+		}
+		servers.begin()->second->FlushTelemetryPending();
+		return true;
+	}
+	for (auto &kv : servers) {
+		if (kv.second->Port() == port) {
+			kv.second->FlushTelemetryPending();
+			return true;
+		}
+	}
+	return false;
+}
+
 //===--------------------------------------------------------------------===//
 // Row access + masking policies
 //===--------------------------------------------------------------------===//

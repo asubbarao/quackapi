@@ -46,7 +46,8 @@ and continues. Override with `http_client := 'httplib'` or `SET quackapi_http_cl
 Inbound server remains httplib. See [curl_httpfs.md](../curl_httpfs.md).
 
 **Access log:** a table destination is written asynchronously in batches of up to
-100 rows or one second. The queue holds 10,000 entries; overflow is written to
+100 rows or one second. `quackapi_telemetry_flush` drains pending rows without
+stopping the server. The queue holds 10,000 entries; overflow is written to
 stderr and counted as `access_log_overflow_count` in `/healthz`. A failed table
 flush falls back to stderr, retries with 1-second-to-60-second backoff, emits one
 warning per failure episode, and logs a recovery line when the table works again.
@@ -82,6 +83,12 @@ FROM quackapi_requests(8000) ORDER BY received_at;
 Returns one row per configured telemetry sink. It returns no rows when no server
 is running. `target` is the table name for the table sink and empty for stderr;
 `dropped_total` counts table-queue overflow.
+
+### `quackapi_telemetry_flush([port])`
+
+Drains pending telemetry rows for the selected running server without stopping
+it. This is a synchronous completion barrier for asynchronous table sinks; a
+port is required when multiple servers are running.
 
 **Compression:** `auto` negotiates `Accept-Encoding` q-values, preferring zstd on
 ties. `gzip` and `zstd` restrict the selected coding, `off` disables compression,

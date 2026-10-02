@@ -23,8 +23,10 @@ SELECT quackapi_fetch('http://127.0.0.1:29580/health').status;
 ----
 200
 
-statement ok
-SELECT sleep_ms(1100);
+query I
+SELECT * FROM quackapi_telemetry_flush(29580);
+----
+Flushed telemetry for quackapi server on port 29580
 
 query II
 SELECT sink, exported_total
@@ -32,6 +34,12 @@ FROM quackapi_telemetry_status()
 ORDER BY sink;
 ----
 table	1
+
+query III
+SELECT method, path, status
+FROM telemetry_status_log;
+----
+GET	/health	200
 
 query I
 SELECT * FROM quackapi_stop(29580);
