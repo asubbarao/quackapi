@@ -152,3 +152,9 @@ query I
 SELECT * FROM quackapi_stop(29564);
 ----
 Stopped quackapi server on port 29564
+
+# The ring is allocated at serve time, so oversized values are rejected.
+statement error
+SELECT * FROM quackapi_serve(29569, host := '127.0.0.1', request_ring := 1000001);
+----
+request_ring must be between 0 and 1000000

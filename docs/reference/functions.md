@@ -51,7 +51,7 @@ stderr and counted as `access_log_overflow_count` in `/healthz`. A failed table
 flush falls back to stderr, retries with 1-second-to-60-second backoff, emits one
 warning per failure episode, and logs a recovery line when the table works again.
 
-`request_ring BIGINT` defaults to `10000`; `0` disables the in-memory ring.
+`request_ring BIGINT` defaults to `10000` (maximum `1000000`); `0` disables the in-memory ring.
 
 ### `quackapi_requests([port])`
 
@@ -418,7 +418,7 @@ not application-facing functions.
 | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | CORS allow list; empty = off |
 | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | Serve memory preference when named param omitted |
 | `SET quackapi_log_level = 'silent' \| 'error' \| 'warn' \| 'info' \| 'debug'` | Serve log verbosity; default `info` |
-| `SET quackapi_request_ring = N` | Recent TCP requests retained by `quackapi_requests()`; default `10000`, `0` disables |
+| `SET quackapi_request_ring = N` | Recent TCP requests retained by `quackapi_requests()`; default `10000`, maximum `1000000`, `0` disables |
 | `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | Response compression; default `auto` |
 | `SET quackapi_compression_min_bytes = N` | Minimum response size; default `1024` |
 | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | Outbound httpfs client preference (default `auto` → curl_httpfs) |

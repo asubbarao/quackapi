@@ -244,8 +244,9 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->request_ring = setting.GetValue<int64_t>();
 		}
 	}
-	if (bind_data->request_ring < 0) {
-		throw InvalidInputException("quackapi_serve: request_ring must be >= 0");
+	// The ring is allocated up front at serve time, so bound it to keep a typo from exhausting memory.
+	if (bind_data->request_ring < 0 || bind_data->request_ring > 1000000) {
+		throw InvalidInputException("quackapi_serve: request_ring must be between 0 and 1000000");
 	}
 	auto access_entry = input.named_parameters.find("access_log");
 	if (access_entry != input.named_parameters.end()) {
