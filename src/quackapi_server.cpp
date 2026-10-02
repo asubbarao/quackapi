@@ -1736,13 +1736,15 @@ enum class QuackapiAccessLogColumn : uint8_t {
 	SPAN_ID,
 	PARENT_SPAN_ID,
 	SAMPLED,
+	HEADERS,
+	QUERY,
 };
 
 static constexpr const char *QUACKAPI_ACCESS_LOG_COLUMNS[] = {
     "request_id", "received_at", "method",         "path",           "route_name", "route_path",
     "status",     "duration_ms", "sql_prepare_ms", "sql_execute_ms", "rows_out",   "bytes_in",
     "bytes_out",  "client_ip",   "user_agent",     "http_version",   "error_type", "error_message",
-    "trace_id",   "span_id",     "parent_span_id", "sampled"};
+    "trace_id",   "span_id",     "parent_span_id", "sampled",        "headers",    "query"};
 
 static std::mutex quackapi_access_log_flush_mutex;
 
@@ -1792,6 +1794,23 @@ static Value AccessLogValue(const QuackapiRequestRecord &entry, QuackapiAccessLo
 		return entry.parent_span_id.empty() ? Value() : Value(entry.parent_span_id);
 	case QuackapiAccessLogColumn::SAMPLED:
 		return Value::BOOLEAN(entry.sampled);
+	case QuackapiAccessLogColumn::HEADERS:
+		if (!entry.headers_logged) {
+			return Value();
+		}
+		{
+			vector<Value> keys;
+			vector<Value> values;
+			keys.reserve(entry.headers.size());
+			values.reserve(entry.headers.size());
+			for (auto &header : entry.headers) {
+				keys.emplace_back(header.first);
+				values.emplace_back(header.second);
+			}
+			return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(keys), std::move(values));
+		}
+	case QuackapiAccessLogColumn::QUERY:
+		return entry.query_logged ? Value(entry.query) : Value();
 	}
 	throw InternalException("unknown quackapi access-log column");
 }
@@ -2063,7 +2082,8 @@ static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &re
                                                const string &route_path, double latency_ms, int64_t received_at_micros,
                                                double sql_prepare_ms, double sql_execute_ms, int64_t rows_out,
                                                const string &trace_id, const string &span_id,
-                                               const string &parent_span_id, bool sampled);
+                                               const string &parent_span_id, bool sampled,
+                                               const QuackapiServeOptions &options);
 
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
                                        const QuackapiServeOptions &opts, bool bind_and_listen)
@@ -2136,7 +2156,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		bool sampled;
 		MakeTraceContext(req.get_header_value("traceparent"), trace_id, span_id, parent_span_id, sampled);
 		EmitAccessLog(MakeRequestRecord(req, res, res.get_header_value("X-Request-ID"), "static", string(), latency_ms,
-		                                received_at, -1, -1, -1, trace_id, span_id, parent_span_id, sampled));
+		                                received_at, -1, -1, -1, trace_id, span_id, parent_span_id, sampled, options));
 	});
 
 	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
@@ -2392,12 +2412,91 @@ static int64_t ResponseBytes(const duckdb_httplib::Response &res) {
 	return static_cast<int64_t>(bytes);
 }
 
+static bool IsDeniedHeaderName(const string &name) {
+	return name == "authorization" || name == "proxy-authorization" || name == "cookie" || name == "set-cookie" ||
+	       name == "x-api-key" || StringUtil::Contains(name, "token") || StringUtil::Contains(name, "secret") ||
+	       StringUtil::Contains(name, "password");
+}
+
+static unordered_map<string, string> RedactedHeaders(const duckdb_httplib::Request &req, const string &allowlist) {
+	vector<string> allowed;
+	for (auto name : StringUtil::Split(allowlist, ',')) {
+		StringUtil::Trim(name);
+		name = StringUtil::Lower(name);
+		if (!name.empty()) {
+			allowed.push_back(std::move(name));
+		}
+	}
+	unordered_map<string, string> result;
+	for (auto &header : req.headers) {
+		auto name = StringUtil::Lower(header.first);
+		bool is_allowed = false;
+		for (auto &candidate : allowed) {
+			if (name == candidate) {
+				is_allowed = true;
+				break;
+			}
+		}
+		if (is_allowed && result.find(name) == result.end()) {
+			result.emplace(name, IsDeniedHeaderName(name) ? "[REDACTED]" : header.second);
+		}
+	}
+	return result;
+}
+
+static bool IsDeniedQueryKey(const string &raw_key) {
+	auto key = StringUtil::Lower(duckdb_httplib::decode_query_component(raw_key, true));
+	static constexpr const char *DENIED_QUERY_KEY_PARTS[] = {"token", "key",  "secret", "password",
+	                                                         "sig",   "code", "auth"};
+	for (auto part : DENIED_QUERY_KEY_PARTS) {
+		if (StringUtil::Contains(key, part)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string RedactRawQuery(const string &target) {
+	auto query_start = target.find('?');
+	if (query_start == string::npos) {
+		return string();
+	}
+	auto raw_query = target.substr(query_start + 1);
+	string redacted;
+	redacted.reserve(raw_query.size());
+	idx_t start = 0;
+	while (start <= raw_query.size()) {
+		if (start > 0) {
+			redacted.push_back('&');
+		}
+		auto end = raw_query.find('&', start);
+		if (end == string::npos) {
+			end = raw_query.size();
+		}
+		auto pair = raw_query.substr(start, end - start);
+		auto equals = pair.find('=');
+		auto raw_key = pair.substr(0, equals);
+		redacted += raw_key;
+		if (IsDeniedQueryKey(raw_key)) {
+			redacted += "=[REDACTED]";
+		} else if (equals != string::npos) {
+			redacted += pair.substr(equals);
+		}
+		if (end == raw_query.size()) {
+			break;
+		}
+		start = end + 1;
+	}
+	return redacted;
+}
+
 static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
                                                const string &request_id, const string &route_name,
                                                const string &route_path, double latency_ms, int64_t received_at_micros,
                                                double sql_prepare_ms, double sql_execute_ms, int64_t rows_out,
                                                const string &trace_id, const string &span_id,
-                                               const string &parent_span_id, bool sampled) {
+                                               const string &parent_span_id, bool sampled,
+                                               const QuackapiServeOptions &options) {
 	QuackapiRequestRecord entry;
 	entry.request_id = request_id;
 	entry.received_at_micros = received_at_micros;
@@ -2425,6 +2524,14 @@ static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &re
 	entry.span_id = span_id;
 	entry.parent_span_id = parent_span_id;
 	entry.sampled = sampled;
+	entry.headers_logged = !options.log_headers.empty();
+	if (entry.headers_logged) {
+		entry.headers = RedactedHeaders(req, options.log_headers);
+	}
+	entry.query_logged = options.log_query;
+	if (entry.query_logged) {
+		entry.query = RedactRawQuery(req.target);
+	}
 	return entry;
 }
 
@@ -2691,7 +2798,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		double latency_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 		EmitAccessLog(MakeRequestRecord(req, res, request_id.empty() ? string("-") : request_id, route_name, route_path,
 		                                latency_ms, received_at_micros, sql_prepare_ms, sql_execute_ms, rows_out,
-		                                trace_id, span_id, parent_span_id, sampled));
+		                                trace_id, span_id, parent_span_id, sampled, options));
 	};
 
 	auto db = db_ptr.lock();

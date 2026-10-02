@@ -69,6 +69,10 @@ struct QuackapiServeOptions {
 	//! When non-empty, append access-log rows to this operator-created table instead
 	//! of stderr. The writer falls back to stderr if the table cannot be used.
 	string access_log_table;
+	//! Header names permitted in the access-log map; empty avoids retaining headers.
+	string log_headers;
+	//! Preserve the raw query string in the access log after key-based redaction.
+	bool log_query = false;
 	//! Enable DuckDB built-in QueryLog at serve (CALL enable_logging). Default
 	//! **false** when DuckDB logging was not already enabled — per-handler QueryLog
 	//! to stdout destroys HTTP throughput. Preserve prior operator logging unless
@@ -166,6 +170,10 @@ struct QuackapiRequestRecord {
 	string span_id;
 	string parent_span_id;
 	bool sampled = true;
+	bool headers_logged = false;
+	unordered_map<string, string> headers;
+	bool query_logged = false;
+	string query;
 };
 
 //! Fixed storage keeps request recording bounded while the mutex makes snapshots
