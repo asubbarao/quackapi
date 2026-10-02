@@ -1910,6 +1910,9 @@ public:
 		last_export_ticks.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 	}
 
+	void FlushPending() override {
+	}
+
 	void Flush() override {
 	}
 
@@ -1975,6 +1978,16 @@ public:
 		} else if (fallback) {
 			EmitAccessLogStderr(entry);
 		}
+	}
+
+	void FlushPending() override {
+		std::unique_lock<std::mutex> lock(mutex);
+		if (!worker.joinable() || stopping || (pending.empty() && !flushing)) {
+			return;
+		}
+		flush_requested = true;
+		condition.notify_one();
+		condition.wait(lock, [&] { return !flush_requested && !flushing; });
 	}
 
 	void Flush() override {
@@ -2088,11 +2101,19 @@ private:
 			vector<QuackapiRequestRecord> batch;
 			{
 				std::unique_lock<std::mutex> lock(mutex);
-				condition.wait_for(lock, std::chrono::seconds(1), [&] { return stopping || pending.size() >= 100; });
+				condition.wait_for(lock, std::chrono::seconds(1),
+				                   [&] { return stopping || flush_requested || pending.size() >= 100; });
 				batch.assign(std::make_move_iterator(pending.begin()), std::make_move_iterator(pending.end()));
 				pending.clear();
+				if (batch.empty() && flush_requested) {
+					flush_requested = false;
+					condition.notify_all();
+				}
 				if (batch.empty() && stopping) {
 					break;
+				}
+				if (!batch.empty()) {
+					flushing = true;
 				}
 			}
 			if (batch.empty()) {
@@ -2121,6 +2142,14 @@ private:
 					EmitAccessLogStderr(entry);
 				}
 			}
+			{
+				std::lock_guard<std::mutex> lock(mutex);
+				flushing = false;
+				if (flush_requested && pending.empty()) {
+					flush_requested = false;
+				}
+				condition.notify_all();
+			}
 		}
 	}
 
@@ -2132,6 +2161,8 @@ private:
 	vector<QuackapiRequestRecord> pending;
 	std::thread worker;
 	bool stopping = false;
+	bool flush_requested = false;
+	bool flushing = false;
 	bool failed = false;
 	std::chrono::steady_clock::time_point retry_at;
 	int64_t retry_delay_seconds = 1;
@@ -2649,6 +2680,12 @@ std::vector<QuackapiTelemetryStatus> QuackapiHttpServer::SnapshotTelemetryStatus
 		result.push_back(sink->Status());
 	}
 	return result;
+}
+
+void QuackapiHttpServer::FlushTelemetryPending() {
+	for (auto &sink : telemetry_sinks) {
+		sink->FlushPending();
+	}
 }
 
 idx_t QuackapiHttpServer::AccessLogOverflowCount() const {
