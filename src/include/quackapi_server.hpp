@@ -21,6 +21,7 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
+class Value;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
@@ -193,6 +194,10 @@ public:
 	virtual void Flush() = 0;
 	virtual QuackapiTelemetryStatus Status() const = 0;
 };
+
+//! Convert the opt-in request fields to the access-log MAP/VARCHAR values.
+Value QuackapiRequestHeadersValue(const QuackapiRequestRecord &entry);
+Value QuackapiRequestQueryValue(const QuackapiRequestRecord &entry);
 
 //! Fixed storage keeps request recording bounded while the mutex makes snapshots
 //! safe without holding the request path behind a reader's work.

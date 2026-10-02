@@ -926,6 +926,10 @@ static Value RequestsValue(const QuackapiRequestRecord &record, idx_t column) {
 		return record.parent_span_id.empty() ? Value() : Value(record.parent_span_id);
 	case 21:
 		return Value::BOOLEAN(record.sampled);
+	case 22:
+		return QuackapiRequestHeadersValue(record);
+	case 23:
+		return QuackapiRequestQueryValue(record);
 	default:
 		throw InternalException("unknown quackapi request column");
 	}
@@ -941,18 +945,36 @@ static unique_ptr<FunctionData> RequestsBind(ClientContext &, TableFunctionBindI
 	if (has_port && (bind_data->port < 1 || bind_data->port > 65535)) {
 		throw InvalidInputException("quackapi_requests: port must be between 1 and 65535");
 	}
-	const LogicalType types[] = {
-	    LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	    LogicalType::VARCHAR, LogicalType::INTEGER,   LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
-	    LogicalType::BIGINT,  LogicalType::BIGINT,    LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR,
-	    LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	    LogicalType::VARCHAR, LogicalType::BOOLEAN};
+	const LogicalType types[] = {LogicalType::VARCHAR,
+	                             LogicalType::TIMESTAMP,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::INTEGER,
+	                             LogicalType::DOUBLE,
+	                             LogicalType::DOUBLE,
+	                             LogicalType::DOUBLE,
+	                             LogicalType::BIGINT,
+	                             LogicalType::BIGINT,
+	                             LogicalType::BIGINT,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR,
+	                             LogicalType::BOOLEAN,
+	                             LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+	                             LogicalType::VARCHAR};
 	const char *const columns[] = {"request_id",     "received_at", "method",        "path",           "route_name",
 	                               "route_path",     "status",      "duration_ms",   "sql_prepare_ms", "sql_execute_ms",
 	                               "rows_out",       "bytes_in",    "bytes_out",     "client_ip",      "user_agent",
 	                               "http_version",   "error_type",  "error_message", "trace_id",       "span_id",
-	                               "parent_span_id", "sampled"};
-	for (idx_t i = 0; i < 22; i++) {
+	                               "parent_span_id", "sampled",     "headers",       "query"};
+	for (idx_t i = 0; i < 24; i++) {
 		return_types.emplace_back(types[i]);
 		names.emplace_back(columns[i]);
 	}
@@ -971,7 +993,7 @@ static void RequestsExec(ClientContext &, TableFunctionInput &data_p, DataChunk 
 	idx_t row = 0;
 	while (state.offset < state.records.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &record = state.records[state.offset];
-		for (idx_t column = 0; column < 22; column++) {
+		for (idx_t column = 0; column < 24; column++) {
 			output.SetValue(column, row, RequestsValue(record, column));
 		}
 		row++;
