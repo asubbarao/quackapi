@@ -1748,6 +1748,25 @@ static constexpr const char *QUACKAPI_ACCESS_LOG_COLUMNS[] = {
 
 static std::mutex quackapi_access_log_flush_mutex;
 
+Value QuackapiRequestHeadersValue(const QuackapiRequestRecord &entry) {
+	if (!entry.headers_logged) {
+		return Value();
+	}
+	vector<Value> keys;
+	vector<Value> values;
+	keys.reserve(entry.headers.size());
+	values.reserve(entry.headers.size());
+	for (auto &header : entry.headers) {
+		keys.emplace_back(header.first);
+		values.emplace_back(header.second);
+	}
+	return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(keys), std::move(values));
+}
+
+Value QuackapiRequestQueryValue(const QuackapiRequestRecord &entry) {
+	return entry.query_logged ? Value(entry.query) : Value();
+}
+
 static Value AccessLogValue(const QuackapiRequestRecord &entry, QuackapiAccessLogColumn column) {
 	switch (column) {
 	case QuackapiAccessLogColumn::REQUEST_ID:
@@ -1795,22 +1814,9 @@ static Value AccessLogValue(const QuackapiRequestRecord &entry, QuackapiAccessLo
 	case QuackapiAccessLogColumn::SAMPLED:
 		return Value::BOOLEAN(entry.sampled);
 	case QuackapiAccessLogColumn::HEADERS:
-		if (!entry.headers_logged) {
-			return Value();
-		}
-		{
-			vector<Value> keys;
-			vector<Value> values;
-			keys.reserve(entry.headers.size());
-			values.reserve(entry.headers.size());
-			for (auto &header : entry.headers) {
-				keys.emplace_back(header.first);
-				values.emplace_back(header.second);
-			}
-			return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(keys), std::move(values));
-		}
+		return QuackapiRequestHeadersValue(entry);
 	case QuackapiAccessLogColumn::QUERY:
-		return entry.query_logged ? Value(entry.query) : Value();
+		return QuackapiRequestQueryValue(entry);
 	}
 	throw InternalException("unknown quackapi access-log column");
 }

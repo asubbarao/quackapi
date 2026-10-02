@@ -52,6 +52,55 @@ SELECT * FROM quackapi_stop(29561);
 ----
 Stopped quackapi server on port 29561
 
+# Opt-in request headers and query are retained in the ring after redaction.
+query I
+SELECT * FROM quackapi_serve(29566, host := '127.0.0.1', access_log := false,
+                             log_headers := 'authorization,x-tenant-id', log_query := true);
+----
+http://127.0.0.1:29566
+
+query I
+SELECT (quackapi_fetch(
+  'http://127.0.0.1:29566/ring/first?token=abc&q=x',
+  MAP {'Authorization': 'Bearer do-not-store', 'x-tenant-id': 'tenant-42'}
+)).status;
+----
+200
+
+# The outbound client may reorder query parameters, so assert on content, not order.
+query IIIII
+SELECT headers['authorization'], headers['x-tenant-id'],
+       contains(query, 'token=[REDACTED]'), contains(query, 'q=x'), contains(query, 'abc')
+FROM quackapi_requests(29566);
+----
+[REDACTED]	tenant-42	true	true	false
+
+query I
+SELECT * FROM quackapi_stop(29566);
+----
+Stopped quackapi server on port 29566
+
+# Defaults retain neither optional request field.
+query I
+SELECT * FROM quackapi_serve(29567, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29567
+
+query I
+SELECT status FROM quackapi_fetch('http://127.0.0.1:29567/ring/second');
+----
+200
+
+query II
+SELECT headers IS NULL, query IS NULL FROM quackapi_requests(29567);
+----
+true	true
+
+query I
+SELECT * FROM quackapi_stop(29567);
+----
+Stopped quackapi server on port 29567
+
 # The ring keeps only the newest two records, in oldest-first order.
 query I
 SELECT * FROM quackapi_serve(29562, host := '127.0.0.1', access_log := false, request_ring := 2);

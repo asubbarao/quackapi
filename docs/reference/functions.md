@@ -59,7 +59,7 @@ warning per failure episode, and logs a recovery line when the table works again
 |--|--|
 | **Kind** | Table function |
 | **Args** | `port INTEGER` optional; required when multiple servers are running |
-| **Returns** | `request_id`, `received_at`, `method`, `path`, `route_name`, `route_path`, `status`, `duration_ms`, `sql_prepare_ms`, `sql_execute_ms`, `rows_out`, `bytes_in`, `bytes_out`, `client_ip`, `user_agent`, `http_version`, `error_type`, `error_message`, `trace_id`, `span_id`, `parent_span_id`, `sampled` |
+| **Returns** | `request_id`, `received_at`, `method`, `path`, `route_name`, `route_path`, `status`, `duration_ms`, `sql_prepare_ms`, `sql_execute_ms`, `rows_out`, `bytes_in`, `bytes_out`, `client_ip`, `user_agent`, `http_version`, `error_type`, `error_message`, `trace_id`, `span_id`, `parent_span_id`, `sampled`, `headers`, `query` |
 
 Returns recent TCP requests oldest-first from a bounded in-memory ring. It
 returns no rows when no server is running; unknown optional fields are NULL.
