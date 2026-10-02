@@ -49,6 +49,12 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
 target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
 
+# The vendored httplib default backlog is 5. That drops loopback connections
+# when the outbound pool fans out to its 32-client cap before the server can
+# accept them. Use the platform's full listen backlog for both extension forms.
+target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
+
 # Auth crypto uses DuckDB's bundled mbedtls (third_party/mbedtls), the SAME
 # static library httpfs and parquet link as `duckdb_mbedtls`.
 #
