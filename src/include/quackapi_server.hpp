@@ -21,6 +21,7 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
+class Value;
 class QuackapiAccessLogWriter;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
@@ -175,6 +176,10 @@ struct QuackapiRequestRecord {
 	bool query_logged = false;
 	string query;
 };
+
+//! Convert the opt-in request fields to the access-log MAP/VARCHAR values.
+Value QuackapiRequestHeadersValue(const QuackapiRequestRecord &entry);
+Value QuackapiRequestQueryValue(const QuackapiRequestRecord &entry);
 
 //! Fixed storage keeps request recording bounded while the mutex makes snapshots
 //! safe without holding the request path behind a reader's work.
