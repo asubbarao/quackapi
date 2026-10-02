@@ -21,7 +21,6 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
-class QuackapiAccessLogWriter;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
@@ -176,6 +175,25 @@ struct QuackapiRequestRecord {
 	string query;
 };
 
+struct QuackapiTelemetryStatus {
+	string sink;
+	string target;
+	idx_t queued = 0;
+	idx_t exported_total = 0;
+	idx_t dropped_total = 0;
+	string last_error;
+	int64_t last_export_age_ms = -1;
+};
+
+class QuackapiTelemetrySink {
+public:
+	virtual ~QuackapiTelemetrySink() = default;
+
+	virtual void Enqueue(const QuackapiRequestRecord &record) = 0;
+	virtual void Flush() = 0;
+	virtual QuackapiTelemetryStatus Status() const = 0;
+};
+
 //! Fixed storage keeps request recording bounded while the mutex makes snapshots
 //! safe without holding the request path behind a reader's work.
 class QuackapiRequestRing {
@@ -267,6 +285,10 @@ public:
 	}
 	//! Copy the retained records oldest-first while holding only the ring lock.
 	std::vector<QuackapiRequestRecord> SnapshotRequests() const;
+	//! Keep per-sink counters queryable without exposing sink ownership to the registry.
+	std::vector<QuackapiTelemetryStatus> SnapshotTelemetryStatus() const;
+	//! Compatibility counter used by /healthz.
+	idx_t AccessLogOverflowCount() const;
 	//! True while the TCP listener thread is alive (false after StopAccepting).
 	bool IsRunning() const {
 		return is_running.load();
@@ -296,7 +318,7 @@ private:
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
 	unique_ptr<QuackapiRequestRing> request_ring;
-	unique_ptr<QuackapiAccessLogWriter> access_log_writer;
+	std::vector<unique_ptr<QuackapiTelemetrySink>> telemetry_sinks;
 };
 
 //! In-process HTTP-shape invoke (no TCP). Builds a Request, runs Dispatch, returns

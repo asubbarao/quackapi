@@ -71,6 +71,18 @@ FROM quackapi_requests() WHERE status >= 500;
 FROM quackapi_requests(8000) ORDER BY received_at;
 ```
 
+### `quackapi_telemetry_status([port])`
+
+| | |
+|--|--|
+| **Kind** | Table function |
+| **Args** | `port INTEGER` optional; required when multiple servers are running |
+| **Returns** | `sink`, `target`, `queued`, `exported_total`, `dropped_total`, `last_error`, `last_export_age_ms` |
+
+Returns one row per configured telemetry sink. It returns no rows when no server
+is running. `target` is the table name for the table sink and empty for stderr;
+`dropped_total` counts table-queue overflow.
+
 **Compression:** `auto` negotiates `Accept-Encoding` q-values, preferring zstd on
 ties. `gzip` and `zstd` restrict the selected coding, `off` disables compression,
 and bodies smaller than `compression_min_bytes` are skipped. Eligible responses

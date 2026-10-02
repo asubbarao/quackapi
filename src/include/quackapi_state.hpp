@@ -315,6 +315,9 @@ public:
 	//! Snapshot one server's request ring; port 0 means the only running server.
 	//! A port is required when more than one server is running.
 	vector<QuackapiRequestRecord> SnapshotRequests(int port = 0);
+	//! Snapshot telemetry sinks; port 0 means the only running server.
+	//! A port is required when more than one server is running.
+	vector<QuackapiTelemetryStatus> SnapshotTelemetryStatus(int port = 0);
 
 	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
 	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);
