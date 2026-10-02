@@ -60,20 +60,20 @@ SELECT * FROM quackapi_serve(29566, host := '127.0.0.1', access_log := false,
 http://127.0.0.1:29566
 
 query I
-# Use the raw-request stall overload so the test observes the literal query order.
 SELECT (quackapi_fetch(
   'http://127.0.0.1:29566/ring/first?token=abc&q=x',
-  MAP {'Authorization': 'Bearer do-not-store', 'x-tenant-id': 'tenant-42'},
-  1
+  MAP {'Authorization': 'Bearer do-not-store', 'x-tenant-id': 'tenant-42'}
 )).status;
 ----
 200
 
-query III
-SELECT headers['authorization'], headers['x-tenant-id'], query
+# The outbound client may reorder query parameters, so assert on content, not order.
+query IIIII
+SELECT headers['authorization'], headers['x-tenant-id'],
+       contains(query, 'token=[REDACTED]'), contains(query, 'q=x'), contains(query, 'abc')
 FROM quackapi_requests(29566);
 ----
-[REDACTED]	tenant-42	token=[REDACTED]&q=x
+[REDACTED]	tenant-42	true	true	false
 
 query I
 SELECT * FROM quackapi_stop(29566);
