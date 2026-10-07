@@ -25,6 +25,22 @@ FROM quackapi_request('POST', '/sql', '{"sql":"SELECT nope FROM nowhere"}');
 ----
 500	true
 
+# error() in a handler is a handler bug → 500, not 422 with a fabricated location.
+query I
+CREATE OR REPLACE ROUTE thrower GET '/thrower' AS SELECT error('kaboom-custom-msg') AS x;
+----
+Route thrower: GET /thrower
+
+query II
+SELECT status, contains(decode(body), 'kaboom-custom-msg') FROM quackapi_request('GET', '/thrower');
+----
+500	true
+
+query I
+DROP ROUTE thrower;
+----
+Dropped route thrower
+
 query I
 DROP ROUTE sql;
 ----

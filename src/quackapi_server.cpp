@@ -4269,7 +4269,17 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						loc_kind = kv.second.first;
 					}
 				}
-				SetJson(res, 422, ValidationErrorJson(loc_kind, pname, err, "value_error"));
+				if (pname == "_") {
+					// No bound client value is implicated in the error (e.g. the
+					// handler raised error() deliberately): the client cannot be
+					// blamed, so this is a handler bug → 500, not a 422 with a
+					// fabricated param location.
+					fprintf(stderr, "quackapi: handler error (no client value implicated) → 500: %s\n",
+					        err.c_str());
+					SetInternalError(res, err);
+				} else {
+					SetJson(res, 422, ValidationErrorJson(loc_kind, pname, err, "value_error"));
+				}
 			} else {
 				SetInternalError(res, err);
 			}
