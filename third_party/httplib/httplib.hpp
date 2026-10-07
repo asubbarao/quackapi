@@ -8512,8 +8512,10 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
 
   // Check if the request URI doesn't exceed the limit
   if (req.target.size() > CPPHTTPLIB_REQUEST_URI_MAX_LENGTH) {
-    Headers dummy;
-    detail::read_headers(strm, dummy);
+    // NOTE (quackapi): the request line and headers were already consumed
+    // above, so there is nothing left to drain here. A second read_headers()
+    // would block on the socket until SO_RCVTIMEO, pinning a worker thread
+    // for the full timeout per oversized-URI request (slow-DoS).
     res.status = StatusCode::UriTooLong_414;
     output_error_log(Error::ExceedUriMaxLength, &req);
     return write_response(strm, close_connection, req, res);
