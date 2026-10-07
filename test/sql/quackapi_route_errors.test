@@ -25,6 +25,35 @@ FROM quackapi_request('POST', '/sql', '{"sql":"SELECT nope FROM nowhere"}');
 ----
 500	true
 
+query I
+CREATE TABLE quackapi_sql_empty (x INTEGER);
+----
+
+# Dynamic SQL is validated before delegation so parser errors cannot become 200 []
+query II
+SELECT status, contains(decode(body), 'SELEC')
+FROM quackapi_request('POST', '/sql', '{"sql":"SELEC 1"}');
+----
+422	true
+
+# Valid SELECT response shape is unchanged.
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 42 AS answer"}');
+----
+200	[{"answer":42}]
+
+# A valid statement with no rows remains 200 [].
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT * FROM quackapi_sql_empty"}');
+----
+200	[]
+
+query I
+DROP TABLE quackapi_sql_empty;
+----
+
 # error() in a handler is a handler bug → 500, not 422 with a fabricated location.
 query I
 CREATE OR REPLACE ROUTE thrower GET '/thrower' AS SELECT error('kaboom-custom-msg') AS x;
