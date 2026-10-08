@@ -24,6 +24,28 @@ SELECT * FROM quackapi_add_api_key('other', 'route-other-key', 'other-user');
 statement ok
 CREATE GROUP v1 WITH (prefix='/api/v1', auth=api);
 
+# Scheduling belongs to routes, not groups.
+statement error
+CREATE GROUP scheduled WITH (prefix='/scheduled', schedule='*/5 * * * * *');
+----
+Unknown GROUP option
+
+# A grouped route may own a schedule after its prefix is expanded.
+query I
+CREATE ROUTE scheduled_group GET '/scheduled' GROUP v1 SCHEDULE '*/5 * * * * *' AS SELECT 'ok' AS msg;
+----
+Route scheduled_group: GET /api/v1/scheduled
+
+query II
+SELECT pattern, schedule FROM quackapi_routes() WHERE name = 'scheduled_group';
+----
+/api/v1/scheduled	*/5 * * * * *
+
+query I
+DROP ROUTE scheduled_group;
+----
+Dropped route scheduled_group
+
 # Member with no REQUIRE — inherits group auth; path joins prefix
 statement ok
 CREATE ROUTE items_list GET '/items' GROUP v1 AS

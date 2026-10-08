@@ -46,6 +46,41 @@ bool IsParamTypeName(const string &tok) {
 	       u == "BOOLEAN" || u == "BOOL";
 }
 
+bool HasRoutePathParams(const string &pattern) {
+	idx_t start = 0;
+	while (start <= pattern.size()) {
+		auto end = pattern.find('/', start);
+		auto segment = pattern.substr(start, end == string::npos ? string::npos : end - start);
+		if ((!segment.empty() && segment[0] == ':') ||
+		    (segment.size() >= 2 && segment.front() == '{' && segment.back() == '}')) {
+			return true;
+		}
+		if (end == string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return false;
+}
+
+bool ValidateRouteSchedule(const string &schedule, string &error) {
+	idx_t fields = 0;
+	bool in_field = false;
+	for (auto c : schedule) {
+		if (StringUtil::CharacterIsSpace(c)) {
+			in_field = false;
+		} else if (!in_field) {
+			fields++;
+			in_field = true;
+		}
+	}
+	if (fields != 6) {
+		error = "SCHEDULE must contain exactly 6 whitespace-separated cron fields (seconds first)";
+		return false;
+	}
+	return true;
+}
+
 //! Serialize param specs for the apply_route table function (plan → exec).
 //! Format fields (FS=\x1f): name, type, has_def, def_null, def_raw, has_ge, ge, has_gt, gt,
 //! has_le, le, has_lt, lt, has_min, min, has_max, max, source, external_name
@@ -283,7 +318,8 @@ bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
 //!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
 //!     [ENVELOPE array|object] [EMPTY STATUS <n> [BODY '<json>']]
-//!     [TIMEOUT <n>|'30s'|'5m'] [GROUP <name> | IN GROUP <name>]
+//!     [TIMEOUT <n>|'30s'|'5m'] [SCHEDULE '<6-field cron, seconds first>']
+//!     [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>'] [BODY TYPE '<duckdb-json-structure>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
 //!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
@@ -378,9 +414,58 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	int empty_status = 0;
 	string empty_body;
 	int32_t timeout_sec = 0;
+	string schedule;
+	bool schedule_seen = false;
+	string schedule_error;
 	auto rest_upper = StringUtil::Upper(rest);
+	auto TryConsumeSchedule = [&]() -> bool {
+		if (!(StringUtil::StartsWith(rest_upper, "SCHEDULE") &&
+		      (rest.size() == 8 || StringUtil::CharacterIsSpace(rest[8])))) {
+			return false;
+		}
+		if (schedule_seen) {
+			schedule_error = "SCHEDULE specified more than once";
+			return true;
+		}
+		auto after_schedule = QuackapiTrim(rest.substr(8));
+		if (after_schedule.empty() || after_schedule[0] != '\'') {
+			schedule_error = "SCHEDULE expects a quoted 6-field cron expression (seconds first)";
+			return true;
+		}
+		string value;
+		idx_t i = 1;
+		while (i < after_schedule.size()) {
+			if (after_schedule[i] == '\'') {
+				if (i + 1 < after_schedule.size() && after_schedule[i + 1] == '\'') {
+					value += '\'';
+					i += 2;
+					continue;
+				}
+				break;
+			}
+			value += after_schedule[i++];
+		}
+		if (i >= after_schedule.size() || after_schedule[i] != '\'') {
+			schedule_error = "Unterminated SCHEDULE string";
+			return true;
+		}
+		if (!ValidateRouteSchedule(value, schedule_error)) {
+			return true;
+		}
+		schedule = std::move(value);
+		schedule_seen = true;
+		rest = QuackapiTrim(after_schedule.substr(i + 1));
+		rest_upper = StringUtil::Upper(rest);
+		return true;
+	};
 	for (int clause_round = 0; clause_round < 18; clause_round++) {
 		rest_upper = StringUtil::Upper(rest);
+		if (TryConsumeSchedule()) {
+			if (!schedule_error.empty()) {
+				return ParserExtensionParseResult(schedule_error);
+			}
+			continue;
+		}
 		// [STATUS <n>]
 		if (StringUtil::StartsWith(rest_upper, "STATUS") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
@@ -777,7 +862,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					auto mu = StringUtil::Upper(maybe);
 					if (mu != "DEFAULT" && mu != "GE" && mu != "GT" && mu != "LE" && mu != "LT" && mu != "MIN_LENGTH" &&
 					    mu != "MAX_LENGTH" && mu != "PARAM" && mu != "BODY" && mu != "AS" && mu != "HEADER" &&
-					    mu != "COOKIE" && mu != "QUERY" && !IsParamTypeName(maybe)) {
+					    mu != "COOKIE" && mu != "QUERY" && mu != "SCHEDULE" && !IsParamTypeName(maybe)) {
 						spec.external_name = maybe;
 						rest = QuackapiTrim(rest.substr(te));
 					}
@@ -807,6 +892,10 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			}
 			if (StringUtil::StartsWith(rest_upper, "TIMEOUT") &&
 			    (rest.size() == 7 || StringUtil::CharacterIsSpace(rest[7]))) {
+				break;
+			}
+			if (StringUtil::StartsWith(rest_upper, "SCHEDULE") &&
+			    (rest.size() == 8 || StringUtil::CharacterIsSpace(rest[8]))) {
 				break;
 			}
 			// HEADER / COOKIE may appear after DEFAULT/constraints too.
@@ -892,6 +981,14 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			body_schema = bs_err.substr(1);
 		} else if (!bs_err.empty() && bs_err[0] == '\x02') {
 			body_type = bs_err.substr(1);
+		}
+	}
+
+	// SCHEDULE may also follow PARAM/BODY clauses.
+	rest_upper = StringUtil::Upper(rest);
+	if (TryConsumeSchedule()) {
+		if (!schedule_error.empty()) {
+			return ParserExtensionParseResult(schedule_error);
 		}
 	}
 
@@ -1014,6 +1111,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.empty_status = empty_status;
 	data->route.empty_body = empty_body;
 	data->route.timeout_sec = timeout_sec;
+	data->route.schedule = schedule;
 	return ParserExtensionParseResult(std::move(data));
 }
 
@@ -1082,6 +1180,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	if (input.inputs.size() > 18 && !input.inputs[18].IsNull()) {
 		bind_data->route.timeout_sec = input.inputs[18].GetValue<int32_t>();
 	}
+	if (input.inputs.size() > 20 && !input.inputs[20].IsNull()) {
+		bind_data->route.schedule = input.inputs[20].GetValue<string>();
+	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
@@ -1111,6 +1212,10 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			// policy seam: group.policy reserved for future shared policy; unused in v1.
 		} else if (bind_data.route.pattern.empty() || bind_data.route.pattern[0] != '/') {
 			throw InvalidInputException("Route pattern must start with '/'");
+		}
+		if (!bind_data.route.schedule.empty() && HasRoutePathParams(bind_data.route.pattern)) {
+			throw InvalidInputException(
+			    "Scheduled route \"%s\" cannot have path parameters; use a parameter-free route", bind_data.route.name);
 		}
 		// Validate the handler SQL now so a broken route fails at CREATE time,
 		// not at first request. Do this BEFORE mutating the registry so
@@ -1184,14 +1289,15 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyRouteFunction() {
 	// action, or_replace, name, method, pattern, handler, status, require_auth,
 	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format,
-	// envelope, empty_status, empty_body, timeout_sec, body_type
-	return MakeApplyDdlFunction(
-	    "quackapi_apply_route",
-	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	     LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	     LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	     LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
-	    ApplyRouteExec, ApplyRouteBind);
+	// envelope, empty_status, empty_body, timeout_sec, body_type, schedule
+	return MakeApplyDdlFunction("quackapi_apply_route",
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR},
+	                            ApplyRouteExec, ApplyRouteBind);
 }
 
 ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
@@ -1219,6 +1325,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.route.empty_body));
 	result.parameters.push_back(Value::INTEGER(data.route.timeout_sec));
 	result.parameters.push_back(Value(data.route.body_type));
+	result.parameters.push_back(Value(data.route.schedule));
 	FinishDdlPlan(result);
 	return result;
 }

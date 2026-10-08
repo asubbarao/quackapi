@@ -166,6 +166,9 @@ struct QuackapiRoute {
 	//! When set, HandleRequest extends SO_RCVTIMEO/SO_SNDTIMEO and the active
 	//! SocketStream select deadlines for this connection only.
 	int32_t timeout_sec = 0;
+	//! Optional six-field cron expression (seconds first), owned by cronjob.
+	//! Empty means this route is not scheduled.
+	string schedule;
 };
 
 //! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).

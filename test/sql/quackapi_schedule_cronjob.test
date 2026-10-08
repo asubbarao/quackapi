@@ -1,0 +1,34 @@
+# name: test/sql/quackapi_schedule_cronjob.test
+# description: optional cronjob registration for scheduled routes
+# group: [sql]
+
+require quackapi
+
+require cronjob
+
+statement ok
+CREATE ROUTE cron_target GET '/cron-target' SCHEDULE '*/1 * * * * *' AS SELECT 'cron-ok' AS msg;
+
+# This is the same bootstrap statement documented in README.md. cronjob stores
+# the in-process quackapi_request invocation and the route's six-field schedule.
+query I
+SELECT cron(
+  'SELECT * FROM quackapi_request(' ||
+    chr(39) || replace(method, chr(39), chr(39) || chr(39)) || chr(39) || ', ' ||
+    chr(39) || replace(pattern, chr(39), chr(39) || chr(39)) || chr(39) || ')',
+  schedule
+) IS NOT NULL
+FROM quackapi_routes()
+WHERE schedule IS NOT NULL AND name = 'cron_target';
+----
+true
+
+query III
+SELECT job_id, schedule, query
+FROM cron_jobs()
+WHERE schedule = '*/1 * * * * *';
+----
+task_0	*/1 * * * * *	SELECT * FROM quackapi_request('GET', '/cron-target')
+
+statement ok
+DROP ROUTE cron_target;
