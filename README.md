@@ -100,27 +100,36 @@ rejected at `CREATE` time. `SCHEDULE` is route-only; `CREATE GROUP` does not
 accept it. A route may join a group and schedule its own parameter-free,
 group-expanded path.
 
-At application startup, load `cronjob` and register every scheduled route with
-this one statement. `quackapi_request` executes the route handler in-process,
-so no HTTP listener or external request is needed:
+At application startup, load `cronjob` and register each scheduled route with
+its own `cron()` statement. `quackapi_request` executes the route handler
+in-process, so no HTTP listener or external request is needed:
 
 ```sql
 INSTALL cronjob FROM community;
 LOAD cronjob;
 
-SELECT cron(
-  'SELECT * FROM quackapi_request(' ||
-    chr(39) || replace(method, chr(39), chr(39) || chr(39)) || chr(39) || ', ' ||
-    chr(39) || replace(pattern, chr(39), chr(39) || chr(39)) || chr(39) || ')',
-  schedule
-) AS job_id
+-- one statement per route
+SELECT cron('SELECT * FROM quackapi_request(''POST'', ''/jobs/refresh'')', '0 */5 * * * *');
+```
+
+Register one route per `cron()` call. With the `cronjob` extension on DuckDB
+1.5.x, a single `SELECT cron(query, schedule) FROM quackapi_routes() WHERE
+schedule IS NOT NULL` over several rows registers every job with the **first
+row's schedule**, so generate the statements from `quackapi_routes()` and run
+them one at a time (self-dispatch):
+
+```sql
+SELECT 'SELECT cron(' || chr(39) || 'SELECT * FROM quackapi_request('
+    || chr(39) || chr(39) || method || chr(39) || chr(39) || ', '
+    || chr(39) || chr(39) || pattern || chr(39) || chr(39) || ')' || chr(39)
+    || ', ' || chr(39) || schedule || chr(39) || ');' AS statement
 FROM quackapi_routes()
 WHERE schedule IS NOT NULL;
 ```
 
 The optional `test/sql/quackapi_schedule_cronjob.test` SQLLogic case asserts
-this registration when `cronjob` is available; otherwise run the statement
-above manually in the same DuckDB v1.5.6 environment.
+a single-route registration when `cronjob` is available; otherwise run the
+statements above manually in the same DuckDB v1.5.6 environment.
 
 ### Response modes (column names)
 
