@@ -31,4 +31,7 @@ WHERE schedule = '*/1 * * * * *';
 task_0	*/1 * * * * *	SELECT * FROM quackapi_request('GET', '/cron-target')
 
 statement ok
+SELECT cron_delete('task_0');
+
+statement ok
 DROP ROUTE cron_target;
