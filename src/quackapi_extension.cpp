@@ -783,6 +783,8 @@ static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInp
 	names.emplace_back("empty_status");
 	return_types.emplace_back(LogicalType::INTEGER);
 	names.emplace_back("timeout_sec");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("schedule");
 	return make_uniq<RoutesBindData>();
 }
 
@@ -809,6 +811,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		output.SetValue(9, row, Value(route.response_envelope.empty() ? "array" : route.response_envelope));
 		output.SetValue(10, row, Value::INTEGER(route.empty_status));
 		output.SetValue(11, row, Value::INTEGER(route.timeout_sec));
+		output.SetValue(12, row, route.schedule.empty() ? Value() : Value(route.schedule));
 		row++;
 		state.offset++;
 	}

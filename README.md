@@ -65,6 +65,7 @@ curl http://127.0.0.1:8000/items/abc
 CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
   [STATUS <n>]
   [REQUIRE <auth>]
+  [SCHEDULE '<6-field cron expression, seconds first>']
   [GROUP <group> | IN GROUP <group>]
   [BODY SCHEMA '<json-schema>']
   [BODY TYPE '<duckdb-json-transform-structure>']
@@ -83,11 +84,52 @@ DROP ROUTE <name>;
 | **Params** | Cast to the types the prepared handler expects; failures → **422** with FastAPI-shaped `detail` |
 | **Success status** | Default `200`; override with `STATUS 201` (etc.) |
 | **Auth** | `REQUIRE <scheme>` runs a `CREATE AUTH` scheme before the handler |
+| **Schedule** | Optional six-field cron expression (`seconds minutes hours day-of-month month day-of-week`); stored on the route and registered by the community `cronjob` extension |
 
 Live updates: a route created after `quackapi_serve()` is served immediately.
 Handler SQL is validated at `CREATE` time (broken SQL fails at create, not on
 first request). `CREATE OR REPLACE` does not leave a half-applied route on
 failure.
+
+### Scheduled routes
+
+quackapi stores `SCHEDULE` metadata but does not run a scheduler. Timing stays
+with the community `cronjob` extension. Scheduled routes must be callable
+without path parameters: a `:param` or `{param}` in the final route pattern is
+rejected at `CREATE` time. `SCHEDULE` is route-only; `CREATE GROUP` does not
+accept it. A route may join a group and schedule its own parameter-free,
+group-expanded path.
+
+At application startup, load `cronjob` and register each scheduled route with
+its own `cron()` statement. `quackapi_request` executes the route handler
+in-process, so no HTTP listener or external request is needed:
+
+```sql
+INSTALL cronjob FROM community;
+LOAD cronjob;
+
+-- one statement per route
+SELECT cron('SELECT * FROM quackapi_request(''POST'', ''/jobs/refresh'')', '0 */5 * * * *');
+```
+
+Register one route per `cron()` call. With the `cronjob` extension on DuckDB
+1.5.x, a single `SELECT cron(query, schedule) FROM quackapi_routes() WHERE
+schedule IS NOT NULL` over several rows registers every job with the **first
+row's schedule**, so generate the statements from `quackapi_routes()` and run
+them one at a time (self-dispatch):
+
+```sql
+SELECT 'SELECT cron(' || chr(39) || 'SELECT * FROM quackapi_request('
+    || chr(39) || chr(39) || method || chr(39) || chr(39) || ', '
+    || chr(39) || chr(39) || pattern || chr(39) || chr(39) || ')' || chr(39)
+    || ', ' || chr(39) || schedule || chr(39) || ');' AS statement
+FROM quackapi_routes()
+WHERE schedule IS NOT NULL;
+```
+
+The optional `test/sql/quackapi_schedule_cronjob.test` SQLLogic case asserts
+a single-route registration when `cronjob` is available; otherwise run the
+statements above manually in the same DuckDB v1.5.6 environment.
 
 ### Response modes (column names)
 
@@ -209,7 +251,7 @@ the “PDF service” is a function call in the same address space — not an RP
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_telemetry_flush` | `([port])` — drain pending sink rows without stopping | `status` |
-| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec` |
+| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |

@@ -40,6 +40,56 @@ SELECT pattern FROM quackapi_routes() WHERE name = 'hello';
 ----
 /hello2
 
+# SCHEDULE stores a six-field cron expression (seconds first); absent is NULL
+query I
+CREATE ROUTE scheduled GET '/scheduled' SCHEDULE '*/5 * * * * *' AS SELECT 'ok' AS msg;
+----
+Route scheduled: GET /scheduled
+
+query III
+SELECT name, schedule, schedule IS NULL FROM quackapi_routes() WHERE name IN ('hello', 'scheduled') ORDER BY name;
+----
+hello	NULL	true
+scheduled	*/5 * * * * *	false
+
+# SCHEDULE requires exactly six fields
+statement error
+CREATE ROUTE bad_schedule GET '/bad-schedule' SCHEDULE '*/5 * * * *' AS SELECT 1;
+----
+6 whitespace-separated cron fields
+
+# Scheduled routes cannot require a path parameter
+statement error
+CREATE ROUTE scheduled_param GET '/scheduled/:id' SCHEDULE '*/5 * * * * *' AS SELECT $id::INTEGER AS id;
+----
+cannot have path parameters
+
+# OR REPLACE changes and then removes the schedule
+query I
+CREATE OR REPLACE ROUTE scheduled GET '/scheduled' SCHEDULE '0 0 1 * * *' AS SELECT 'changed' AS msg;
+----
+Route scheduled: GET /scheduled
+
+query I
+SELECT schedule FROM quackapi_routes() WHERE name = 'scheduled';
+----
+0 0 1 * * *
+
+query I
+CREATE OR REPLACE ROUTE scheduled GET '/scheduled' AS SELECT 'unscheduled' AS msg;
+----
+Route scheduled: GET /scheduled
+
+query I
+SELECT schedule IS NULL FROM quackapi_routes() WHERE name = 'scheduled';
+----
+true
+
+query I
+DROP ROUTE scheduled;
+----
+Dropped route scheduled
+
 # Path params and STATUS clause parse
 query I
 CREATE ROUTE item GET '/items/:id' STATUS 201 AS SELECT $id::INT AS id;
