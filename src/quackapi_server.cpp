@@ -971,6 +971,28 @@ vector<bool> ProtectedSqlText(const string &sql) {
 	return protected_text;
 }
 
+//! Parse request SQL without executing it. The /sql route delegates the
+//! submitted text to a dynamic SQL table function; some remote query paths
+//! report parser failures as an empty result instead of an error result.
+//! Extracting each statement preserves valid multi-statement input without
+//! binding against the route server's catalog instead of the remote database.
+bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
+	try {
+		auto statements = con.ExtractStatements(sql);
+		if (statements.empty()) {
+			error = "No statement to parse!";
+			return false;
+		}
+		return true;
+	} catch (std::exception &ex) {
+		error = ex.what();
+		return false;
+	} catch (...) {
+		error = "unknown SQL validation error";
+		return false;
+	}
+}
+
 //! Resolve the native DuckDB type represented by a BODY TYPE declaration.
 //! This lets route SQL use $body.items directly: the server inserts the cast
 //! from the one declaration before DuckDB prepares the handler.
@@ -4208,6 +4230,21 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
+		// The SQL route delegates the body value to a dynamic SQL function. Validate
+		// it locally first so remote parser/binder failures cannot become 200 []
+		// when the delegate reports an empty result instead of an error.
+		if (match.route.pattern == "/sql") {
+			auto sql_it = provided.find("sql");
+			if (sql_it != provided.end()) {
+				string sql_error;
+				if (!ValidateRequestSql(con, sql_it->second.second, sql_error)) {
+					SetJson(res, 422, ValidationErrorJson("body", "sql", sql_error, "value_error"));
+					finish();
+					return;
+				}
+			}
+		}
+
 		auto execute_started = std::chrono::steady_clock::now();
 		auto result = prepared->Execute(named_values, false);
 		sql_execute_ms =
@@ -4274,8 +4311,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					// handler raised error() deliberately): the client cannot be
 					// blamed, so this is a handler bug → 500, not a 422 with a
 					// fabricated param location.
-					fprintf(stderr, "quackapi: handler error (no client value implicated) → 500: %s\n",
-					        err.c_str());
+					fprintf(stderr, "quackapi: handler error (no client value implicated) → 500: %s\n", err.c_str());
 					SetInternalError(res, err);
 				} else {
 					SetJson(res, 422, ValidationErrorJson(loc_kind, pname, err, "value_error"));
