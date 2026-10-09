@@ -1,0 +1,71 @@
+# name: test/sql/quackapi_mcp.test
+# description: POST /mcp speaks MCP (JSON-RPC) over the same routes /openapi.json describes
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE ROUTE add POST '/add' PARAM a INTEGER PARAM b INTEGER AS SELECT ($a + $b) AS sum;
+
+statement ok
+CREATE ROUTE hello GET '/hello' PARAM name VARCHAR DEFAULT 'world' AS SELECT 'hi ' || $name AS msg;
+
+# initialize
+query II
+SELECT status, decode(body)::JSON ->> '$.result.serverInfo.name'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}');
+----
+200	quackapi
+
+# a notification (no id) gets 202 and no body
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","method":"notifications/initialized"}');
+----
+202	(empty)
+
+# tools/list: one tool per route, its params (from the same document as /openapi.json) as the input schema
+query IIII
+SELECT t ->> 'name', t ->> 'description', json_keys(t -> 'inputSchema' -> 'properties'), (t -> 'inputSchema' ->> 'required')
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'),
+     UNNEST(from_json(decode(body)::JSON -> '$.result.tools', '["JSON"]')) AS u(t)
+ORDER BY 1;
+----
+add	POST /add	[b, a]	["b","a"]
+hello	GET /hello	[name]	[]
+
+# tools/call on a POST route: the arguments are the JSON body
+query II
+SELECT decode(body)::JSON ->> '$.result.content[0].text', decode(body)::JSON ->> '$.result.isError'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":40}}}');
+----
+[{"sum":42}]	false
+
+# tools/call on a GET route: the arguments are the query string
+query I
+SELECT decode(body)::JSON ->> '$.result.content[0].text'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"hello","arguments":{"name":"duck"}}}');
+----
+[{"msg":"hi duck"}]
+
+# a failing route is a tool result with isError, not a JSON-RPC error
+query I
+SELECT decode(body)::JSON ->> '$.result.isError'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"add","arguments":{"a":"x","b":1}}}');
+----
+true
+
+# unknown tool and unknown method are JSON-RPC errors
+query I
+SELECT decode(body)::JSON ->> '$.error.code'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nope","arguments":{}}}');
+----
+-32602
+
+query I
+SELECT decode(body)::JSON ->> '$.error.code'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":7,"method":"resources/list"}');
+----
+-32601

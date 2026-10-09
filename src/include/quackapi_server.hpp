@@ -308,6 +308,10 @@ public:
 private:
 	static void ListenThread(QuackapiHttpServer *server);
 	void HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
+	//! POST /mcp: Model Context Protocol (JSON-RPC) over the same routes /openapi.json describes.
+	//! tools/list = one tool per route operation; tools/call runs that route through HandleRequest.
+	void HandleMcp(const duckdb_httplib::Request &req, duckdb_httplib::Response &res, DatabaseInstance &db,
+	               const string &server_url);
 	void ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
 	string NextRequestId(DatabaseInstance &db);
 	void EmitAccessLog(const QuackapiRequestRecord &entry);
