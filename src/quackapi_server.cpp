@@ -2331,6 +2331,150 @@ void QuackapiHttpServer::Dispatch(const duckdb_httplib::Request &req, duckdb_htt
 	HandleRequest(req, res);
 }
 
+//! First column of the first row of a prepared statement, as text; throws the DuckDB error.
+static string McpScalar(Connection &con, const string &sql, vector<Value> args) {
+	auto stmt = con.Prepare(sql);
+	if (stmt->HasError()) {
+		throw InvalidInputException(stmt->GetError());
+	}
+	auto result = stmt->Execute(args, false);
+	if (result->HasError()) {
+		throw InvalidInputException(result->GetError());
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return string();
+	}
+	auto value = chunk->GetValue(0, 0);
+	return value.IsNull() ? string() : value.ToString();
+}
+
+void QuackapiHttpServer::HandleMcp(const duckdb_httplib::Request &req, duckdb_httplib::Response &res,
+                                   DatabaseInstance &db, const string &server_url) {
+	Connection con(db);
+	// The JSON-RPC request, read once into a typed struct.
+	string id;
+	string method;
+	string tool;
+	string arguments;
+	try {
+		auto stmt = con.Prepare("SELECT m.id::VARCHAR, m.method, m.params.name, m.params.arguments::VARCHAR FROM "
+		                        "(SELECT from_json($1::JSON, '{\"id\": \"JSON\", \"method\": \"VARCHAR\", \"params\": "
+		                        "{\"name\": \"VARCHAR\", \"arguments\": \"JSON\"}}') AS m)");
+		vector<Value> body_arg {Value(req.body)};
+		auto parsed = stmt->Execute(body_arg, false);
+		if (parsed->HasError()) {
+			SetJson(res, 400,
+			        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}");
+			return;
+		}
+		auto chunk = parsed->Fetch();
+		auto field = [&](idx_t col) {
+			auto v = chunk->GetValue(col, 0);
+			return v.IsNull() ? string() : v.ToString();
+		};
+		id = field(0);
+		method = field(1);
+		tool = field(2);
+		arguments = field(3);
+	} catch (std::exception &ex) {
+		SetInternalError(res, ex.what());
+		return;
+	}
+	// A notification (no id) gets no reply body.
+	if (id.empty()) {
+		res.status = 202;
+		res.body.clear();
+		return;
+	}
+
+	string result;
+	string error;
+	try {
+		if (method == "initialize") {
+			result = McpScalar(con,
+			                   "SELECT to_json({protocolVersion: '2025-06-18', serverInfo: {name: 'quackapi', version: "
+			                   "'1'}, capabilities: {tools: {listChanged: false}}})",
+			                   {});
+		} else if (method == "ping") {
+			result = "{}";
+		} else if (method == "tools/list") {
+			// One tool per operation of the OpenAPI document: name = operationId (the route name), input schema =
+			// the operation's parameters (and the JSON body schema, when the route declares one).
+			result = McpScalar(
+			    con,
+			    "WITH op AS (SELECT p.key AS path, o.key AS verb, o.value AS op "
+			    "            FROM json_each($1::JSON -> 'paths') AS p, json_each(p.value) AS o), "
+			    "params AS (SELECT path, verb, op, "
+			    "           coalesce(from_json(op -> 'parameters', '[\"JSON\"]'), []) AS ps FROM op) "
+			    "SELECT to_json({tools: coalesce(list({name: op ->> 'operationId', "
+			    "    description: upper(verb) || ' ' || path, "
+			    "    inputSchema: {type: 'object', "
+			    "        properties: map_from_entries(list_transform(ps, x -> {key: x ->> 'name', value: x -> "
+			    "'schema'})), "
+			    "        required: list_filter(list_transform(ps, x -> CASE WHEN (x ->> 'required')::BOOLEAN "
+			    "                                                       THEN x ->> 'name' END), n -> n IS NOT NULL)}} "
+			    "    ORDER BY op ->> 'operationId'), [])}) FROM params",
+			    {Value(BuildOpenApiDocument(db, server_url))});
+		} else if (method == "tools/call") {
+			// Run the named route through the normal request path; its response body is the tool's text.
+			auto &qa_state = QuackapiState::Get(db);
+			auto routes = qa_state.LiveRoutes();
+			const QuackapiRoute *target = nullptr;
+			for (auto &route : *routes) {
+				if (route.name == tool) {
+					target = &route;
+					break;
+				}
+			}
+			if (!target) {
+				error = "{\"code\":-32602,\"message\":\"Unknown tool\"}";
+			} else {
+				duckdb_httplib::Request call;
+				call.method = target->method;
+				call.path = target->pattern;
+				call.target = target->pattern;
+				call.version = "HTTP/1.1";
+				call.remote_addr = req.remote_addr;
+				call.local_addr = req.local_addr;
+				for (auto &h : req.headers) {
+					if (StringUtil::CIEquals(h.first, "Authorization")) {
+						call.set_header(h.first, h.second);
+					}
+				}
+				string body = arguments.empty() ? string("{}") : arguments;
+				if (target->method == "GET" || target->method == "HEAD") {
+					auto stmt = con.Prepare("SELECT key, $1::JSON ->> key FROM json_each($1::JSON)");
+					vector<Value> args_arg {Value(body)};
+					auto pairs = stmt->Execute(args_arg, false);
+					if (!pairs->HasError()) {
+						for (auto chunk = pairs->Fetch(); chunk && chunk->size() > 0; chunk = pairs->Fetch()) {
+							for (idx_t r = 0; r < chunk->size(); r++) {
+								call.params.emplace(chunk->GetValue(0, r).ToString(), chunk->GetValue(1, r).ToString());
+							}
+						}
+					}
+				} else {
+					call.body = body;
+					call.set_header("Content-Type", "application/json");
+					call.set_header("Content-Length", std::to_string(body.size()));
+				}
+				duckdb_httplib::Response reply;
+				HandleRequest(call, reply);
+				result = McpScalar(con, "SELECT to_json({content: [{type: 'text', text: $1}], isError: $2})",
+				                   {Value(reply.body), Value::BOOLEAN(reply.status >= 400)});
+			}
+		} else {
+			error = "{\"code\":-32601,\"message\":\"Method not found\"}";
+		}
+	} catch (std::exception &ex) {
+		error = McpScalar(con, "SELECT to_json({code: -32603, message: $1})", {Value(string(ex.what()))});
+	}
+	auto envelope = error.empty() ? "SELECT to_json({jsonrpc: '2.0', id: $1::JSON, result: $2::JSON})"
+	                              : "SELECT to_json({jsonrpc: '2.0', id: $1::JSON, error: $2::JSON})";
+	SetJson(res, 200, McpScalar(con, envelope, {Value(id), Value(error.empty() ? result : error)}));
+}
+
 //! Parse application/x-www-form-urlencoded query into httplib Params.
 void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &params) {
 	if (query.empty()) {
@@ -3222,6 +3366,15 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			finish();
 			return;
 		}
+	}
+
+	// Built-in MCP endpoint, generated from the same route catalog as /openapi.json.
+	if (req.method == "POST" && (req.path == "/mcp" || req.path == "/mcp/")) {
+		route_name = "mcp";
+		route_path = "/mcp";
+		HandleMcp(req, res, *db, StringUtil::Format("http://%s:%d", host, port));
+		finish();
+		return;
 	}
 
 	// Built-in OPTIONS for docs paths: 204 preflight only when CORS is on;
