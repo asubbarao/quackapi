@@ -27,13 +27,17 @@ FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","method":"notifications/
 202	(empty)
 
 # tools/list: one tool per route, its params (from the same document as /openapi.json) as the input schema
+# NB: parameter order is platform-dependent (unordered_map iteration differs
+# on MSVC vs libstdc++), so sort the key lists before comparing.
 query IIII
-SELECT t ->> 'name', t ->> 'description', json_keys(t -> 'inputSchema' -> 'properties'), (t -> 'inputSchema' ->> 'required')
+SELECT t ->> 'name', t ->> 'description',
+       list_sort(json_keys(t -> 'inputSchema' -> 'properties')),
+       list_sort(from_json(t -> 'inputSchema' ->> 'required', '["VARCHAR"]'))
 FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'),
      UNNEST(from_json(decode(body)::JSON -> '$.result.tools', '["JSON"]')) AS u(t)
 ORDER BY 1;
 ----
-add	POST /add	[b, a]	["b","a"]
+add	POST /add	[a, b]	[a, b]
 hello	GET /hello	[name]	[]
 
 # tools/call on a POST route: the arguments are the JSON body
