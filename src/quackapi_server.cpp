@@ -2430,39 +2430,93 @@ void QuackapiHttpServer::HandleMcp(const duckdb_httplib::Request &req, duckdb_ht
 			if (!target) {
 				error = "{\"code\":-32602,\"message\":\"Unknown tool\"}";
 			} else {
-				duckdb_httplib::Request call;
-				call.method = target->method;
-				call.path = target->pattern;
-				call.target = target->pattern;
-				call.version = "HTTP/1.1";
-				call.remote_addr = req.remote_addr;
-				call.local_addr = req.local_addr;
-				for (auto &h : req.headers) {
-					if (StringUtil::CIEquals(h.first, "Authorization")) {
-						call.set_header(h.first, h.second);
-					}
-				}
+				// Explode the arguments object once: `:name` / `{name}` path
+				// segments are substituted into the pattern (a literal
+				// "/users/:id" would otherwise match with the placeholder as
+				// the captured value), the rest become the query string
+				// (GET/HEAD) or the JSON body.
 				string body = arguments.empty() ? string("{}") : arguments;
-				if (target->method == "GET" || target->method == "HEAD") {
+				unordered_map<string, string> arg_map;
+				{
 					auto stmt = con.Prepare("SELECT key, $1::JSON ->> key FROM json_each($1::JSON)");
 					vector<Value> args_arg {Value(body)};
 					auto pairs = stmt->Execute(args_arg, false);
 					if (!pairs->HasError()) {
 						for (auto chunk = pairs->Fetch(); chunk && chunk->size() > 0; chunk = pairs->Fetch()) {
 							for (idx_t r = 0; r < chunk->size(); r++) {
-								call.params.emplace(chunk->GetValue(0, r).ToString(), chunk->GetValue(1, r).ToString());
+								arg_map[chunk->GetValue(0, r).ToString()] = chunk->GetValue(1, r).ToString();
 							}
 						}
 					}
-				} else {
-					call.body = body;
-					call.set_header("Content-Type", "application/json");
-					call.set_header("Content-Length", std::to_string(body.size()));
 				}
-				duckdb_httplib::Response reply;
-				HandleRequest(call, reply);
-				result = McpScalar(con, "SELECT to_json({content: [{type: 'text', text: $1}], isError: $2})",
-				                   {Value(reply.body), Value::BOOLEAN(reply.status >= 400)});
+				string call_path;
+				string missing_path_param;
+				{
+					bool first = true;
+					idx_t start = 0;
+					while (start <= target->pattern.size()) {
+						auto end = target->pattern.find('/', start);
+						auto seg = target->pattern.substr(start, end == string::npos ? string::npos : end - start);
+						string pname;
+						if (!seg.empty() && seg[0] == ':') {
+							pname = seg.substr(1);
+						} else if (seg.size() >= 2 && seg.front() == '{' && seg.back() == '}') {
+							pname = seg.substr(1, seg.size() - 2);
+						}
+						if (!pname.empty()) {
+							auto it = arg_map.find(pname);
+							if (it == arg_map.end()) {
+								missing_path_param = pname;
+								break;
+							}
+							seg = it->second;
+						}
+						if (!first) {
+							call_path += '/';
+						}
+						call_path += seg;
+						first = false;
+						if (end == string::npos) {
+							break;
+						}
+						start = end + 1;
+					}
+				}
+				if (!missing_path_param.empty()) {
+					error = McpScalar(con, "SELECT to_json({code: -32602, message: $1})",
+					                  {Value("Missing path parameter '" + missing_path_param + "' for tool '" +
+					                         tool + "'")});
+				} else {
+					duckdb_httplib::Request call;
+					call.method = target->method;
+					call.path = call_path;
+					call.target = call_path;
+					call.version = "HTTP/1.1";
+					call.remote_addr = req.remote_addr;
+					call.local_addr = req.local_addr;
+					for (auto &h : req.headers) {
+						if (StringUtil::CIEquals(h.first, "Authorization")) {
+							call.set_header(h.first, h.second);
+						}
+					}
+					if (target->method == "GET" || target->method == "HEAD") {
+						// Path params already ride in the path; keep them out of
+						// the query string so each value has a single source.
+						for (auto &kv : arg_map) {
+							if (!IsPathParam(target->pattern, kv.first)) {
+								call.params.emplace(kv.first, kv.second);
+							}
+						}
+					} else {
+						call.body = body;
+						call.set_header("Content-Type", "application/json");
+						call.set_header("Content-Length", std::to_string(body.size()));
+					}
+					duckdb_httplib::Response reply;
+					HandleRequest(call, reply);
+					result = McpScalar(con, "SELECT to_json({content: [{type: 'text', text: $1}], isError: $2})",
+					                   {Value(reply.body), Value::BOOLEAN(reply.status >= 400)});
+				}
 			}
 		} else {
 			error = "{\"code\":-32601,\"message\":\"Method not found\"}";

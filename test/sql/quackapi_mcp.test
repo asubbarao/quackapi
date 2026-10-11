@@ -73,3 +73,31 @@ SELECT decode(body)::JSON ->> '$.error.code'
 FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":7,"method":"resources/list"}');
 ----
 -32601
+
+# tools/call substitutes path params into the pattern (the literal placeholder
+# must not leak through as the captured value)
+statement ok
+CREATE ROUTE mcpuser GET '/mcpusers/:id' AS SELECT $id AS uid;
+
+query I
+SELECT decode(body)::JSON ->> '$.result.content[0].text'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"mcpuser","arguments":{"id":42}}}');
+----
+[{"uid":"42"}]
+
+# same for the {id} brace form on a POST route (arguments stay the JSON body)
+statement ok
+CREATE ROUTE mcppostuser POST '/mcppusers/{id}' AS SELECT $id AS uid;
+
+query I
+SELECT decode(body)::JSON ->> '$.result.content[0].text'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"mcppostuser","arguments":{"id":7}}}');
+----
+[{"uid":"7"}]
+
+# a path param with no argument value is -32602, not a silent placeholder value
+query II
+SELECT decode(body)::JSON ->> '$.error.code', decode(body)::JSON ->> '$.error.message'
+FROM quackapi_request('POST', '/mcp', '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"mcpuser","arguments":{}}}');
+----
+-32602	Missing path parameter 'id' for tool 'mcpuser'
