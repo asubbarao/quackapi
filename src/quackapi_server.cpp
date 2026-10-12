@@ -2483,9 +2483,9 @@ void QuackapiHttpServer::HandleMcp(const duckdb_httplib::Request &req, duckdb_ht
 					}
 				}
 				if (!missing_path_param.empty()) {
-					error = McpScalar(con, "SELECT to_json({code: -32602, message: $1})",
-					                  {Value("Missing path parameter '" + missing_path_param + "' for tool '" +
-					                         tool + "'")});
+					error = McpScalar(
+					    con, "SELECT to_json({code: -32602, message: $1})",
+					    {Value("Missing path parameter '" + missing_path_param + "' for tool '" + tool + "'")});
 				} else {
 					duckdb_httplib::Request call;
 					call.method = target->method;
