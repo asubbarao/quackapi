@@ -1,0 +1,91 @@
+# name: test/sql/quackapi_encoding_contract.test
+# description: Route encoders preserve typed JSON, CSV cells, and encoded byte limits
+# group: [sql]
+
+require quackapi
+
+require json
+
+# A JSON column must remain a JSON object, not a quoted JSON string. Nested
+# DuckDB values and SQL NULL must keep their distinct JSON representations.
+statement ok
+CREATE ROUTE typed_json GET '/encoding/typed' AS
+  SELECT '{"nested":[1,null,{"ok":true}]}'::JSON AS document,
+         {'numbers': [2, 3], 'label': 'x'} AS object_value,
+         MAP {'k': [4, 5]} AS mapping,
+         [6, NULL, 7] AS values,
+         NULL::VARCHAR AS absent;
+
+query IIIII
+SELECT json_type(payload, '$[0].document'),
+       json_extract(payload, '$[0].document.nested[2].ok') = 'true'::JSON,
+       json_extract(payload, '$[0].object_value.numbers') = '[2,3]'::JSON,
+       json_extract(payload, '$[0].mapping.k') = '[4,5]'::JSON,
+       json_extract(payload, '$[0].values') = '[6,null,7]'::JSON
+FROM (SELECT decode(body)::JSON AS payload FROM quackapi_request('GET', '/encoding/typed'));
+----
+OBJECT	true	true	true	true
+
+query I
+SELECT json_extract(payload, '$[0].absent') = 'null'::JSON
+FROM (SELECT decode(body)::JSON AS payload FROM quackapi_request('GET', '/encoding/typed'));
+----
+true
+
+statement ok
+CREATE ROUTE typed_ndjson GET '/encoding/ndjson' FORMAT ndjson AS
+  SELECT i, {'n': [i, NULL]} AS nested
+  FROM range(2049) t(i);
+
+# More than one DuckDB vector must serialize without a missing or extra row.
+query III
+SELECT len(string_split(trim(decode(body), E'\n'), E'\n')),
+       json_extract_string(split_part(decode(body), E'\n', 1)::JSON, '$.i'),
+       json_extract_string(split_part(decode(body), E'\n', 2049)::JSON, '$.i')
+FROM quackapi_request('GET', '/encoding/ndjson');
+----
+2049	0	2048
+
+statement ok
+CREATE ROUTE typed_csv GET '/encoding/csv' FORMAT csv AS
+  SELECT 'comma,quote"newline' || chr(10) || 'tail' AS cell,
+         NULL::VARCHAR AS absent,
+         {'n': [1, 2]} AS nested;
+
+# DuckDB's CSV writer quotes punctuation/newlines and JSON-encodes nested cells.
+query III
+SELECT contains(decode(body), '"comma,quote""newline' || chr(10) || 'tail"'),
+       contains(decode(body), ',,"{""n"":[1,2]}"'),
+       starts_with(decode(body), 'cell,absent,nested' || chr(10))
+FROM quackapi_request('GET', '/encoding/csv');
+----
+true	true	true
+
+# The limit applies to the complete encoded response, including brackets,
+# property names, quotes and punctuation, and permits an exact-size response.
+statement ok
+CREATE ROUTE encoded_limit GET '/encoding/limit' AS SELECT 'x' AS a;
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('GET', '/encoding/limit', max_response_bytes := 11);
+----
+200	[{"a":"x"}]
+
+query I
+SELECT status
+FROM quackapi_request('GET', '/encoding/limit', max_response_bytes := 10);
+----
+507
+
+# Text mode carries BLOB bytes unchanged, including NUL, invalid UTF-8,
+# quotation marks and a newline. Decoding this body would lose that contract.
+statement ok
+CREATE ROUTE binary_body GET '/encoding/blob' AS
+  SELECT from_hex('00ff220a5c') AS text;
+
+query III
+SELECT status, hex(body), content_type
+FROM quackapi_request('GET', '/encoding/blob');
+----
+200	00FF220A5C	text/plain; charset=utf-8
