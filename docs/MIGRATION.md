@@ -20,6 +20,41 @@ guide lists the changed SQL names and the remaining boundary for each area.
 The old server options that selected an HTTP client or native PostgreSQL path
 are gone. QuackAPI does not install outbound HTTP providers automatically.
 
+## Request logging
+
+`quackapi_serve` emits its enabled access events through DuckDB's native
+logger. It does not keep a separate request table. The event is a JSON message
+written with DuckDB's unnamed `DefaultLogType` (the log `type` is the empty
+string), so `logging_mode = 'ENABLE_SELECTED'` captures it only when that empty
+type is selected; a selection containing only named log types excludes it. To
+inspect request events in the in-memory logger, enable level-only logging and
+query the native log table:
+
+```sql
+SET logging_storage = 'memory';
+SET logging_mode = 'LEVEL_ONLY';
+SET logging_level = 'INFO';
+SET enable_logging = true;
+
+SELECT log_level, message
+FROM duckdb_logs()
+WHERE type = '';
+```
+
+QuackAPI's `access_log` defaults to on; `log_level` filters by QuackAPI's
+request-event severity, while `log_headers` is an allowlist and `log_query`
+defaults to false with query-key redaction. Those privacy controls apply before
+the event reaches DuckDB's logger.
+
+The `otlp` extension is an OTLP receiver and reader: `otlp_serve()` accepts
+OTLP/HTTP (or OTLP/gRPC unary when configured) and stores incoming records in
+`otlp_logs`, `otlp_traces`, and metric tables. It does not export DuckDB's
+native logger records or register an OTLP logger-storage sink. A separately
+configured Collector/export pipeline could adapt native logger output to OTLP,
+but that path is not provided by QuackAPI or verified here. The existing
+`otlp_serve()` endpoint is for OTLP clients/collectors to send telemetry into
+DuckDB.
+
 ## Outbound POST
 
 `quackapi_post` remains a volatile scalar function, including its existing
