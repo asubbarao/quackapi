@@ -144,7 +144,7 @@ jobs:
             -DCURL_HTTPFS_EXTENSION="$curl_provider" \
             -DCURL_HTTPFS_VERSION=v0.4.5 \
             -DHTTPFS_EXTENSION="$httpfs_provider" \
-            -DHTTPFS_VERSION=b26737e
+            -DHTTPFS_VERSION=748f5ac
           cmake --build build/post_http_test_curl -j"$(nproc)"
           ctest --test-dir build/post_http_test_curl --output-on-failure
           cmake -S test/cpp -B build/post_http_test_httpfs \
@@ -152,7 +152,7 @@ jobs:
             -DQUACKAPI_VERSION="$quackapi_version" \
             -DPOST_PROVIDER_EXTENSION="$httpfs_provider" \
             -DPOST_PROVIDER_NAME=httpfs \
-            -DPOST_PROVIDER_VERSION=b26737e
+            -DPOST_PROVIDER_VERSION=748f5ac
           cmake --build build/post_http_test_httpfs -j"$(nproc)"
           ctest --test-dir build/post_http_test_httpfs --output-on-failure
 

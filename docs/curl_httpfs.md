@@ -49,9 +49,10 @@ transport errors.
 
 Sub-second request deadlines use DuckDB's `HTTPParams::timeout_usec` field.
 The `curl_httpfs` fixes are under review in
-[PR #75](https://github.com/dentiny/duckdb-curl-filesystem/pull/75) and
-[PR #76](https://github.com/dentiny/duckdb-curl-filesystem/pull/76). The
-HTTPFS-Curl timeout change is under review in
+[PR #75](https://github.com/dentiny/duckdb-curl-filesystem/pull/75) (fractional
+timeouts), [PR #76](https://github.com/dentiny/duckdb-curl-filesystem/pull/76)
+(Content-Type), and [PR #77](https://github.com/dentiny/duckdb-curl-filesystem/pull/77)
+(reusable MultiCurl clients). The HTTPFS-Curl timeout change is under review in
 [`duckdb/duckdb-httpfs#490`](https://github.com/duckdb/duckdb-httpfs/pull/490).
 Until those changes and the provider-specific POST fixes are merged, treat
 these pinned source builds as compatibility-test inputs, not released support.
