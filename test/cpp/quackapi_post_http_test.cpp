@@ -620,14 +620,14 @@ int main(int argc, char **argv) {
 		Run(memory_connection, "SET threads = 4");
 		Run(memory_connection, "SET memory_limit = '128MB'");
 		Run(memory_connection, "SET quackapi_post_concurrency = 4");
-		auto large_rows = Run(memory_connection,
-		                      "SELECT count(i), sum(json_array_length(response.body::JSON, '$[0].payload')) "
-		                      "FROM quackapi_post((SELECT i, " +
-		                          SqlQuote("http://127.0.0.1:" + std::to_string(port) + "/large-json") +
-		                          " AS url, '{}' AS body FROM range(256) t(i)))");
+		auto large_rows =
+		    Run(memory_connection, "SELECT count(i), sum(json_array_length(response.body::JSON, '$[0].payload')) "
+		                           "FROM quackapi_post((SELECT i, " +
+		                               SqlQuote("http://127.0.0.1:" + std::to_string(port) + "/large-json") +
+		                               " AS url, '{}' AS body FROM range(256) t(i)))");
 		Check(large_rows->GetValue(0, 0).GetValue<int64_t>() == 256 &&
 		          large_rows->GetValue(1, 0).GetValue<int64_t>() == 2560000 && large_received.load() == 256,
-		      "table POST did not stream 256 large JSON bodies through downstream parsing under 128 MB");
+		      "table POST did not return all 256 large JSON bodies for downstream parsing under 128 MB");
 		std::cout << "POST HTTP integration passed: 176 requests including table batches\n";
 		return 0;
 	} catch (const std::exception &error) {
