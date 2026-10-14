@@ -5,6 +5,7 @@
 require quackapi
 
 require json
+require json_schema
 
 # Registry starts empty
 query I
