@@ -48,12 +48,35 @@ WITH eligible AS (
     SELECT sent.path, sent.receipt.status AS status,
         sent.receipt.error AS error, sent.receipt.body AS returned_body,
         direct.body AS direct_body, direct.ast_rows
-    FROM sent JOIN direct USING (path)
+    FROM sent LEFT JOIN direct USING (path)
+), summary AS (
+    SELECT count(path) AS compared_files, count(DISTINCT path) AS distinct_files,
+        sum(ast_rows) AS direct_ast_rows,
+        count(path) FILTER (WHERE status IS DISTINCT FROM 200 OR error IS NOT NULL) AS request_failures,
+        count(path) FILTER (WHERE direct_body IS NULL) AS missing_direct_files,
+        count(path) FILTER (WHERE returned_body IS DISTINCT FROM direct_body) AS ast_mismatches,
+        min(path) FILTER (WHERE status IS DISTINCT FROM 200 OR error IS NOT NULL
+            OR direct_body IS NULL OR returned_body IS DISTINCT FROM direct_body) AS first_failed_path,
+        min(status) FILTER (WHERE status IS DISTINCT FROM 200 OR error IS NOT NULL
+            OR returned_body IS DISTINCT FROM direct_body) AS failed_status,
+        min(error) FILTER (WHERE error IS NOT NULL) AS first_error,
+        min(left(returned_body, 240)) FILTER (WHERE returned_body IS DISTINCT FROM direct_body) AS failed_body_sample
+    FROM compared
 )
-SELECT count(path) AS compared_files, sum(ast_rows) AS direct_ast_rows,
-    count(path) FILTER (WHERE status <> 200 OR error IS NOT NULL) AS request_failures,
-    count(path) FILTER (WHERE returned_body IS DISTINCT FROM direct_body) AS ast_mismatches,
-    min(path) FILTER (WHERE returned_body IS DISTINCT FROM direct_body) AS first_mismatch
-FROM compared;
+SELECT compared_files, distinct_files, direct_ast_rows, request_failures,
+    missing_direct_files, ast_mismatches, first_failed_path, failed_status,
+    first_error, failed_body_sample,
+    CASE WHEN compared_files = 256 AND distinct_files = 256
+        AND direct_ast_rows = 541619 AND request_failures = 0
+        AND missing_direct_files = 0 AND ast_mismatches = 0 THEN 'PASS'
+    ELSE error(printf('AST self-dispatch mismatch: compared=%s distinct=%s direct_rows=%s requests=%s missing_direct=%s arrays=%s first_path=%s status=%s error=%s body=%s',
+        compared_files::VARCHAR, distinct_files::VARCHAR,
+        coalesce(direct_ast_rows, -1)::VARCHAR,
+        request_failures::VARCHAR, missing_direct_files::VARCHAR,
+        ast_mismatches::VARCHAR,
+        coalesce(first_failed_path, '<none>'),
+        coalesce(failed_status::VARCHAR, '<none>'), coalesce(first_error, '<none>'),
+        coalesce(failed_body_sample, '<none>'))) END AS verdict
+FROM summary;
 
 SELECT * FROM quackapi_stop();

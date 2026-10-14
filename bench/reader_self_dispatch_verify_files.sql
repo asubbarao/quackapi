@@ -53,22 +53,42 @@ WITH candidates AS (
         getenv('READER_BENCH_SOURCE_ROOT') || '/duckdb/extension/**/*'])
 ), compared AS (
     SELECT sent.path, sent.reader, sent.source_bytes, sent.receipt.status AS status,
-        sent.receipt.error AS error,
-        json_extract_string(sent.receipt.body::JSON, '$[0].filename') AS returned_path,
-        json_extract_string(sent.receipt.body::JSON, '$[0].content') AS returned_content,
-        CASE WHEN sent.reader = 'blob' THEN direct.content::VARCHAR
-            ELSE decode(direct.content) END AS direct_content,
+        sent.receipt.error AS error, left(sent.receipt.body, 240) AS body_sample,
+        try_cast(try_cast(sent.receipt.body AS JSON)
+            AS STRUCT(filename VARCHAR, content VARCHAR)[]) AS returned_rows,
+        [struct_pack(filename := sent.path,
+            content := CASE WHEN sent.reader = 'blob' THEN direct.content::VARCHAR
+                ELSE decode(direct.content) END)] AS expected_rows,
         octet_length(direct.content) AS direct_bytes,
-        json_array_length(sent.receipt.body::JSON) AS returned_rows
-    FROM sent JOIN direct USING (path)
+        direct.path IS NULL AS missing_direct
+    FROM sent LEFT JOIN direct USING (path)
+), summary AS (
+    SELECT count(path) AS compared_files, count(DISTINCT path) AS distinct_files,
+        count(path) FILTER (WHERE status IS DISTINCT FROM 200 OR error IS NOT NULL) AS request_failures,
+        count(path) FILTER (WHERE missing_direct) AS missing_direct_files,
+        count(path) FILTER (WHERE source_bytes IS DISTINCT FROM direct_bytes) AS changed_source_bytes,
+        count(path) FILTER (WHERE returned_rows IS DISTINCT FROM expected_rows) AS row_mismatches,
+        min(path) FILTER (WHERE status IS DISTINCT FROM 200 OR error IS NOT NULL
+            OR missing_direct OR source_bytes IS DISTINCT FROM direct_bytes
+            OR returned_rows IS DISTINCT FROM expected_rows) AS first_failed_path,
+        min(status) FILTER (WHERE status IS DISTINCT FROM 200 OR error IS NOT NULL
+            OR returned_rows IS DISTINCT FROM expected_rows) AS failed_status,
+        min(error) FILTER (WHERE error IS NOT NULL) AS first_error,
+        min(body_sample) FILTER (WHERE returned_rows IS DISTINCT FROM expected_rows) AS failed_body_sample
+    FROM compared
 )
-SELECT count(path) AS compared_files,
-    count(path) FILTER (WHERE status <> 200 OR error IS NOT NULL) AS request_failures,
-    count(path) FILTER (WHERE returned_rows <> 1) AS wrong_row_counts,
-    count(path) FILTER (WHERE path <> returned_path) AS wrong_paths,
-    count(path) FILTER (WHERE source_bytes <> direct_bytes) AS changed_source_bytes,
-    count(path) FILTER (WHERE returned_content IS DISTINCT FROM direct_content) AS content_mismatches,
-    min(path) FILTER (WHERE returned_content IS DISTINCT FROM direct_content) AS first_mismatch
-FROM compared;
+SELECT compared_files, distinct_files, request_failures, missing_direct_files,
+    changed_source_bytes, row_mismatches, first_failed_path, failed_status,
+    first_error, failed_body_sample,
+    CASE WHEN compared_files = 4097 AND distinct_files = 4097
+        AND request_failures = 0 AND missing_direct_files = 0
+        AND changed_source_bytes = 0 AND row_mismatches = 0 THEN 'PASS'
+    ELSE error(printf('file self-dispatch mismatch: compared=%s distinct=%s requests=%s missing_direct=%s source_bytes=%s rows=%s first_path=%s status=%s error=%s body=%s',
+        compared_files::VARCHAR, distinct_files::VARCHAR, request_failures::VARCHAR,
+        missing_direct_files::VARCHAR, changed_source_bytes::VARCHAR,
+        row_mismatches::VARCHAR, coalesce(first_failed_path, '<none>'),
+        coalesce(failed_status::VARCHAR, '<none>'), coalesce(first_error, '<none>'),
+        coalesce(failed_body_sample, '<none>'))) END AS verdict
+FROM summary;
 
 SELECT * FROM quackapi_stop();
