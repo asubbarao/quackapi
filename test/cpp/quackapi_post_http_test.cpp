@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
 			int seen = peak.load();
 			while (now > seen && !peak.compare_exchange_weak(seen, now)) {
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(180));
+			std::this_thread::sleep_for(std::chrono::milliseconds(request.body == "wide" ? 900 : 180));
 			active.fetch_sub(1);
 			response.set_content(request.body, "text/plain");
 		});
@@ -126,35 +126,47 @@ int main(int argc, char **argv) {
 		      "transport failure lost its row-local error");
 		Check(received.load() == 58, "mixed batch retried or lost requests");
 
+		auto concurrent = [&](int callers_count, const std::string &body) {
+			std::atomic<int> ready {0};
+			std::atomic<bool> go {false};
+			std::atomic<int> passed {0};
+			std::vector<std::thread> callers;
+			for (int i = 0; i < callers_count; i++) {
+				callers.emplace_back([&]() {
+					Connection caller(database);
+					ready.fetch_add(1);
+					while (!go.load()) {
+						std::this_thread::yield();
+					}
+					auto result = caller.Query("SELECT (quackapi_post(" + SqlQuote(slow_url) + ", " +
+					                           SqlQuote(body) + ")).status");
+					if (!result->HasError() && result->GetValue(0, 0).GetValue<int>() == 200) {
+						passed.fetch_add(1);
+					}
+				});
+			}
+			while (ready.load() != callers_count) {
+				std::this_thread::yield();
+			}
+			go.store(true);
+			for (auto &caller : callers) {
+				caller.join();
+			}
+			return passed.load();
+		};
+
 		Run(connection, "SET quackapi_post_concurrency = 4");
-		std::atomic<int> ready {0};
-		std::atomic<bool> go {false};
-		std::atomic<int> passed {0};
-		std::vector<std::thread> callers;
-		for (int i = 0; i < 10; i++) {
-			callers.emplace_back([&]() {
-				Connection caller(database);
-				ready.fetch_add(1);
-				while (!go.load()) {
-					std::this_thread::yield();
-				}
-				auto result = caller.Query("SELECT (quackapi_post(" + SqlQuote(slow_url) + ", 'x')).status");
-				if (!result->HasError() && result->GetValue(0, 0).GetValue<int>() == 200) {
-					passed.fetch_add(1);
-				}
-			});
-		}
-		while (ready.load() != 10) {
-			std::this_thread::yield();
-		}
-		go.store(true);
-		for (auto &caller : callers) {
-			caller.join();
-		}
-		Check(passed.load() == 10, "concurrent POST lost a request");
+		Check(concurrent(10, "x") == 10, "concurrent POST lost a request");
 		Check(peak.load() > 1 && peak.load() <= 4, "POST ignored database-wide concurrency limit");
 		Check(received.load() == 68, "concurrent POST retried or lost requests");
-		std::cout << "POST HTTP integration passed: 68 requests, peak=" << peak.load() << '\n';
+
+		// A positive bound above 32 must be effective, not silently clamped.
+		peak.store(0);
+		Run(connection, "SET quackapi_post_concurrency = 40");
+		Check(concurrent(36, "wide") == 36, "wide POST batch lost a request");
+		Check(peak.load() > 32 && peak.load() <= 40, "POST concurrency was capped at 32");
+		Check(received.load() == 104, "wide POST batch retried or lost requests");
+		std::cout << "POST HTTP integration passed: 104 requests, wide peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
