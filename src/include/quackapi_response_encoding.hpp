@@ -3,14 +3,57 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "httplib.hpp"
+#include <memory>
 
 namespace duckdb {
 
 class Connection;
 struct QuackapiRoute;
+class DataChunk;
 
 enum class ResponseMode { JSON, HTML, TEXT };
 enum class BodyFormat { JSON, NDJSON, CSV, PARQUET, ARROW };
+enum class JsonRowMode { ARRAY, OBJECT, NDJSON };
+
+//! Bounded accumulator shared by streaming encoders. Each append is atomic:
+//! once the next append would exceed the limit, it is rejected and Data() is
+//! empty so callers cannot accidentally send a truncated response.
+class QuackapiResponseWriter {
+public:
+	explicit QuackapiResponseWriter(idx_t max_bytes);
+	bool Append(const char *data, idx_t length);
+	bool Append(const string &data);
+	idx_t BytesWritten() const;
+	bool ExceededLimit() const;
+	const string &Data() const;
+
+private:
+	idx_t max_bytes;
+	idx_t bytes_written;
+	bool exceeded_limit;
+	string data;
+};
+
+//! Vectorized JSON row encoder. A native DuckDB json_object expression is
+//! bound once for the result schema and evaluated against each result chunk.
+class QuackapiJsonChunkEncoder {
+public:
+	QuackapiJsonChunkEncoder(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+	                         const vector<idx_t> &data_cols, JsonRowMode mode, QuackapiResponseWriter &writer);
+	~QuackapiJsonChunkEncoder();
+	QuackapiJsonChunkEncoder(QuackapiJsonChunkEncoder &&) noexcept;
+	QuackapiJsonChunkEncoder &operator=(QuackapiJsonChunkEncoder &&) noexcept;
+	QuackapiJsonChunkEncoder(const QuackapiJsonChunkEncoder &) = delete;
+	QuackapiJsonChunkEncoder &operator=(const QuackapiJsonChunkEncoder &) = delete;
+
+	void AppendChunk(DataChunk &chunk);
+	idx_t RowCount() const;
+	void Finish();
+
+private:
+	class State;
+	unique_ptr<State> state;
+};
 
 string ValueToJson(const Value &value);
 bool IsSpecialResponseColumn(const string &name);

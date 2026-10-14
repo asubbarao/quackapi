@@ -9,14 +9,23 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
 
 namespace duckdb {
 namespace {
+
+const string &EmptyString() {
+	static const string empty;
+	return empty;
+}
 
 string TrimMediaToken(string value) {
 	StringUtil::Trim(value);
@@ -24,6 +33,155 @@ string TrimMediaToken(string value) {
 }
 
 } // namespace
+
+QuackapiResponseWriter::QuackapiResponseWriter(idx_t max_bytes)
+    : max_bytes(max_bytes), bytes_written(0), exceeded_limit(false) {
+}
+
+bool QuackapiResponseWriter::Append(const char *append_data, idx_t length) {
+	if (exceeded_limit) {
+		return false;
+	}
+	if (length > max_bytes - bytes_written) {
+		exceeded_limit = true;
+		return false;
+	}
+	if (length) {
+		data.append(append_data, length);
+	}
+	bytes_written += length;
+	return true;
+}
+
+bool QuackapiResponseWriter::Append(const string &append_data) {
+	return Append(append_data.data(), append_data.size());
+}
+
+idx_t QuackapiResponseWriter::BytesWritten() const {
+	return bytes_written;
+}
+
+bool QuackapiResponseWriter::ExceededLimit() const {
+	return exceeded_limit;
+}
+
+const string &QuackapiResponseWriter::Data() const {
+	return exceeded_limit ? EmptyString() : data;
+}
+
+class QuackapiJsonChunkEncoder::State {
+public:
+	State(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+	      const vector<idx_t> &data_cols, JsonRowMode mode, QuackapiResponseWriter &writer)
+	    : mode(mode), writer(writer), row_count(0), encoded_rows(0), finished(false) {
+		if (names.size() != types.size()) {
+			throw InvalidInputException("JSON encoder: result name/type count mismatch");
+		}
+		// json_object supplies DuckDB's own recursive serializer for every column
+		// type (including MAP, STRUCT, LIST, and JSON), rather than Value::ToString.
+		auto load = con.Query("LOAD json");
+		if (load->HasError()) {
+			throw InvalidInputException("JSON encoder: could not LOAD json: %s", load->GetError());
+		}
+		vector<unique_ptr<Expression>> args;
+		for (auto col : data_cols) {
+			if (col >= names.size()) {
+				throw InvalidInputException("JSON encoder: data column index is out of bounds");
+			}
+			args.push_back(make_uniq<BoundConstantExpression>(Value(names[col])));
+			args.push_back(make_uniq<BoundReferenceExpression>(types[col], UnsafeNumericCast<storage_t>(col)));
+		}
+		FunctionBinder binder(*con.context);
+		ErrorData error;
+		expression = binder.BindScalarFunction(DEFAULT_SCHEMA, "json_object", std::move(args), error);
+		if (!expression) {
+			throw InvalidInputException("JSON encoder: could not bind json_object: %s", error.Message());
+		}
+		executor = make_uniq<ExpressionExecutor>(*con.context, *expression);
+		if (mode == JsonRowMode::ARRAY) {
+			writer.Append("[");
+		}
+	}
+
+	void AppendChunk(DataChunk &chunk) {
+		if (finished) {
+			throw InternalException("JSON encoder: cannot append after Finish");
+		}
+		row_count += chunk.size();
+		if (writer.ExceededLimit() || chunk.size() == 0 || (mode == JsonRowMode::OBJECT && encoded_rows > 0)) {
+			return;
+		}
+		Vector rows(LogicalType::JSON(), chunk.size());
+		executor->ExecuteExpression(chunk, rows);
+		UnifiedVectorFormat format;
+		rows.ToUnifiedFormat(chunk.size(), format);
+		auto data = format.GetData<string_t>();
+		for (idx_t i = 0; i < chunk.size(); i++) {
+			if (mode == JsonRowMode::ARRAY && encoded_rows > 0 && !writer.Append(",")) {
+				return;
+			}
+			auto index = format.sel->get_index(i);
+			if (!format.validity.RowIsValid(index)) {
+				throw InternalException("JSON encoder: json_object returned NULL");
+			}
+			auto row = data[index].GetString();
+			if (!writer.Append(row.data(), row.size())) {
+				return;
+			}
+			if (mode == JsonRowMode::NDJSON && !writer.Append("\n")) {
+				return;
+			}
+			encoded_rows++;
+			if (mode == JsonRowMode::OBJECT) {
+				return;
+			}
+		}
+	}
+
+	void Finish() {
+		if (finished) {
+			return;
+		}
+		finished = true;
+		if (mode == JsonRowMode::ARRAY) {
+			writer.Append("]");
+		} else if (mode == JsonRowMode::OBJECT && encoded_rows == 0) {
+			writer.Append("null");
+		}
+	}
+
+	JsonRowMode mode;
+	QuackapiResponseWriter &writer;
+	idx_t row_count;
+	idx_t encoded_rows;
+	bool finished;
+	unique_ptr<Expression> expression;
+	unique_ptr<ExpressionExecutor> executor;
+};
+
+QuackapiJsonChunkEncoder::QuackapiJsonChunkEncoder(Connection &con, const vector<string> &names,
+                                                   const vector<LogicalType> &types, const vector<idx_t> &data_cols,
+                                                   JsonRowMode mode, QuackapiResponseWriter &writer)
+    : state(make_uniq<State>(con, names, types, data_cols, mode, writer)) {
+}
+
+QuackapiJsonChunkEncoder::~QuackapiJsonChunkEncoder() = default;
+
+QuackapiJsonChunkEncoder::QuackapiJsonChunkEncoder(QuackapiJsonChunkEncoder &&) noexcept = default;
+
+QuackapiJsonChunkEncoder &QuackapiJsonChunkEncoder::operator=(QuackapiJsonChunkEncoder &&) noexcept = default;
+
+void QuackapiJsonChunkEncoder::AppendChunk(DataChunk &chunk) {
+	state->AppendChunk(chunk);
+}
+
+idx_t QuackapiJsonChunkEncoder::RowCount() const {
+	return state->row_count;
+}
+
+void QuackapiJsonChunkEncoder::Finish() {
+	state->Finish();
+}
 
 //! Render a DuckDB Value as JSON. The database typed the column — the JSON
 //! representation follows the type, not string-formatting heuristics.
