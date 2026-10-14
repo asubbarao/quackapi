@@ -99,9 +99,9 @@ struct QuackapiHttplibServer : duckdb_httplib::Server {
 //! SO_* is restored to serve defaults in QuackapiHttplibServer after
 //! process_request returns (keep-alive safe). Do not restore in a HandleRequest
 //! destructor — that runs before httplib's write_response.
-//! Records the applied write deadline on qa_state only after this path runs
-//! (early return leaves the serve-level seed from HandleRequest unchanged).
-void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
+//! Route timeout introspection was removed; the socket deadlines remain local
+//! to the active request.
+void ApplyRouteIoTimeout(time_t timeout_sec) {
 	if (timeout_sec <= 0) {
 		return;
 	}
@@ -114,7 +114,6 @@ void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
 		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec, 0);
 		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
 	}
-	qa_state.SetLastEffectiveWriteTimeoutSec(static_cast<int32_t>(timeout_sec));
 }
 
 //! Content-Encoding choice after Accept-Encoding negotiation.
@@ -348,9 +347,6 @@ string ValidationErrorJsonSchema(Connection &con, const string &msg, const strin
 	return ValidationErrorJson("body", "_schema", msg, type);
 }
 
-//! Preserve whether a JSON member was an actual JSON null. A string value of
-//! "null" remains a string and must not silently become SQL NULL.
-
 //! Media type from Content-Type (strip parameters; lowercased).
 string ContentTypeMedia(const case_insensitive_map_t<string> &headers) {
 	auto it = headers.find("Content-Type");
@@ -364,88 +360,6 @@ string ContentTypeMedia(const case_insensitive_map_t<string> &headers) {
 	}
 	StringUtil::Trim(ct);
 	return StringUtil::Lower(ct);
-}
-
-//! Extract top-level JSON object fields as string values for binding.
-//! On invalid JSON sets err_json and returns false. Arrays/non-objects → model_attributes_type.
-bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensitive_map_t<JsonBodyField> &fields,
-                           string &err_json) {
-	fields.clear();
-	if (raw_body.empty()) {
-		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
-		return false;
-	}
-	// Hot path: flat object without spinning DuckDB (POST /write etc.).
-	if (TryExtractFlatJsonObject(raw_body, fields)) {
-		return true;
-	}
-	// json_each lives in the JSON extension and is not available when automatic
-	// extension loading is disabled. Loading a bundled extension is idempotent.
-	auto json_load = con.Query("LOAD json");
-	if (json_load->HasError()) {
-		err_json = ValidationErrorJsonBody("JSON extension unavailable", "value_error");
-		return false;
-	}
-	// Validate JSON parse first (TRY_CAST → NULL on failure).
-	auto check = con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(raw_body));
-	if (check->HasError()) {
-		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
-		return false;
-	}
-	auto check_chunk = check->Fetch();
-	if (!check_chunk || check_chunk->size() == 0 || !check_chunk->GetValue(0, 0).GetValue<bool>()) {
-		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
-		return false;
-	}
-	// Must be an object to extract named fields (FastAPI body model).
-	auto type_res = con.Query("SELECT json_type(?::JSON)", Value(raw_body));
-	if (type_res->HasError()) {
-		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
-		return false;
-	}
-	auto type_chunk = type_res->Fetch();
-	string jtype = type_chunk && type_chunk->size() > 0 && !type_chunk->GetValue(0, 0).IsNull()
-	                   ? type_chunk->GetValue(0, 0).GetValue<string>()
-	                   : string();
-	if (jtype != "OBJECT") {
-		err_json = ValidationErrorJsonBody("Input should be a valid dictionary or object to extract fields from",
-		                                   "model_attributes_type");
-		return false;
-	}
-	// json_each supplies the literal key, so keys containing dots or other JSONPath
-	// metacharacters cannot be reinterpreted as a path expression.
-	auto fields_res = con.Query("SELECT key, "
-	                            "  CASE type "
-	                            "    WHEN 'VARCHAR' THEN json_extract_string(value, '$') "
-	                            "    WHEN 'NULL' THEN NULL "
-	                            "    ELSE CAST(value AS VARCHAR) "
-	                            "  END AS val "
-	                            "FROM json_each(?::JSON)",
-	                            Value(raw_body));
-	if (fields_res->HasError()) {
-		err_json = ValidationErrorJsonBody("JSON decode error", "json_invalid");
-		return false;
-	}
-	while (true) {
-		auto chunk = fields_res->Fetch();
-		if (!chunk || chunk->size() == 0) {
-			break;
-		}
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			auto key_v = chunk->GetValue(0, row);
-			if (key_v.IsNull()) {
-				continue;
-			}
-			string key = key_v.GetValue<string>();
-			auto val_v = chunk->GetValue(1, row);
-			if (val_v.IsNull()) {
-				fields[key] = {string(), true};
-				continue;
-			}
-			fields[key] = {val_v.GetValue<string>(), false};
-		}
-	}
-	return true;
 }
 
 //! Validate body against BODY SCHEMA using community json_schema extension.
@@ -497,16 +411,6 @@ bool ValidateBodySchema(Connection &con, const string &schema, const string &raw
 bool TransformTypedBody(Connection &con, const string &body_type, const string &raw_body, Value &out,
                         string &err_json) {
 	auto result = con.Query("SELECT try(json_transform_strict(?::JSON, ?::JSON))", Value(raw_body), Value(body_type));
-	// json_transform is supplied by DuckDB's bundled json extension. Test and
-	// embedded deployments may turn automatic extension loading off, so load it
-	// explicitly only after DuckDB identifies this precise missing dependency.
-	if (result->HasError() && result->GetError().find("json extension") != string::npos) {
-		auto load = con.Query("LOAD json");
-		if (!load->HasError()) {
-			result =
-			    con.Query("SELECT try(json_transform_strict(?::JSON, ?::JSON))", Value(raw_body), Value(body_type));
-		}
-	}
 	if (!result->HasError()) {
 		auto chunk = result->Fetch();
 		if (chunk && chunk->size() > 0 && !chunk->GetValue(0, 0).IsNull()) {
@@ -2409,11 +2313,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	// Per-route IO timeout (CREATE ROUTE … TIMEOUT / WITH (timeout_sec := N)).
 	// Extends httplib SocketStream select deadlines + SO_RCVTIMEO/SO_SNDTIMEO for
 	// this connection through handler execute and response write.
-	// Seed introspection with serve write_timeout_sec; ApplyRouteIoTimeout
-	// overwrites only when it actually applies a route override.
-	qa_state.SetLastEffectiveWriteTimeoutSec(options.write_timeout_sec);
 	if (match.route.timeout_sec > 0) {
-		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec), qa_state);
+		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec));
 	}
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
@@ -2637,10 +2538,18 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					// A native BODY TYPE bound only through $body can be an object or
 					// array. It does not need the flat-field extractor; the native
 					// transform below validates the complete payload directly.
-					if (needs_json_field_extraction && !ExtractJsonBodyFields(con, req.body, body_fields, err_json)) {
-						SetJson(res, 422, err_json);
-						finish();
-						return;
+					if (needs_json_field_extraction) {
+						auto parse_result = ParseJsonBodyFields(req.body, body_fields);
+						if (parse_result != JsonBodyParseResult::SUCCESS) {
+							err_json = parse_result == JsonBodyParseResult::INVALID_JSON
+							               ? ValidationErrorJsonBody("JSON decode error", "json_invalid")
+							               : ValidationErrorJsonBody(
+							                     "Input should be a valid dictionary or object to extract fields from",
+							                     "model_attributes_type");
+							SetJson(res, 422, err_json);
+							finish();
+							return;
+						}
 					}
 					if (!match.route.body_schema.empty()) {
 						if (!ValidateBodySchema(con, match.route.body_schema, req.body, err_json)) {

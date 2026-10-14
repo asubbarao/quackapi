@@ -31,12 +31,12 @@ query I
 CREATE TABLE quackapi_sql_empty (x INTEGER);
 ----
 
-# Dynamic SQL is validated before delegation so parser errors cannot become 200 []
+# SQL errors raised by an ordinary registered route remain server errors.
 query II
 SELECT status, contains(decode(body), 'SELEC')
 FROM quackapi_request('POST', '/sql', '{"sql":"SELEC 1"}');
 ----
-422	true
+500	true
 
 # Valid SELECT response shape is unchanged.
 query II

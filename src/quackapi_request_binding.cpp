@@ -1,6 +1,9 @@
 #include "quackapi_request_binding.hpp"
 
+#include <cstdlib>
+
 #include "duckdb/common/string_util.hpp"
+#include "yyjson.hpp"
 
 namespace duckdb {
 bool IsJsonMediaType(const string &media) {
@@ -44,149 +47,43 @@ void ParseFormUrlEncoded(const string &body, case_insensitive_map_t<string> &out
 		i = amp + 1;
 	}
 }
-//! Fast path: flat JSON object of string/number/bool/null scalars (no DuckDB round-trip).
-//! Returns true on success. false → caller may fall back to SQL extract or error.
-bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<JsonBodyField> &fields) {
-	const char *s = raw_body.c_str();
-	const char *end = s + raw_body.size();
-	auto skip_ws = [&]() {
-		while (s < end && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) {
-			s++;
-		}
-	};
-	auto is_digit = [](char c) {
-		return c >= '0' && c <= '9';
-	};
-	// This path deliberately accepts only unescaped JSON strings.  Escapes require
-	// full JSON decoding (in particular, UTF-16 surrogate handling), so leave them
-	// to DuckDB instead of attempting a partial implementation here.
-	auto parse_plain_string = [&](string &out) {
-		if (s >= end || *s != '"') {
-			return false;
-		}
-		s++;
-		while (s < end && *s != '"') {
-			const auto ch = static_cast<unsigned char>(*s);
-			if (ch < 0x20 || *s == '\\') {
-				return false;
-			}
-			out.push_back(*s++);
-		}
-		if (s >= end) {
-			return false;
-		}
-		s++;
-		return true;
-	};
-	auto parse_number = [&]() {
-		const char *start = s;
-		if (s < end && *s == '-') {
-			s++;
-		}
-		if (s >= end) {
-			return false;
-		}
-		if (*s == '0') {
-			s++;
-			if (s < end && is_digit(*s)) {
-				return false;
-			}
-		} else if (*s >= '1' && *s <= '9') {
-			do {
-				s++;
-			} while (s < end && is_digit(*s));
-		} else {
-			return false;
-		}
-		if (s < end && *s == '.') {
-			s++;
-			if (s >= end || !is_digit(*s)) {
-				return false;
-			}
-			do {
-				s++;
-			} while (s < end && is_digit(*s));
-		}
-		if (s < end && (*s == 'e' || *s == 'E')) {
-			s++;
-			if (s < end && (*s == '+' || *s == '-')) {
-				s++;
-			}
-			if (s >= end || !is_digit(*s)) {
-				return false;
-			}
-			do {
-				s++;
-			} while (s < end && is_digit(*s));
-		}
-		return s > start;
-	};
-	skip_ws();
-	if (s >= end || *s != '{') {
-		return false;
-	}
-	s++;
+JsonBodyParseResult ParseJsonBodyFields(const string &raw_body, case_insensitive_map_t<JsonBodyField> &fields) {
 	fields.clear();
-	skip_ws();
-	if (s < end && *s == '}') {
-		s++;
-		skip_ws();
-		return s == end;
+	if (raw_body.empty()) {
+		return JsonBodyParseResult::INVALID_JSON;
 	}
-	while (s < end) {
-		skip_ws();
-		string key;
-		if (!parse_plain_string(key)) {
-			return false;
-		}
-		skip_ws();
-		if (s >= end || *s != ':') {
-			return false;
-		}
-		s++;
-		skip_ws();
-		if (s >= end) {
-			return false;
-		}
-		string val;
-		bool explicit_null = false;
-		if (*s == '"') {
-			if (!parse_plain_string(val)) {
-				return false;
-			}
-		} else if (*s == 'n' && s + 4 <= end && string(s, 4) == "null") {
-			explicit_null = true;
-			s += 4;
-		} else if (*s == 't' && s + 4 <= end && string(s, 4) == "true") {
-			val = "true";
-			s += 4;
-		} else if (*s == 'f' && s + 5 <= end && string(s, 5) == "false") {
-			val = "false";
-			s += 5;
-		} else if (*s == '-' || (*s >= '0' && *s <= '9')) {
-			const char *start = s;
-			if (!parse_number()) {
-				return false;
-			}
-			val.assign(start, s - start);
+	auto document =
+	    duckdb_yyjson::yyjson_read(raw_body.data(), raw_body.size(), duckdb_yyjson::YYJSON_READ_BIGNUM_AS_RAW);
+	if (!document) {
+		return JsonBodyParseResult::INVALID_JSON;
+	}
+	unique_ptr<duckdb_yyjson::yyjson_doc, void (*)(duckdb_yyjson::yyjson_doc *)> doc(document,
+	                                                                                 duckdb_yyjson::yyjson_doc_free);
+	auto root = duckdb_yyjson::yyjson_doc_get_root(doc.get());
+	if (!root || !duckdb_yyjson::yyjson_is_obj(root)) {
+		return JsonBodyParseResult::NOT_OBJECT;
+	}
+	auto iter = duckdb_yyjson::yyjson_obj_iter_with(root);
+	duckdb_yyjson::yyjson_val *key = nullptr;
+	while ((key = duckdb_yyjson::yyjson_obj_iter_next(&iter))) {
+		auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key);
+		string name(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
+		if (duckdb_yyjson::yyjson_is_null(value)) {
+			fields[name] = {string(), true};
+		} else if (duckdb_yyjson::yyjson_is_str(value)) {
+			fields[name] = {string(duckdb_yyjson::yyjson_get_str(value), duckdb_yyjson::yyjson_get_len(value)), false};
 		} else {
-			// nested object/array — not flat; fall back
-			return false;
+			size_t length = 0;
+			auto serialized = duckdb_yyjson::yyjson_val_write(value, duckdb_yyjson::YYJSON_WRITE_NOFLAG, &length);
+			if (!serialized) {
+				fields.clear();
+				return JsonBodyParseResult::INVALID_JSON;
+			}
+			fields[name] = {string(serialized, length), false};
+			std::free(serialized);
 		}
-		fields[key] = {val, explicit_null};
-		skip_ws();
-		if (s < end && *s == ',') {
-			s++;
-			continue;
-		}
-		if (s < end && *s == '}') {
-			s++;
-			skip_ws();
-			return s == end;
-		}
-		return false;
 	}
-	return false;
+	return JsonBodyParseResult::SUCCESS;
 }
 //! Parse application/x-www-form-urlencoded query into httplib Params.
 void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &params) {

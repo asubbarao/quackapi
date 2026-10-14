@@ -20,12 +20,14 @@ struct JsonBodyField {
 	}
 };
 
+enum class JsonBodyParseResult : uint8_t { SUCCESS, INVALID_JSON, NOT_OBJECT };
+
 bool IsJsonMediaType(const string &media);
 bool IsFormUrlEncodedMediaType(const string &media);
 bool IsMultipartMediaType(const string &media);
 bool IsBodyMethod(const string &method);
 void ParseFormUrlEncoded(const string &body, case_insensitive_map_t<string> &out);
-bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<JsonBodyField> &fields);
+JsonBodyParseResult ParseJsonBodyFields(const string &raw_body, case_insensitive_map_t<JsonBodyField> &fields);
 void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &params);
 
 } // namespace duckdb
