@@ -13,8 +13,13 @@ BASE="http://127.0.0.1:${PORT}"
 FIFO="${TMPDIR:-/tmp}/quackapi_conformance_$$.fifo"
 LOG="${TMPDIR:-/tmp}/quackapi_conformance_$$.log"
 PIDFILE="${TMPDIR:-/tmp}/quackapi_conformance_$$.pid"
+DUCKDB_CLEAN_HOME="$(mktemp -d "${TMPDIR:-/tmp}/quackapi_conformance_home_XXXXXX")"
 RESULTS_DIR="${RESULTS_DIR:-$CONF/results}"
 DPID=""
+
+duckdb_cli() {
+  HOME="$DUCKDB_CLEAN_HOME" "$DUCK" "$@"
+}
 
 cleanup() {
   if [[ -n "$DPID" ]] && kill -0 "$DPID" 2>/dev/null; then
@@ -22,6 +27,7 @@ cleanup() {
     wait "$DPID" 2>/dev/null || true
   fi
   rm -f "$FIFO" "$PIDFILE"
+  rm -rf "$DUCKDB_CLEAN_HOME"
 }
 trap cleanup EXIT
 
@@ -39,12 +45,17 @@ if [[ "$EXT" == *"'"* ]]; then
   echo "quackapi artifact path contains a SQL quote: $EXT" >&2
   exit 2
 fi
-core_version="$("$DUCK" -unsigned -noheader -list -c 'SELECT library_version, source_id FROM pragma_version();')"
-if [[ "$core_version" != 'v1.5.6|069cc9f9' ]]; then
-  echo "wrong DuckDB core: $core_version (expected v1.5.6|069cc9f9)" >&2
+core_version="$(duckdb_cli -unsigned -noheader -list -c 'SELECT library_version, source_id FROM pragma_version();')"
+if [[ "$core_version" != 'v1.5.6|069cc9f9' && "$core_version" != 'v1.5.6|069cc9f9b5' ]]; then
+  echo "wrong DuckDB core: $core_version (expected v1.5.6 and source ID 069cc9f9 or 069cc9f9b5)" >&2
   exit 2
 fi
-actual_ext_version="$("$DUCK" -unsigned -noheader -list -c "LOAD '$EXT'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'quackapi' AND loaded;")"
+initially_loaded="$(duckdb_cli -unsigned -noheader -list -c "SELECT count(extension_name) FROM duckdb_extensions() WHERE loaded AND extension_name IN ('quackapi', 'curl_httpfs', 'httpfs');")"
+if [[ "$initially_loaded" != '0' ]]; then
+  echo "test core unexpectedly preloaded QuackAPI or an HTTP provider before explicit LOAD" >&2
+  exit 2
+fi
+actual_ext_version="$(duckdb_cli -unsigned -noheader -list -c "LOAD '$EXT'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'quackapi' AND loaded;")"
 if [[ "$actual_ext_version" != "$EXPECTED_EXT_VERSION" ]]; then
   echo "wrong quackapi artifact: $actual_ext_version (expected $EXPECTED_EXT_VERSION from $EXT)" >&2
   exit 2
@@ -56,7 +67,7 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
 fi
 mkfifo "$FIFO"
 
-"$DUCK" -unsigned <"$FIFO" >"$LOG" 2>&1 &
+duckdb_cli -unsigned <"$FIFO" >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 DPID=$!
 

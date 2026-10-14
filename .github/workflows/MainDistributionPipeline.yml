@@ -122,6 +122,23 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_lifetime_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-lifetime-test
           /tmp/quackapi-lifetime-test
 
+      - name: Build clean pinned core for loadable extension contracts
+        run: |
+          cmake -S duckdb -B build/post-clean-core \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_MAIN_DUCKDB_LIBRARY=ON \
+            -DBUILD_SHELL=OFF \
+            -DBUILD_UNITTESTS=OFF \
+            -DBUILD_BENCHMARKS=OFF \
+            -DEXTENSION_STATIC_BUILD=FALSE \
+            -DDUCKDB_EXTENSION_CONFIGS= \
+            -DDISABLE_BUILTIN_EXTENSIONS=TRUE \
+            -DDISABLE_EXTENSION_LOAD=FALSE \
+            -DOVERRIDE_GIT_DESCRIBE=v1.5.6
+          cmake --build build/post-clean-core --target duckdb -j"$(nproc)"
+          test -f build/post-clean-core/src/libduckdb.so
+
       - name: Build pinned curl_httpfs POST provider
         uses: actions/checkout@v4
         with:
@@ -159,11 +176,13 @@ jobs:
         run: |
           quackapi_artifact="$PWD/build/release/extension/quackapi/quackapi.duckdb_extension"
           quackapi_version="$(git rev-parse --short HEAD)"
+          duckdb_test_core="$PWD/build/post-clean-core/src/libduckdb.so"
           curl_provider="$PWD/provider-curl-httpfs/build/release/extension/curl_httpfs/curl_httpfs.duckdb_extension"
           httpfs_provider="$PWD/provider-httpfs-curl/build/release/extension/httpfs/httpfs.duckdb_extension"
           cmake -S test/cpp -B build/post_http_test_curl \
             -DQUACKAPI_EXTENSION="$quackapi_artifact" \
             -DQUACKAPI_VERSION="$quackapi_version" \
+            -DDUCKDB_LIBRARY="$duckdb_test_core" \
             -DPOST_PROVIDER_EXTENSION="$curl_provider" \
             -DPOST_PROVIDER_NAME=curl_httpfs \
             -DPOST_PROVIDER_VERSION=v0.4.5 \
@@ -187,6 +206,7 @@ jobs:
           cmake -S test/cpp -B build/post_http_test_httpfs \
             -DQUACKAPI_EXTENSION="$quackapi_artifact" \
             -DQUACKAPI_VERSION="$quackapi_version" \
+            -DDUCKDB_LIBRARY="$duckdb_test_core" \
             -DPOST_PROVIDER_EXTENSION="$httpfs_provider" \
             -DPOST_PROVIDER_NAME=httpfs \
             -DPOST_PROVIDER_VERSION=748f5ac

@@ -52,6 +52,13 @@ static void CheckExtension(Connection &connection, const std::string &name, cons
 	Check(result->GetValue(1, 0).GetValue<bool>(), name + " extension is not loaded");
 }
 
+static void CheckExtensionsInitiallyUnloaded(Connection &connection) {
+	auto loaded = Run(connection, "SELECT count(extension_name) FROM duckdb_extensions() "
+	                              "WHERE loaded AND extension_name IN ('quackapi', 'curl_httpfs', 'httpfs')");
+	Check(loaded->GetValue(0, 0).GetValue<int64_t>() == 0,
+	      "test core unexpectedly preloaded QuackAPI or an HTTP provider");
+}
+
 struct ListenerGuard {
 	duckdb_httplib::Server &server;
 	std::thread &listener;
@@ -153,6 +160,7 @@ int main(int argc, char **argv) {
 		          actual_source_id +
 		          "'; expected v1.5.6 and an 8- or 10-character prefix of pinned core "
 		          "069cc9f9b5be802405797faecc284961b07c70ef");
+		CheckExtensionsInitiallyUnloaded(connection);
 		Run(connection, "LOAD " + SqlQuote(argv[3]));
 		CheckExtension(connection, argv[4], argv[5]);
 		if (std::string(argv[4]) == "httpfs") {
@@ -421,7 +429,8 @@ int main(int argc, char **argv) {
 		                                "query_timeout_ms := 1000)");
 		Check(loopback->GetValue(0, 0).GetValue<int>() == 200 &&
 		          loopback->GetValue(1, 0).ToString() == "[{\"upstream_status\":200}]",
-		      "same-database HTTP loopback stalled or returned the wrong row");
+		      "same-database HTTP loopback stalled or returned the wrong row: status=" +
+		          loopback->GetValue(0, 0).ToString() + " body=" + loopback->GetValue(1, 0).ToString());
 		Run(connection, "SELECT * FROM quackapi_stop(" + std::to_string(log_port) + ")");
 
 		// The SQL caller has already been interrupted. Database shutdown must

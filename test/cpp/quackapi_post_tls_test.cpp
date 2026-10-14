@@ -31,6 +31,13 @@ static std::string Quote(const std::string &value) {
 	return "'" + value + "'";
 }
 
+static void CheckExtensionsInitiallyUnloaded(Connection &connection) {
+	auto loaded = Run(connection, "SELECT count(extension_name) FROM duckdb_extensions() "
+	                              "WHERE loaded AND extension_name IN ('quackapi', 'curl_httpfs', 'httpfs')");
+	Check(loaded->GetValue(0, 0).GetValue<int64_t>() == 0,
+	      "test core unexpectedly preloaded QuackAPI or an HTTP provider");
+}
+
 int main(int argc, char **argv) {
 	try {
 		Check(argc == 8, "usage: post_tls_test QUACKAPI_PATH QUACKAPI_VERSION PROVIDER_PATH PROVIDER_NAME "
@@ -85,6 +92,7 @@ int main(int argc, char **argv) {
 		          actual_source_id +
 		          "'; expected v1.5.6 and an 8- or 10-character prefix of pinned core "
 		          "069cc9f9b5be802405797faecc284961b07c70ef");
+		CheckExtensionsInitiallyUnloaded(connection);
 		Run(connection, "LOAD " + Quote(argv[3]));
 		Run(connection, "LOAD " + Quote(argv[1]));
 		auto loaded = Run(connection, "SELECT extension_name, extension_version FROM duckdb_extensions() "
