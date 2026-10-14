@@ -30,8 +30,13 @@ struct ClientConfig {
 	bool verify_ssl = true;
 
 	bool Matches(const HTTPUtil &util, const HTTPParams &params, const string &candidate_origin) const {
-		return provider_name == util.GetName() && params_type == typeid(params).name() && origin == candidate_origin &&
-		       http_proxy == params.http_proxy && http_proxy_port == params.http_proxy_port &&
+		// The common fields below cannot fingerprint provider-specific parameter
+		// subclasses. Until a provider exposes a configuration comparison API,
+		// only reuse the exact base parameter type; replace provider-specialized
+		// clients for every request rather than risk carrying stale settings.
+		return typeid(params) == typeid(HTTPParams) && provider_name == util.GetName() &&
+		       params_type == typeid(params).name() && origin == candidate_origin && http_proxy == params.http_proxy &&
+		       (http_proxy.empty() || http_proxy_port == params.http_proxy_port) &&
 		       http_proxy_username == params.http_proxy_username && http_proxy_password == params.http_proxy_password &&
 		       keep_alive == params.keep_alive && follow_location == params.follow_location &&
 		       override_verify_ssl == params.override_verify_ssl && verify_ssl == params.verify_ssl;
@@ -42,7 +47,7 @@ struct ClientConfig {
 		params_type = typeid(params).name();
 		origin = candidate_origin;
 		http_proxy = params.http_proxy;
-		http_proxy_port = params.http_proxy_port;
+		http_proxy_port = http_proxy.empty() ? 0 : params.http_proxy_port;
 		http_proxy_username = params.http_proxy_username;
 		http_proxy_password = params.http_proxy_password;
 		keep_alive = params.keep_alive;
