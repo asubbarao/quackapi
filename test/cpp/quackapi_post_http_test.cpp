@@ -602,6 +602,21 @@ int main(int argc, char **argv) {
 		Check(active.load() == 0 && table_cancelled.load() && table_cancel_elapsed < std::chrono::milliseconds(600) &&
 		          received.load() == 176,
 		      "interrupted table POST did not cancel promptly or admitted another row");
+		auto table_headers = Run(connection, "SELECT response.status, response.body FROM quackapi_post((SELECT " +
+		                                         SqlQuote(headers_url) +
+		                                         " AS url, '{}'::JSON AS body, "
+		                                         "'application/vnd.quackapi-test+json' AS content_type, "
+		                                         "MAP {'X-Trace': 'table-42'} AS headers))");
+		Check(table_headers->GetValue(0, 0).GetValue<int>() == 200 &&
+		          table_headers->GetValue(1, 0).ToString() == "application/vnd.quackapi-test+json|table-42|1",
+		      "table POST changed typed body, Content-Type or custom headers");
+		auto table_default_headers = Run(connection, "SELECT response.status, response.body FROM "
+		                                                 "quackapi_post((SELECT " +
+		                                                     SqlQuote(headers_url) + " AS url, '{}' AS body))");
+		Check(table_default_headers->GetValue(0, 0).GetValue<int>() == 200 &&
+		          table_default_headers->GetValue(1, 0).ToString() == "application/json||1" &&
+		          received.load() == 178,
+		      "table POST changed default Content-Type or request count");
 
 		// A full scalar response vector exhausts this limit. The table operator
 		// must let downstream JSON parsing consume a bounded batch at a time.
@@ -628,7 +643,7 @@ int main(int argc, char **argv) {
 		Check(large_rows->GetValue(0, 0).GetValue<int64_t>() == 256 &&
 		          large_rows->GetValue(1, 0).GetValue<int64_t>() == 2560000 && large_received.load() == 256,
 		      "table POST did not return all 256 large JSON bodies for downstream parsing under 128 MB");
-		std::cout << "POST HTTP integration passed: 176 requests including table batches\n";
+		std::cout << "POST HTTP integration passed: 178 requests including table batches\n";
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
