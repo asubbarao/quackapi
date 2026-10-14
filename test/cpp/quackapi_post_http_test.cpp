@@ -52,6 +52,12 @@ static void CheckExtension(Connection &connection, const std::string &name, cons
 	Check(result->GetValue(1, 0).GetValue<bool>(), name + " extension is not loaded");
 }
 
+static void CheckExtensionUnloaded(Connection &connection, const std::string &name) {
+	auto result = Run(connection, "SELECT loaded FROM duckdb_extensions() WHERE extension_name = " + SqlQuote(name));
+	Check(result->RowCount() == 1 && !result->GetValue(0, 0).GetValue<bool>(),
+	      name + " was already loaded by the test host before the exact artifact path was used");
+}
+
 struct ListenerGuard {
 	duckdb_httplib::Server &server;
 	std::thread &listener;
@@ -153,6 +159,8 @@ int main(int argc, char **argv) {
 		          actual_source_id +
 		          "'; expected v1.5.6 and an 8- or 10-character prefix of pinned core "
 		          "069cc9f9b5be802405797faecc284961b07c70ef");
+		CheckExtensionUnloaded(connection, argv[4]);
+		CheckExtensionUnloaded(connection, "quackapi");
 		Run(connection, "LOAD " + SqlQuote(argv[3]));
 		CheckExtension(connection, argv[4], argv[5]);
 		if (std::string(argv[4]) == "httpfs") {
@@ -270,6 +278,8 @@ int main(int argc, char **argv) {
 		other_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
 		DuckDB other_database(nullptr, &other_config);
 		Connection other_setup(other_database);
+		CheckExtensionUnloaded(other_setup, argv[4]);
+		CheckExtensionUnloaded(other_setup, "quackapi");
 		Run(other_setup, "LOAD " + SqlQuote(argv[3]));
 		Run(other_setup, "LOAD " + SqlQuote(argv[1]));
 		CheckExtension(other_setup, argv[4], argv[5]);
@@ -429,6 +439,8 @@ int main(int argc, char **argv) {
 		// drains its DB-owned worker rather than detaching it.
 		auto closing_database = make_uniq<DuckDB>(nullptr, &config);
 		auto closing_connection = make_uniq<Connection>(*closing_database);
+		CheckExtensionUnloaded(*closing_connection, argv[4]);
+		CheckExtensionUnloaded(*closing_connection, "quackapi");
 		Run(*closing_connection, "LOAD " + SqlQuote(argv[3]));
 		Run(*closing_connection, "LOAD " + SqlQuote(argv[1]));
 		if (std::string(argv[4]) == "httpfs") {
@@ -468,6 +480,8 @@ int main(int argc, char **argv) {
 		reuse_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
 		DuckDB reuse_database(nullptr, &reuse_config);
 		Connection reuse_connection(reuse_database);
+		CheckExtensionUnloaded(reuse_connection, argv[4]);
+		CheckExtensionUnloaded(reuse_connection, "quackapi");
 		Run(reuse_connection, "LOAD " + SqlQuote(argv[3]));
 		Run(reuse_connection, "LOAD " + SqlQuote(argv[1]));
 		CheckExtension(reuse_connection, argv[4], argv[5]);
@@ -626,6 +640,8 @@ int main(int argc, char **argv) {
 		memory_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
 		DuckDB memory_database(nullptr, &memory_config);
 		Connection memory_connection(memory_database);
+		CheckExtensionUnloaded(memory_connection, argv[4]);
+		CheckExtensionUnloaded(memory_connection, "quackapi");
 		Run(memory_connection, "LOAD " + SqlQuote(argv[3]));
 		Run(memory_connection, "LOAD " + SqlQuote(argv[1]));
 		CheckExtension(memory_connection, argv[4], argv[5]);
