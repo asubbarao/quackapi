@@ -161,8 +161,11 @@ int64_t QuackapiRemainingTimeoutMillis(int64_t fallback_ms) {
 	if (current_deadline == std::chrono::steady_clock::time_point::max()) {
 		return fallback_ms;
 	}
-	return std::max<int64_t>(1, std::min(fallback_ms, std::chrono::duration_cast<std::chrono::milliseconds>(
-	                                                      current_deadline - std::chrono::steady_clock::now())
-	                                                      .count()));
+	const auto remaining = current_deadline - std::chrono::steady_clock::now();
+	auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+	if (remaining_ms < remaining) {
+		remaining_ms += std::chrono::milliseconds(1);
+	}
+	return std::max<int64_t>(1, std::min(fallback_ms, remaining_ms.count()));
 }
 } // namespace duckdb
