@@ -489,9 +489,9 @@ int main(int argc, char **argv) {
 		Run(connection, "SET threads = 4");
 		Run(connection, "SET quackapi_post_concurrency = 40");
 		peak.store(0);
-		auto table_wide = Run(connection, "SELECT i, response.status, response.body FROM quackapi_post((SELECT i, " +
-		                                      SqlQuote(slow_url) +
-		                                      " AS url, 'wide' AS body FROM range(40) t(i))) ORDER BY i");
+		auto table_wide =
+		    Run(connection, "SELECT i, response.status, response.body FROM quackapi_post((SELECT i, " +
+		                        SqlQuote(slow_url) + " AS url, 'wide' AS body FROM range(40) t(i))) ORDER BY i");
 		Check(table_wide->RowCount() == 40, "table POST dropped an input row");
 		for (idx_t i = 0; i < 40; i++) {
 			Check(table_wide->GetValue(0, i).GetValue<int64_t>() == static_cast<int64_t>(i) &&
@@ -566,8 +566,7 @@ int main(int argc, char **argv) {
 		std::atomic<bool> table_cancelled {false};
 		std::thread table_call([&]() {
 			auto result = table_interrupted.Query("SELECT count(i) FROM quackapi_post((SELECT i, " +
-			                                      SqlQuote(slow_url) +
-			                                      " AS url, 'wide' AS body FROM range(33) t(i)))");
+			                                      SqlQuote(slow_url) + " AS url, 'wide' AS body FROM range(33) t(i)))");
 			table_cancelled.store(result->HasError());
 		});
 		const auto table_started_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -587,8 +586,7 @@ int main(int argc, char **argv) {
 		while (active.load() != 0 && std::chrono::steady_clock::now() < table_drained_by) {
 			std::this_thread::yield();
 		}
-		Check(active.load() == 0 && table_cancelled.load() &&
-		          table_cancel_elapsed < std::chrono::milliseconds(600) &&
+		Check(active.load() == 0 && table_cancelled.load() && table_cancel_elapsed < std::chrono::milliseconds(600) &&
 		          received.load() == 176,
 		      "interrupted table POST did not cancel promptly or admitted another row");
 		std::cout << "POST HTTP integration passed: 176 requests including table batches\n";
