@@ -71,7 +71,7 @@ CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
   [BODY TYPE '<duckdb-json-transform-structure>']
   [PARAM <name> [<type>] [HEADER|COOKIE|QUERY [wire-name]]
          [DEFAULT <lit>] [GE|GT|LE|LT <n>] [MIN_LENGTH|MAX_LENGTH <n>] …]
-  AS <select>;
+  AS <select> | AS $<param>;
 
 DROP ROUTE <name>;
 ```
@@ -81,6 +81,7 @@ DROP ROUTE <name>;
 | **Method** | `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` |
 | **Path** | Must start with `/` (unless joined via `GROUP`). `:param` and `{param}` bind to `$param` |
 | **Handler** | Any SQL statement that returns a result (typically `SELECT` / `INSERT … RETURNING` / `COPY`) |
+| **Exec handler** | Exactly one parameter, `AS $sql`: the request's bound text is executed as SQL — see [Exec routes](#exec-routes-as-sql) |
 | **Params** | Cast to the types the prepared handler expects; failures → **422** with FastAPI-shaped `detail` |
 | **Success status** | Default `200`; override with `STATUS 201` (etc.) |
 | **Auth** | `REQUIRE <scheme>` runs a `CREATE AUTH` scheme before the handler |
@@ -90,6 +91,39 @@ Live updates: a route created after `quackapi_serve()` is served immediately.
 Handler SQL is validated at `CREATE` time (broken SQL fails at create, not on
 first request). `CREATE OR REPLACE` does not leave a half-applied route on
 failure.
+
+### Exec routes (`AS $sql`)
+
+A handler that is exactly one parameter runs the request's SQL text itself —
+an HTTP door to the database, without a loopback through another client:
+
+```sql
+CREATE AUTH ops AS API_KEY;
+CREATE ROUTE sql POST '/sql' REQUIRE ops
+  PARAM sql VARCHAR MIN_LENGTH 1
+  AS $sql;
+```
+
+```sh
+curl -X POST http://127.0.0.1:8000/sql -H 'X-API-Key: …' \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"CREATE TABLE t AS SELECT 1 AS id; INSERT INTO t VALUES (2); SELECT * FROM t"}'
+# [{"id":1},{"id":2}]
+```
+
+| Behavior | Detail |
+|----------|--------|
+| **Recognised** | The handler, trimmed, is one `$name` and nothing else. `CREATE` skips handler validation for it; `$claims_*` never qualifies |
+| **Binding** | The parameter binds like any other (JSON body field, form field, query string, `HEADER`/`COOKIE`), so `PARAM … MIN_LENGTH`/`DEFAULT` apply |
+| **Execution** | The text is split into statements with DuckDB's parser and each runs once, in order, on the request's connection — DDL, DML, `PRAGMA`, `SET`, `INSTALL`/`LOAD`, `COPY`, `ATTACH` |
+| **Response** | The **last** statement's result, through the usual negotiation (JSON default, `Accept: text/csv`, `application/x-ndjson`, `application/vnd.apache.arrow.stream`, route `FORMAT`; `html`/`text` columns). A last statement with no columns (`SET`, `PRAGMA …`) answers `[]` |
+| **Errors** | The first failing statement stops the batch — later statements never run — and answers **422** with a FastAPI-shaped `detail` whose `loc` is the parameter (`["body","sql"]`) and whose `msg` is DuckDB's error (`Statement 2 of 3 failed: …` for a batch). Earlier statements are not rolled back unless the batch opened its own `BEGIN` |
+| **Limits** | `REQUIRE` runs before any request SQL; `query_timeout_ms` bounds the whole batch (504); `max_response_bytes` applies to the last result |
+| **Session** | Each request gets its own connection: `SET`, `TEMP` objects and open transactions end with the request. `SET GLOBAL`, tables and `ATTACH` persist |
+| **Policies** | Request SQL cannot be policy-rewritten, so while any row-access or masking policy is bound an exec route answers 403 |
+
+An exec route executes arbitrary SQL with the server's privileges. Keep it on
+loopback or behind `REQUIRE`.
 
 ### Scheduled routes
 

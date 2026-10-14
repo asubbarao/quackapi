@@ -128,3 +128,8 @@ SELECT $name::VARCHAR AS name, $age::INTEGER AS age;
 
 CREATE ROUTE upload POST '/upload' AS
 SELECT $file::VARCHAR AS content, $filename::VARCHAR AS filename;
+
+-- Exec routes: the handler is one parameter; the request's SQL runs directly.
+CREATE ROUTE exec_sql POST '/exec-sql' AS $sql;
+
+CREATE ROUTE exec_sql_secure POST '/exec-sql-secure' REQUIRE site AS $sql;

@@ -993,6 +993,38 @@ bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
 	}
 }
 
+//! Execute request SQL text for an exec route (`AS $sql`): every statement in
+//! order on the request connection, stopping at the first failure. The last
+//! statement's result is the response. Unlike Connection::Query(string), which
+//! answers with the first statement that produces rows, a batch such as
+//! `CREATE …; INSERT …; SELECT …` answers with its final SELECT.
+bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error) {
+	vector<unique_ptr<SQLStatement>> statements;
+	try {
+		statements = con.ExtractStatements(sql);
+	} catch (std::exception &ex) {
+		error = ErrorData(ex).Message();
+		return false;
+	}
+	if (statements.empty()) {
+		error = "No statement to execute";
+		return false;
+	}
+	const auto statement_count = statements.size();
+	for (idx_t i = 0; i < statement_count; i++) {
+		unique_ptr<QueryResult> statement_result = con.Query(std::move(statements[i]));
+		if (statement_result->HasError()) {
+			error = statement_result->GetError();
+			if (statement_count > 1) {
+				error = StringUtil::Format("Statement %llu of %llu failed: %s", i + 1, statement_count, error);
+			}
+			return false;
+		}
+		result = std::move(statement_result);
+	}
+	return true;
+}
+
 //! Resolve the native DuckDB type represented by a BODY TYPE declaration.
 //! This lets route SQL use $body.items directly: the server inserts the cast
 //! from the one declaration before DuckDB prepares the handler.
@@ -3682,6 +3714,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	string policy_error;
 	string handler_sql =
 	    RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth, policy_error);
+	// Exec route (`AS $sql`): the bound parameter is the SQL to run. With row
+	// access or masking policies bound, the handler cannot be policy-rewritten,
+	// so the check above already fails closed (403) before any request SQL runs.
+	string exec_param;
+	const bool exec_route = QuackapiExecRouteParam(match.route.handler_sql, exec_param);
 	if (deny_unauth || !policy_error.empty()) {
 		SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
 		finish();
@@ -3953,7 +3990,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// Native Postgres path (optional): same model as FastAPI+psycopg —
 		// thread-local libpq, fresh PQexecParams per request. BEFORE DuckDB
 		// prepare so INSERT…RETURNING and other ATTACH-hostile SQL still work.
-		if (!options.pg_dsn.empty()) {
+		if (!options.pg_dsn.empty() && !exec_route) {
 			string pg_body, pg_err;
 			auto pg_result =
 			    QuackapiTryPgNative(options.pg_dsn, handler_sql, provided, options.max_response_bytes, pg_body, pg_err);
@@ -3979,7 +4016,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// DuckDB prepare (after libpq short-circuit). Fresh prepare every request:
 		// no SQL-keyed body/plan cache — mutable tables and volatile functions
 		// (now/uuid) must re-execute.
-		if (has_body_named && !match.route.body_type.empty()) {
+		if (has_body_named && !match.route.body_type.empty() && !exec_route) {
 			string body_sql_type = has_validated_typed_body ? validated_typed_body.type().ToString() : string();
 			if (body_sql_type.empty()) {
 				string type_error;
@@ -3992,7 +4029,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			handler_sql = RewriteTypedBodyParameter(handler_sql, body_sql_type);
 		}
 		auto prepare_started = std::chrono::steady_clock::now();
-		auto prepared_owned = con.Prepare(handler_sql);
+		// An exec route prepares a stand-in that names its one parameter, so the
+		// request's SQL text goes through the same binding and PARAM validation
+		// (MIN_LENGTH, DEFAULT, HEADER, …) as any other route parameter.
+		auto prepared_owned = con.Prepare(exec_route ? "SELECT $" + exec_param : handler_sql);
 		sql_prepare_ms =
 		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prepare_started).count();
 		if (prepared_owned->HasError()) {
@@ -4061,6 +4101,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					expected = LogicalType::VARCHAR;
 				}
 			}
+			const bool is_exec_sql = exec_route && StringUtil::CIEquals(param_name, exec_param);
+			if (is_exec_sql) {
+				// The exec parameter is SQL text, whatever its declaration says.
+				expected = LogicalType::VARCHAR;
+			}
 
 			auto it = provided.find(param_name);
 			// Default loc for missing errors: path / header / cookie / query.
@@ -4126,7 +4171,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					    {ValidationLocJson(loc_kind, param_name), "Input should be a valid integer", "type_error"});
 					continue;
 				}
-			} else if (expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR) {
+			} else if (!is_exec_sql &&
+			           (expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR)) {
 				// If raw is not a strict integer but DuckDB would accept it as
 				// INTEGER (float/scientific/hex-ish), reject so execute-time
 				// `$param::INTEGER` cannot round. Plain non-numeric strings
@@ -4233,7 +4279,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// The SQL route delegates the body value to a dynamic SQL function. Validate
 		// it locally first so remote parser/binder failures cannot become 200 []
 		// when the delegate reports an empty result instead of an error.
-		if (match.route.pattern == "/sql") {
+		if (match.route.pattern == "/sql" && !exec_route) {
 			auto sql_it = provided.find("sql");
 			if (sql_it != provided.end()) {
 				string sql_error;
@@ -4246,9 +4292,36 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		auto execute_started = std::chrono::steady_clock::now();
-		auto result = prepared->Execute(named_values, false);
-		sql_execute_ms =
-		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
+		unique_ptr<QueryResult> result;
+		if (exec_route) {
+			// The request's SQL is client input: any statement failure is a 422
+			// on the parameter that carried it, and later statements never run.
+			auto sql_it = bound_raw.find(exec_param);
+			if (sql_it == bound_raw.end()) {
+				SetJson(res, 422,
+				        ValidationErrorJson(IsBodyMethod(req.method) ? "body" : "query", exec_param, "Field required",
+				                            "missing"));
+				finish();
+				return;
+			}
+			string exec_error;
+			const bool exec_ok = ExecuteRequestSql(con, sql_it->second.second, result, exec_error);
+			sql_execute_ms =
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
+			if (!exec_ok) {
+				if (deadline.Expired()) {
+					SetJson(res, 504, "{\"detail\":\"Query execution deadline exceeded\"}");
+				} else {
+					SetJson(res, 422, ValidationErrorJson(sql_it->second.first, exec_param, exec_error, "value_error"));
+				}
+				finish();
+				return;
+			}
+		} else {
+			result = prepared->Execute(named_values, false);
+			sql_execute_ms =
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
+		}
 		if (result->HasError()) {
 			// Preserve the status mapping while returning DuckDB's diagnostic so clients can fix bad input.
 			// - Conversion errors → 422 with recovered param name (not "_")
@@ -4403,6 +4476,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		// No data columns: empty body (redirect / cookie-only responses).
+		if (data_cols.empty() && exec_route && location_col == names.size() && set_cookie_col == names.size()) {
+			// A final SET / PRAGMA / BEGIN returns no columns at all; answer the
+			// same empty JSON array a zero-row SELECT gets, not an empty body.
+			SetJson(res, match.route.status, "[]");
+			finish();
+			return;
+		}
 		if (data_cols.empty()) {
 			res.status = match.route.status;
 			res.body.clear();

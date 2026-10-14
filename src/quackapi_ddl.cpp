@@ -1256,8 +1256,13 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 					throw InvalidInputException("Invalid BODY SCHEMA JSON for route \"%s\"", bind_data.route.name);
 				}
 			}
-			auto prepared = con.Prepare(bind_data.route.handler_sql);
-			if (prepared->HasError()) {
+			// An exec route (`AS $sql`) has no SQL of its own to validate: the
+			// request supplies it, and each request reports its own errors.
+			string exec_param;
+			auto prepared = QuackapiExecRouteParam(bind_data.route.handler_sql, exec_param)
+			                    ? unique_ptr<PreparedStatement>()
+			                    : con.Prepare(bind_data.route.handler_sql);
+			if (prepared && prepared->HasError()) {
 				// Native libpq path (pg_dsn): handler SQL is Postgres dialect and may
 				// not prepare under DuckDB (domains, DO, INSERT…RETURNING, …). Allow
 				// CREATE when pg_dsn is configured; request time uses libpq, else 500.

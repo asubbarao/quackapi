@@ -18,6 +18,13 @@ string QuackapiTrim(const string &input);
 //! JSON string escape including control bytes as \u00XX (auth + OpenAPI + responses).
 string QuackapiJsonEscape(const string &input);
 
+//! An exec route's handler is exactly one named parameter (`AS $sql`). The
+//! request binds that parameter and quackapi executes its text as SQL on the
+//! request connection instead of preparing the handler. Returns the parameter
+//! name. $claims_* names are server-bound, never request SQL, so they do not
+//! qualify.
+bool QuackapiExecRouteParam(const string &handler_sql, string &param_name);
+
 //===--------------------------------------------------------------------===//
 // DDL apply-table-function shell (CREATE/DROP ROUTE|GROUP|AUTH|… plan→exec)
 //
