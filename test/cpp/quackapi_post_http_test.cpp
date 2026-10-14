@@ -166,7 +166,36 @@ int main(int argc, char **argv) {
 		Check(concurrent(36, "wide") == 36, "wide POST batch lost a request");
 		Check(peak.load() > 32 && peak.load() <= 40, "POST concurrency was capped at 32");
 		Check(received.load() == 104, "wide POST batch retried or lost requests");
-		std::cout << "POST HTTP integration passed: 104 requests, wide peak=" << peak.load() << '\n';
+
+		// Interrupt a request waiting behind the sole active worker. It must
+		// leave the queue promptly and never reach the HTTP fixture.
+		Run(connection, "SET quackapi_post_concurrency = 1");
+		Connection first(database);
+		Connection queued(database);
+		std::atomic<bool> first_ok {false};
+		std::atomic<bool> queued_failed {false};
+		std::thread first_call([&]() {
+			auto result = first.Query("SELECT (quackapi_post(" + SqlQuote(slow_url) + ", 'wide')).status");
+			first_ok.store(!result->HasError() && result->GetValue(0, 0).GetValue<int>() == 200);
+		});
+		while (active.load() == 0) {
+			std::this_thread::yield();
+		}
+		const auto queued_at = std::chrono::steady_clock::now();
+		std::thread queued_call([&]() {
+			auto result = queued.Query("SELECT (quackapi_post(" + SqlQuote(slow_url) + ", 'queued')).status");
+			queued_failed.store(result->HasError());
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		queued.Interrupt();
+		queued_call.join();
+		const auto queued_elapsed = std::chrono::steady_clock::now() - queued_at;
+		first_call.join();
+		Check(first_ok.load(), "active POST did not finish after peer cancellation");
+		Check(queued_failed.load() && queued_elapsed < std::chrono::milliseconds(600),
+		      "queued POST did not cancel promptly");
+		Check(received.load() == 105, "cancelled queued POST reached the server");
+		std::cout << "POST HTTP integration passed: 105 requests, wide peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
