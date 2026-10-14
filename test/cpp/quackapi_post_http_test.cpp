@@ -53,8 +53,10 @@ struct ListenerGuard {
 
 int main(int argc, char **argv) {
 	try {
-		Check(argc == 5,
-		      "usage: quackapi_post_http_test QUACKAPI_PATH QUACKAPI_VERSION PROVIDER_PATH PROVIDER_VERSION");
+		Check(argc == 6, "usage: quackapi_post_http_test QUACKAPI_PATH QUACKAPI_VERSION PROVIDER_PATH PROVIDER_NAME "
+		                 "PROVIDER_VERSION");
+		Check(std::string(argv[4]) == "curl_httpfs" || std::string(argv[4]) == "httpfs",
+		      "expected curl_httpfs or httpfs provider");
 		std::atomic<int> received {0};
 		std::atomic<int> active {0};
 		std::atomic<int> peak {0};
@@ -103,7 +105,10 @@ int main(int argc, char **argv) {
 		Check(version->GetValue(0, 0).ToString() == "v1.5.6" && version->GetValue(1, 0).ToString() == "069cc9f9",
 		      "test core must be DuckDB 069cc9f9 v1.5.6");
 		Run(connection, "LOAD " + SqlQuote(argv[3]));
-		CheckExtension(connection, "curl_httpfs", argv[4]);
+		CheckExtension(connection, argv[4], argv[5]);
+		if (std::string(argv[4]) == "httpfs") {
+			Run(connection, "SET httpfs_client_implementation = 'curl'");
+		}
 		const std::string core_settings = "SELECT current_setting('threads')::VARCHAR || '|' || "
 		                                  "current_setting('memory_limit')::VARCHAR || '|' || "
 		                                  "current_setting('preserve_insertion_order')::VARCHAR || '|' || "
@@ -215,8 +220,11 @@ int main(int argc, char **argv) {
 		Connection other_setup(other_database);
 		Run(other_setup, "LOAD " + SqlQuote(argv[3]));
 		Run(other_setup, "LOAD " + SqlQuote(argv[1]));
-		CheckExtension(other_setup, "curl_httpfs", argv[4]);
+		CheckExtension(other_setup, argv[4], argv[5]);
 		CheckExtension(other_setup, "quackapi", argv[2]);
+		if (std::string(argv[4]) == "httpfs") {
+			Run(other_setup, "SET httpfs_client_implementation = 'curl'");
+		}
 		Run(connection, "SET quackapi_post_concurrency = 1");
 		Run(other_setup, "SET quackapi_post_concurrency = 1");
 		peak.store(0);
@@ -306,6 +314,7 @@ int main(int argc, char **argv) {
 		const auto active_ms = std::chrono::duration_cast<std::chrono::milliseconds>(active_elapsed).count();
 		Check(active_failed.load() && active_elapsed < std::chrono::milliseconds(600),
 		      "active POST ignored caller interrupt: elapsed_ms=" + std::to_string(active_ms));
+
 		std::cout << "POST HTTP integration passed: 111 requests, wide peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
