@@ -456,7 +456,8 @@ int main(int argc, char **argv) {
 			      "10 sequential POSTs used " + std::to_string(reuse_peer_ports.size()) + " peer ports");
 		}
 
-		std::cout << "POST HTTP integration passed: 127 requests, auto peak=" << peak.load() << '\n';
+		Check(received.load() == 126, "bounded HTTP fixture lost or retried a request");
+		std::cout << "POST HTTP integration passed: 126 requests, auto peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
