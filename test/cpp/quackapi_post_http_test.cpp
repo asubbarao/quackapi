@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "httplib.hpp"
+#include "quackapi_core_identity.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +23,13 @@ static void Check(bool condition, const std::string &message) {
 	if (!condition) {
 		throw std::runtime_error(message);
 	}
+}
+
+static void VerifyCoreIdentityGuard() {
+	Check(MatchesPinnedDuckDBIdentity("v1.5.6", "069cc9f9"), "core identity guard rejected the 8-character pinned ID");
+	Check(MatchesPinnedDuckDBIdentity("v1.5.6", "069cc9f9b5"), "core identity guard rejected the 10-character pinned ID");
+	Check(!MatchesPinnedDuckDBIdentity("v1.5.5", "069cc9f9"), "core identity guard accepted the wrong version");
+	Check(!MatchesPinnedDuckDBIdentity("v1.5.6", "069cc9f8"), "core identity guard accepted the wrong source ID");
 }
 
 static std::unique_ptr<MaterializedQueryResult> Run(Connection &connection, const std::string &sql) {
@@ -58,6 +66,7 @@ int main(int argc, char **argv) {
 	try {
 		Check(argc == 6, "usage: quackapi_post_http_test QUACKAPI_PATH QUACKAPI_VERSION PROVIDER_PATH PROVIDER_NAME "
 		                 "PROVIDER_VERSION");
+		VerifyCoreIdentityGuard();
 		Check(std::string(argv[4]) == "curl_httpfs" || std::string(argv[4]) == "httpfs",
 		      "expected curl_httpfs or httpfs provider");
 		std::atomic<int> received {0};
@@ -125,9 +134,10 @@ int main(int argc, char **argv) {
 		auto version = Run(connection, "PRAGMA version");
 		const auto actual_library_version = version->GetValue(0, 0).ToString();
 		const auto actual_source_id = version->GetValue(1, 0).ToString();
-		Check(actual_library_version == "v1.5.6" && actual_source_id == "069cc9f9",
+		Check(MatchesPinnedDuckDBIdentity(actual_library_version, actual_source_id),
 		      "test core mismatch: actual library_version='" + actual_library_version + "', source_id='" +
-		          actual_source_id + "'; expected v1.5.6 / 069cc9f9");
+		          actual_source_id + "'; expected v1.5.6 and an 8- or 10-character prefix of pinned core "
+		          "069cc9f9b5be802405797faecc284961b07c70ef");
 		Run(connection, "LOAD " + SqlQuote(argv[3]));
 		CheckExtension(connection, argv[4], argv[5]);
 		if (std::string(argv[4]) == "httpfs") {
