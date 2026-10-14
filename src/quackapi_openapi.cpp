@@ -314,12 +314,12 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			string body_schema;
 			if (!route.body_schema.empty() && !route.body_type.empty()) {
 				body_schema = "{\"allOf\":[" + route.body_schema + "," +
-				              QuackapiDuckdbTransformToOpenApi(route.body_type) +
+				              QuackapiDuckdbTransformToOpenApi(con, route.body_type) +
 				              "],\"x-duckdb-json-transform\":" + JsonString(route.body_type) + "}";
 			} else if (!route.body_schema.empty()) {
 				body_schema = route.body_schema;
 			} else {
-				body_schema = QuackapiDuckdbTransformToOpenApi(route.body_type);
+				body_schema = QuackapiDuckdbTransformToOpenApi(con, route.body_type);
 				if (body_schema.size() > 1 && body_schema.back() == '}') {
 					body_schema.pop_back();
 					body_schema += ",\"x-duckdb-json-transform\":" + JsonString(route.body_type) + "}";
