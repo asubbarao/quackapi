@@ -427,11 +427,18 @@ int main(int argc, char **argv) {
 		Run(connection, "CREATE ROUTE loopback_outer GET '/loopback-outer' AS SELECT "
 		                "(quackapi_post('http://127.0.0.1:" +
 		                    std::to_string(log_port) + "/loopback-inner', '{}')).status AS upstream_status");
+		const auto loopback_start = std::chrono::steady_clock::now();
 		auto loopback = Run(connection, "SELECT status, decode(body) FROM quackapi_request('GET', '/loopback-outer', "
 		                                "query_timeout_ms := 1000)");
-		Check(loopback->GetValue(0, 0).GetValue<int>() == 200 &&
-		          loopback->GetValue(1, 0).ToString() == "[{\"upstream_status\":200}]",
-		      "same-database HTTP loopback stalled or returned the wrong row");
+		const auto loopback_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                             std::chrono::steady_clock::now() - loopback_start)
+		                             .count();
+		const auto loopback_status = loopback->GetValue(0, 0).GetValue<int>();
+		const auto loopback_body = loopback->GetValue(1, 0).ToString();
+		Check(loopback_status == 200 && loopback_body == "[{\"upstream_status\":200}]",
+		      "same-database HTTP loopback stalled or returned the wrong row: status=" +
+		          std::to_string(loopback_status) + ", body=" + loopback_body +
+		          ", elapsed_ms=" + std::to_string(loopback_ms));
 		Run(connection, "SELECT * FROM quackapi_stop(" + std::to_string(log_port) + ")");
 
 		// The SQL caller has already been interrupted. Database shutdown must
