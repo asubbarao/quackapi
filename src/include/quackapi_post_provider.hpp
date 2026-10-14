@@ -1,9 +1,8 @@
 //===----------------------------------------------------------------------===//
 // quackapi_post_provider.hpp
 //
-// Provider boundary for outbound POST. The implementation currently preserves
-// the existing HTTP/HTTPS transports; later provider work can replace it
-// without changing the SQL surface or scheduler.
+// HTTPUtil-backed outbound POST provider. Each executor worker owns its
+// provider client state; clients are never shared across workers.
 //===----------------------------------------------------------------------===//
 #pragma once
 
@@ -11,9 +10,13 @@
 
 namespace duckdb {
 
+class QuackapiPostWorkerState;
+struct QuackapiPostRequest;
+
 struct QuackapiPostProvider {
-	static QuackapiHttpFetchResult Post(DatabaseInstance &db, const string &url, const string &body,
-	                                    const string &content_type, const unordered_map<string, string> &extra_headers);
+	static unique_ptr<QuackapiPostWorkerState> CreateWorkerState(DatabaseInstance &db);
+	static QuackapiHttpFetchResult Post(DatabaseInstance &db, QuackapiPostWorkerState &state,
+	                                    const QuackapiPostRequest &request);
 };
 
 } // namespace duckdb
