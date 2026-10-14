@@ -611,11 +611,10 @@ int main(int argc, char **argv) {
 		          table_headers->GetValue(1, 0).ToString() == "application/vnd.quackapi-test+json|table-42|1",
 		      "table POST changed typed body, Content-Type or custom headers");
 		auto table_default_headers = Run(connection, "SELECT response.status, response.body FROM "
-		                                                 "quackapi_post((SELECT " +
-		                                                     SqlQuote(headers_url) + " AS url, '{}' AS body))");
+		                                             "quackapi_post((SELECT " +
+		                                                 SqlQuote(headers_url) + " AS url, '{}' AS body))");
 		Check(table_default_headers->GetValue(0, 0).GetValue<int>() == 200 &&
-		          table_default_headers->GetValue(1, 0).ToString() == "application/json||1" &&
-		          received.load() == 178,
+		          table_default_headers->GetValue(1, 0).ToString() == "application/json||1" && received.load() == 178,
 		      "table POST changed default Content-Type or request count");
 
 		// A full scalar response vector exhausts this limit. The table operator
