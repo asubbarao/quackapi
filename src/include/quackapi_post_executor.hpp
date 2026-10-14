@@ -1,23 +1,46 @@
 //===----------------------------------------------------------------------===//
 // quackapi_post_executor.hpp
 //
-// Scheduling boundary for one scalar-function input chunk. This phase keeps
-// the existing per-chunk worker behavior; the boundary allows the following
-// executor change without altering POST registration or provider code.
+// Database-owned bounded execution for outbound POST requests.
 //===----------------------------------------------------------------------===//
 #pragma once
 
 #include "quackapi_http_fetch.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
-#include <functional>
+#include <atomic>
+#include <memory>
 
 namespace duckdb {
 
-using QuackapiPostOperation = std::function<QuackapiHttpFetchResult(idx_t)>;
+struct QuackapiPostWorkerState {
+	virtual ~QuackapiPostWorkerState() = default;
+};
 
-struct QuackapiPostExecutor {
-	static void Execute(idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &results,
-	                    const QuackapiPostOperation &perform);
+struct QuackapiPostRequest {
+	string url;
+	string body;
+	string content_type;
+	unordered_map<string, string> headers;
+	shared_ptr<std::atomic<bool>> cancelled;
+};
+
+class ClientContext;
+class DatabaseInstance;
+
+class QuackapiPostExecutor : public ObjectCacheEntry {
+public:
+	explicit QuackapiPostExecutor(DatabaseInstance &db);
+	~QuackapiPostExecutor() override;
+	string GetObjectType() override;
+	optional_idx GetEstimatedCacheMemory() const override;
+	static vector<QuackapiHttpFetchResult> Execute(ClientContext &context, vector<QuackapiPostRequest> requests,
+	                                               const vector<bool> &skip);
+	static string ObjectType();
+
+private:
+	class Impl;
+	unique_ptr<Impl> impl;
 };
 
 } // namespace duckdb

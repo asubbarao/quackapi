@@ -3,46 +3,48 @@
 #include "quackapi_post_provider.hpp"
 
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/database.hpp"
 
 namespace duckdb {
 
 namespace {
 
+void ValidatePostConcurrency(ClientContext &, SetScope, Value &value) {
+	if (value.GetValue<int64_t>() < 0) {
+		throw InvalidInputException("quackapi_post_concurrency must be 0 or a positive integer");
+	}
+}
+
 void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
+	auto &context = state.GetContext();
 	const auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 
 	vector<bool> skip(count, false);
-	vector<string> urls(count);
-	vector<string> bodies(count);
-	vector<string> content_types(count);
-	vector<unordered_map<string, string>> headers(count);
+	vector<QuackapiPostRequest> requests(count);
 	for (idx_t i = 0; i < count; i++) {
 		auto url = args.data[0].GetValue(i);
 		if (url.IsNull()) {
 			skip[i] = true;
 			continue;
 		}
-		urls[i] = url.ToString();
+		requests[i].url = url.ToString();
 		auto body = args.data[1].GetValue(i);
-		bodies[i] = body.IsNull() ? string() : body.ToString();
-		content_types[i] = "application/json";
+		requests[i].body = body.IsNull() ? string() : body.ToString();
+		requests[i].content_type = "application/json";
 		if (args.ColumnCount() > 2) {
 			auto content_type = args.data[2].GetValue(i);
 			if (!content_type.IsNull()) {
-				content_types[i] = content_type.ToString();
+				requests[i].content_type = content_type.ToString();
 			}
 		}
 		if (args.ColumnCount() > 3) {
-			headers[i] = QuackapiHttpHeadersFromValue(args.data[3].GetValue(i));
+			requests[i].headers = QuackapiHttpHeadersFromValue(args.data[3].GetValue(i));
 		}
 	}
 
-	vector<QuackapiHttpFetchResult> responses(count);
-	QuackapiPostExecutor::Execute(count, skip, responses, [&](idx_t i) {
-		return QuackapiPostProvider::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
-	});
+	auto responses = QuackapiPostExecutor::Execute(context, std::move(requests), skip);
 
 	for (idx_t i = 0; i < count; i++) {
 		result.SetValue(i, skip[i] ? Value(QuackapiHttpFetchResultType()) : QuackapiHttpFetchResultValue(responses[i]));
@@ -52,6 +54,11 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 } // namespace
 
 void RegisterQuackapiPostFunctions(ExtensionLoader &loader) {
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption("quackapi_post_concurrency",
+	                          "Maximum concurrent outbound quackapi_post requests for this database. "
+	                          "0 uses the database thread count (minimum 1).",
+	                          LogicalType::BIGINT, Value::BIGINT(0), ValidatePostConcurrency, SetScope::GLOBAL);
 	const auto header_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	const auto result_type = QuackapiHttpFetchResultType();
 
