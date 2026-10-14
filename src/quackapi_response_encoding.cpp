@@ -84,6 +84,10 @@ const string &QuackapiResponseWriter::Data() const {
 	return exceeded_limit ? EmptyString() : data;
 }
 
+string QuackapiResponseWriter::TakeData() {
+	return std::move(data);
+}
+
 class QuackapiJsonChunkEncoder::State {
 public:
 	State(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
@@ -139,8 +143,8 @@ public:
 			if (!format.validity.RowIsValid(index)) {
 				throw InternalException("JSON encoder: json_object returned NULL");
 			}
-			auto row = data[index].GetString();
-			if (!writer.Append(row.data(), row.size())) {
+			auto row = data[index];
+			if (!writer.Append(row.GetData(), row.GetSize())) {
 				return;
 			}
 			if (mode == JsonRowMode::NDJSON && !writer.Append("\n")) {

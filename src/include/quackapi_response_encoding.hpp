@@ -25,6 +25,7 @@ public:
 	idx_t BytesWritten() const;
 	bool ExceededLimit() const;
 	const string &Data() const;
+	string TakeData();
 
 private:
 	idx_t max_bytes;
