@@ -1,0 +1,87 @@
+# name: test/sql/quackapi_removed_surface.test
+# description: Removed SQL registrations and parser statements stay absent while routes remain usable
+# group: [sql]
+
+require quackapi
+
+# Verify the live catalog after loading QuackAPI. A stale registration would
+# otherwise remain callable even if its implementation source was deleted.
+query I
+SELECT coalesce(len(list(function_name)), 0) = 0
+FROM duckdb_functions()
+WHERE function_name IN (
+  'quackapi_ack', 'quackapi_dequeue', 'quackapi_enqueue', 'quackapi_nack',
+  'quackapi_renew', 'quackapi_queues',
+  'quackapi_graphql_routes', 'quackapi_graphql_tables',
+  'quackapi_policies', 'quackapi_streams',
+  'quackapi_fetch', 'quackapi_parallel_fetch', 'quackapi_http_pool',
+  'quackapi_http_util_name', 'quackapi_last_write_timeout_sec',
+  'quackapi_telemetry_flush', 'quackapi_telemetry_status',
+  'quackapi_request_ring');
+----
+true
+
+query I
+SELECT coalesce(len(list(name)), 0) = 0
+FROM duckdb_settings()
+WHERE name IN (
+  'quackapi_graphql_allow_all', 'quackapi_http_client',
+  'quackapi_memory_limit', 'quackapi_pg_dsn', 'quackapi_request_ring');
+----
+true
+
+statement error
+CREATE GRAPHQL ROUTE removed_graphql POST '/removed-graphql' FROM items;
+----
+syntax error at or near "GRAPHQL"
+
+statement error
+CREATE QUEUE removed_queue;
+----
+syntax error at or near "QUEUE"
+
+statement error
+CREATE ROW ACCESS POLICY removed_row_policy AS (tenant_id) RETURNS BOOLEAN USING (true);
+----
+syntax error at or near "ROW"
+
+statement error
+CREATE MASKING POLICY removed_masking_policy ON VARCHAR USING ('masked');
+----
+syntax error at or near "MASKING"
+
+statement error
+CREATE STREAM removed_stream GET '/removed-stream' AS SELECT 1;
+----
+syntax error at or near "STREAM"
+
+statement error
+CREATE API FOR TABLE removed_table;
+----
+syntax error at or near "API"
+
+statement error
+CREATE ROUTE removed_arrow GET '/removed-arrow' FORMAT arrow AS SELECT 1;
+----
+FORMAT must be json, ndjson, or csv
+
+statement error
+CREATE ROUTE removed_parquet GET '/removed-parquet' FORMAT parquet AS SELECT 1;
+----
+FORMAT must be json, ndjson, or csv
+
+# The parser still accepts explicit routes and the request adapter still runs.
+query I
+CREATE ROUTE kept_route GET '/kept-route' AS SELECT 7 AS answer;
+----
+Route kept_route: GET /kept-route
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/kept-route');
+----
+200	[{"answer":7}]
+
+query I
+DROP ROUTE kept_route;
+----
+Dropped route kept_route
