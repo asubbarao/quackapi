@@ -4,19 +4,16 @@
 #include "quackapi_request_binding.hpp"
 #include "quackapi_response_encoding.hpp"
 
-#include <condition_variable>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <mutex>
 #include <thread>
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/limits.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
@@ -27,10 +24,10 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/timestamp.hpp"
-#include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -891,436 +888,9 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 } // namespace
 
-enum class QuackapiAccessLogColumn : uint8_t {
-	REQUEST_ID,
-	RECEIVED_AT,
-	METHOD,
-	PATH,
-	ROUTE_NAME,
-	ROUTE_PATH,
-	STATUS,
-	DURATION_MS,
-	SQL_PREPARE_MS,
-	SQL_EXECUTE_MS,
-	ROWS_OUT,
-	BYTES_IN,
-	BYTES_OUT,
-	CLIENT_IP,
-	USER_AGENT,
-	HTTP_VERSION,
-	ERROR_TYPE,
-	ERROR_MESSAGE,
-	TRACE_ID,
-	SPAN_ID,
-	PARENT_SPAN_ID,
-	SAMPLED,
-	HEADERS,
-	QUERY,
-};
-
-static constexpr const char *QUACKAPI_ACCESS_LOG_COLUMNS[] = {
-    "request_id", "received_at", "method",         "path",           "route_name", "route_path",
-    "status",     "duration_ms", "sql_prepare_ms", "sql_execute_ms", "rows_out",   "bytes_in",
-    "bytes_out",  "client_ip",   "user_agent",     "http_version",   "error_type", "error_message",
-    "trace_id",   "span_id",     "parent_span_id", "sampled",        "headers",    "query"};
-
-static std::mutex quackapi_access_log_flush_mutex;
-
-Value QuackapiRequestHeadersValue(const QuackapiRequestRecord &entry) {
-	if (!entry.headers_logged) {
-		return Value();
-	}
-	vector<Value> keys;
-	vector<Value> values;
-	keys.reserve(entry.headers.size());
-	values.reserve(entry.headers.size());
-	for (auto &header : entry.headers) {
-		keys.emplace_back(header.first);
-		values.emplace_back(header.second);
-	}
-	return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(keys), std::move(values));
-}
-
-Value QuackapiRequestQueryValue(const QuackapiRequestRecord &entry) {
-	return entry.query_logged ? Value(entry.query) : Value();
-}
-
-static Value AccessLogValue(const QuackapiRequestRecord &entry, QuackapiAccessLogColumn column) {
-	switch (column) {
-	case QuackapiAccessLogColumn::REQUEST_ID:
-		return Value(entry.request_id);
-	case QuackapiAccessLogColumn::RECEIVED_AT:
-		return Value::TIMESTAMP(timestamp_t(entry.received_at_micros));
-	case QuackapiAccessLogColumn::METHOD:
-		return Value(entry.method);
-	case QuackapiAccessLogColumn::PATH:
-		return Value(entry.path);
-	case QuackapiAccessLogColumn::ROUTE_NAME:
-		return entry.route_name.empty() ? Value() : Value(entry.route_name);
-	case QuackapiAccessLogColumn::ROUTE_PATH:
-		return entry.route_path.empty() ? Value() : Value(entry.route_path);
-	case QuackapiAccessLogColumn::STATUS:
-		return Value::INTEGER(entry.status);
-	case QuackapiAccessLogColumn::DURATION_MS:
-		return Value::DOUBLE(entry.duration_ms);
-	case QuackapiAccessLogColumn::SQL_PREPARE_MS:
-		return entry.sql_prepare_ms < 0 ? Value() : Value::DOUBLE(entry.sql_prepare_ms);
-	case QuackapiAccessLogColumn::SQL_EXECUTE_MS:
-		return entry.sql_execute_ms < 0 ? Value() : Value::DOUBLE(entry.sql_execute_ms);
-	case QuackapiAccessLogColumn::ROWS_OUT:
-		return entry.rows_out < 0 ? Value() : Value::BIGINT(entry.rows_out);
-	case QuackapiAccessLogColumn::BYTES_IN:
-		return Value::BIGINT(entry.bytes_in);
-	case QuackapiAccessLogColumn::BYTES_OUT:
-		return Value::BIGINT(entry.bytes_out);
-	case QuackapiAccessLogColumn::CLIENT_IP:
-		return Value(entry.client_ip);
-	case QuackapiAccessLogColumn::USER_AGENT:
-		return Value(entry.user_agent);
-	case QuackapiAccessLogColumn::HTTP_VERSION:
-		return entry.http_version.empty() ? Value() : Value(entry.http_version);
-	case QuackapiAccessLogColumn::ERROR_TYPE:
-		return entry.error_type.empty() ? Value() : Value(entry.error_type);
-	case QuackapiAccessLogColumn::ERROR_MESSAGE:
-		return entry.error_message.empty() ? Value() : Value(entry.error_message);
-	case QuackapiAccessLogColumn::TRACE_ID:
-		return entry.trace_id.empty() ? Value() : Value(entry.trace_id);
-	case QuackapiAccessLogColumn::SPAN_ID:
-		return entry.span_id.empty() ? Value() : Value(entry.span_id);
-	case QuackapiAccessLogColumn::PARENT_SPAN_ID:
-		return entry.parent_span_id.empty() ? Value() : Value(entry.parent_span_id);
-	case QuackapiAccessLogColumn::SAMPLED:
-		return Value::BOOLEAN(entry.sampled);
-	case QuackapiAccessLogColumn::HEADERS:
-		return QuackapiRequestHeadersValue(entry);
-	case QuackapiAccessLogColumn::QUERY:
-		return QuackapiRequestQueryValue(entry);
-	}
-	throw InternalException("unknown quackapi access-log column");
-}
-
-static vector<string> SplitAccessLogTable(const string &table) {
-	vector<string> parts = StringUtil::Split(table, '.');
-	for (auto &part : parts) {
-		StringUtil::Trim(part);
-	}
-	if (parts.empty() || parts.size() > 3) {
-		throw InvalidInputException("access_log table must be a table, schema.table, or database.schema.table");
-	}
-	for (auto &part : parts) {
-		if (part.empty()) {
-			throw InvalidInputException("access_log table name contains an empty identifier");
-		}
-	}
-	return parts;
-}
-
-static unique_ptr<TableDescription> AccessLogTableInfo(Connection &con, const vector<string> &parts) {
-	if (parts.size() == 1) {
-		return con.TableInfo(parts[0]);
-	}
-	if (parts.size() == 2) {
-		return con.TableInfo(parts[0], parts[1]);
-	}
-	return con.TableInfo(parts[0], parts[1], parts[2]);
-}
-
-static unique_ptr<Appender> AccessLogAppender(Connection &con, const vector<string> &parts) {
-	if (parts.size() == 1) {
-		return make_uniq<Appender>(con, parts[0]);
-	}
-	if (parts.size() == 2) {
-		return make_uniq<Appender>(con, parts[0], parts[1]);
-	}
-	return make_uniq<Appender>(con, parts[0], parts[1], parts[2]);
-}
-
 static constexpr const char *QUACKAPI_STATIC_LOG_MARKER = "X-Quackapi-Static-Access-Log";
 static constexpr const char *QUACKAPI_STATIC_LOG_STARTED = "X-Quackapi-Static-Started";
 static constexpr const char *QUACKAPI_STATIC_LOG_RECEIVED = "X-Quackapi-Static-Received";
-static constexpr idx_t QUACKAPI_ACCESS_LOG_QUEUE_CAPACITY = 10000;
-
-static int64_t TelemetryExportAgeMs(const std::chrono::steady_clock::time_point &last_export, bool has_export) {
-	if (!has_export) {
-		return -1;
-	}
-	auto age = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_export);
-	return age.count() < 0 ? 0 : age.count();
-}
-
-class QuackapiStderrTelemetrySink final : public QuackapiTelemetrySink {
-public:
-	void Enqueue(const QuackapiRequestRecord &entry) override {
-		// Keep the existing line writer synchronous so stderr retains its current ordering.
-		EmitAccessLogStderr(entry);
-		// Atomics, not a mutex: this runs on every request and must not serialize workers.
-		exported_total.fetch_add(1, std::memory_order_relaxed);
-		last_export_ticks.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
-	}
-
-	void FlushPending() override {
-	}
-
-	void Flush() override {
-	}
-
-	QuackapiTelemetryStatus Status() const override {
-		QuackapiTelemetryStatus result;
-		result.sink = "stderr";
-		result.exported_total = exported_total.load(std::memory_order_relaxed);
-		auto ticks = last_export_ticks.load(std::memory_order_relaxed);
-		result.last_export_age_ms = TelemetryExportAgeMs(
-		    std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(ticks)), ticks != NO_EXPORT);
-		return result;
-	}
-
-private:
-	static constexpr int64_t NO_EXPORT = NumericLimits<int64_t>::Minimum();
-	std::atomic<idx_t> exported_total {0};
-	std::atomic<int64_t> last_export_ticks {NO_EXPORT};
-};
-
-class QuackapiTableTelemetrySink final : public QuackapiTelemetrySink {
-public:
-	QuackapiTableTelemetrySink(DatabaseInstance &db, string table_p)
-	    : db_ptr(db.shared_from_this()), table(std::move(table_p)) {
-		worker = std::thread(&QuackapiTableTelemetrySink::Run, this);
-	}
-
-	~QuackapiTableTelemetrySink() override {
-		Flush();
-	}
-
-	void Enqueue(const QuackapiRequestRecord &entry) override {
-		bool fallback;
-		bool overflow = false;
-		bool warn_overflow = false;
-		idx_t overflow_count_snapshot = 0;
-		{
-			std::lock_guard<std::mutex> lock(mutex);
-			fallback = failed && std::chrono::steady_clock::now() < retry_at;
-			if (!fallback) {
-				if (pending.size() >= QUACKAPI_ACCESS_LOG_QUEUE_CAPACITY) {
-					overflow = true;
-					overflow_count_snapshot = ++overflow_count;
-					if (!overflow_warning_emitted) {
-						overflow_warning_emitted = true;
-						warn_overflow = true;
-					}
-				} else {
-					pending.push_back(entry);
-					if (pending.size() >= 100) {
-						condition.notify_one();
-					}
-				}
-			}
-		}
-		if (overflow) {
-			if (warn_overflow) {
-				fprintf(stderr,
-				        "quackapi: access_log table \"%s\" queue full; falling back to stderr "
-				        "(overflow_count=%llu)\n",
-				        table.c_str(), (unsigned long long)overflow_count_snapshot);
-			}
-			EmitAccessLogStderr(entry);
-		} else if (fallback) {
-			EmitAccessLogStderr(entry);
-		}
-	}
-
-	void FlushPending() override {
-		std::unique_lock<std::mutex> lock(mutex);
-		if (!worker.joinable() || stopping || (pending.empty() && !flushing)) {
-			return;
-		}
-		flush_requested = true;
-		condition.notify_one();
-		condition.wait(lock, [&] { return !flush_requested && !flushing; });
-	}
-
-	void Flush() override {
-		Shutdown();
-	}
-
-	QuackapiTelemetryStatus Status() const override {
-		std::lock_guard<std::mutex> lock(mutex);
-		QuackapiTelemetryStatus result;
-		result.sink = "table";
-		result.target = table;
-		result.queued = pending.size();
-		result.exported_total = exported_total;
-		result.dropped_total = overflow_count;
-		result.last_error = last_error;
-		result.last_export_age_ms = TelemetryExportAgeMs(last_export, has_export);
-		return result;
-	}
-
-private:
-	void Shutdown() {
-		if (!worker.joinable()) {
-			return;
-		}
-		{
-			std::lock_guard<std::mutex> lock(mutex);
-			stopping = true;
-		}
-		condition.notify_one();
-		worker.join();
-	}
-
-	void FlushBatch(const vector<QuackapiRequestRecord> &batch) {
-		if (table_parts.empty()) {
-			table_parts = SplitAccessLogTable(table);
-		}
-		std::lock_guard<std::mutex> write_lock(quackapi_access_log_flush_mutex);
-		auto db = db_ptr.lock();
-		if (!db) {
-			throw InvalidInputException("database is shutting down");
-		}
-		Connection con(*db);
-		auto info = AccessLogTableInfo(con, table_parts);
-		if (!info) {
-			throw CatalogException("access_log table \"%s\" does not exist", table);
-		}
-		auto appender = AccessLogAppender(con, table_parts);
-		appender->ClearColumns();
-
-		vector<QuackapiAccessLogColumn> selected;
-		for (idx_t i = 0; i < sizeof(QUACKAPI_ACCESS_LOG_COLUMNS) / sizeof(QUACKAPI_ACCESS_LOG_COLUMNS[0]); i++) {
-			for (auto &column : info->columns) {
-				if (!column.Generated() && StringUtil::CIEquals(column.Name(), QUACKAPI_ACCESS_LOG_COLUMNS[i])) {
-					appender->AddColumn(column.Name());
-					selected.push_back(static_cast<QuackapiAccessLogColumn>(i));
-					break;
-				}
-			}
-		}
-		if (selected.empty()) {
-			throw InvalidInputException("access_log table has no recognized request columns");
-		}
-		for (auto &entry : batch) {
-			appender->BeginRow();
-			for (auto column : selected) {
-				appender->Append(AccessLogValue(entry, column));
-			}
-			appender->EndRow();
-		}
-		appender->Flush();
-	}
-
-	void MarkExported(idx_t count) {
-		std::lock_guard<std::mutex> lock(mutex);
-		exported_total += count;
-		last_export = std::chrono::steady_clock::now();
-		has_export = true;
-	}
-
-	void MarkFailed(const string &reason) {
-		std::lock_guard<std::mutex> lock(mutex);
-		last_error = reason;
-		if (!failed) {
-			failed = true;
-			fprintf(stderr,
-			        "quackapi: access_log table \"%s\" failed; falling back to stderr "
-			        "(overflow_count=%llu): %s\n",
-			        table.c_str(), (unsigned long long)overflow_count, reason.c_str());
-		}
-		retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(retry_delay_seconds);
-		retry_delay_seconds = std::min<int64_t>(retry_delay_seconds * 2, 60);
-	}
-
-	void MarkRecovered() {
-		std::lock_guard<std::mutex> lock(mutex);
-		if (!failed) {
-			return;
-		}
-		failed = false;
-		retry_delay_seconds = 1;
-		fprintf(stderr, "quackapi: access_log table \"%s\" recovered; resuming table logging\n", table.c_str());
-	}
-
-	void Run() {
-		try {
-			table_parts = SplitAccessLogTable(table);
-		} catch (std::exception &ex) {
-			MarkFailed(ex.what());
-		}
-		for (;;) {
-			vector<QuackapiRequestRecord> batch;
-			{
-				std::unique_lock<std::mutex> lock(mutex);
-				condition.wait_for(lock, std::chrono::seconds(1),
-				                   [&] { return stopping || flush_requested || pending.size() >= 100; });
-				batch.assign(std::make_move_iterator(pending.begin()), std::make_move_iterator(pending.end()));
-				pending.clear();
-				if (batch.empty() && flush_requested) {
-					flush_requested = false;
-					condition.notify_all();
-				}
-				if (batch.empty() && stopping) {
-					break;
-				}
-				if (!batch.empty()) {
-					flushing = true;
-				}
-			}
-			if (batch.empty()) {
-				continue;
-			}
-			bool use_stderr;
-			{
-				std::lock_guard<std::mutex> lock(mutex);
-				use_stderr = failed && std::chrono::steady_clock::now() < retry_at;
-			}
-			if (!use_stderr) {
-				try {
-					FlushBatch(batch);
-					MarkExported(batch.size());
-					MarkRecovered();
-				} catch (std::exception &ex) {
-					MarkFailed(ex.what());
-					use_stderr = true;
-				} catch (...) {
-					MarkFailed("unknown append error");
-					use_stderr = true;
-				}
-			}
-			if (use_stderr) {
-				for (auto &entry : batch) {
-					EmitAccessLogStderr(entry);
-				}
-			}
-			{
-				std::lock_guard<std::mutex> lock(mutex);
-				flushing = false;
-				if (flush_requested && pending.empty()) {
-					flush_requested = false;
-				}
-				condition.notify_all();
-			}
-		}
-	}
-
-	weak_ptr<DatabaseInstance> db_ptr;
-	string table;
-	vector<string> table_parts;
-	mutable std::mutex mutex;
-	std::condition_variable condition;
-	vector<QuackapiRequestRecord> pending;
-	std::thread worker;
-	bool stopping = false;
-	bool flush_requested = false;
-	bool flushing = false;
-	bool failed = false;
-	std::chrono::steady_clock::time_point retry_at;
-	int64_t retry_delay_seconds = 1;
-	idx_t overflow_count = 0;
-	idx_t exported_total = 0;
-	string last_error;
-	std::chrono::steady_clock::time_point last_export;
-	bool has_export = false;
-	bool overflow_warning_emitted = false;
-};
 
 string SanitizeClientRequestId(const string &s);
 static void MakeTraceContext(const string &traceparent, string &trace_id, string &span_id, string &parent_span_id,
@@ -1338,12 +908,10 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
     : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins), options(opts),
       started_at(std::chrono::steady_clock::now()), compression(opts.compression),
       compression_min_bytes(opts.compression_min_bytes) {
-	if (options.access_log) {
-		if (options.access_log_table.empty()) {
-			telemetry_sinks.push_back(make_uniq<QuackapiStderrTelemetrySink>());
-		} else {
-			telemetry_sinks.push_back(make_uniq<QuackapiTableTelemetrySink>(db, options.access_log_table));
-		}
+	// JSON is a runtime dependency for typed request bodies and validation. Load
+	// an available copy once the database is initialized; never install it here.
+	if (!db.ExtensionIsLoaded("json") && !ExtensionHelper::TryAutoLoadAvailableExtension(db, "json")) {
+		throw IOException("QuackAPI requires the DuckDB JSON extension; load json before serving requests");
 	}
 	// In-process only (quackapi_request): no TCP server object, no bind.
 	if (!bind_and_listen) {
@@ -1352,9 +920,6 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	}
 
 	server = make_uniq<QuackapiHttplibServer>();
-	if (options.request_ring > 0) {
-		request_ring = make_uniq<QuackapiRequestRing>(static_cast<size_t>(options.request_ring));
-	}
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
 	// requests before route handlers, so API routes always win over files.
@@ -1760,12 +1325,10 @@ static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &re
 }
 
 void QuackapiHttpServer::EmitAccessLog(const QuackapiRequestRecord &entry) {
-	if (request_ring) {
-		request_ring->Push(entry);
-	}
 	if (!options.access_log) {
 		return;
 	}
+	LogLevel level;
 	bool emit = false;
 	switch (options.log_level) {
 	case QuackapiLogLevel::DEBUG_LEVEL:
@@ -1784,53 +1347,19 @@ void QuackapiHttpServer::EmitAccessLog(const QuackapiRequestRecord &entry) {
 	if (!emit) {
 		return;
 	}
-	for (auto &sink : telemetry_sinks) {
-		sink->Enqueue(entry);
+	if (entry.status >= 500) {
+		level = LogLevel::LOG_ERROR;
+	} else if (entry.status >= 400 || entry.duration_ms >= static_cast<double>(options.slow_request_ms)) {
+		level = LogLevel::LOG_WARNING;
+	} else if (options.log_level == QuackapiLogLevel::DEBUG_LEVEL) {
+		level = LogLevel::LOG_DEBUG;
+	} else {
+		level = LogLevel::LOG_INFO;
 	}
-}
-
-std::vector<QuackapiRequestRecord> QuackapiHttpServer::SnapshotRequests() const {
-	return request_ring ? request_ring->Snapshot() : std::vector<QuackapiRequestRecord>();
-}
-
-std::vector<QuackapiTelemetryStatus> QuackapiHttpServer::SnapshotTelemetryStatus() const {
-	std::vector<QuackapiTelemetryStatus> result;
-	result.reserve(telemetry_sinks.size());
-	for (auto &sink : telemetry_sinks) {
-		result.push_back(sink->Status());
+	auto db = db_ptr.lock();
+	if (db) {
+		EmitQuackapiAccessLog(*db, entry, level);
 	}
-	return result;
-}
-
-void QuackapiHttpServer::FlushTelemetryPending() {
-	for (auto &sink : telemetry_sinks) {
-		sink->FlushPending();
-	}
-}
-
-idx_t QuackapiHttpServer::AccessLogOverflowCount() const {
-	idx_t result = 0;
-	for (auto &status : SnapshotTelemetryStatus()) {
-		result += status.dropped_total;
-	}
-	return result;
-}
-
-static string TelemetryHealthJson(const std::vector<QuackapiTelemetryStatus> &statuses) {
-	string result = "[";
-	for (idx_t i = 0; i < statuses.size(); i++) {
-		if (i > 0) {
-			result += ",";
-		}
-		const auto &status = statuses[i];
-		result += StringUtil::Format("{\"sink\":\"%s\",\"queued\":%llu,\"exported_total\":%llu,"
-		                             "\"dropped_total\":%llu,\"last_error\":\"%s\"}",
-		                             QuackapiJsonEscape(status.sink), (unsigned long long)status.queued,
-		                             (unsigned long long)status.exported_total,
-		                             (unsigned long long)status.dropped_total, QuackapiJsonEscape(status.last_error));
-	}
-	result += "]";
-	return result;
 }
 
 void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
@@ -2113,18 +1642,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 			auto uptime_sec =
 			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at).count();
-			auto telemetry_status = SnapshotTelemetryStatus();
-			auto access_log_overflow_count = AccessLogOverflowCount();
 			if (ready) {
 				SetJson(
 				    res, 200,
 				    StringUtil::Format(
 				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
-				        "\"request_id_source\":\"%s\",\"access_log_overflow_count\":%llu,"
-				        "\"telemetry\":%s}",
+				        "\"request_id_source\":\"%s\"}",
 				        QuackapiJsonEscape(version), (long long)uptime_sec,
-				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
-				        (unsigned long long)access_log_overflow_count, TelemetryHealthJson(telemetry_status)));
+				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source)));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
 			}
@@ -3176,9 +2701,6 @@ void QuackapiHttpServer::Close() {
 QuackapiHttpServer::~QuackapiHttpServer() {
 	try {
 		Close();
-		for (auto &sink : telemetry_sinks) {
-			sink->Flush();
-		}
 	} catch (std::exception &) {
 	}
 }

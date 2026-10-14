@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -21,7 +20,6 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
-class Value;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
@@ -60,18 +58,12 @@ struct QuackapiServeOptions {
 	QuackapiLogLevel log_level = QuackapiLogLevel::INFO;
 	//! Requests at or above this duration are included at WARN level.
 	int64_t slow_request_ms = 1000;
-	//! Emit one structured access-log line per request (stderr, JSON). Default true.
+	//! Emit one structured request event through DuckDB's native logger. Default true.
 	bool access_log = true;
-	//! When non-empty, append access-log rows to this operator-created table instead
-	//! of stderr. The writer falls back to stderr if the table cannot be used.
-	string access_log_table;
-	//! Header names permitted in the access-log map; empty avoids retaining headers.
+	//! Header names permitted in the structured access log; empty omits headers.
 	string log_headers;
 	//! Preserve the raw query string in the access log after key-based redaction.
 	bool log_query = false;
-	//! Number of completed TCP requests retained for quackapi_requests().
-	//! Zero disables the ring and its allocation.
-	int64_t request_ring = 10000;
 
 	// --- Batteries: health routes (ON by default) ---
 	//! Auto-register GET /health + GET /healthz. Default true.
@@ -105,7 +97,7 @@ struct QuackapiServeOptions {
 	idx_t compression_min_bytes = 1024;
 };
 
-//! One completed request, shared by the stderr and table access-log sinks.
+//! One completed request, emitted through DuckDB's native logger.
 struct QuackapiRequestRecord {
 	string request_id;
 	int64_t received_at_micros;
@@ -133,70 +125,6 @@ struct QuackapiRequestRecord {
 	unordered_map<string, string> headers;
 	bool query_logged = false;
 	string query;
-};
-
-struct QuackapiTelemetryStatus {
-	string sink;
-	string target;
-	idx_t queued = 0;
-	idx_t exported_total = 0;
-	idx_t dropped_total = 0;
-	string last_error;
-	int64_t last_export_age_ms = -1;
-};
-
-class QuackapiTelemetrySink {
-public:
-	virtual ~QuackapiTelemetrySink() = default;
-
-	virtual void Enqueue(const QuackapiRequestRecord &record) = 0;
-	virtual void FlushPending() = 0;
-	virtual void Flush() = 0;
-	virtual QuackapiTelemetryStatus Status() const = 0;
-};
-
-//! Convert the opt-in request fields to the access-log MAP/VARCHAR values.
-Value QuackapiRequestHeadersValue(const QuackapiRequestRecord &entry);
-Value QuackapiRequestQueryValue(const QuackapiRequestRecord &entry);
-
-//! Fixed storage keeps request recording bounded while the mutex makes snapshots
-//! safe without holding the request path behind a reader's work.
-class QuackapiRequestRing {
-public:
-	explicit QuackapiRequestRing(size_t capacity) : records(capacity) {
-	}
-
-	void Push(const QuackapiRequestRecord &record) {
-		std::lock_guard<std::mutex> lock(mutex);
-		if (records.empty()) {
-			return;
-		}
-		records[head] = record;
-		head = (head + 1) % records.size();
-		if (count < records.size()) {
-			count++;
-		}
-	}
-
-	std::vector<QuackapiRequestRecord> Snapshot() const {
-		std::lock_guard<std::mutex> lock(mutex);
-		std::vector<QuackapiRequestRecord> result;
-		result.reserve(count);
-		if (records.empty()) {
-			return result;
-		}
-		const auto first = count == records.size() ? head : 0;
-		for (size_t i = 0; i < count; i++) {
-			result.push_back(records[(first + i) % records.size()]);
-		}
-		return result;
-	}
-
-private:
-	std::vector<QuackapiRequestRecord> records;
-	mutable std::mutex mutex;
-	size_t head = 0;
-	size_t count = 0;
 };
 
 //! Parse log_level named param / setting. Accepts silent|error|warn|info|debug
@@ -247,14 +175,6 @@ public:
 	const QuackapiServeOptions &Options() const {
 		return options;
 	}
-	//! Copy the retained records oldest-first while holding only the ring lock.
-	std::vector<QuackapiRequestRecord> SnapshotRequests() const;
-	//! Keep per-sink counters queryable without exposing sink ownership to the registry.
-	std::vector<QuackapiTelemetryStatus> SnapshotTelemetryStatus() const;
-	//! Flush queued telemetry without stopping the server.
-	void FlushTelemetryPending();
-	//! Compatibility counter used by /healthz.
-	idx_t AccessLogOverflowCount() const;
 	//! True while the TCP listener thread is alive (false after StopAccepting).
 	bool IsRunning() const {
 		return is_running.load();
@@ -283,8 +203,6 @@ private:
 	unique_ptr<duckdb_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
-	unique_ptr<QuackapiRequestRing> request_ring;
-	std::vector<unique_ptr<QuackapiTelemetrySink>> telemetry_sinks;
 };
 
 //! In-process HTTP-shape invoke (no TCP). Builds a Request, runs Dispatch, returns
