@@ -484,7 +484,114 @@ int main(int argc, char **argv) {
 		Check(redirect->GetValue(0, 0).GetValue<int>() == 200 && redirect->GetValue(1, 0).ToString() == "redirect" &&
 		          redirect_received.load() == 1 && received.load() == 127,
 		      "HTTP 307 POST redirect did not reach its target exactly once");
-		std::cout << "POST HTTP integration passed: 127 requests, auto peak=" << peak.load() << '\n';
+
+		// The table overload must not reintroduce the old 32-request cap.
+		Run(connection, "SET threads = 4");
+		Run(connection, "SET quackapi_post_concurrency = 40");
+		peak.store(0);
+		auto table_wide = Run(connection, "SELECT i, response.status, response.body FROM quackapi_post((SELECT i, " +
+		                                      SqlQuote(slow_url) +
+		                                      " AS url, 'wide' AS body FROM range(40) t(i))) ORDER BY i");
+		Check(table_wide->RowCount() == 40, "table POST dropped an input row");
+		for (idx_t i = 0; i < 40; i++) {
+			Check(table_wide->GetValue(0, i).GetValue<int64_t>() == static_cast<int64_t>(i) &&
+			          table_wide->GetValue(1, i).GetValue<int>() == 200 &&
+			          table_wide->GetValue(2, i).ToString() == "wide",
+			      "table POST crossed or lost rows above concurrency 32");
+		}
+		Check(peak.load() > 32 && peak.load() <= 40 && received.load() == 167,
+		      "table POST ignored its configured concurrency above 32");
+
+		// Separate table callers share the database's limit, while a second
+		// DuckDB instance has its own limit even with the same HTTP provider.
+		Run(connection, "SET quackapi_post_concurrency = 2");
+		peak.store(0);
+		std::atomic<int> table_ready {0};
+		std::atomic<bool> table_go {false};
+		std::atomic<int> table_passed {0};
+		auto table_caller = [&]() {
+			Connection caller(database);
+			table_ready.fetch_add(1);
+			while (!table_go.load()) {
+				std::this_thread::yield();
+			}
+			auto result = caller.Query("SELECT count(i) FROM quackapi_post((SELECT i, " + SqlQuote(slow_url) +
+			                           " AS url, 'wide' AS body FROM range(3) t(i))) WHERE response.status = 200");
+			if (!result->HasError() && result->GetValue(0, 0).GetValue<int64_t>() == 3) {
+				table_passed.fetch_add(1);
+			}
+		};
+		std::thread table_first(table_caller);
+		std::thread table_second(table_caller);
+		while (table_ready.load() != 2) {
+			std::this_thread::yield();
+		}
+		table_go.store(true);
+		table_first.join();
+		table_second.join();
+		Check(table_passed.load() == 2 && peak.load() > 1 && peak.load() <= 2 && received.load() == 173,
+		      "table POST callers did not share the database-wide limit");
+
+		Run(connection, "SET quackapi_post_concurrency = 1");
+		Run(other_setup, "SET quackapi_post_concurrency = 1");
+		peak.store(0);
+		std::atomic<int> table_independent_ready {0};
+		std::atomic<bool> table_independent_go {false};
+		std::atomic<int> table_independent_passed {0};
+		auto table_database_call = [&](DuckDB &target) {
+			Connection caller(target);
+			table_independent_ready.fetch_add(1);
+			while (!table_independent_go.load()) {
+				std::this_thread::yield();
+			}
+			auto result = caller.Query("SELECT response.status FROM quackapi_post((SELECT " + SqlQuote(slow_url) +
+			                           " AS url, 'wide' AS body))");
+			if (!result->HasError() && result->GetValue(0, 0).GetValue<int>() == 200) {
+				table_independent_passed.fetch_add(1);
+			}
+		};
+		std::thread table_db_first([&]() { table_database_call(database); });
+		std::thread table_db_second([&]() { table_database_call(other_database); });
+		while (table_independent_ready.load() != 2) {
+			std::this_thread::yield();
+		}
+		table_independent_go.store(true);
+		table_db_first.join();
+		table_db_second.join();
+		Check(table_independent_passed.load() == 2 && peak.load() == 2 && received.load() == 175,
+		      "independent databases shared the table POST concurrency limit");
+
+		// Interrupt an in-flight table batch before it can admit the next row.
+		Connection table_interrupted(database);
+		std::atomic<bool> table_cancelled {false};
+		std::thread table_call([&]() {
+			auto result = table_interrupted.Query("SELECT count(i) FROM quackapi_post((SELECT i, " +
+			                                      SqlQuote(slow_url) +
+			                                      " AS url, 'wide' AS body FROM range(33) t(i)))");
+			table_cancelled.store(result->HasError());
+		});
+		const auto table_started_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (active.load() == 0 && std::chrono::steady_clock::now() < table_started_by) {
+			std::this_thread::yield();
+		}
+		if (active.load() == 0) {
+			table_interrupted.Interrupt();
+			table_call.join();
+			Check(false, "table POST never reached the slow HTTP fixture");
+		}
+		const auto table_cancel_at = std::chrono::steady_clock::now();
+		table_interrupted.Interrupt();
+		table_call.join();
+		const auto table_cancel_elapsed = std::chrono::steady_clock::now() - table_cancel_at;
+		const auto table_drained_by = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (active.load() != 0 && std::chrono::steady_clock::now() < table_drained_by) {
+			std::this_thread::yield();
+		}
+		Check(active.load() == 0 && table_cancelled.load() &&
+		          table_cancel_elapsed < std::chrono::milliseconds(600) &&
+		          received.load() == 176,
+		      "interrupted table POST did not cancel promptly or admitted another row");
+		std::cout << "POST HTTP integration passed: 176 requests including table batches\n";
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
