@@ -104,8 +104,22 @@ int main(int argc, char **argv) {
 		      "test core must be DuckDB 069cc9f9 v1.5.6");
 		Run(connection, "LOAD " + SqlQuote(argv[3]));
 		CheckExtension(connection, "curl_httpfs", argv[4]);
+		const std::string core_settings = "SELECT current_setting('threads')::VARCHAR || '|' || "
+		                                  "current_setting('memory_limit')::VARCHAR || '|' || "
+		                                  "current_setting('preserve_insertion_order')::VARCHAR || '|' || "
+		                                  "current_setting('autoinstall_known_extensions')::VARCHAR || '|' || "
+		                                  "current_setting('autoload_known_extensions')::VARCHAR";
+		const std::string installed_extensions =
+		    "SELECT string_agg(extension_name, ',' ORDER BY extension_name) "
+		    "FROM duckdb_extensions() WHERE installed AND extension_name != 'quackapi'";
+		const auto settings_before = Run(connection, core_settings)->GetValue(0, 0).ToString();
+		const auto extensions_before = Run(connection, installed_extensions)->GetValue(0, 0).ToString();
 		Run(connection, "LOAD " + SqlQuote(argv[1]));
 		CheckExtension(connection, "quackapi", argv[2]);
+		Check(Run(connection, core_settings)->GetValue(0, 0).ToString() == settings_before,
+		      "loading QuackAPI changed unrelated DuckDB settings");
+		Check(Run(connection, installed_extensions)->GetValue(0, 0).ToString() == extensions_before,
+		      "loading QuackAPI installed another extension");
 		const std::string echo_url = "http://127.0.0.1:" + std::to_string(port) + "/echo";
 		const std::string headers_url = "http://127.0.0.1:" + std::to_string(port) + "/headers";
 		const std::string slow_url = "http://127.0.0.1:" + std::to_string(port) + "/slow";

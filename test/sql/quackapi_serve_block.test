@@ -6,6 +6,17 @@ require json
 
 require quackapi
 
+# Serving must leave ordinary DuckDB resource and extension-autoload settings
+# under the application's control.
+statement ok
+SET threads = 3;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+SET autoinstall_known_extensions = false;
+
 # ---------------------------------------------------------------------------
 # Default serve still returns immediately (block defaults false)
 # ---------------------------------------------------------------------------
@@ -33,6 +44,13 @@ query II
 SELECT ready, listen_url FROM quackapi_wait(29452, timeout_ms := 2000, host := '127.0.0.1');
 ----
 true	http://127.0.0.1:29452
+
+query III
+SELECT current_setting('threads'),
+       current_setting('preserve_insertion_order'),
+       current_setting('autoinstall_known_extensions');
+----
+3	false	false
 
 # Dead port → ready=false within timeout (no hang)
 query II
