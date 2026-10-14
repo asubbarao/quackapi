@@ -281,6 +281,26 @@ int main(int argc, char **argv) {
 		Check(queued_failed.load() && queued_elapsed < std::chrono::milliseconds(600),
 		      "queued POST did not cancel promptly");
 		Check(received.load() == 109, "cancelled queued POST reached the server");
+		Run(connection, "CREATE ROUTE post_wait GET '/post-wait' AS SELECT "
+		                "(quackapi_post(" +
+		                    SqlQuote(slow_url) + ", 'queued')).status AS upstream_status");
+		Connection occupied(database);
+		std::thread occupied_call([&]() {
+			auto result = occupied.Query("SELECT (quackapi_post(" + SqlQuote(slow_url) + ", 'wide')).status");
+			first_ok.store(!result->HasError() && result->GetValue(0, 0).GetValue<int>() == 200);
+		});
+		while (active.load() == 0) {
+			std::this_thread::yield();
+		}
+		const auto waiting_at = std::chrono::steady_clock::now();
+		auto waiting = Run(connection, "SELECT status FROM quackapi_request('GET', '/post-wait', "
+		                               "query_timeout_ms := 100)");
+		const auto waiting_elapsed = std::chrono::steady_clock::now() - waiting_at;
+		occupied_call.join();
+		Check(first_ok.load() && waiting->GetValue(0, 0).GetValue<int>() == 504 &&
+		          waiting_elapsed < std::chrono::milliseconds(600),
+		      "queued POST ignored its route deadline");
+		Check(received.load() == 110, "expired queued POST reached the server");
 
 		// The inbound route deadline must bound its outbound POST, even after
 		// the provider has started receiving a slow response.
@@ -341,9 +361,47 @@ int main(int argc, char **argv) {
 		          access_log.find("trace-42") != std::string::npos &&
 		          access_log.find("normal=yes") != std::string::npos,
 		      "native access log did not redact credentials while preserving allowed metadata");
+		Run(connection, "CREATE ROUTE loopback_inner POST '/loopback-inner' AS SELECT 9 AS value");
+		Run(connection, "CREATE ROUTE loopback_outer GET '/loopback-outer' AS SELECT "
+		                "(quackapi_post('http://127.0.0.1:" +
+		                    std::to_string(log_port) + "/loopback-inner', '{}')).status AS upstream_status");
+		auto loopback = Run(connection, "SELECT status, decode(body) FROM quackapi_request('GET', '/loopback-outer', "
+		                                "query_timeout_ms := 1000)");
+		Check(loopback->GetValue(0, 0).GetValue<int>() == 200 &&
+		          loopback->GetValue(1, 0).ToString() == "[{\"upstream_status\":200}]",
+		      "same-database HTTP loopback stalled or returned the wrong row");
 		Run(connection, "SELECT * FROM quackapi_stop(" + std::to_string(log_port) + ")");
 
-		std::cout << "POST HTTP integration passed: 111 requests, wide peak=" << peak.load() << '\n';
+		// The SQL caller has already been interrupted, so database shutdown
+		// should not wait for an unrelated 900ms provider response to drain.
+		auto closing_database = make_uniq<DuckDB>(nullptr, &config);
+		auto closing_connection = make_uniq<Connection>(*closing_database);
+		Run(*closing_connection, "LOAD " + SqlQuote(argv[3]));
+		Run(*closing_connection, "LOAD " + SqlQuote(argv[1]));
+		if (std::string(argv[4]) == "httpfs") {
+			Run(*closing_connection, "SET httpfs_client_implementation = 'curl'");
+		}
+		std::atomic<bool> closing_failed {false};
+		std::thread closing_call([&]() {
+			auto result =
+			    closing_connection->Query("SELECT (quackapi_post(" + SqlQuote(slow_url) + ", 'wide')).status");
+			closing_failed.store(result->HasError());
+		});
+		while (active.load() == 0) {
+			std::this_thread::yield();
+		}
+		closing_connection->Interrupt();
+		closing_call.join();
+		Check(closing_failed.load(), "shutdown probe did not interrupt its caller");
+		closing_connection.reset();
+		const auto closing_at = std::chrono::steady_clock::now();
+		closing_database.reset();
+		const auto closing_elapsed = std::chrono::steady_clock::now() - closing_at;
+		Check(closing_elapsed < std::chrono::milliseconds(600),
+		      "database shutdown waited for an interrupted provider request: elapsed_ms=" +
+		          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(closing_elapsed).count()));
+
+		std::cout << "POST HTTP integration passed: 114 requests, wide peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
