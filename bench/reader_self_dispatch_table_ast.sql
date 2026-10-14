@@ -3,7 +3,9 @@
 SET threads = 4;
 SET memory_limit = '1GB';
 SET preserve_insertion_order = false;
-SET quackapi_post_concurrency = 32;
+-- Defaults to 32; set READER_BENCH_CONCURRENCY=4 for the matched bounded run.
+SET quackapi_post_concurrency = coalesce(
+    try_cast(getenv('READER_BENCH_CONCURRENCY') AS INTEGER), 32);
 LOAD hostfs;
 LOAD json;
 LOAD sitting_duck;
