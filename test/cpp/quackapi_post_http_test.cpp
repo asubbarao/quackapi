@@ -123,8 +123,11 @@ int main(int argc, char **argv) {
 		DuckDB database(nullptr, &config);
 		Connection connection(database);
 		auto version = Run(connection, "PRAGMA version");
-		Check(version->GetValue(0, 0).ToString() == "v1.5.6" && version->GetValue(1, 0).ToString() == "069cc9f9",
-		      "test core must be DuckDB 069cc9f9 v1.5.6");
+		const auto actual_library_version = version->GetValue(0, 0).ToString();
+		const auto actual_source_id = version->GetValue(1, 0).ToString();
+		Check(actual_library_version == "v1.5.6" && actual_source_id == "069cc9f9",
+		      "test core mismatch: actual library_version='" + actual_library_version + "', source_id='" +
+		          actual_source_id + "'; expected v1.5.6 / 069cc9f9");
 		Run(connection, "LOAD " + SqlQuote(argv[3]));
 		CheckExtension(connection, argv[4], argv[5]);
 		if (std::string(argv[4]) == "httpfs") {

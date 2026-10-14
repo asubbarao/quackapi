@@ -67,8 +67,11 @@ int main(int argc, char **argv) {
 		DuckDB database(nullptr, &config);
 		Connection connection(database);
 		auto version = Run(connection, "PRAGMA version");
-		Check(version->GetValue(0, 0).ToString() == "v1.5.6" && version->GetValue(1, 0).ToString() == "069cc9f9",
-		      "wrong DuckDB core for provider replacement");
+		const auto actual_library_version = version->GetValue(0, 0).ToString();
+		const auto actual_source_id = version->GetValue(1, 0).ToString();
+		Check(actual_library_version == "v1.5.6" && actual_source_id == "069cc9f9",
+		      "provider replacement core mismatch: actual library_version='" + actual_library_version +
+		          "', source_id='" + actual_source_id + "'; expected v1.5.6 / 069cc9f9");
 		Run(connection, "LOAD " + Quote(argv[5]));
 		Run(connection, "SET httpfs_client_implementation = 'curl'");
 		Run(connection, "LOAD " + Quote(argv[1]));
