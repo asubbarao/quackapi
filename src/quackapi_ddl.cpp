@@ -4,6 +4,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
@@ -1218,19 +1219,21 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 		{
 			Connection con(*context.db);
 			if (!bind_data.route.body_schema.empty()) {
-				// BODY SCHEMA depends on the community json_schema extension. Load only
-				// an extension the caller has already made available; never install it
-				// from route DDL.
-				auto load = con.Query("LOAD json_schema");
-				if (load->HasError()) {
+				// Load dependencies only when already available locally; route DDL must
+				// never install an extension as a side effect.
+				if (!ExtensionHelper::TryAutoLoadAvailableExtension(*context.db, "json")) {
+					throw InvalidInputException(
+					    "BODY SCHEMA requires the DuckDB JSON extension; load json before creating "
+					    "this route");
+				}
+				if (!ExtensionHelper::TryAutoLoadAvailableExtension(*context.db, "json_schema")) {
 					throw InvalidInputException("BODY SCHEMA requires the json_schema extension to be available and "
-					                            "loadable; load json_schema before creating this route: %s",
-					                            load->GetError());
+					                            "loadable; make it available locally before creating this route");
 				}
 
 				// Catch malformed schema text at CREATE time rather than on the first
 				// request. TRY_CAST returns NULL for invalid JSON without throwing.
-				// The core json extension is loaded when QuackAPI loads.
+				// The core json extension was loaded above without an install fallback.
 				auto schema_json =
 				    con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(bind_data.route.body_schema));
 				if (schema_json->HasError()) {
