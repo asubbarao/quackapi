@@ -146,9 +146,8 @@ ParserExtensionParseResult MiddlewareDdlParse(ParserExtensionInfo *, const strin
 	if (handler_sql.empty()) {
 		return ParserExtensionParseResult("MIDDLEWARE AS requires SQL");
 	}
-	if (handler_sql.size() > QUACKAPI_MIDDLEWARE_MAX_SQL_BYTES) {
-		return ParserExtensionParseResult("MIDDLEWARE SQL exceeds the 16 KiB definition limit");
-	}
+	// The size limit is a setting, so it is checked where a ClientContext exists
+	// (ApplyMiddlewareExec); the parser has none.
 
 	auto data = make_uniq<MiddlewareDdlParseData>();
 	data->action = "CREATE";
@@ -181,6 +180,19 @@ unique_ptr<FunctionData> ApplyMiddlewareBind(ClientContext &, TableFunctionBindI
 	return std::move(bind_data);
 }
 
+//! A positive SET quackapi_middleware_* value, or its default when unset.
+idx_t ReadMiddlewareLimit(ClientContext &context, const string &name, int64_t fallback) {
+	Value setting;
+	int64_t value = fallback;
+	if (context.TryGetCurrentSetting(name, setting) && !setting.IsNull()) {
+		value = setting.GetValue<int64_t>();
+	}
+	if (value <= 0) {
+		throw InvalidInputException("%s must be >= 1", name);
+	}
+	return static_cast<idx_t>(value);
+}
+
 void ApplyMiddlewareExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->CastNoConst<ApplyMiddlewareBindData>();
 	if (bind_data.finished) {
@@ -193,9 +205,12 @@ void ApplyMiddlewareExec(ClientContext &context, TableFunctionInput &data_p, Dat
 		    (!bind_data.middleware.group_name.empty() && !IsMiddlewareName(bind_data.middleware.group_name))) {
 			throw InvalidInputException("Middleware names must use [A-Za-z0-9_-] and be at most 128 bytes");
 		}
-		if (bind_data.middleware.handler_sql.empty() ||
-		    bind_data.middleware.handler_sql.size() > QUACKAPI_MIDDLEWARE_MAX_SQL_BYTES) {
-			throw InvalidInputException("Middleware SQL must be between 1 byte and 16 KiB");
+		const auto max_sql_bytes = ReadMiddlewareLimit(context, "quackapi_middleware_max_sql_bytes",
+		                                               QUACKAPI_DEFAULT_MIDDLEWARE_MAX_SQL_BYTES);
+		if (bind_data.middleware.handler_sql.empty() || bind_data.middleware.handler_sql.size() > max_sql_bytes) {
+			throw InvalidInputException(
+			    "Middleware SQL must be between 1 byte and %llu bytes (SET quackapi_middleware_max_sql_bytes)",
+			    (unsigned long long)max_sql_bytes);
 		}
 		// Compile on CREATE so malformed SQL is never registered. Preparation does
 		// not execute the statement; request values bind later through DuckDB's
@@ -206,7 +221,9 @@ void ApplyMiddlewareExec(ClientContext &context, TableFunctionInput &data_p, Dat
 			throw InvalidInputException("Invalid handler SQL for middleware \"%s\": %s", bind_data.middleware.name,
 			                            prepared->GetError());
 		}
-		registry.Add(bind_data.middleware, bind_data.or_replace);
+		registry.Add(bind_data.middleware, bind_data.or_replace,
+		             ReadMiddlewareLimit(context, "quackapi_middleware_max_definitions",
+		                                 QUACKAPI_DEFAULT_MIDDLEWARE_MAX_DEFINITIONS));
 		message = StringUtil::Format(
 		    "Middleware %s: %s%s", bind_data.middleware.name, QuackapiMiddlewarePhaseName(bind_data.middleware.phase),
 		    bind_data.middleware.group_name.empty() ? "" : " GROUP " + bind_data.middleware.group_name);
@@ -310,9 +327,9 @@ bool IsForbiddenResponseHeader(const string &name) {
 	       lower == "transfer-encoding" || lower == "upgrade";
 }
 
-bool IsSafeResponseHeader(const string &name, const string &value) {
-	if (name.empty() || name.size() > 256 || value.size() > QUACKAPI_MIDDLEWARE_MAX_HEADER_BYTES ||
-	    name.size() + value.size() > QUACKAPI_MIDDLEWARE_MAX_HEADER_BYTES || IsForbiddenResponseHeader(name)) {
+bool IsSafeResponseHeader(const string &name, const string &value, idx_t max_header_bytes) {
+	if (name.empty() || name.size() > 256 || name.size() + value.size() > max_header_bytes ||
+	    IsForbiddenResponseHeader(name)) {
 		return false;
 	}
 	for (auto c : name) {
@@ -386,7 +403,7 @@ QuackapiMiddlewareRegistry &QuackapiMiddlewareRegistry::Get(DatabaseInstance &db
 	return *state;
 }
 
-void QuackapiMiddlewareRegistry::Add(const QuackapiMiddleware &middleware, bool or_replace) {
+void QuackapiMiddlewareRegistry::Add(const QuackapiMiddleware &middleware, bool or_replace, idx_t max_definitions) {
 	std::lock_guard<std::mutex> lock(mutex);
 	for (auto it = middlewares.begin(); it != middlewares.end(); ++it) {
 		if (it->name == middleware.name) {
@@ -400,9 +417,10 @@ void QuackapiMiddlewareRegistry::Add(const QuackapiMiddleware &middleware, bool 
 			return;
 		}
 	}
-	if (middlewares.size() >= QUACKAPI_MIDDLEWARE_MAX_DEFINITIONS) {
-		throw InvalidInputException("Middleware registry limit is %llu definitions",
-		                            (unsigned long long)QUACKAPI_MIDDLEWARE_MAX_DEFINITIONS);
+	if (middlewares.size() >= max_definitions) {
+		throw InvalidInputException(
+		    "Middleware registry limit is %llu definitions (SET quackapi_middleware_max_definitions)",
+		    (unsigned long long)max_definitions);
 	}
 	auto added = middleware;
 	added.registration_order = next_registration_order++;
@@ -562,7 +580,7 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 					contract_checked = true;
 				}
 				for (idx_t row = 0; row < chunk->size(); row++) {
-					if (++row_count > QUACKAPI_MIDDLEWARE_MAX_RESULT_ROWS) {
+					if (++row_count > static_cast<idx_t>(context.max_result_rows)) {
 						SetMiddlewareFailure(context);
 						return false;
 					}
@@ -587,7 +605,7 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 						if (!header_name.IsNull()) {
 							auto name = header_name.ToString();
 							auto value = header_value.ToString();
-							if (!IsSafeResponseHeader(name, value)) {
+							if (!IsSafeResponseHeader(name, value, static_cast<idx_t>(context.max_header_bytes))) {
 								SetMiddlewareFailure(context);
 								return false;
 							}
@@ -602,7 +620,7 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 						}
 						auto body_value =
 						    body.IsNull() ? string("{\"detail\":\"Request rejected by middleware\"}") : body.ToString();
-						if (body_value.size() > QUACKAPI_MIDDLEWARE_MAX_BODY_BYTES) {
+						if (body_value.size() > static_cast<idx_t>(context.max_body_bytes)) {
 							SetMiddlewareFailure(context);
 							return false;
 						}

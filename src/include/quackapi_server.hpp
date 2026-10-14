@@ -11,6 +11,8 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 
+#include "quackapi_middleware.hpp"
+
 namespace duckdb_httplib {
 class Server;
 struct Request;
@@ -23,17 +25,17 @@ class ClientContext;
 class DatabaseInstance;
 class Value;
 
-//! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
-static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
-
-//! Default HTTP worker thread-pool size (httplib TaskQueue).
-static constexpr size_t QUACKAPI_DEFAULT_WORKER_THREADS = 32;
-//! Default keep-alive max requests per connection.
-static constexpr size_t QUACKAPI_DEFAULT_KEEP_ALIVE_MAX = 128;
-//! Default keep-alive idle timeout (seconds).
-static constexpr time_t QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC = 10;
-//! Default socket read/write timeout (seconds).
-static constexpr time_t QUACKAPI_DEFAULT_IO_TIMEOUT_SEC = 30;
+// Defaults of the SET quackapi_* transport settings (each also a serve named parameter).
+//! SET quackapi_max_request_bytes: larger request bodies get 413 (8 MiB).
+static constexpr int64_t QUACKAPI_DEFAULT_MAX_REQUEST_BYTES = 8LL * 1024 * 1024;
+//! SET quackapi_worker_threads: HTTP worker thread-pool size (httplib TaskQueue).
+static constexpr int64_t QUACKAPI_DEFAULT_WORKER_THREADS = 32;
+//! SET quackapi_keep_alive_max_count: requests per keep-alive connection.
+static constexpr int64_t QUACKAPI_DEFAULT_KEEP_ALIVE_MAX = 128;
+//! SET quackapi_keep_alive_timeout_sec: keep-alive idle timeout (seconds).
+static constexpr int64_t QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC = 10;
+//! SET quackapi_read_timeout_sec / quackapi_write_timeout_sec: socket timeout (seconds).
+static constexpr int64_t QUACKAPI_DEFAULT_IO_TIMEOUT_SEC = 30;
 
 //! Access-log / server log verbosity. Default INFO is informative, not silent.
 enum class QuackapiLogLevel : uint8_t {
@@ -103,6 +105,13 @@ struct QuackapiServeOptions {
 	int64_t query_timeout_ms = 30000;
 	int64_t max_response_bytes = 16 * 1024 * 1024;
 	int32_t max_pending_requests = 256;
+	//! Request body cap; larger bodies get 413.
+	int64_t max_request_bytes = QUACKAPI_DEFAULT_MAX_REQUEST_BYTES;
+
+	// --- SQL middleware limits applied per request ---
+	int64_t middleware_max_result_rows = QUACKAPI_DEFAULT_MIDDLEWARE_MAX_RESULT_ROWS;
+	int64_t middleware_max_header_bytes = QUACKAPI_DEFAULT_MIDDLEWARE_MAX_HEADER_BYTES;
+	int64_t middleware_max_body_bytes = QUACKAPI_DEFAULT_MIDDLEWARE_MAX_BODY_BYTES;
 
 	// --- Batteries: DuckDB SETs applied at serve (overridable) ---
 	//! Empty = apply non-clobber memory guard (256MB when still at system default).

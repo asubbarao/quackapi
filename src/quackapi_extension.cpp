@@ -110,11 +110,6 @@ struct ServeBindData : public TableFunctionData {
 	string threads;
 	bool preserve_insertion_order = false;
 	bool enable_http_metadata_cache = true;
-	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
-	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
-	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
-	int32_t read_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
-	int32_t write_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	//! Response compression policy (auto|gzip|zstd|off). Default auto.
 	string compression = "auto";
 	//! Min body size in bytes before compression. Default 1024.
@@ -158,28 +153,56 @@ static string AccessLogValueString(const Value &value) {
 	return value.ToString();
 }
 
+//! A positive limit: the `name` named parameter wins, else SET quackapi_<name>, else fallback.
+static int64_t ReadPositiveLimit(ClientContext &context, TableFunctionBindInput &input, const string &name,
+                                 int64_t fallback, int64_t maximum) {
+	Value setting;
+	int64_t value = fallback;
+	auto named = input.named_parameters.find(name);
+	if (named != input.named_parameters.end()) {
+		if (named->second.IsNull()) {
+			throw InvalidInputException("%s must not be NULL", name);
+		}
+		value = named->second.GetValue<int64_t>();
+	} else if (context.TryGetCurrentSetting("quackapi_" + name, setting) && !setting.IsNull()) {
+		value = setting.GetValue<int64_t>();
+	}
+	if (value <= 0 || value > maximum) {
+		throw InvalidInputException("%s must be between 1 and %lld", name, maximum);
+	}
+	return value;
+}
+
 static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
 	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
-		Value setting;
-		int64_t value = fallback;
-		auto named = input.named_parameters.find(name);
-		if (named != input.named_parameters.end()) {
-			if (named->second.IsNull()) {
-				throw InvalidInputException("%s must not be NULL", name);
-			}
-			value = named->second.GetValue<int64_t>();
-		} else if (context.TryGetCurrentSetting("quackapi_" + name, setting) && !setting.IsNull()) {
-			value = setting.GetValue<int64_t>();
-		}
-		if (value <= 0 || value > maximum) {
-			throw InvalidInputException("%s must be between 1 and %lld", name, maximum);
-		}
-		return value;
+		return ReadPositiveLimit(context, input, name, fallback, maximum);
 	};
 	opts.query_timeout_ms = read("query_timeout_ms", 30000, 86400000);
 	opts.max_response_bytes = read("max_response_bytes", 16 * 1024 * 1024, 1024LL * 1024 * 1024);
 	opts.max_pending_requests = static_cast<int32_t>(read("max_pending_requests", 256, 100000));
 	opts.slow_request_ms = read("slow_request_ms", 1000, 86400000);
+	// Middleware limits are settings only; requests read them from the serve options.
+	opts.middleware_max_result_rows =
+	    read("middleware_max_result_rows", QUACKAPI_DEFAULT_MIDDLEWARE_MAX_RESULT_ROWS, 1000000);
+	opts.middleware_max_header_bytes =
+	    read("middleware_max_header_bytes", QUACKAPI_DEFAULT_MIDDLEWARE_MAX_HEADER_BYTES, 1024LL * 1024);
+	opts.middleware_max_body_bytes =
+	    read("middleware_max_body_bytes", QUACKAPI_DEFAULT_MIDDLEWARE_MAX_BODY_BYTES, 1024LL * 1024 * 1024);
+}
+
+//! httplib transport knobs for quackapi_serve: named parameter wins, else SET quackapi_<name>.
+static void BindServeTransport(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
+	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
+		return ReadPositiveLimit(context, input, name, fallback, maximum);
+	};
+	opts.worker_threads = static_cast<int32_t>(read("worker_threads", QUACKAPI_DEFAULT_WORKER_THREADS, 4096));
+	opts.keep_alive_max_count =
+	    static_cast<int32_t>(read("keep_alive_max_count", QUACKAPI_DEFAULT_KEEP_ALIVE_MAX, 1000000));
+	opts.keep_alive_timeout_sec =
+	    static_cast<int32_t>(read("keep_alive_timeout_sec", QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC, 86400));
+	opts.read_timeout_sec = static_cast<int32_t>(read("read_timeout_sec", QUACKAPI_DEFAULT_IO_TIMEOUT_SEC, 86400));
+	opts.write_timeout_sec = static_cast<int32_t>(read("write_timeout_sec", QUACKAPI_DEFAULT_IO_TIMEOUT_SEC, 86400));
+	opts.max_request_bytes = read("max_request_bytes", QUACKAPI_DEFAULT_MAX_REQUEST_BYTES, 1024LL * 1024 * 1024);
 }
 
 static void BindAccessLogPrivacy(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
@@ -213,6 +236,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<ServeBindData>();
 	BindResourceLimits(context, input, bind_data->limits);
+	BindServeTransport(context, input, bind_data->limits);
 	BindAccessLogPrivacy(context, input, bind_data->limits);
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
@@ -308,26 +332,6 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto http_meta_entry = input.named_parameters.find("enable_http_metadata_cache");
 	if (http_meta_entry != input.named_parameters.end()) {
 		bind_data->enable_http_metadata_cache = http_meta_entry->second.GetValue<bool>();
-	}
-	auto wt_entry = input.named_parameters.find("worker_threads");
-	if (wt_entry != input.named_parameters.end()) {
-		bind_data->worker_threads = wt_entry->second.GetValue<int32_t>();
-	}
-	auto kam_entry = input.named_parameters.find("keep_alive_max_count");
-	if (kam_entry != input.named_parameters.end()) {
-		bind_data->keep_alive_max_count = kam_entry->second.GetValue<int32_t>();
-	}
-	auto kat_entry = input.named_parameters.find("keep_alive_timeout_sec");
-	if (kat_entry != input.named_parameters.end()) {
-		bind_data->keep_alive_timeout_sec = kat_entry->second.GetValue<int32_t>();
-	}
-	auto rt_entry = input.named_parameters.find("read_timeout_sec");
-	if (rt_entry != input.named_parameters.end()) {
-		bind_data->read_timeout_sec = rt_entry->second.GetValue<int32_t>();
-	}
-	auto wrt_entry = input.named_parameters.find("write_timeout_sec");
-	if (wrt_entry != input.named_parameters.end()) {
-		bind_data->write_timeout_sec = wrt_entry->second.GetValue<int32_t>();
 	}
 	// compression named param wins; else SET quackapi_compression (default auto).
 	auto comp_entry = input.named_parameters.find("compression");
@@ -449,11 +453,6 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.threads = bind_data.threads;
 	opts.preserve_insertion_order = bind_data.preserve_insertion_order;
 	opts.enable_http_metadata_cache = bind_data.enable_http_metadata_cache;
-	opts.worker_threads = bind_data.worker_threads;
-	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
-	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
-	opts.read_timeout_sec = bind_data.read_timeout_sec;
-	opts.write_timeout_sec = bind_data.write_timeout_sec;
 	opts.http_client = bind_data.http_client;
 	opts.pg_dsn = bind_data.pg_dsn;
 
@@ -1108,17 +1107,6 @@ static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_
 }
 
 //===--------------------------------------------------------------------===//
-// quackapi_http_util_name() — active outbound HTTPUtil (no curl_httpfs dep)
-//===--------------------------------------------------------------------===//
-// When curl_httpfs is LOADed this is typically "MultiCurl". Same underlying
-// DBConfig::GetHTTPUtil().GetName() that curl_httpfs_http_util_name() reads.
-
-static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	result.Reference(Value(QuackapiHttpFetch::ActiveHttpUtilName(db)));
-}
-
-//===--------------------------------------------------------------------===//
 // quackapi_last_write_timeout_sec() — effective write deadline of last request
 //===--------------------------------------------------------------------===//
 // Reports what HandleRequest / ApplyRouteIoTimeout actually applied — serve
@@ -1215,6 +1203,49 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          Value::BIGINT(256));
 	config.AddExtensionOption("quackapi_graphql_allow_all", "Explicit legacy opt-in to public GraphQL catalog exposure",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	// httplib transport for quackapi_serve; each is overridden by its named parameter.
+	config.AddExtensionOption("quackapi_worker_threads",
+	                          "HTTP worker threads (concurrent request handlers) for quackapi_serve. Default 32. "
+	                          "Overridden by worker_threads named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_WORKER_THREADS));
+	config.AddExtensionOption("quackapi_keep_alive_max_count",
+	                          "Requests served on one keep-alive connection before it is closed. Default 128. "
+	                          "Overridden by keep_alive_max_count named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX));
+	config.AddExtensionOption("quackapi_keep_alive_timeout_sec",
+	                          "Idle seconds before a keep-alive connection is closed. Default 10. Overridden by "
+	                          "keep_alive_timeout_sec named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC));
+	config.AddExtensionOption("quackapi_read_timeout_sec",
+	                          "Socket read timeout in seconds for quackapi_serve. Default 30. Overridden by "
+	                          "read_timeout_sec named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC));
+	config.AddExtensionOption("quackapi_write_timeout_sec",
+	                          "Socket write timeout in seconds for quackapi_serve. Default 30. Overridden by "
+	                          "write_timeout_sec named parameter or a route TIMEOUT.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_IO_TIMEOUT_SEC));
+	config.AddExtensionOption("quackapi_max_request_bytes",
+	                          "Largest request body quackapi_serve accepts; larger bodies get 413. Default 8388608 "
+	                          "(8 MiB). Overridden by max_request_bytes named parameter.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_MAX_REQUEST_BYTES));
+	// SQL middleware limits. Request-time limits are read when the server starts.
+	config.AddExtensionOption("quackapi_middleware_max_sql_bytes",
+	                          "Largest CREATE MIDDLEWARE handler SQL, in bytes. Default 16384.", LogicalType::BIGINT,
+	                          Value::BIGINT(QUACKAPI_DEFAULT_MIDDLEWARE_MAX_SQL_BYTES));
+	config.AddExtensionOption("quackapi_middleware_max_definitions",
+	                          "Most middleware definitions CREATE MIDDLEWARE will register. Default 64.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_MIDDLEWARE_MAX_DEFINITIONS));
+	config.AddExtensionOption("quackapi_middleware_max_result_rows",
+	                          "Most rows one middleware may return before the request fails closed. Default 64.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_MIDDLEWARE_MAX_RESULT_ROWS));
+	config.AddExtensionOption("quackapi_middleware_max_header_bytes",
+	                          "Largest response header (name plus value) a middleware may set, in bytes. Default 8192.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_MIDDLEWARE_MAX_HEADER_BYTES));
+	config.AddExtensionOption("quackapi_middleware_max_body_bytes",
+	                          "Largest response body a blocking middleware may return, in bytes. Default 1048576.",
+	                          LogicalType::BIGINT, Value::BIGINT(QUACKAPI_DEFAULT_MIDDLEWARE_MAX_BODY_BYTES));
+	// quackapi_post: fan-out, idle pool and timeouts (read at call time).
+	RegisterQuackapiHttpClientSettings(config);
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
 	// Also carries compression + compression_min_bytes + http_client.
@@ -1248,6 +1279,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	serve.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
 	serve.named_parameters["max_pending_requests"] = LogicalType::BIGINT;
+	serve.named_parameters["max_request_bytes"] = LogicalType::BIGINT;
 	serve_set.AddFunction(serve);
 	serve.arguments.clear();
 	serve_set.AddFunction(serve);
@@ -1339,18 +1371,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// CREATE STREAM + quackapi_streams() (SSE push; WS deferred on httplib).
 	RegisterQuackapiStreamFunctions(loader);
 
-	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
-	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
-	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
-
 	// Effective write deadline applied to the most recent route request
 	// (ApplyRouteIoTimeout / serve write_timeout_sec). Test/introspection seam.
 	loader.RegisterFunction(
 	    ScalarFunction("quackapi_last_write_timeout_sec", {}, LogicalType::INTEGER, LastWriteTimeoutSecFunction));
 
-	// Outbound HTTP with a connection pool that survives ACROSS requests:
-	// quackapi_fetch / quackapi_post / quackapi_http_pool. See the header of
-	// quackapi_http_fetch.hpp for why the un-pooled path costs ~27ms a call.
+	// quackapi_post: outbound POST with a connection pool that survives ACROSS
+	// requests. See the header of quackapi_http_fetch.hpp for why it is pooled.
 	RegisterQuackapiHttpFetchFunctions(loader);
 
 	// Durable broker-less job queue (CREATE QUEUE + enqueue/dequeue/ack/nack).

@@ -34,6 +34,15 @@ struct QuackapiMiddleware {
 	uint64_t registration_order = 0;
 };
 
+//! Defaults of the SET quackapi_middleware_* settings. SQL size and definition
+//! count are read at CREATE MIDDLEWARE; the per-request limits are read when
+//! the server starts (or by quackapi_request) and travel in the context below.
+constexpr int64_t QUACKAPI_DEFAULT_MIDDLEWARE_MAX_SQL_BYTES = 16 * 1024;
+constexpr int64_t QUACKAPI_DEFAULT_MIDDLEWARE_MAX_DEFINITIONS = 64;
+constexpr int64_t QUACKAPI_DEFAULT_MIDDLEWARE_MAX_RESULT_ROWS = 64;
+constexpr int64_t QUACKAPI_DEFAULT_MIDDLEWARE_MAX_HEADER_BYTES = 8 * 1024;
+constexpr int64_t QUACKAPI_DEFAULT_MIDDLEWARE_MAX_BODY_BYTES = 1024 * 1024;
+
 //! Request/response values exposed to the middleware executor. Server code
 //! populates request fields after routing and authentication, and applies the
 //! mutable response fields if ExecuteQuackapiMiddleware returns false.
@@ -57,6 +66,10 @@ struct QuackapiMiddlewareContext {
 	//! inherits a tighter active deadline when one is already installed.
 	int64_t timeout_ms = 30000;
 	int64_t elapsed_ms = 0;
+	//! SET quackapi_middleware_max_result_rows / _max_header_bytes / _max_body_bytes.
+	int64_t max_result_rows = QUACKAPI_DEFAULT_MIDDLEWARE_MAX_RESULT_ROWS;
+	int64_t max_header_bytes = QUACKAPI_DEFAULT_MIDDLEWARE_MAX_HEADER_BYTES;
+	int64_t max_body_bytes = QUACKAPI_DEFAULT_MIDDLEWARE_MAX_BODY_BYTES;
 	//! Set only for a malformed or failing hook. Its error never reaches HTTP.
 	bool middleware_failed = false;
 };
@@ -79,11 +92,6 @@ struct QuackapiMiddlewareContext {
 //! `header_name` and `header_value` must be present together. Header rows may
 //! be emitted alongside a control row. The server validates this contract and
 //! fails closed on invalid results or execution errors.
-constexpr idx_t QUACKAPI_MIDDLEWARE_MAX_SQL_BYTES = 16 * 1024;
-constexpr idx_t QUACKAPI_MIDDLEWARE_MAX_DEFINITIONS = 64;
-constexpr idx_t QUACKAPI_MIDDLEWARE_MAX_RESULT_ROWS = 64;
-constexpr idx_t QUACKAPI_MIDDLEWARE_MAX_HEADER_BYTES = 8 * 1024;
-constexpr idx_t QUACKAPI_MIDDLEWARE_MAX_BODY_BYTES = 1024 * 1024;
 
 string QuackapiMiddlewarePhaseName(QuackapiMiddlewarePhase phase);
 
@@ -108,7 +116,8 @@ public:
 	static QuackapiMiddlewareRegistry &Get(DatabaseInstance &db);
 
 	//! CREATE [OR REPLACE] MIDDLEWARE. Replacing preserves registration order.
-	void Add(const QuackapiMiddleware &middleware, bool or_replace);
+	//! A new name beyond max_definitions (SET quackapi_middleware_max_definitions) is refused.
+	void Add(const QuackapiMiddleware &middleware, bool or_replace, idx_t max_definitions);
 	//! DROP MIDDLEWARE. Returns false if absent.
 	bool Drop(const string &name);
 	//! Applicable snapshot in deterministic lifecycle order. BEFORE runs global

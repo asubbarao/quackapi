@@ -2280,24 +2280,26 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		                                received_at, -1, -1, -1, trace_id, span_id, parent_span_id, sampled, options));
 	});
 
-	// Transport defaults (overridable via serve opts) — correct-by-default for servers.
+	// Transport knobs: SET quackapi_* or the serve named parameter, validated at bind.
+	// The fallbacks only guard a hand-built QuackapiServeOptions.
 	int32_t workers =
 	    opts.worker_threads > 0 ? opts.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	const auto max_pending = opts.max_pending_requests;
 	server->new_task_queue = [workers, max_pending] {
 		return new duckdb_httplib::ThreadPool(static_cast<size_t>(workers), static_cast<size_t>(max_pending));
 	};
-	server->set_keep_alive_max_count(opts.keep_alive_max_count > 0 ? static_cast<size_t>(opts.keep_alive_max_count)
-	                                                               : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
-	server->set_keep_alive_timeout(opts.keep_alive_timeout_sec > 0 ? static_cast<time_t>(opts.keep_alive_timeout_sec)
-	                                                               : QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
-	server->set_read_timeout(opts.read_timeout_sec > 0 ? static_cast<time_t>(opts.read_timeout_sec)
-	                                                   : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
-	server->set_write_timeout(opts.write_timeout_sec > 0 ? static_cast<time_t>(opts.write_timeout_sec)
-	                                                     : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
+	server->set_keep_alive_max_count(static_cast<size_t>(
+	    opts.keep_alive_max_count > 0 ? opts.keep_alive_max_count : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX));
+	server->set_keep_alive_timeout(static_cast<time_t>(
+	    opts.keep_alive_timeout_sec > 0 ? opts.keep_alive_timeout_sec : QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC));
+	server->set_read_timeout(
+	    static_cast<time_t>(opts.read_timeout_sec > 0 ? opts.read_timeout_sec : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC));
+	server->set_write_timeout(
+	    static_cast<time_t>(opts.write_timeout_sec > 0 ? opts.write_timeout_sec : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC));
 	server->set_tcp_nodelay(true);
 	// Cap request bodies to avoid unbounded memory DoS (httplib default is SIZE_MAX).
-	server->set_payload_max_length(QUACKAPI_PAYLOAD_MAX_LENGTH);
+	server->set_payload_max_length(
+	    static_cast<size_t>(opts.max_request_bytes > 0 ? opts.max_request_bytes : QUACKAPI_DEFAULT_MAX_REQUEST_BYTES));
 
 	auto handler = [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 		HandleRequest(req, res);
@@ -3714,6 +3716,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 			context->timeout_ms = options.query_timeout_ms;
 			context->elapsed_ms = elapsed_ms;
+			context->max_result_rows = options.middleware_max_result_rows;
+			context->max_header_bytes = options.middleware_max_header_bytes;
+			context->max_body_bytes = options.middleware_max_body_bytes;
 			context->headers_json = PairsToJsonObject(req.headers);
 			context->query_json = PairsToJsonObject(req.params);
 			if (!ExecuteQuackapiMiddleware(con, *db, QuackapiMiddlewarePhase::BEFORE, context->group_name, *context,
