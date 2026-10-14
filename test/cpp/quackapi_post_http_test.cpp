@@ -73,10 +73,19 @@ int main(int argc, char **argv) {
 		std::atomic<int> received {0};
 		std::atomic<int> ambiguous_received {0};
 		std::atomic<int> redirect_received {0};
+		std::atomic<int> large_received {0};
 		std::atomic<int> active {0};
 		std::atomic<int> peak {0};
 		std::mutex peer_mutex;
 		std::set<int> reuse_peer_ports;
+		std::string large_json_body = "[{\"payload\":[";
+		for (int i = 0; i < 10000; i++) {
+			if (i > 0) {
+				large_json_body += ',';
+			}
+			large_json_body += '0';
+		}
+		large_json_body += "]}]";
 		duckdb_httplib::Server server;
 		server.set_keep_alive_max_count(20);
 		server.new_task_queue = []() {
@@ -106,6 +115,10 @@ int main(int argc, char **argv) {
 		server.Post("/redirect", [&](const duckdb_httplib::Request &, duckdb_httplib::Response &response) {
 			redirect_received.fetch_add(1);
 			response.set_redirect("/echo", 307);
+		});
+		server.Post("/large-json", [&](const duckdb_httplib::Request &, duckdb_httplib::Response &response) {
+			large_received.fetch_add(1);
+			response.set_content(large_json_body, "application/json");
 		});
 		server.Post("/slow", [&](const duckdb_httplib::Request &request, duckdb_httplib::Response &response) {
 			received.fetch_add(1);
@@ -589,6 +602,32 @@ int main(int argc, char **argv) {
 		Check(active.load() == 0 && table_cancelled.load() && table_cancel_elapsed < std::chrono::milliseconds(600) &&
 		          received.load() == 176,
 		      "interrupted table POST did not cancel promptly or admitted another row");
+
+		// A full scalar response vector exhausts this limit. The table operator
+		// must let downstream JSON parsing consume a bounded batch at a time.
+		DBConfig memory_config;
+		memory_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		DuckDB memory_database(nullptr, &memory_config);
+		Connection memory_connection(memory_database);
+		Run(memory_connection, "LOAD " + SqlQuote(argv[3]));
+		Run(memory_connection, "LOAD " + SqlQuote(argv[1]));
+		CheckExtension(memory_connection, argv[4], argv[5]);
+		CheckExtension(memory_connection, "quackapi", argv[2]);
+		if (std::string(argv[4]) == "httpfs") {
+			Run(memory_connection, "SET httpfs_client_implementation = 'curl'");
+		}
+		Run(memory_connection, "LOAD json");
+		Run(memory_connection, "SET threads = 4");
+		Run(memory_connection, "SET memory_limit = '128MB'");
+		Run(memory_connection, "SET quackapi_post_concurrency = 4");
+		auto large_rows = Run(memory_connection,
+		                      "SELECT count(i), sum(json_array_length(response.body::JSON, '$[0].payload')) "
+		                      "FROM quackapi_post((SELECT i, " +
+		                          SqlQuote("http://127.0.0.1:" + std::to_string(port) + "/large-json") +
+		                          " AS url, '{}' AS body FROM range(256) t(i)))");
+		Check(large_rows->GetValue(0, 0).GetValue<int64_t>() == 256 &&
+		          large_rows->GetValue(1, 0).GetValue<int64_t>() == 2560000 && large_received.load() == 256,
+		      "table POST did not stream 256 large JSON bodies through downstream parsing under 128 MB");
 		std::cout << "POST HTTP integration passed: 176 requests including table batches\n";
 		return 0;
 	} catch (const std::exception &error) {
