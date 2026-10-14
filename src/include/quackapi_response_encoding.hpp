@@ -12,7 +12,7 @@ struct QuackapiRoute;
 class DataChunk;
 
 enum class ResponseMode { JSON, HTML, TEXT };
-enum class BodyFormat { JSON, NDJSON, CSV, PARQUET, ARROW };
+enum class BodyFormat { JSON, NDJSON, CSV };
 enum class JsonRowMode { ARRAY, OBJECT, NDJSON };
 
 //! Bounded accumulator shared by streaming encoders. Each append is atomic:
@@ -23,6 +23,7 @@ public:
 	explicit QuackapiResponseWriter(idx_t max_bytes);
 	bool Append(const char *data, idx_t length);
 	bool Append(const string &data);
+	bool SetMaxBytes(idx_t max_bytes);
 	idx_t BytesWritten() const;
 	bool ExceededLimit() const;
 	const string &Data() const;
@@ -82,15 +83,5 @@ void SetInternalError(duckdb_httplib::Response &res, const string &server_side_d
 ResponseMode ResponseModeFor(const vector<string> &names);
 BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::Request &req);
 string EmptyResultBody(const QuackapiRoute &route);
-string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &data_cols,
-                              const vector<vector<Value>> &rows);
-string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &data_cols, const vector<Value> &cols);
-string SerializeRowsNdjson(const vector<string> &names, const vector<idx_t> &data_cols,
-                           const vector<vector<Value>> &rows);
-string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_cols, const vector<vector<Value>> &rows);
-string SerializeRowsParquet(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
-                            const vector<idx_t> &data_cols, const vector<vector<Value>> &rows);
-string SerializeRowsArrow(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
-                          const vector<idx_t> &data_cols, const vector<vector<Value>> &rows);
 
 } // namespace duckdb

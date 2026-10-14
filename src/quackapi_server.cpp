@@ -3583,138 +3583,182 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 
-		// Materialize rows once so we can apply headers then serialize body.
-		vector<vector<Value>> rows;
-		idx_t response_value_bytes = 0;
-		while (true) {
-			auto chunk = result->Fetch();
-			if (!chunk || chunk->size() == 0) {
-				break;
-			}
-			for (idx_t row = 0; row < chunk->size(); row++) {
-				vector<Value> cols;
-				cols.resize(chunk->ColumnCount());
-				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-					cols[col] = chunk->GetValue(col, row);
-					response_value_bytes += cols[col].ToString().size();
-					if (response_value_bytes > static_cast<idx_t>(options.max_response_bytes)) {
-						SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
-						finish();
-						return;
-					}
-				}
-				rows.push_back(std::move(cols));
-			}
-		}
-		rows_out = static_cast<int64_t>(rows.size());
-
-		// Apply Location / Set-Cookie from first (or each) row.
-		string location_value;
-		vector<string> set_cookie_values;
-		for (auto &cols : rows) {
-			if (location_col < cols.size() && !cols[location_col].IsNull() && location_value.empty()) {
-				location_value = cols[location_col].ToString();
-			}
-			if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
-				set_cookie_values.push_back(cols[set_cookie_col].ToString());
-			}
-		}
-		if (!location_value.empty()) {
-			res.set_header("Location", location_value);
-		}
-		for (auto &cv : set_cookie_values) {
-			// httplib Headers is multimap — set_header appends.
-			res.set_header("Set-Cookie", cv);
-		}
-
 		// HTML/TEXT mode uses the single remaining data column name.
 		vector<string> data_names;
 		for (auto c : data_cols) {
 			data_names.push_back(names[c]);
 		}
 		auto mode = ResponseModeFor(data_names);
+		const bool object_envelope =
+		    StringUtil::Lower(match.route.response_envelope.empty() ? "array" : match.route.response_envelope) ==
+		    "object";
+
+		idx_t max_response_bytes = static_cast<idx_t>(options.max_response_bytes);
+		QuackapiResponseWriter response_writer(max_response_bytes);
+		unique_ptr<QuackapiJsonChunkEncoder> json_encoder;
+		unique_ptr<QuackapiCsvChunkEncoder> csv_encoder;
+		if (!data_cols.empty() && mode == ResponseMode::JSON) {
+			if (body_format == BodyFormat::CSV) {
+				csv_encoder = make_uniq<QuackapiCsvChunkEncoder>(con, names, result->types, data_cols, response_writer);
+			} else {
+				JsonRowMode row_mode = JsonRowMode::ARRAY;
+				if (body_format == BodyFormat::NDJSON) {
+					row_mode = JsonRowMode::NDJSON;
+				} else if (object_envelope) {
+					row_mode = JsonRowMode::OBJECT;
+				}
+				json_encoder = make_uniq<QuackapiJsonChunkEncoder>(con, names, result->types, data_cols, row_mode,
+				                                                   response_writer);
+			}
+		}
+
+		string location_value;
+		vector<string> set_cookie_values;
+		idx_t header_value_bytes = 0;
+		idx_t rows_fetched = 0;
+		bool limit_exceeded = false;
+		while (true) {
+			auto chunk = result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			rows_fetched += chunk->size();
+			rows_out = static_cast<int64_t>(rows_fetched);
+
+			// Keep response-control columns outside the body while reading them
+			// from every chunk, matching the old first-Location/all-Cookies rules.
+			for (idx_t row = 0; row < chunk->size() && !limit_exceeded; row++) {
+				if (location_col < chunk->ColumnCount()) {
+					auto value = chunk->GetValue(location_col, row);
+					if (!value.IsNull()) {
+						auto text = value.ToString();
+						if (text.size() > max_response_bytes - header_value_bytes) {
+							limit_exceeded = true;
+						} else {
+							header_value_bytes += text.size();
+							if (location_value.empty() && !text.empty()) {
+								location_value = text;
+							}
+						}
+					}
+				}
+				if (set_cookie_col < chunk->ColumnCount()) {
+					auto value = chunk->GetValue(set_cookie_col, row);
+					if (!value.IsNull()) {
+						auto text = value.ToString();
+						if (text.size() > max_response_bytes - header_value_bytes) {
+							limit_exceeded = true;
+						} else {
+							header_value_bytes += text.size();
+							set_cookie_values.push_back(std::move(text));
+						}
+					}
+				}
+			}
+			if (limit_exceeded || !response_writer.SetMaxBytes(max_response_bytes - header_value_bytes)) {
+				limit_exceeded = true;
+				break;
+			}
+
+			if (mode == ResponseMode::HTML || mode == ResponseMode::TEXT) {
+				auto col = data_cols[0];
+				auto &vector = chunk->data[col];
+				UnifiedVectorFormat format;
+				vector.ToUnifiedFormat(chunk->size(), format);
+				const bool raw_string_bytes = result->types[col].id() == LogicalTypeId::BLOB ||
+				                              result->types[col].id() == LogicalTypeId::VARCHAR ||
+				                              result->types[col].IsJSONType();
+				const string_t *values = nullptr;
+				if (raw_string_bytes) {
+					values = format.GetData<string_t>();
+				}
+				for (idx_t row = 0; row < chunk->size(); row++) {
+					auto index = format.sel->get_index(row);
+					if (!format.validity.RowIsValid(index)) {
+						continue;
+					}
+					if (raw_string_bytes) {
+						auto &value = values[index];
+						response_writer.Append(value.GetData(), value.GetSize());
+					} else {
+						auto value = chunk->GetValue(col, row);
+						auto text = value.ToString();
+						response_writer.Append(text);
+					}
+					if (response_writer.ExceededLimit()) {
+						limit_exceeded = true;
+						break;
+					}
+				}
+			} else if (csv_encoder) {
+				csv_encoder->AppendChunk(*chunk);
+			} else if (json_encoder) {
+				json_encoder->AppendChunk(*chunk);
+			}
+			if (response_writer.ExceededLimit()) {
+				limit_exceeded = true;
+				break;
+			}
+		}
+
+		if (limit_exceeded) {
+			SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+			finish();
+			return;
+		}
 
 		// 0-row EMPTY STATUS: override success STATUS (any FORMAT / html/text).
-		if (rows.empty() && match.route.empty_status != 0) {
+		if (rows_fetched == 0 && match.route.empty_status != 0) {
 			SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
 			finish();
 			return;
+		}
+
+		if (!location_value.empty()) {
+			res.set_header("Location", location_value);
+		}
+		for (auto &cookie : set_cookie_values) {
+			// httplib Headers is multimap — set_header appends.
+			res.set_header("Set-Cookie", cookie);
 		}
 
 		// No data columns: empty body (redirect / cookie-only responses).
 		if (data_cols.empty()) {
 			res.status = match.route.status;
 			res.body.clear();
-			// Drop Content-Type when there is no body.
 			finish();
 			return;
 		}
 
-		// HTML/TEXT mode: a single data column named `html`/`text` serves its raw
-		// string value (e.g. SELECT tera_render(...) AS html). Multiple rows are
-		// concatenated in order, so a query returning fragments streams a page.
-		// Column-name modes win over FORMAT / Accept.
-		if (mode != ResponseMode::JSON) {
-			string body;
-			idx_t col = data_cols[0];
-			for (auto &cols : rows) {
-				if (col < cols.size() && !cols[col].IsNull()) {
-					body += cols[col].ToString();
-				}
-			}
+		if (json_encoder) {
+			json_encoder->Finish();
+		}
+		if (csv_encoder) {
+			csv_encoder->Finish();
+		}
+		if (response_writer.ExceededLimit()) {
+			SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+			finish();
+			return;
+		}
+
+		if (mode == ResponseMode::HTML || mode == ResponseMode::TEXT) {
 			res.status = match.route.status;
-			res.set_content(body,
+			res.set_content(response_writer.Data(),
 			                mode == ResponseMode::HTML ? "text/html; charset=utf-8" : "text/plain; charset=utf-8");
-			// Keep body so Content-Length is correct; httplib omits the body for HEAD.
-			finish();
-			return;
-		}
-
-		const bool object_envelope =
-		    StringUtil::Lower(match.route.response_envelope.empty() ? "array" : match.route.response_envelope) ==
-		    "object";
-
-		// Serialize rows: json array | json object | ndjson | csv | parquet | arrow.
-		string body;
-		const char *content_type = "application/json";
-		if (body_format == BodyFormat::NDJSON) {
-			body = SerializeRowsNdjson(names, data_cols, rows);
-			content_type = "application/x-ndjson";
 		} else if (body_format == BodyFormat::CSV) {
-			body = SerializeRowsCsv(names, data_cols, rows);
-			content_type = "text/csv; charset=utf-8";
-		} else if (body_format == BodyFormat::PARQUET) {
-			body = SerializeRowsParquet(con, names, result->types, data_cols, rows);
-			content_type = "application/vnd.apache.parquet";
-		} else if (body_format == BodyFormat::ARROW) {
-			body = SerializeRowsArrow(con, names, result->types, data_cols, rows);
-			// nanoarrow FORMAT ARROWS produces IPC *stream* (0xFFFFFFFF magic).
-			content_type = "application/vnd.apache.arrow.stream";
-		} else if (object_envelope) {
-			if (rows.size() > 1) {
-				SetJson(res, 500,
-				        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(rows.size()) +
-				            "\"}");
-				finish();
-				return;
-			}
-			if (rows.empty()) {
-				// No EMPTY STATUS → JSON null (array default remains []).
-				body = "null";
-			} else {
-				body = SerializeRowJsonObject(names, data_cols, rows[0]);
-			}
-			SetJson(res, match.route.status, body);
-			finish();
-			return;
+			res.status = match.route.status;
+			res.set_content(response_writer.Data(), "text/csv; charset=utf-8");
+		} else if (body_format == BodyFormat::NDJSON) {
+			res.status = match.route.status;
+			res.set_content(response_writer.Data(), "application/x-ndjson");
+		} else if (object_envelope && rows_fetched > 1) {
+			SetJson(res, 500,
+			        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(rows_fetched) +
+			            "\"}");
 		} else {
-			body = SerializeRowsJsonArray(names, data_cols, rows);
-			SetJson(res, match.route.status, body);
-			finish();
-			return;
+			SetJson(res, match.route.status, response_writer.Data());
 		}
-		res.status = match.route.status;
-		res.set_content(body, content_type);
 		// Keep body so Content-Length is correct; httplib omits the body for HEAD.
 	} catch (std::exception &ex) {
 		SetInternalError(res, ex.what());
