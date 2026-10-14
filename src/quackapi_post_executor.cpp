@@ -147,7 +147,7 @@ public:
 				}
 				const auto concurrency = EffectiveConcurrency(db);
 				EnsureWorkers(std::min(concurrency, active + queue.size()));
-				queue_cv.notify_all();
+				queue_cv.notify_one();
 			}
 		} catch (InterruptException &) {
 			CancelBatch(batch);
@@ -265,7 +265,7 @@ private:
 				queue.pop_front();
 				active++;
 				worker.active_job = job;
-				space_cv.notify_all();
+				space_cv.notify_one();
 			}
 
 			auto &batch = *job->batch;
@@ -308,7 +308,7 @@ private:
 				active--;
 				worker.active_job.reset();
 			}
-			queue_cv.notify_all();
+			queue_cv.notify_one();
 			batch.cv.notify_all();
 			if (batch.cancelled.load()) {
 				CancelBatch(job->batch);
