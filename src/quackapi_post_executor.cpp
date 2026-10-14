@@ -151,12 +151,10 @@ public:
 			}
 		} catch (InterruptException &) {
 			CancelBatch(batch);
-			DrainBatch(batch, Accepted(batch));
 			throw;
 		} catch (...) {
 			auto error = std::current_exception();
 			CancelBatch(batch);
-			DrainBatch(batch, Accepted(batch));
 			std::rethrow_exception(error);
 		}
 
@@ -170,6 +168,7 @@ public:
 			}
 			if (context.IsInterrupted() || IsExpired(deadline) || batch->interrupted.load()) {
 				CancelBatch(batch);
+				throw InterruptException();
 			}
 			std::unique_lock<std::mutex> guard(batch->mutex);
 			batch->cv.wait_for(guard, std::chrono::milliseconds(10));
@@ -225,12 +224,10 @@ private:
 				flag->store(true);
 			}
 		}
+		// Queued jobs are removed below. Active jobs retain their shared batch and
+		// owned request until provider I/O returns, so the SQL caller need not drain them.
+		// An in-flight POST can still complete remotely; DB teardown joins all workers.
 		CancelQueued(batch);
-	}
-
-	void DrainBatch(const shared_ptr<PostBatch> &batch, idx_t expected) {
-		std::unique_lock<std::mutex> guard(batch->mutex);
-		batch->cv.wait(guard, [&]() { return batch->completed >= expected; });
 	}
 
 	void WorkerLoop(Worker &worker) {
