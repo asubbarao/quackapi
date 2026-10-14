@@ -1,4 +1,5 @@
 #include "quackapi_http_fetch.hpp"
+#include "quackapi_post.hpp"
 #include "quackapi_thread_join.hpp"
 #include "quackapi_limits.hpp"
 
@@ -690,47 +691,6 @@ void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
-void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	const auto count = args.size();
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-
-	vector<bool> skip(count, false);
-	vector<string> urls(count);
-	vector<string> bodies(count);
-	vector<string> content_types(count);
-	vector<unordered_map<string, string>> headers(count);
-	for (idx_t i = 0; i < count; i++) {
-		auto url = args.data[0].GetValue(i);
-		if (url.IsNull()) {
-			skip[i] = true;
-			continue;
-		}
-		urls[i] = url.ToString();
-		auto body = args.data[1].GetValue(i);
-		bodies[i] = body.IsNull() ? string() : body.ToString();
-		content_types[i] = "application/json";
-		if (args.ColumnCount() > 2) {
-			auto ct = args.data[2].GetValue(i);
-			if (!ct.IsNull()) {
-				content_types[i] = ct.ToString();
-			}
-		}
-		if (args.ColumnCount() > 3) {
-			headers[i] = HeadersFromValue(args.data[3].GetValue(i));
-		}
-	}
-
-	vector<QuackapiHttpFetchResult> out(count);
-	FanOutRequests(count, skip, out, [&](idx_t i) {
-		return QuackapiHttpFetch::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
-	});
-
-	for (idx_t i = 0; i < count; i++) {
-		result.SetValue(i, skip[i] ? Value(FetchResultType()) : ToValue(out[i]));
-	}
-}
-
 struct PoolGlobalState : public GlobalTableFunctionState {
 	vector<QuackapiHttpPoolStats> rows;
 	idx_t offset = 0;
@@ -856,6 +816,18 @@ void ParallelFetchExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 
 } // namespace
 
+LogicalType QuackapiHttpFetchResultType() {
+	return FetchResultType();
+}
+
+Value QuackapiHttpFetchResultValue(const QuackapiHttpFetchResult &result) {
+	return ToValue(result);
+}
+
+unordered_map<string, string> QuackapiHttpHeadersFromValue(const Value &value) {
+	return HeadersFromValue(value);
+}
+
 void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	const auto header_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	const auto result_type = FetchResultType();
@@ -926,23 +898,7 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	fetch_tf.named_parameters["stall_ms"] = LogicalType::INTEGER;
 	loader.RegisterFunction(fetch_tf);
 
-	ScalarFunctionSet post_set("quackapi_post");
-	ScalarFunction post2("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR}, result_type, PostScalar);
-	post2.stability = FunctionStability::VOLATILE;
-	ScalarFunction post2j("quackapi_post", {LogicalType::VARCHAR, LogicalType::JSON()}, result_type, PostScalar);
-	post2j.stability = FunctionStability::VOLATILE;
-	ScalarFunction post3("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                     result_type, PostScalar);
-	post3.stability = FunctionStability::VOLATILE;
-	ScalarFunction post4("quackapi_post",
-	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, header_type}, result_type,
-	                     PostScalar);
-	post4.stability = FunctionStability::VOLATILE;
-	post_set.AddFunction(post2);
-	post_set.AddFunction(post2j);
-	post_set.AddFunction(post3);
-	post_set.AddFunction(post4);
-	loader.RegisterFunction(post_set);
+	RegisterQuackapiPostFunctions(loader);
 
 	loader.RegisterFunction(TableFunction("quackapi_http_pool", {}, PoolExec, PoolBind, PoolInit));
 

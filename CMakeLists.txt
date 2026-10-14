@@ -24,6 +24,9 @@ set(EXTENSION_SOURCES
     src/quackapi_ddl.cpp
     src/quackapi_auth.cpp
     src/quackapi_http_fetch.cpp
+    src/quackapi_post.cpp
+    src/quackapi_post_executor.cpp
+    src/quackapi_post_provider.cpp
     src/quackapi_limits.cpp
     src/quackapi_middleware.cpp
     src/quackapi_table_api.cpp
