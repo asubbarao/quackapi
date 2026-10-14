@@ -6,6 +6,8 @@ set -euo pipefail
 CONF="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$CONF/../.." && pwd)"
 DUCK="${DUCKDB:-$REPO/build/release/duckdb}"
+EXT="${QUACKAPI_EXT:-$REPO/build/release/extension/quackapi/quackapi.duckdb_extension}"
+EXPECTED_EXT_VERSION="${QUACKAPI_EXPECTED_VERSION:-$(git -C "$REPO" rev-parse --short HEAD)}"
 PORT="${PORT:-18770}"
 BASE="http://127.0.0.1:${PORT}"
 FIFO="${TMPDIR:-/tmp}/quackapi_conformance_$$.fifo"
@@ -29,20 +31,42 @@ if [[ ! -x "$DUCK" ]]; then
   exit 2
 fi
 
+if [[ ! -f "$EXT" ]]; then
+  echo "quackapi extension artifact not found: $EXT" >&2
+  exit 2
+fi
+if [[ "$EXT" == *"'"* ]]; then
+  echo "quackapi artifact path contains a SQL quote: $EXT" >&2
+  exit 2
+fi
+core_version="$("$DUCK" -unsigned -noheader -list -c 'SELECT library_version, source_id FROM pragma_version();')"
+if [[ "$core_version" != 'v1.5.6|069cc9f9' ]]; then
+  echo "wrong DuckDB core: $core_version (expected v1.5.6|069cc9f9)" >&2
+  exit 2
+fi
+actual_ext_version="$("$DUCK" -unsigned -noheader -list -c "LOAD '$EXT'; SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'quackapi' AND loaded;")"
+if [[ "$actual_ext_version" != "$EXPECTED_EXT_VERSION" ]]; then
+  echo "wrong quackapi artifact: $actual_ext_version (expected $EXPECTED_EXT_VERSION from $EXT)" >&2
+  exit 2
+fi
+
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
   echo "Port $PORT is already occupied; choose PORT for an isolated run" >&2
   exit 2
 fi
 mkfifo "$FIFO"
 
-"$DUCK" -init /dev/null -unsigned <"$FIFO" >"$LOG" 2>&1 &
+"$DUCK" -unsigned <"$FIFO" >"$LOG" 2>&1 &
 echo $! >"$PIDFILE"
 DPID=$!
 
 exec 3>"$FIFO"
 
 {
-  echo "LOAD quackapi;"
+  echo "SET threads = 4;"
+  echo "SET memory_limit = '256MB';"
+  echo "SET preserve_insertion_order = false;"
+  printf "LOAD '%s';\n" "$EXT"
   cat "$CONF/routes.sql"
   echo "SELECT * FROM quackapi_serve(${PORT}, health_routes := false, access_log := false);"
   echo "SELECT * FROM quackapi_servers();"
