@@ -84,6 +84,11 @@ struct QuackapiHttpFetch {
 	static void ResetPool();
 };
 
+//! Shared SQL conversion helpers for the fetch and POST scalar functions.
+LogicalType QuackapiHttpFetchResultType();
+Value QuackapiHttpFetchResultValue(const QuackapiHttpFetchResult &result);
+unordered_map<string, string> QuackapiHttpHeadersFromValue(const Value &value);
+
 //! quackapi_fetch / quackapi_post / quackapi_http_pool / quackapi_parallel_fetch.
 void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader);
 
