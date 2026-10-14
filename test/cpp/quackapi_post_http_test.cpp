@@ -315,6 +315,34 @@ int main(int argc, char **argv) {
 		Check(active_failed.load() && active_elapsed < std::chrono::milliseconds(600),
 		      "active POST ignored caller interrupt: elapsed_ms=" + std::to_string(active_ms));
 
+		// Real HTTP access logs must use DuckDB's native logger and redact
+		// explicitly allowed credential headers and sensitive query values.
+		Run(connection, "SET enable_logging = true");
+		Run(connection, "SET logging_storage = 'memory'");
+		Run(connection, "SET logging_level = 'debug'");
+		duckdb_httplib::Server reserve;
+		const int log_port = reserve.bind_to_any_port("127.0.0.1");
+		Check(log_port > 0, "could not reserve access-log fixture port");
+		reserve.stop();
+		Run(connection, "CREATE ROUTE log_secret GET '/log-secret' AS SELECT 1 AS ok");
+		Run(connection, "SELECT * FROM quackapi_serve(" + std::to_string(log_port) +
+		                    ", host := '127.0.0.1', access_log := true, log_level := 'debug', "
+		                    "log_headers := 'Authorization,X-Trace', log_query := true)");
+		duckdb_httplib::Client inbound("127.0.0.1", log_port);
+		auto logged_response = inbound.Get("/log-secret?api_key=secret42&normal=yes",
+		                                   {{"Authorization", "Bearer secret42"}, {"X-Trace", "trace-42"}});
+		Check(logged_response && logged_response->status == 200, "real HTTP access-log request failed");
+		auto logs = Run(connection, "SELECT message FROM duckdb_logs() WHERE contains(message, '\"type\":\"access\"') "
+		                            "ORDER BY timestamp DESC");
+		Check(logs->RowCount() > 0, "real HTTP request did not write a native DuckDB access log");
+		const auto access_log = logs->GetValue(0, 0).ToString();
+		Check(access_log.find("secret42") == std::string::npos && access_log.find("Bearer") == std::string::npos &&
+		          access_log.find("[REDACTED]") != std::string::npos &&
+		          access_log.find("trace-42") != std::string::npos &&
+		          access_log.find("normal=yes") != std::string::npos,
+		      "native access log did not redact credentials while preserving allowed metadata");
+		Run(connection, "SELECT * FROM quackapi_stop(" + std::to_string(log_port) + ")");
+
 		std::cout << "POST HTTP integration passed: 111 requests, wide peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
