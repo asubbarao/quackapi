@@ -2,6 +2,7 @@
 // belongs only to this disposable loopback fixture.
 #include "duckdb.hpp"
 #include "httplib.hpp"
+#include "quackapi_core_identity.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -77,8 +78,13 @@ int main(int argc, char **argv) {
 		DuckDB database(nullptr, &config);
 		Connection connection(database);
 		auto version = Run(connection, "PRAGMA version");
-		Check(version->GetValue(0, 0).ToString() == "v1.5.6" && version->GetValue(1, 0).ToString() == "069cc9f9",
-		      "test core must be DuckDB 069cc9f9 v1.5.6");
+		const auto actual_library_version = version->GetValue(0, 0).ToString();
+		const auto actual_source_id = version->GetValue(1, 0).ToString();
+		Check(MatchesPinnedDuckDBIdentity(actual_library_version, actual_source_id),
+		      "test core mismatch: actual library_version='" + actual_library_version + "', source_id='" +
+		          actual_source_id +
+		          "'; expected v1.5.6 and an 8- or 10-character prefix of pinned core "
+		          "069cc9f9b5be802405797faecc284961b07c70ef");
 		Run(connection, "LOAD " + Quote(argv[3]));
 		Run(connection, "LOAD " + Quote(argv[1]));
 		auto loaded = Run(connection, "SELECT extension_name, extension_version FROM duckdb_extensions() "
