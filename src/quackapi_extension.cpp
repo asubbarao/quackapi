@@ -16,12 +16,13 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include "quackapi_auth.hpp"
 #include "quackapi_ddl.hpp"
-#include "quackapi_http_fetch.hpp"
+#include "quackapi_post.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
 
@@ -1003,29 +1004,6 @@ static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_
 }
 
 //===--------------------------------------------------------------------===//
-// quackapi_http_util_name() — active outbound HTTPUtil (no curl_httpfs dep)
-//===--------------------------------------------------------------------===//
-// When curl_httpfs is LOADed this is typically "MultiCurl". Same underlying
-// DBConfig::GetHTTPUtil().GetName() that curl_httpfs_http_util_name() reads.
-
-static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	result.Reference(Value(QuackapiHttpFetch::ActiveHttpUtilName(db)));
-}
-
-//===--------------------------------------------------------------------===//
-// quackapi_last_write_timeout_sec() — effective write deadline of last request
-//===--------------------------------------------------------------------===//
-// Reports what HandleRequest / ApplyRouteIoTimeout actually applied — serve
-// write_timeout_sec when no route override ran, or the route timeout_sec when
-// ApplyRouteIoTimeout extended the socket deadlines. Not a registry lookup.
-
-static void LastWriteTimeoutSecFunction(DataChunk &, ExpressionState &state, Vector &result) {
-	auto &qa = QuackapiState::Get(*state.GetContext().db);
-	result.Reference(Value::INTEGER(qa.GetLastEffectiveWriteTimeoutSec()));
-}
-
-//===--------------------------------------------------------------------===//
 // Load
 //===--------------------------------------------------------------------===//
 
@@ -1033,6 +1011,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// SET quackapi_cors_origins = '*' | 'https://app.example,https://admin.example'
 	// Default empty = CORS off. Serve-time cors_origins := '…' overrides this SET.
 	auto &db = loader.GetDatabaseInstance();
+	if (!ExtensionHelper::TryAutoLoadAvailableExtension(db, "json")) {
+		throw IOException("QuackAPI requires the DuckDB JSON extension to be available and loadable before loading "
+		                  "quackapi");
+	}
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("quackapi_cors_origins",
 	                          "CORS allowed origins for quackapi_serve (* or comma-separated list). "
@@ -1188,19 +1170,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quack_nop_authorization so they can be SET as quack_*_function.
 	RegisterQuackAuthBridgeFunctions(loader);
 
-	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
-	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
-	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
-
-	// Effective write deadline applied to the most recent route request
-	// (ApplyRouteIoTimeout / serve write_timeout_sec). Test/introspection seam.
-	loader.RegisterFunction(
-	    ScalarFunction("quackapi_last_write_timeout_sec", {}, LogicalType::INTEGER, LastWriteTimeoutSecFunction));
-
-	// Outbound HTTP with a connection pool that survives ACROSS requests:
-	// quackapi_fetch / quackapi_post / quackapi_http_pool. See the header of
-	// quackapi_http_fetch.hpp for why the un-pooled path costs ~27ms a call.
-	RegisterQuackapiHttpFetchFunctions(loader);
+	RegisterQuackapiPostFunctions(loader);
 
 	loader.RegisterFunction(GetApplyMiddlewareFunction());
 	loader.RegisterFunction(GetQuackapiMiddlewaresFunction());

@@ -216,21 +216,9 @@ public:
 	//! A port is required when more than one server is running.
 	bool FlushTelemetry(int port = 0);
 
-	//! Effective write deadline (seconds) applied to the most recent route
-	//! request. Seeded with serve write_timeout_sec; ApplyRouteIoTimeout
-	//! overwrites it only when it actually extends the socket deadlines.
-	//! Test/introspection seam — not a registry field.
-	void SetLastEffectiveWriteTimeoutSec(int32_t sec) {
-		last_effective_write_timeout_sec.store(sec, std::memory_order_relaxed);
-	}
-	int32_t GetLastEffectiveWriteTimeoutSec() const {
-		return last_effective_write_timeout_sec.load(std::memory_order_relaxed);
-	}
-
 private:
 	void PublishRoutes();
 
-	std::atomic<int32_t> last_effective_write_timeout_sec {0};
 	struct RateLimitEntry {
 		int count = 0;
 		std::chrono::steady_clock::time_point expires;

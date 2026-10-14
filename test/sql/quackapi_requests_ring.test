@@ -11,13 +11,13 @@ SELECT count(*) FROM quackapi_requests();
 0
 
 statement ok
-CREATE OR REPLACE ROUTE ring_first GET '/ring/first' AS SELECT 'first' AS result;
+CREATE OR REPLACE ROUTE ring_first POST '/ring/first' AS SELECT 'first' AS result;
 
 statement ok
-CREATE OR REPLACE ROUTE ring_second GET '/ring/second' AS SELECT 'second' AS result;
+CREATE OR REPLACE ROUTE ring_second POST '/ring/second' AS SELECT 'second' AS result;
 
 statement ok
-CREATE OR REPLACE ROUTE ring_fail GET '/ring/fail' AS SELECT * FROM query($sql);
+CREATE OR REPLACE ROUTE ring_fail POST '/ring/fail' AS SELECT * FROM query($sql);
 
 # Access-log output is disabled, but the ring still records every request.
 query I
@@ -26,17 +26,17 @@ SELECT * FROM quackapi_serve(29561, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29561
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29561/ring/first').status;
+SELECT quackapi_post('http://127.0.0.1:29561/ring/first', '{}').status;
 ----
 200
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29561/ring/missing').status;
+SELECT quackapi_post('http://127.0.0.1:29561/ring/missing', '{}').status;
 ----
 404
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29561/ring/second').status;
+SELECT quackapi_post('http://127.0.0.1:29561/ring/second', '{}').status;
 ----
 200
 
@@ -60,8 +60,8 @@ SELECT * FROM quackapi_serve(29566, host := '127.0.0.1', access_log := false,
 http://127.0.0.1:29566
 
 query I
-SELECT (quackapi_fetch(
-  'http://127.0.0.1:29566/ring/first?token=abc&q=x',
+SELECT (quackapi_post(
+  'http://127.0.0.1:29566/ring/first?token=abc&q=x', '{}', 'application/json',
   MAP {'Authorization': 'Bearer do-not-store', 'x-tenant-id': 'tenant-42'}
 )).status;
 ----
@@ -87,7 +87,7 @@ SELECT * FROM quackapi_serve(29567, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29567
 
 query I
-SELECT status FROM quackapi_fetch('http://127.0.0.1:29567/ring/second');
+SELECT status FROM quackapi_post('http://127.0.0.1:29567/ring/second', '{}');
 ----
 200
 
@@ -108,13 +108,13 @@ SELECT * FROM quackapi_serve(29562, host := '127.0.0.1', access_log := false, re
 http://127.0.0.1:29562
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-one').status;
+SELECT quackapi_post('http://127.0.0.1:29562/ring/two-one', '{}').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-two').status;
+SELECT quackapi_post('http://127.0.0.1:29562/ring/two-two', '{}').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-three').status;
+SELECT quackapi_post('http://127.0.0.1:29562/ring/two-three', '{}').status;
 
 query I
 SELECT count(*) FROM quackapi_requests(29562);
@@ -138,10 +138,10 @@ SELECT * FROM quackapi_serve(29563, host := '127.0.0.1', access_log := false, re
 http://127.0.0.1:29563
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29563/ring/zero-one').status;
+SELECT quackapi_post('http://127.0.0.1:29563/ring/zero-one', '{}').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29563/ring/zero-two').status;
+SELECT quackapi_post('http://127.0.0.1:29563/ring/zero-two', '{}').status;
 
 query I
 SELECT count(*) FROM quackapi_requests(29563);
@@ -163,10 +163,10 @@ SELECT * FROM quackapi_serve(29565, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29565
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29565/ring/setting-one').status;
+SELECT quackapi_post('http://127.0.0.1:29565/ring/setting-one', '{}').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29565/ring/setting-two').status;
+SELECT quackapi_post('http://127.0.0.1:29565/ring/setting-two', '{}').status;
 
 query I
 SELECT count(*) FROM quackapi_requests(29565);
@@ -188,7 +188,7 @@ SELECT * FROM quackapi_serve(29564, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29564
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29564/ring/fail?sql=SELECT%20nope%20FROM%20nowhere').status;
+SELECT quackapi_post('http://127.0.0.1:29564/ring/fail?sql=SELECT%20nope%20FROM%20nowhere', '{}').status;
 ----
 500
 

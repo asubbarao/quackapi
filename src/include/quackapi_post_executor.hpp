@@ -5,7 +5,7 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
-#include "quackapi_http_fetch.hpp"
+#include "quackapi_post_result.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 #include <atomic>

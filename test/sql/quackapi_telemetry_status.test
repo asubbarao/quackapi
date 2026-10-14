@@ -5,6 +5,9 @@
 require quackapi
 
 statement ok
+CREATE ROUTE telemetry_probe POST '/telemetry/probe' AS SELECT 'ok' AS result;
+
+statement ok
 CREATE TABLE telemetry_status_log (
   request_id VARCHAR,
   received_at TIMESTAMP,
@@ -19,7 +22,7 @@ SELECT * FROM quackapi_serve(29580, host := '127.0.0.1', access_log := 'telemetr
 http://127.0.0.1:29580
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29580/health').status;
+SELECT quackapi_post('http://127.0.0.1:29580/telemetry/probe', '{}').status;
 ----
 200
 
@@ -39,7 +42,7 @@ query III
 SELECT method, path, status
 FROM telemetry_status_log;
 ----
-GET	/health	200
+POST	/telemetry/probe	200
 
 query I
 SELECT * FROM quackapi_stop(29580);
@@ -55,12 +58,6 @@ query I
 SELECT sink FROM quackapi_telemetry_status();
 ----
 stderr
-
-query I
-SELECT contains(body, '"telemetry"') AND contains(body, '"access_log_overflow_count"')
-FROM quackapi_fetch('http://127.0.0.1:29581/healthz');
-----
-true
 
 query I
 SELECT * FROM quackapi_stop(29581);

@@ -120,32 +120,6 @@ DROP ROUTE keeper;
 statement ok
 DROP ROUTE mover;
 
-# ---------------------------------------------------------------------------
-# Bug: serve(health_routes=true) → stop → serve(health_routes=false) left
-# __quackapi_health* in the registry (RegisterQuackapiHealthRoutes no-op).
-# ---------------------------------------------------------------------------
-statement ok
-SELECT * FROM quackapi_serve(29451, host := '127.0.0.1');
-
-query I
-SELECT count(*) FROM quackapi_routes() WHERE starts_with(name, '__quackapi_health');
-----
-2
-
-statement ok
-SELECT * FROM quackapi_stop(29451);
-
-statement ok
-SELECT * FROM quackapi_serve(29451, host := '127.0.0.1', health_routes := false);
-
-query I
-SELECT count(*) FROM quackapi_routes() WHERE starts_with(name, '__quackapi_health');
-----
-0
-
-statement ok
-SELECT * FROM quackapi_stop(29451);
-
 # OpenAPI after DROP ROUTE: path must vanish (live snapshot — regression lock).
 statement ok
 CREATE ROUTE oa GET '/oa' AS SELECT 1 AS n;

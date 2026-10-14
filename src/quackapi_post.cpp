@@ -1,6 +1,7 @@
 #include "quackapi_post.hpp"
 #include "quackapi_post_executor.hpp"
 #include "quackapi_post_provider.hpp"
+#include "quackapi_post_result.hpp"
 
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
