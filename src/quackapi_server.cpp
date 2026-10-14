@@ -1951,8 +1951,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		for (auto &kv : match.path_params) {
 			provided[kv.first] = {"path", kv.second};
 		}
-		// Server-stamped request id — bindable as $request_id in handler SQL
-		// (and libpq path). Wins over any client query/path of the same name.
+		// Server-stamped request id — bindable as $request_id in handler SQL.
+		// Wins over any client query/path of the same name.
 		provided["request_id"] = {"server", request_id};
 		provided["trace_id"] = {"server", trace_id};
 		provided["span_id"] = {"server", span_id};
@@ -2647,20 +2647,21 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		if (mode == ResponseMode::HTML || mode == ResponseMode::TEXT) {
 			res.status = match.route.status;
-			res.set_content(response_writer.Data(),
+			res.set_content(response_writer.TakeData(),
 			                mode == ResponseMode::HTML ? "text/html; charset=utf-8" : "text/plain; charset=utf-8");
 		} else if (body_format == BodyFormat::CSV) {
 			res.status = match.route.status;
-			res.set_content(response_writer.Data(), "text/csv; charset=utf-8");
+			res.set_content(response_writer.TakeData(), "text/csv; charset=utf-8");
 		} else if (body_format == BodyFormat::NDJSON) {
 			res.status = match.route.status;
-			res.set_content(response_writer.Data(), "application/x-ndjson");
+			res.set_content(response_writer.TakeData(), "application/x-ndjson");
 		} else if (object_envelope && rows_fetched > 1) {
 			SetJson(res, 500,
 			        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(rows_fetched) +
 			            "\"}");
 		} else {
-			SetJson(res, match.route.status, response_writer.Data());
+			res.status = match.route.status;
+			res.set_content(response_writer.TakeData(), "application/json");
 		}
 		// Keep body so Content-Length is correct; httplib omits the body for HEAD.
 	} catch (std::exception &ex) {
