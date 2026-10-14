@@ -95,6 +95,22 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_lifetime_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-lifetime-test
           /tmp/quackapi-lifetime-test
 
+      - name: Verify outbound POST over real HTTP
+        run: |
+          extension_dir="$PWD/build/release/post_http_extensions"
+          ./build/release/duckdb -unsigned -c "SET extension_directory='$extension_dir'; INSTALL curl_httpfs FROM community;"
+          duckdb_platform="$(./build/release/duckdb -unsigned -noheader -list -c 'SELECT platform();')"
+          provider_artifact="$extension_dir/v1.5.6/$duckdb_platform/curl_httpfs.duckdb_extension"
+          quackapi_artifact="$PWD/build/release/extension/quackapi/quackapi.duckdb_extension"
+          quackapi_version="$(git rev-parse --short HEAD)"
+          cmake -S test/cpp -B build/post_http_test \
+            -DQUACKAPI_EXTENSION="$quackapi_artifact" \
+            -DQUACKAPI_VERSION="$quackapi_version" \
+            -DPOST_PROVIDER_EXTENSION="$provider_artifact" \
+            -DPOST_PROVIDER_VERSION=v0.4.5
+          cmake --build build/post_http_test -j"$(nproc)"
+          ctest --test-dir build/post_http_test --output-on-failure
+
       - name: Verify benchmark correctness gates
         run: |
           python3 bench/test_bench_config.py
