@@ -1,0 +1,35 @@
+# name: test/sql/quackapi_concurrent_request.test
+# description: Concurrent in-process route requests keep independent path bindings
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE ROUTE concurrent_echo GET '/concurrent/:id' AS
+  SELECT $id::INTEGER AS id,
+         {'seen': [$id::INTEGER, NULL]} AS nested,
+         repeat('x', 64) AS payload;
+
+# Each iteration uses a separate DuckDB connection. A route registration,
+# request context or path binding shared incorrectly between callers changes
+# the result of at least one request.
+concurrentloop threadid 0 40
+
+query III
+SELECT status,
+       json_extract_string(decode(body)::JSON, '$[0].id') = '${threadid}',
+       json_extract_string(decode(body)::JSON, '$[0].nested.seen[0]') = '${threadid}'
+FROM quackapi_request('GET', '/concurrent/${threadid}');
+----
+200	true	true
+
+endloop
+
+# The same registry remains usable after all concurrent callers finish.
+query II
+SELECT status, json_extract_string(decode(body)::JSON, '$[0].id')
+FROM quackapi_request('GET', '/concurrent/42');
+----
+200	42
