@@ -10,7 +10,7 @@
 
 namespace duckdb {
 
-class QuackapiPostWorkerState;
+struct QuackapiPostWorkerState;
 struct QuackapiPostRequest;
 
 struct QuackapiPostProvider {
