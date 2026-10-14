@@ -9,6 +9,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
 
@@ -58,10 +59,19 @@ idx_t EffectiveConcurrency(DatabaseInstance &db) {
 	return MaxValue<idx_t>(1, db.NumberOfThreads());
 }
 
+idx_t WaitingQueueCapacity(idx_t concurrency) {
+	return concurrency > NumericLimits<idx_t>::Maximum() / 2 ? NumericLimits<idx_t>::Maximum() : concurrency * 2;
+}
+
 } // namespace
 
 class QuackapiPostExecutor::Impl {
 public:
+	struct Worker {
+		std::thread thread;
+		shared_ptr<PostJob> active_job;
+	};
+
 	explicit Impl(DatabaseInstance &db_p) : db(db_p) {
 	}
 
@@ -69,12 +79,30 @@ public:
 		{
 			std::lock_guard<std::mutex> guard(lock);
 			stopping = true;
+			for (auto &job : queue) {
+				job->request.cancelled->store(true);
+				job->batch->cancelled.store(true);
+				job->batch->interrupted.store(true);
+				std::lock_guard<std::mutex> batch_guard(job->batch->mutex);
+				job->batch->completed++;
+				job->batch->cv.notify_all();
+			}
+			queue.clear();
+			for (auto &worker : workers) {
+				if (worker->active_job) {
+					auto &job = *worker->active_job;
+					job.request.cancelled->store(true);
+					job.batch->cancelled.store(true);
+					job.batch->interrupted.store(true);
+					job.batch->cv.notify_all();
+				}
+			}
 		}
 		queue_cv.notify_all();
 		space_cv.notify_all();
 		for (auto &worker : workers) {
-			if (worker.joinable()) {
-				worker.join();
+			if (worker->thread.joinable()) {
+				worker->thread.join();
 			}
 		}
 	}
@@ -92,10 +120,6 @@ public:
 				batch->cancellation_flags[i] = requests[i].cancelled;
 			}
 		}
-		const auto concurrency = EffectiveConcurrency(db);
-		const auto queue_capacity =
-		    concurrency > NumericLimits<idx_t>::Maximum() / 2 ? NumericLimits<idx_t>::Maximum() : concurrency * 2;
-
 		try {
 			for (idx_t i = 0; i < requests.size(); i++) {
 				if (skip[i]) {
@@ -108,7 +132,7 @@ public:
 				job->request = std::move(requests[i]);
 
 				std::unique_lock<std::mutex> guard(lock);
-				while (!stopping && queue.size() >= queue_capacity) {
+				while (!stopping && queue.size() >= WaitingQueueCapacity(EffectiveConcurrency(db))) {
 					CheckCaller(context, deadline);
 					space_cv.wait_for(guard, std::chrono::milliseconds(10));
 				}
@@ -116,21 +140,27 @@ public:
 				if (stopping || batch->cancelled.load()) {
 					throw InterruptException();
 				}
-				EnsureWorkers(concurrency);
 				queue.push_back(std::move(job));
 				{
 					std::lock_guard<std::mutex> batch_guard(batch->mutex);
 					batch->accepted++;
 				}
+				const auto concurrency = EffectiveConcurrency(db);
+				EnsureWorkers(std::min(concurrency, active + queue.size()));
 				queue_cv.notify_all();
 			}
 		} catch (InterruptException &) {
 			CancelBatch(batch);
 			DrainBatch(batch, Accepted(batch));
 			throw;
+		} catch (...) {
+			auto error = std::current_exception();
+			CancelBatch(batch);
+			DrainBatch(batch, Accepted(batch));
+			std::rethrow_exception(error);
 		}
 
-		const auto expected = requests.size() - CountSkipped(skip);
+		const auto expected = Accepted(batch);
 		while (true) {
 			{
 				std::lock_guard<std::mutex> guard(batch->mutex);
@@ -156,17 +186,16 @@ private:
 		return batch->accepted;
 	}
 
-	static idx_t CountSkipped(const vector<bool> &skip) {
-		idx_t count = 0;
-		for (auto value : skip) {
-			count += value ? 1 : 0;
-		}
-		return count;
-	}
-
 	void EnsureWorkers(idx_t desired) {
 		while (workers.size() < desired) {
-			workers.emplace_back([this]() { WorkerLoop(); });
+			workers.emplace_back(make_uniq<Worker>());
+			auto *worker = workers.back().get();
+			try {
+				worker->thread = std::thread([this, worker]() { WorkerLoop(*worker); });
+			} catch (...) {
+				workers.pop_back();
+				throw;
+			}
 		}
 	}
 
@@ -185,6 +214,7 @@ private:
 			}
 		}
 		space_cv.notify_all();
+		queue_cv.notify_all();
 		batch->cv.notify_all();
 	}
 
@@ -203,7 +233,7 @@ private:
 		batch->cv.wait(guard, [&]() { return batch->completed >= expected; });
 	}
 
-	void WorkerLoop() {
+	void WorkerLoop(Worker &worker) {
 		unique_ptr<QuackapiPostWorkerState> state;
 		try {
 			state = QuackapiPostProvider::CreateWorkerState(db);
@@ -214,14 +244,30 @@ private:
 			shared_ptr<PostJob> job;
 			{
 				std::unique_lock<std::mutex> guard(lock);
-				queue_cv.wait(guard,
-				              [&]() { return stopping || (!queue.empty() && active < EffectiveConcurrency(db)); });
+				for (;;) {
+					if (stopping && queue.empty()) {
+						break;
+					}
+					if (!stopping && !queue.empty()) {
+						const auto desired = std::min(EffectiveConcurrency(db), active + queue.size());
+						try {
+							EnsureWorkers(desired);
+						} catch (...) {
+							// Existing workers can still drain the queue if growth hits a system limit.
+						}
+					}
+					if (!queue.empty() && (stopping || active < EffectiveConcurrency(db))) {
+						break;
+					}
+					queue_cv.wait_for(guard, std::chrono::milliseconds(10));
+				}
 				if (stopping && queue.empty()) {
 					break;
 				}
 				job = std::move(queue.front());
 				queue.pop_front();
 				active++;
+				worker.active_job = job;
 				space_cv.notify_all();
 			}
 
@@ -263,11 +309,12 @@ private:
 			{
 				std::lock_guard<std::mutex> guard(lock);
 				active--;
+				worker.active_job.reset();
 			}
 			queue_cv.notify_all();
 			batch.cv.notify_all();
 			if (batch.cancelled.load()) {
-				CancelQueued(job->batch);
+				CancelBatch(job->batch);
 			}
 		}
 		state.reset();
@@ -278,7 +325,7 @@ private:
 	std::condition_variable queue_cv;
 	std::condition_variable space_cv;
 	std::deque<shared_ptr<PostJob>> queue;
-	vector<std::thread> workers;
+	vector<unique_ptr<Worker>> workers;
 	idx_t active = 0;
 	bool stopping = false;
 };
