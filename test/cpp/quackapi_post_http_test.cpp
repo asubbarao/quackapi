@@ -27,7 +27,8 @@ static void Check(bool condition, const std::string &message) {
 
 static void VerifyCoreIdentityGuard() {
 	Check(MatchesPinnedDuckDBIdentity("v1.5.6", "069cc9f9"), "core identity guard rejected the 8-character pinned ID");
-	Check(MatchesPinnedDuckDBIdentity("v1.5.6", "069cc9f9b5"), "core identity guard rejected the 10-character pinned ID");
+	Check(MatchesPinnedDuckDBIdentity("v1.5.6", "069cc9f9b5"),
+	      "core identity guard rejected the 10-character pinned ID");
 	Check(!MatchesPinnedDuckDBIdentity("v1.5.5", "069cc9f9"), "core identity guard accepted the wrong version");
 	Check(!MatchesPinnedDuckDBIdentity("v1.5.6", "069cc9f8"), "core identity guard accepted the wrong source ID");
 }
@@ -136,7 +137,8 @@ int main(int argc, char **argv) {
 		const auto actual_source_id = version->GetValue(1, 0).ToString();
 		Check(MatchesPinnedDuckDBIdentity(actual_library_version, actual_source_id),
 		      "test core mismatch: actual library_version='" + actual_library_version + "', source_id='" +
-		          actual_source_id + "'; expected v1.5.6 and an 8- or 10-character prefix of pinned core "
+		          actual_source_id +
+		          "'; expected v1.5.6 and an 8- or 10-character prefix of pinned core "
 		          "069cc9f9b5be802405797faecc284961b07c70ef");
 		Run(connection, "LOAD " + SqlQuote(argv[3]));
 		CheckExtension(connection, argv[4], argv[5]);
