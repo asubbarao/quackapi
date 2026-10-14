@@ -6,54 +6,26 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
-#include <typeinfo>
-
 namespace duckdb {
 
 namespace {
 
 constexpr int64_t OUTBOUND_TIMEOUT_FALLBACK_MS = 600 * 1000;
 
-//! Connection settings that must match before a worker may reuse its provider
-//! client. Request headers and timeouts stay request-local.
+//! Identity of a provider client that may be reinitialized by the next request.
 struct ClientConfig {
 	string provider_name;
-	string params_type;
 	string origin;
-	string http_proxy;
-	idx_t http_proxy_port = 0;
-	string http_proxy_username;
-	string http_proxy_password;
-	bool keep_alive = true;
-	bool follow_location = true;
-	bool override_verify_ssl = false;
-	bool verify_ssl = true;
 
-	bool Matches(const HTTPUtil &util, const HTTPParams &params, const string &candidate_origin) const {
-		// The common fields below cannot fingerprint provider-specific parameter
-		// subclasses. Until a provider exposes a configuration comparison API,
-		// only reuse the exact base parameter type; replace provider-specialized
-		// clients for every request rather than risk carrying stale settings.
-		return typeid(params) == typeid(HTTPParams) && provider_name == util.GetName() &&
-		       params_type == typeid(params).name() && origin == candidate_origin && http_proxy == params.http_proxy &&
-		       (http_proxy.empty() || http_proxy_port == params.http_proxy_port) &&
-		       http_proxy_username == params.http_proxy_username && http_proxy_password == params.http_proxy_password &&
-		       keep_alive == params.keep_alive && follow_location == params.follow_location &&
-		       override_verify_ssl == params.override_verify_ssl && verify_ssl == params.verify_ssl;
+	bool Matches(const HTTPUtil &util, const string &candidate_origin) const {
+		const auto name = util.GetName();
+		const bool reviewed_provider = name == "HTTPFS-Curl" || name == "MultiCurl";
+		return reviewed_provider && provider_name == name && origin == candidate_origin;
 	}
 
-	void Set(const HTTPUtil &util, const HTTPParams &params, const string &candidate_origin) {
+	void Set(const HTTPUtil &util, const string &candidate_origin) {
 		provider_name = util.GetName();
-		params_type = typeid(params).name();
 		origin = candidate_origin;
-		http_proxy = params.http_proxy;
-		http_proxy_port = http_proxy.empty() ? 0 : params.http_proxy_port;
-		http_proxy_username = params.http_proxy_username;
-		http_proxy_password = params.http_proxy_password;
-		keep_alive = params.keep_alive;
-		follow_location = params.follow_location;
-		override_verify_ssl = params.override_verify_ssl;
-		verify_ssl = params.verify_ssl;
 	}
 };
 
@@ -136,25 +108,8 @@ QuackapiHttpFetchResult QuackapiPostProvider::Post(DatabaseInstance &db, Quackap
 	auto params = http_util.InitializeParameters(db, request.url);
 	params->keep_alive = true;
 	params->retries = 0; // POST is not safe to replay after an ambiguous transport failure.
-	const auto timeout_ms = QuackapiRemainingTimeoutMillis(OUTBOUND_TIMEOUT_FALLBACK_MS);
-	params->timeout = static_cast<uint64_t>(timeout_ms / 1000);
-	params->timeout_usec = static_cast<uint64_t>((timeout_ms % 1000) * 1000);
-
 	const bool reused = state.client && state.client_util == &http_util && state.has_client_config &&
-	                    state.client_config.Matches(http_util, *params, origin);
-	if (!reused) {
-		DiscardClient(state);
-		state.client = http_util.InitializeClient(*params, origin);
-		if (!state.client) {
-			throw InvalidConfigurationException(UnsupportedProviderMessage(provider_name));
-		}
-		state.client_util = &http_util;
-		state.client_config.Set(http_util, *params, origin);
-		state.has_client_config = true;
-	} else {
-		// Timeouts are request-specific. Reapply them to a worker-reused client.
-		state.client->Initialize(*params);
-	}
+	                    state.client_config.Matches(http_util, origin);
 
 	HTTPHeaders headers(db);
 	if (!request.content_type.empty()) {
@@ -167,8 +122,35 @@ QuackapiHttpFetchResult QuackapiPostProvider::Post(DatabaseInstance &db, Quackap
 	PostRequestInfo info(request.url, headers, *params, const_data_ptr_cast(request.body.data()), request.body.size());
 	info.try_request = true;
 
-	// The caller can be interrupted while this worker is being scheduled or
-	// while its provider client is prepared. Never send after that signal.
+	// Prepare the provider client with the latest remaining deadline. Parameter
+	// initialization and client setup happen before this point and can consume
+	// part of the caller's budget.
+	ThrowIfCancelled(request);
+	const auto timeout_ms = QuackapiRemainingTimeoutMillis(OUTBOUND_TIMEOUT_FALLBACK_MS);
+	params->timeout = static_cast<uint64_t>(timeout_ms / 1000);
+	params->timeout_usec = static_cast<uint64_t>((timeout_ms % 1000) * 1000);
+	if (!reused) {
+		DiscardClient(state);
+		state.client = http_util.InitializeClient(*params, origin);
+		if (!state.client) {
+			throw InvalidConfigurationException(UnsupportedProviderMessage(provider_name));
+		}
+		state.client_util = &http_util;
+		state.client_config.Set(http_util, origin);
+		state.has_client_config = true;
+	}
+
+	// Client setup itself may use part of the remaining budget. Refresh timeout
+	// parameters and initialize with the current configuration before sending.
+	const auto send_timeout_ms = QuackapiRemainingTimeoutMillis(OUTBOUND_TIMEOUT_FALLBACK_MS);
+	params->timeout = static_cast<uint64_t>(send_timeout_ms / 1000);
+	params->timeout_usec = static_cast<uint64_t>((send_timeout_ms % 1000) * 1000);
+	// The reviewed providers fully apply current HTTPParams on Initialize. This
+	// includes changed proxy/TLS/auth settings; no short-lived params reference
+	// is retained. For fresh clients this also replaces the initial timeout.
+	state.client->Initialize(*params);
+
+	// Never send after setup consumes the remaining deadline.
 	ThrowIfCancelled(request);
 	QuackapiHttpFetchResult result;
 	try {
@@ -177,6 +159,8 @@ QuackapiHttpFetchResult QuackapiPostProvider::Post(DatabaseInstance &db, Quackap
 		DiscardClient(state);
 		throw InvalidConfigurationException(UnsupportedProviderMessage(provider_name));
 	}
+	// This reports HTTPClient object reuse only; the provider does not expose
+	// whether its underlying TCP socket was reused.
 	result.reused_connection = reused;
 	if (!result.request_error.empty()) {
 		DiscardClient(state);
