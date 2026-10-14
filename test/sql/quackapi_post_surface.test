@@ -28,10 +28,14 @@ SELECT quackapi_post(NULL::VARCHAR, '{}'::JSON) IS NULL;
 true
 
 # Loading QuackAPI alone must not silently install or select an HTTP provider.
-statement error
-SELECT quackapi_post('http://127.0.0.1:9/', '{}');
+# The row-local transport adapter reports the configuration error in its
+# receipt, allowing mixed rows to keep their own outcomes.
+query II
+SELECT receipt.status,
+       contains(receipt.error, 'requires an explicitly loaded HTTPUtil provider')
+FROM (SELECT quackapi_post('http://127.0.0.1:9/', '{}') AS receipt);
 ----
-requires an explicitly loaded HTTPUtil provider
+0	true
 
 statement ok
 SET quackapi_post_concurrency = 64;
