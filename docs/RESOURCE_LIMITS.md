@@ -41,6 +41,11 @@ queue slots are full, caller-side backpressure applies. This setting bounds the
 POST transport only; it does not schedule route SQL or change transaction
 semantics.
 
+The worker pool grows when needed and retains its workers while the database is
+open. Lowering the concurrency setting limits future active work but does not
+shrink workers that have already started; their provider client state remains
+owned by those workers until database shutdown.
+
 Query cancellation promptly removes queued POSTs. A provider call already in
 progress may still complete at the remote server. Database shutdown waits for
 active provider calls to return so their worker state stays valid; without a
