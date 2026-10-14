@@ -47,7 +47,7 @@ void CheckCaller(ClientContext &context, std::chrono::steady_clock::time_point d
 	}
 }
 
-idx_t EffectiveConcurrency(DatabaseInstance &db) {
+idx_t EffectiveConcurrencyFor(DatabaseInstance &db) {
 	Value setting;
 	auto found = db.TryGetCurrentSetting(POST_CONCURRENCY_SETTING, setting);
 	if (found) {
@@ -132,7 +132,7 @@ public:
 				job->request = std::move(requests[i]);
 
 				std::unique_lock<std::mutex> guard(lock);
-				while (!stopping && queue.size() >= WaitingQueueCapacity(EffectiveConcurrency(db))) {
+				while (!stopping && queue.size() >= WaitingQueueCapacity(EffectiveConcurrencyFor(db))) {
 					CheckCaller(context, deadline);
 					space_cv.wait_for(guard, std::chrono::milliseconds(10));
 				}
@@ -145,7 +145,7 @@ public:
 					std::lock_guard<std::mutex> batch_guard(batch->mutex);
 					batch->accepted++;
 				}
-				const auto concurrency = EffectiveConcurrency(db);
+				const auto concurrency = EffectiveConcurrencyFor(db);
 				EnsureWorkers(std::min(concurrency, active + queue.size()));
 				queue_cv.notify_one();
 			}
@@ -246,14 +246,14 @@ private:
 						break;
 					}
 					if (!stopping && !queue.empty()) {
-						const auto desired = std::min(EffectiveConcurrency(db), active + queue.size());
+						const auto desired = std::min(EffectiveConcurrencyFor(db), active + queue.size());
 						try {
 							EnsureWorkers(desired);
 						} catch (...) {
 							// Existing workers can still drain the queue if growth hits a system limit.
 						}
 					}
-					if (!queue.empty() && (stopping || active < EffectiveConcurrency(db))) {
+					if (!queue.empty() && (stopping || active < EffectiveConcurrencyFor(db))) {
 						break;
 					}
 					queue_cv.wait_for(guard, std::chrono::milliseconds(10));
@@ -349,6 +349,10 @@ QuackapiPostExecutor::Execute(ClientContext &context, vector<QuackapiPostRequest
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto executor = db.GetObjectCache().GetOrCreateWithTypePrefix<QuackapiPostExecutor>("database", db);
 	return executor->impl->Execute(context, std::move(requests), skip);
+}
+
+idx_t QuackapiPostExecutor::EffectiveConcurrency(ClientContext &context) {
+	return EffectiveConcurrencyFor(DatabaseInstance::GetDatabase(context));
 }
 
 } // namespace duckdb

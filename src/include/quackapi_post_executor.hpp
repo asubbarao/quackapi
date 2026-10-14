@@ -36,6 +36,7 @@ public:
 	optional_idx GetEstimatedCacheMemory() const override;
 	static vector<QuackapiHttpFetchResult> Execute(ClientContext &context, vector<QuackapiPostRequest> requests,
 	                                               const vector<bool> &skip);
+	static idx_t EffectiveConcurrency(ClientContext &context);
 	static string ObjectType();
 
 private:
