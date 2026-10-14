@@ -55,6 +55,26 @@ private:
 	unique_ptr<State> state;
 };
 
+//! DuckDB-native CSV writer for result chunks. All output, including the
+//! header and row terminators, flows through the same bounded response writer.
+class QuackapiCsvChunkEncoder {
+public:
+	QuackapiCsvChunkEncoder(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+	                        const vector<idx_t> &data_cols, QuackapiResponseWriter &writer);
+	~QuackapiCsvChunkEncoder();
+	QuackapiCsvChunkEncoder(QuackapiCsvChunkEncoder &&) noexcept;
+	QuackapiCsvChunkEncoder &operator=(QuackapiCsvChunkEncoder &&) noexcept;
+	QuackapiCsvChunkEncoder(const QuackapiCsvChunkEncoder &) = delete;
+	QuackapiCsvChunkEncoder &operator=(const QuackapiCsvChunkEncoder &) = delete;
+
+	void AppendChunk(DataChunk &chunk);
+	void Finish();
+
+private:
+	class State;
+	unique_ptr<State> state;
+};
+
 string ValueToJson(const Value &value);
 bool IsSpecialResponseColumn(const string &name);
 void SetJson(duckdb_httplib::Response &res, int status, const string &body);

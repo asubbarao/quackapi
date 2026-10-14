@@ -5,8 +5,10 @@
 #include <cstdlib>
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/csv_writer.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/serializer/write_stream.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -15,6 +17,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
@@ -25,6 +28,24 @@ namespace {
 const string &EmptyString() {
 	static const string empty;
 	return empty;
+}
+
+class BoundedResponseStream : public WriteStream {
+public:
+	explicit BoundedResponseStream(QuackapiResponseWriter &writer) : writer(writer) {
+	}
+
+	void WriteData(const_data_ptr_t buffer, idx_t write_size) override {
+		writer.Append(reinterpret_cast<const char *>(buffer), write_size);
+	}
+
+private:
+	QuackapiResponseWriter &writer;
+};
+
+bool IsNestedCsvCell(const LogicalType &type) {
+	auto id = type.id();
+	return id == LogicalTypeId::LIST || id == LogicalTypeId::MAP || id == LogicalTypeId::STRUCT;
 }
 
 string TrimMediaToken(string value) {
@@ -180,6 +201,125 @@ idx_t QuackapiJsonChunkEncoder::RowCount() const {
 }
 
 void QuackapiJsonChunkEncoder::Finish() {
+	state->Finish();
+}
+
+class QuackapiCsvChunkEncoder::State {
+public:
+	State(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
+	      const vector<idx_t> &data_cols, QuackapiResponseWriter &response_writer)
+	    : response_writer(response_writer), stream(response_writer),
+	      writer(stream, SelectNames(names, data_cols), false), writer_state(*con.context, 8192), executor(nullptr),
+	      finished(false) {
+		if (names.size() != types.size()) {
+			throw InvalidInputException("CSV encoder: result name/type count mismatch");
+		}
+		bool needs_json = false;
+		for (auto col : data_cols) {
+			if (col >= names.size()) {
+				throw InvalidInputException("CSV encoder: data column index is out of bounds");
+			}
+			needs_json = needs_json || IsNestedCsvCell(types[col]);
+		}
+		if (needs_json) {
+			auto load = con.Query("LOAD json");
+			if (load->HasError()) {
+				throw InvalidInputException("CSV encoder: could not LOAD json: %s", load->GetError());
+			}
+		}
+		for (auto col : data_cols) {
+			unique_ptr<Expression> cell =
+			    make_uniq<BoundReferenceExpression>(types[col], UnsafeNumericCast<storage_t>(col));
+			if (IsNestedCsvCell(types[col])) {
+				vector<unique_ptr<Expression>> args;
+				args.push_back(std::move(cell));
+				FunctionBinder binder(*con.context);
+				ErrorData error;
+				cell = binder.BindScalarFunction(DEFAULT_SCHEMA, "to_json", std::move(args), error);
+				if (!cell) {
+					throw InvalidInputException("CSV encoder: could not bind to_json: %s", error.Message());
+				}
+			}
+			casts.push_back(BoundCastExpression::AddCastToType(*con.context, std::move(cell), LogicalType::VARCHAR));
+			output_types.push_back(LogicalType::VARCHAR);
+		}
+		if (!casts.empty()) {
+			executor = make_uniq<ExpressionExecutor>(*con.context, casts);
+		}
+		writer.options.null_str = {""};
+		writer.options.dialect_options.header = CSVOption<bool>(true, true);
+		writer.writer_options.newline_writing_mode = CSVNewLineMode::WRITE_AFTER;
+		writer.Initialize();
+		writer.WriteRawString(writer.writer_options.newline);
+	}
+
+	static vector<string> SelectNames(const vector<string> &names, const vector<idx_t> &data_cols) {
+		vector<string> result;
+		result.reserve(data_cols.size());
+		for (auto col : data_cols) {
+			if (col >= names.size()) {
+				throw InvalidInputException("CSV encoder: data column index is out of bounds");
+			}
+			result.push_back(names[col]);
+		}
+		return result;
+	}
+
+	void AppendChunk(DataChunk &chunk) {
+		if (finished) {
+			throw InternalException("CSV encoder: cannot append after Finish");
+		}
+		if (chunk.size() == 0) {
+			return;
+		}
+		if (!executor) {
+			for (idx_t i = 0; i < chunk.size(); i++) {
+				response_writer.Append("\n");
+			}
+			return;
+		}
+		DataChunk output;
+		output.Initialize(executor->GetContext(), output_types);
+		executor->Execute(chunk, output);
+		writer.WriteChunk(output, writer_state);
+		writer.Flush(writer_state);
+	}
+
+	void Finish() {
+		if (finished) {
+			return;
+		}
+		finished = true;
+		writer.Flush(writer_state);
+	}
+
+	QuackapiResponseWriter &response_writer;
+	BoundedResponseStream stream;
+	CSVWriter writer;
+	CSVWriterState writer_state;
+	vector<unique_ptr<Expression>> casts;
+	vector<LogicalType> output_types;
+	unique_ptr<ExpressionExecutor> executor;
+	bool finished;
+};
+
+QuackapiCsvChunkEncoder::QuackapiCsvChunkEncoder(Connection &con, const vector<string> &names,
+                                                 const vector<LogicalType> &types, const vector<idx_t> &data_cols,
+                                                 QuackapiResponseWriter &writer)
+    : state(make_uniq<State>(con, names, types, data_cols, writer)) {
+}
+
+QuackapiCsvChunkEncoder::~QuackapiCsvChunkEncoder() = default;
+
+QuackapiCsvChunkEncoder::QuackapiCsvChunkEncoder(QuackapiCsvChunkEncoder &&) noexcept = default;
+
+QuackapiCsvChunkEncoder &QuackapiCsvChunkEncoder::operator=(QuackapiCsvChunkEncoder &&) noexcept = default;
+
+void QuackapiCsvChunkEncoder::AppendChunk(DataChunk &chunk) {
+	state->AppendChunk(chunk);
+}
+
+void QuackapiCsvChunkEncoder::Finish() {
 	state->Finish();
 }
 
