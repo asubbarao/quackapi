@@ -1218,28 +1218,19 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 		{
 			Connection con(*context.db);
 			if (!bind_data.route.body_schema.empty()) {
-				// BODY SCHEMA depends on the community json_schema extension. Resolve it
-				// while creating the route, outside any request deadline, so the first
-				// request cannot unexpectedly pay the installation/network cost.
+				// BODY SCHEMA depends on the community json_schema extension. Load only
+				// an extension the caller has already made available; never install it
+				// from route DDL.
 				auto load = con.Query("LOAD json_schema");
 				if (load->HasError()) {
-					auto install = con.Query("INSTALL json_schema FROM community");
-					if (install->HasError()) {
-						throw InvalidInputException("BODY SCHEMA requires the json_schema extension: %s",
-						                            install->GetError());
-					}
-					load = con.Query("LOAD json_schema");
-				}
-				if (load->HasError()) {
-					throw InvalidInputException("BODY SCHEMA requires the json_schema extension: %s", load->GetError());
+					throw InvalidInputException("BODY SCHEMA requires the json_schema extension to be available and "
+					                            "loadable; load json_schema before creating this route: %s",
+					                            load->GetError());
 				}
 
 				// Catch malformed schema text at CREATE time rather than on the first
 				// request. TRY_CAST returns NULL for invalid JSON without throwing.
-				auto json_load = con.Query("LOAD json");
-				if (json_load->HasError()) {
-					throw InvalidInputException("BODY SCHEMA requires the json extension: %s", json_load->GetError());
-				}
+				// The core json extension is loaded when QuackAPI loads.
 				auto schema_json =
 				    con.Query("SELECT TRY_CAST(? AS JSON) IS NOT NULL", Value(bind_data.route.body_schema));
 				if (schema_json->HasError()) {
