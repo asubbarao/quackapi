@@ -49,7 +49,7 @@ target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE ${CMAKE_CURRENT_SOUR
 target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
 
 # The vendored httplib default backlog is 5. That drops loopback connections
-# when the outbound pool fans out to its 32-client cap before the server can
+# when outbound clients fan out to configured concurrency before the server can
 # accept them. Use the platform's full listen backlog for both extension forms.
 target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
