@@ -21,13 +21,9 @@
 
 #include "quackapi_auth.hpp"
 #include "quackapi_ddl.hpp"
-#include "quackapi_from_x.hpp"
-#include "quackapi_graphql.hpp"
 #include "quackapi_http_fetch.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
-#include "quackapi_stream.hpp"
-#include "quackapi_table_api.hpp"
 
 namespace duckdb {
 
@@ -98,16 +94,9 @@ struct ServeBindData : public TableFunctionData {
 	string static_dir;
 	//! Empty (default) = CORS off. Pass '*' or a comma-separated origin list.
 	string cors_origins;
-	//! Empty = not provided by operator. Named param wins over SET quackapi_memory_limit.
-	string memory_limit;
-	//! Batteries defaults — all correct-by-default for servers; overridable.
 	string log_level = "info";
 	string access_log = "true";
-	bool enable_logging = false;
 	bool health_routes = true;
-	string threads;
-	bool preserve_insertion_order = false;
-	bool enable_http_metadata_cache = true;
 	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
 	int32_t keep_alive_timeout_sec = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_TIMEOUT_SEC);
@@ -117,10 +106,6 @@ struct ServeBindData : public TableFunctionData {
 	string compression = "auto";
 	//! Min body size in bytes before compression. Default 1024.
 	idx_t compression_min_bytes = 1024;
-	//! Outbound HTTP client preference: auto|curl|httplib (default auto).
-	string http_client = "auto";
-	//! Optional libpq DSN for native Postgres execute (bypass ATTACH).
-	string pg_dsn;
 	//! When true, hold the query open after listen_url until stop / SIGINT / SIGTERM.
 	//! Default false — serve still returns immediately (backward compatible).
 	bool block = false;
@@ -236,17 +221,6 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->cors_origins = setting.GetValue<string>();
 		}
 	}
-	// memory_limit named param wins; else fall back to SET quackapi_memory_limit.
-	// Empty means "not provided" — ApplyQuackapiServerDefaults uses non-clobber logic.
-	auto mem_entry = input.named_parameters.find("memory_limit");
-	if (mem_entry != input.named_parameters.end()) {
-		bind_data->memory_limit = mem_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_memory_limit", setting) && !setting.IsNull()) {
-			bind_data->memory_limit = setting.GetValue<string>();
-		}
-	}
 	// log_level named param wins; else SET quackapi_log_level.
 	auto log_entry = input.named_parameters.find("log_level");
 	if (log_entry != input.named_parameters.end()) {
@@ -281,31 +255,9 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		string table;
 		ParseAccessLogString(bind_data->access_log, enabled, table);
 	}
-	auto enlog_entry = input.named_parameters.find("enable_logging");
-	if (enlog_entry != input.named_parameters.end()) {
-		bind_data->enable_logging = enlog_entry->second.GetValue<bool>();
-		bind_data->limits.enable_logging_explicit = true;
-	}
 	auto health_entry = input.named_parameters.find("health_routes");
 	if (health_entry != input.named_parameters.end()) {
 		bind_data->health_routes = health_entry->second.GetValue<bool>();
-	}
-	auto threads_entry = input.named_parameters.find("threads");
-	if (threads_entry != input.named_parameters.end()) {
-		// Accept INTEGER or VARCHAR.
-		if (threads_entry->second.type().id() == LogicalTypeId::VARCHAR) {
-			bind_data->threads = threads_entry->second.GetValue<string>();
-		} else {
-			bind_data->threads = threads_entry->second.ToString();
-		}
-	}
-	auto pio_entry = input.named_parameters.find("preserve_insertion_order");
-	if (pio_entry != input.named_parameters.end()) {
-		bind_data->preserve_insertion_order = pio_entry->second.GetValue<bool>();
-	}
-	auto http_meta_entry = input.named_parameters.find("enable_http_metadata_cache");
-	if (http_meta_entry != input.named_parameters.end()) {
-		bind_data->enable_http_metadata_cache = http_meta_entry->second.GetValue<bool>();
 	}
 	auto wt_entry = input.named_parameters.find("worker_threads");
 	if (wt_entry != input.named_parameters.end()) {
@@ -343,16 +295,6 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		}
 	}
 	// compression_min_bytes named param wins; else SET (default 1024).
-	// pg_dsn named param wins; else SET quackapi_pg_dsn.
-	auto pg_dsn_entry = input.named_parameters.find("pg_dsn");
-	if (pg_dsn_entry != input.named_parameters.end()) {
-		bind_data->pg_dsn = pg_dsn_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_pg_dsn", setting) && !setting.IsNull()) {
-			bind_data->pg_dsn = setting.GetValue<string>();
-		}
-	}
 	auto min_entry = input.named_parameters.find("compression_min_bytes");
 	if (min_entry != input.named_parameters.end()) {
 		auto v = min_entry->second.GetValue<int64_t>();
@@ -368,19 +310,6 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 				throw InvalidInputException("quackapi_serve: compression_min_bytes must be >= 0");
 			}
 			bind_data->compression_min_bytes = static_cast<idx_t>(v);
-		}
-	}
-	// http_client named param wins; else SET quackapi_http_client (default auto).
-	auto hc_entry = input.named_parameters.find("http_client");
-	if (hc_entry != input.named_parameters.end()) {
-		bind_data->http_client = hc_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_http_client", setting) && !setting.IsNull()) {
-			auto s = setting.GetValue<string>();
-			if (!s.empty()) {
-				bind_data->http_client = s;
-			}
 		}
 	}
 	auto block_entry = input.named_parameters.find("block");
@@ -434,30 +363,19 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	// Compose with quack's auth settings when present (no-op if quack unloaded).
 	ComposeQuackAuthSettings(context);
 
-	// Batteries-included serve options (all ON / server-optimal by default).
 	QuackapiServeOptions opts = bind_data.limits;
 	opts.static_dir = bind_data.static_dir;
 	opts.cors_origins = bind_data.cors_origins;
-	opts.memory_limit = bind_data.memory_limit;
 	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
 	opts.request_ring = bind_data.request_ring;
 	ParseAccessLogString(bind_data.access_log, opts.access_log, opts.access_log_table);
-	opts.enable_logging = bind_data.enable_logging;
 	opts.health_routes = bind_data.health_routes;
-	opts.threads = bind_data.threads;
-	opts.preserve_insertion_order = bind_data.preserve_insertion_order;
-	opts.enable_http_metadata_cache = bind_data.enable_http_metadata_cache;
 	opts.worker_threads = bind_data.worker_threads;
 	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
 	opts.keep_alive_timeout_sec = bind_data.keep_alive_timeout_sec;
 	opts.read_timeout_sec = bind_data.read_timeout_sec;
 	opts.write_timeout_sec = bind_data.write_timeout_sec;
-	opts.http_client = bind_data.http_client;
-	opts.pg_dsn = bind_data.pg_dsn;
 
-	// Apply DuckDB SETs / logging / resource guards (overridable, never unsafe).
-	// Outbound client: auto prefers curl_httpfs (loud fallback); curl requires it.
-	ApplyQuackapiServerDefaults(context, opts);
 	// Compose request_id source: community tsid if LOADable, else core uuidv7.
 	ProbeQuackapiRequestIdSource(*context.db, opts);
 	// Auto-register /health + /healthz into the route registry (listed by routes()).
@@ -632,8 +550,6 @@ struct RequestBindData : public TableFunctionData {
 	string path;
 	string body;
 	unordered_map<string, string> req_headers;
-	//! Optional libpq DSN for this request (named param wins over SET quackapi_pg_dsn).
-	string pg_dsn;
 	//! Empty (default) keeps in-process requests quiet. Otherwise true, false, or a table name.
 	string access_log;
 	string log_level = "info";
@@ -643,9 +559,8 @@ struct RequestBindData : public TableFunctionData {
 static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
-		throw InvalidInputException(
-		    "quackapi_request(method, path [, body] [, headers := MAP] [, pg_dsn := VARCHAR]) expects 2 or 3 "
-		    "positional args");
+		throw InvalidInputException("quackapi_request(method, path [, body] [, headers := MAP]) expects 2 or 3 "
+		                            "positional args");
 	}
 	auto bind_data = make_uniq<RequestBindData>();
 	BindResourceLimits(context, input, bind_data->limits);
@@ -666,16 +581,6 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 			if (kv.size() >= 2 && !kv[0].IsNull() && !kv[1].IsNull()) {
 				bind_data->req_headers[kv[0].ToString()] = kv[1].ToString();
 			}
-		}
-	}
-	// pg_dsn named param wins; else SET quackapi_pg_dsn (empty = DuckDB path).
-	auto pg_dsn_it = input.named_parameters.find("pg_dsn");
-	if (pg_dsn_it != input.named_parameters.end() && !pg_dsn_it->second.IsNull()) {
-		bind_data->pg_dsn = pg_dsn_it->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_pg_dsn", setting) && !setting.IsNull()) {
-			bind_data->pg_dsn = setting.GetValue<string>();
 		}
 	}
 	auto access_entry = input.named_parameters.find("access_log");
@@ -727,7 +632,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 		ParseAccessLogString(bind_data.access_log, opts.access_log, opts.access_log_table);
 	}
 	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
-	                         &bind_data.req_headers, &resp_headers, bind_data.pg_dsn, &opts);
+	                         &bind_data.req_headers, &resp_headers, &opts);
 	output.SetValue(0, 0, Value::INTEGER(status));
 	output.SetValue(1, 0, Value::BLOB(const_data_ptr_cast(body.data()), body.size()));
 	output.SetValue(2, 0, Value(content_type));
@@ -823,7 +728,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 struct ServersBindData : public TableFunctionData {};
 
 struct ServersGlobalState : public GlobalTableFunctionState {
-	vector<std::tuple<string, int, string, string>> servers;
+	vector<std::pair<string, int>> servers;
 	idx_t offset = 0;
 };
 
@@ -835,10 +740,6 @@ static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindIn
 	names.emplace_back("port");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("listen_url");
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("http_client");
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("http_client_reason");
 	return make_uniq<ServersBindData>();
 }
 
@@ -855,13 +756,9 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 		auto &server = state.servers[state.offset];
 		const auto &host = std::get<0>(server);
 		const auto port = std::get<1>(server);
-		const auto &http_client = std::get<2>(server);
-		const auto &http_client_reason = std::get<3>(server);
 		output.SetValue(0, row, Value(host));
 		output.SetValue(1, row, Value::INTEGER(port));
 		output.SetValue(2, row, Value(StringUtil::Format("http://%s:%d", host, port)));
-		output.SetValue(3, row, Value(http_client));
-		output.SetValue(4, row, Value(http_client_reason));
 		row++;
 		state.offset++;
 	}
@@ -1141,15 +1038,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "CORS allowed origins for quackapi_serve (* or comma-separated list). "
 	                          "Empty (default) disables CORS. Overridden by cors_origins named parameter.",
 	                          LogicalType::VARCHAR, Value(""));
-	// SET quackapi_memory_limit = '4GB' | '512MB' | …
-	// Empty (default) = leave DuckDB memory_limit alone if already non-default;
-	// otherwise apply the 256MB serve guard. Serve-time memory_limit := '…' wins.
-	config.AddExtensionOption("quackapi_memory_limit",
-	                          "Memory limit applied by quackapi_serve (e.g. '4GB', '512MB'). "
-	                          "Empty (default): do not clobber a non-default DuckDB memory_limit; "
-	                          "only apply the 256MB serve default when nothing was configured. "
-	                          "Overridden by memory_limit named parameter.",
-	                          LogicalType::VARCHAR, Value(""));
 	// SET quackapi_log_level = 'info' | 'debug' | 'warn' | 'error' | 'silent'
 	// Default info — informative access + DuckDB logs, not silent.
 	config.AddExtensionOption("quackapi_log_level",
@@ -1185,54 +1073,27 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Minimum response body size (bytes) before compression. "
 	                          "Default 1024. Overridden by compression_min_bytes named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(1024));
-	// SET quackapi_http_client = 'auto' | 'curl' | 'httplib'
-	// Default auto: INSTALL+LOAD curl_httpfs; fall back to httplib with loud reason.
-	// curl: REQUIRE curl_httpfs — fail serve if INSTALL/LOAD fails (no silent fallback).
-	// httplib: force stock client. Serve-time http_client := '…' wins.
-	// Inbound server remains httplib regardless.
-	config.AddExtensionOption("quackapi_http_client",
-	                          "Outbound HTTP client for httpfs/route fetches: auto|curl|httplib. "
-	                          "Default auto prefers curl_httpfs (pool, HTTP/2, async) and falls back "
-	                          "to httplib with http_client_reason on /healthz when unavailable. "
-	                          "curl fails serve if curl_httpfs cannot INSTALL/LOAD. Overridden by "
-	                          "http_client named parameter. Does not change the inbound HTTP server.",
-	                          LogicalType::VARCHAR, Value("auto"));
-	// SET quackapi_pg_dsn = 'postgresql://…' — native libpq path for serve + request.
-	// Empty (default) = DuckDB handler path only. Overridden by pg_dsn named parameter.
-	config.AddExtensionOption("quackapi_pg_dsn",
-	                          "Postgres DSN for the native libpq handler path (thread-local PGconn). "
-	                          "Empty (default) keeps DuckDB-only execution. Overridden by pg_dsn named "
-	                          "parameter on quackapi_serve / quackapi_request.",
-	                          LogicalType::VARCHAR, Value(""));
-
 	config.AddExtensionOption("quackapi_query_timeout_ms", "Maximum query execution time in milliseconds",
 	                          LogicalType::BIGINT, Value::BIGINT(30000));
 	config.AddExtensionOption("quackapi_max_response_bytes", "Maximum uncompressed response bytes", LogicalType::BIGINT,
 	                          Value::BIGINT(16 * 1024 * 1024));
 	config.AddExtensionOption("quackapi_max_pending_requests", "Maximum queued HTTP connections", LogicalType::BIGINT,
 	                          Value::BIGINT(256));
-	config.AddExtensionOption("quackapi_graphql_allow_all", "Explicit legacy opt-in to public GraphQL catalog exposure",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.
 	// All logging / health / server SETs ON by default; every knob overridable.
-	// Also carries compression + compression_min_bytes + http_client.
+	// Also carries compression + compression_min_bytes.
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
 	serve.named_parameters["host"] = LogicalType::VARCHAR;
 	serve.named_parameters["static_dir"] = LogicalType::VARCHAR;
 	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
-	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
 	serve.named_parameters["log_level"] = LogicalType::VARCHAR;
 	serve.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
 	serve.named_parameters["request_ring"] = LogicalType::BIGINT;
 	serve.named_parameters["log_headers"] = LogicalType::VARCHAR;
 	serve.named_parameters["log_query"] = LogicalType::BOOLEAN;
 	serve.named_parameters["access_log"] = LogicalType::ANY;
-	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
 	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
-	serve.named_parameters["threads"] = LogicalType::VARCHAR;
-	serve.named_parameters["preserve_insertion_order"] = LogicalType::BOOLEAN;
-	serve.named_parameters["enable_http_metadata_cache"] = LogicalType::BOOLEAN;
 	serve.named_parameters["worker_threads"] = LogicalType::INTEGER;
 	serve.named_parameters["keep_alive_max_count"] = LogicalType::INTEGER;
 	serve.named_parameters["keep_alive_timeout_sec"] = LogicalType::INTEGER;
@@ -1240,8 +1101,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
 	serve.named_parameters["compression"] = LogicalType::ANY;
 	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
-	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
-	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	serve.named_parameters["block"] = LogicalType::BOOLEAN;
 	serve.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	serve.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
@@ -1280,7 +1139,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	request2.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
 	request2.named_parameters["log_headers"] = LogicalType::VARCHAR;
 	request2.named_parameters["log_query"] = LogicalType::BOOLEAN;
-	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request2.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request2.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
 	request_set.AddFunction(request2);
@@ -1292,7 +1150,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	request3.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
 	request3.named_parameters["log_headers"] = LogicalType::VARCHAR;
 	request3.named_parameters["log_query"] = LogicalType::BOOLEAN;
-	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
 	request3.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
 	request3.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
 	request_set.AddFunction(request3);
@@ -1331,9 +1188,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quack_nop_authorization so they can be SET as quack_*_function.
 	RegisterQuackAuthBridgeFunctions(loader);
 
-	// CREATE STREAM + quackapi_streams() (SSE push; WS deferred on httplib).
-	RegisterQuackapiStreamFunctions(loader);
-
 	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …
 	// Does NOT auto-LOAD curl_httpfs; missing companion must not fail LOAD quackapi.
 	loader.RegisterFunction(ScalarFunction("quackapi_http_util_name", {}, LogicalType::VARCHAR, HttpUtilNameFunction));
@@ -1351,24 +1205,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetApplyMiddlewareFunction());
 	loader.RegisterFunction(GetQuackapiMiddlewaresFunction());
 
-	// quack_from_{fastapi,rails,express,gin}[+_models]: sitting_duck extractors
-	// that turn a real web-app source tree into route/model IR rows.
-	RegisterQuackapiFromXFunctions(loader);
-
-	// Thin GraphQL allowlist + named route inspection (CREATE GRAPHQL … DDL).
-	RegisterQuackapiGraphqlFunctions(loader);
-
-	// CREATE ROUTE / GROUP / AUTH / STREAM / API FOR TABLE /
-	// GRAPHQL FOR TABLE / GRAPHQL ROUTE — all first-class nouns registered.
+	// CREATE ROUTE / GROUP / AUTH and middleware DDL.
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(GroupDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
-	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(MiddlewareDdlParserExtension());
-	// CREATE STREAM (SSE)
-	ExtensionCallbackManager::Get(db).Register(StreamDdlParserExtension());
-	// CREATE / DROP GRAPHQL FOR TABLE (+ DROP GRAPHQL ALL) + GRAPHQL ROUTE
-	ExtensionCallbackManager::Get(db).Register(GraphqlDdlParserExtension());
 }
 
 void QuackapiExtension::Load(ExtensionLoader &loader) {

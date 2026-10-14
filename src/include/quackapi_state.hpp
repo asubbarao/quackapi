@@ -3,7 +3,6 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
-#include <tuple>
 
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/shared_ptr.hpp"
@@ -86,24 +85,6 @@ struct QuackapiGroup {
 	string require_auth;
 	//! OpenAPI tags CSV (e.g. "items,v1"). Inherited by routes that join the group.
 	string tags;
-	//! Seam for future shared policy / middleware name. Unused in v1 — do not depend.
-	string policy;
-};
-
-//! Named GraphQL-over-HTTP mount (CREATE GRAPHQL ROUTE). Independent of the
-//! built-in POST /graphql global allowlist.
-struct QuackapiGraphqlRoute {
-	string name;
-	//! Upper-case HTTP method; v0 only POST for the query mount.
-	string method = "POST";
-	//! Absolute path, trailing slash stripped (except "/"). Schema is GET path+"/schema".
-	string path;
-	//! Per-route table allowlist (required, ≥1). Does not mutate global graphql_tables.
-	vector<string> tables;
-	//! Empty = public. Non-empty = CREATE AUTH scheme name.
-	string require_auth;
-	//! Row cap for each root field SELECT; 0 means default at execute time.
-	idx_t limit = 100;
 };
 
 //! One registered route. Immutable once snapshotted; the registry replaces
@@ -136,7 +117,7 @@ struct QuackapiRoute {
 	int rate_limit_per_sec = 0;
 	//! "ip" (default), "token" (Authorization / X-API-Key header raw), "key" alias of token.
 	string rate_limit_by;
-	//! Default response body format: "json" (default), "ndjson", "csv", "parquet", or "arrow".
+	//! Default response body format: "json" (default), "ndjson", or "csv".
 	//! Explicit non-json wins over Accept negotiation; json allows Accept override.
 	string response_format = "json";
 	//! JSON shape for FORMAT json: "array" (default, `[{…}]`) or "object" (single row → `{…}`).
@@ -155,25 +136,6 @@ struct QuackapiRoute {
 	//! Optional six-field cron expression (seconds first), owned by cronjob.
 	//! Empty means this route is not scheduled.
 	string schedule;
-};
-
-//! Transport for CREATE STREAM. SSE is first-class on cpp-httplib; WebSocket is
-//! not available on the bundled httplib (no Upgrade/WS API) — WS is rejected at DDL.
-enum class QuackapiStreamTransport : uint8_t {
-	SSE = 0,
-};
-
-//! One SSE push stream registered via CREATE STREAM.
-//! Emits text/event-stream (one event per row). Optional interval re-runs the
-//! SELECT for polling/tailing — no separate thread pool (blocks the httplib worker).
-struct QuackapiStream {
-	string name;
-	string method = "GET"; // SSE is GET; WS deferred
-	string pattern;        // e.g. /events
-	string handler_sql;    // AS <select>; named params bind like routes
-	//! 0 = run SELECT once and close the stream. >0 = re-run after each empty/full cycle.
-	int64_t interval_ms = 0;
-	QuackapiStreamTransport transport = QuackapiStreamTransport::SSE;
 };
 
 //! Per-database quackapi state: the route registry, auth registry, and running servers.
@@ -210,14 +172,6 @@ public:
 	//! Shared immutable view for the HTTP hot path (refcount only — no deep copy).
 	shared_ptr<const vector<QuackapiRoute>> LiveRoutes();
 
-	//! CREATE [OR REPLACE] STREAM. Throws on duplicate name unless or_replace.
-	void AddStream(const QuackapiStream &stream, bool or_replace);
-	//! DROP STREAM. Returns false if no such stream.
-	bool DropStream(const string &name);
-	vector<QuackapiStream> SnapshotStreams();
-	//! Shared immutable view for the HTTP hot path (refcount only — no deep copy).
-	shared_ptr<const vector<QuackapiStream>> LiveStreams();
-
 	//! CREATE [OR REPLACE] GROUP. Throws on duplicate name unless or_replace.
 	void AddGroup(const QuackapiGroup &group, bool or_replace);
 	//! DROP GROUP. Does NOT cascade-drop member routes. Returns false if missing.
@@ -250,8 +204,8 @@ public:
 	bool HasServerOnPort(int port);
 	//! Host for the server on port, if any. Returns false if none.
 	bool GetServerHost(int port, string &host_out);
-	//! (host, port, http_client_active, http_client_reason) for each running server.
-	vector<std::tuple<string, int, string, string>> ListServers();
+	//! (host, port) for each running server.
+	vector<std::pair<string, int>> ListServers();
 	//! Snapshot one server's request ring; port 0 means the only running server.
 	//! A port is required when more than one server is running.
 	vector<QuackapiRequestRecord> SnapshotRequests(int port = 0);
@@ -261,31 +215,6 @@ public:
 	//! Flush queued telemetry for one running server. Port 0 means the only server.
 	//! A port is required when more than one server is running.
 	bool FlushTelemetry(int port = 0);
-
-	// --- Thin GraphQL v0 table allowlist (built-in POST /graphql) ---
-	// Empty allowlist = open mode (all main-schema tables, v0 default).
-	// Non-empty = only registered tables appear in /graphql and /graphql/schema.
-	//! Register a main-schema table/view for GraphQL. Throws on duplicate unless or_replace.
-	void AddGraphqlTable(const string &table_name, bool or_replace);
-	//! Remove one table from the allowlist. Returns false if not registered.
-	bool DropGraphqlTable(const string &table_name);
-	//! Clear allowlist → open catalog mode.
-	void ClearGraphqlTables();
-	//! True when at least one table is registered (allowlist mode).
-	bool GraphqlAllowlistActive();
-	//! True when open mode OR table is on the allowlist.
-	bool IsGraphqlTableAllowed(const string &table_name);
-	//! Sorted snapshot of registered table names (empty in open mode).
-	vector<string> SnapshotGraphqlTables();
-
-	// --- Named GraphQL mounts (CREATE GRAPHQL ROUTE) ---
-	void AddGraphqlRoute(const QuackapiGraphqlRoute &route, bool or_replace);
-	bool DropGraphqlRoute(const string &name);
-	//! Exact path match (normalized). method upper-case.
-	bool GetGraphqlRouteByPath(const string &path, const string &method, QuackapiGraphqlRoute &out);
-	//! True when path is a registered route's schema URL (GET path+"/schema").
-	bool GetGraphqlRouteBySchemaPath(const string &path, QuackapiGraphqlRoute &out);
-	vector<QuackapiGraphqlRoute> SnapshotGraphqlRoutes();
 
 	//! Effective write deadline (seconds) applied to the most recent route
 	//! request. Seeded with serve write_timeout_sec; ApplyRouteIoTimeout
@@ -300,7 +229,6 @@ public:
 
 private:
 	void PublishRoutes();
-	void PublishStreams();
 
 	std::atomic<int32_t> last_effective_write_timeout_sec {0};
 	struct RateLimitEntry {
@@ -315,22 +243,12 @@ private:
 	//! Published under routes_mutex; readers take a shared_ptr copy and drop the lock.
 	shared_ptr<const vector<QuackapiRoute>> routes_live;
 
-	std::mutex streams_mutex;
-	vector<QuackapiStream> streams;
-	shared_ptr<const vector<QuackapiStream>> streams_live;
-
 	std::mutex groups_mutex;
 	vector<QuackapiGroup> groups;
 
 	std::mutex auths_mutex;
 	vector<QuackapiAuth> auths;
 	vector<QuackapiApiKeyEntry> api_keys;
-
-	//! GraphQL allowlist (case-sensitive catalog names, like duckdb_tables).
-	std::mutex graphql_mutex;
-	vector<string> graphql_tables;
-	//! Named GraphQL path mounts (independent of graphql_tables).
-	vector<QuackapiGraphqlRoute> graphql_routes;
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;

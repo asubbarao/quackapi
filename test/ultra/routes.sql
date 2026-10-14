@@ -93,9 +93,6 @@ CREATE ROUTE matrix_small GET '/matrix/small'
 CREATE ROUTE matrix_ndjson GET '/matrix/ndjson' FORMAT ndjson
   AS SELECT id, name, price, tags FROM matrix_items ORDER BY id;
 
-CREATE STREAM matrix_stream GET '/matrix/stream'
-  AS SELECT i AS id FROM range(3) t(i);
-
 CREATE ROUTE matrix_csv GET '/matrix/csv' FORMAT csv
   AS SELECT id, name FROM matrix_items WHERE id <= 2 ORDER BY id;
 

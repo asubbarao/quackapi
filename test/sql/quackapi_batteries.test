@@ -1,38 +1,8 @@
 # name: test/sql/quackapi_batteries.test
-# description: batteries-included overrides — preserve_insertion_order, health_routes off, http_client force
+# description: health route configuration
 # group: [sql]
 
 require quackapi
-
-# log_level extension option defaults to info
-query I
-SELECT current_setting('quackapi_log_level');
-----
-info
-
-# http_client extension option defaults to auto (prefer curl_httpfs)
-query I
-SELECT current_setting('quackapi_http_client');
-----
-auto
-
-# ---------------------------------------------------------------------------
-# Overridable: preserve_insertion_order := true keeps insertion order
-# ---------------------------------------------------------------------------
-query I
-SELECT * FROM quackapi_serve(29202, host := '127.0.0.1', preserve_insertion_order := true);
-----
-http://127.0.0.1:29202
-
-query I
-SELECT current_setting('preserve_insertion_order');
-----
-true
-
-query I
-SELECT * FROM quackapi_stop(29202);
-----
-Stopped quackapi server on port 29202
 
 # ---------------------------------------------------------------------------
 # health_routes := false → not re-registered after explicit drop
@@ -61,22 +31,3 @@ query I
 SELECT * FROM quackapi_stop(29203);
 ----
 Stopped quackapi server on port 29203
-
-# ---------------------------------------------------------------------------
-# http_client := 'httplib' forces stock client (always available; no network
-# needed for the force path). Active backend + reason on quackapi_servers().
-# ---------------------------------------------------------------------------
-query I
-SELECT * FROM quackapi_serve(29204, host := '127.0.0.1', http_client := 'httplib');
-----
-http://127.0.0.1:29204
-
-query II
-SELECT http_client, http_client_reason FROM quackapi_servers() WHERE port = 29204;
-----
-httplib	operator_forced
-
-query I
-SELECT * FROM quackapi_stop(29204);
-----
-Stopped quackapi server on port 29204

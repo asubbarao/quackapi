@@ -47,12 +47,8 @@ enum class QuackapiLogLevel : uint8_t {
 //! Response compression policy. AUTO negotiates zstd/gzip from Accept-Encoding.
 enum class QuackapiCompressionMode : uint8_t { OFF = 0, GZIP = 1, ZSTD = 2, AUTO = 3 };
 
-//! Serve options (static files, CORS, batteries-included server defaults,
-//! response compression). Defaults are correct-by-default for a server
-//! process: logging on, health routes on, throughput-oriented DuckDB SETs
-//! applied at serve time, and Accept-Encoding compression on (zstd preferred,
-//! then gzip). CORS stays off (browser cross-origin blocked) until the
-//! operator opts in with cors_origins.
+//! Serve options for static files, CORS, HTTP limits, logging, and compression.
+//! CORS stays off until the operator opts in with cors_origins.
 struct QuackapiServeOptions {
 	string static_dir;
 	//! Empty = CORS disabled. "*" = reflect any Origin (or * when no Origin).
@@ -73,13 +69,6 @@ struct QuackapiServeOptions {
 	string log_headers;
 	//! Preserve the raw query string in the access log after key-based redaction.
 	bool log_query = false;
-	//! Enable DuckDB built-in QueryLog at serve (CALL enable_logging). Default
-	//! **false** when DuckDB logging was not already enabled — per-handler QueryLog
-	//! to stdout destroys HTTP throughput. Preserve prior operator logging unless
-	//! explicitly overridden; use access_log for ops.
-	bool enable_logging = false;
-	//! True when the operator supplied the enable_logging named parameter.
-	bool enable_logging_explicit = false;
 	//! Number of completed TCP requests retained for quackapi_requests().
 	//! Zero disables the ring and its allocation.
 	int64_t request_ring = 10000;
@@ -104,30 +93,6 @@ struct QuackapiServeOptions {
 	int64_t max_response_bytes = 16 * 1024 * 1024;
 	int32_t max_pending_requests = 256;
 
-	// --- Batteries: DuckDB SETs applied at serve (overridable) ---
-	//! Empty = apply non-clobber memory guard (256MB when still at system default).
-	string memory_limit;
-	//! Empty = leave DuckDB threads at system default (all cores). Else e.g. "8".
-	string threads;
-	//! When true (default), SET preserve_insertion_order=false for throughput.
-	bool preserve_insertion_order = false;
-	//! When true (default), SET enable_http_metadata_cache=true for outbound HTTP.
-	bool enable_http_metadata_cache = true;
-
-	// --- Batteries: outbound HTTP client (curl_httpfs preferred) ---
-	//! Preference: "auto" (default — prefer curl_httpfs, fall back to httplib with
-	//! loud reason), "curl" (require curl_httpfs — fail serve if unavailable), or
-	//! "httplib" (skip curl_httpfs). Named param / SET quackapi_http_client.
-	//! Does NOT touch the inbound httplib SERVER — only the client used by
-	//! httpfs / read_* over https.
-	string http_client = "auto";
-	//! Filled at serve after probe: "curl" or "httplib".
-	string http_client_active;
-	//! Why active is what it is. Empty when curl is active after a successful
-	//! probe. "operator_forced" when operator chose httplib.
-	//! "curl_httpfs_unavailable" when auto fell back (never silent).
-	string http_client_reason;
-
 	//! Request-id source for X-Request-ID. Always **uuidv7** (C++ core, no SQL)
 	//! so the hot path never pays a SELECT per request. Probe may still record
 	//! "tsid" only if an operator forces a future path; default is uuidv7.
@@ -138,12 +103,6 @@ struct QuackapiServeOptions {
 	QuackapiCompressionMode compression = QuackapiCompressionMode::AUTO;
 	//! Bodies smaller than this many bytes are left uncompressed (default 1024).
 	idx_t compression_min_bytes = 1024;
-
-	// --- Native Postgres (optional; same shape as FastAPI+psycopg) ---
-	//! When non-empty, simple routes execute via libpq (thread-local conn,
-	//! fresh PQexecParams per request) instead of DuckDB ATTACH.
-	//! Empty = DuckDB path only. Example: postgresql://user:pass@127.0.0.1:5432/db
-	string pg_dsn;
 };
 
 //! One completed request, shared by the stderr and table access-log sinks.
@@ -333,18 +292,11 @@ private:
 //! Optional body for POST/PUT/PATCH (Content-Type application/json when non-empty).
 //! req_headers: optional request headers (e.g. X-Request-ID, Accept, Authorization).
 //! headers_out: response header map (first value per name; case as httplib stores it).
-//! Optional pg_dsn: when non-empty, in-process dispatch uses the native libpq
-//! path (same as quackapi_serve(..., pg_dsn := ...)). Empty keeps DuckDB-only.
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers = nullptr,
-                              unordered_map<string, string> *headers_out = nullptr, const string &pg_dsn = string(),
+                              unordered_map<string, string> *headers_out = nullptr,
                               const QuackapiServeOptions *request_options = nullptr);
-
-//! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
-//! Overridable via QuackapiServeOptions; never disables safety features.
-//! Returns a human-readable summary of what was applied (for docs / debugging).
-string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions &opts);
 
 //! Auto-register GET /health + GET /healthz into the route registry (OR REPLACE
 //! reserved names). When opts.health_routes is false, drops those reserved

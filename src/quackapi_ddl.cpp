@@ -316,7 +316,7 @@ bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
 
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
+//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv]
 //!     [ENVELOPE array|object] [EMPTY STATUS <n> [BODY '<json>']]
 //!     [TIMEOUT <n>|'30s'|'5m'] [SCHEDULE '<6-field cron, seconds first>']
 //!     [GROUP <name> | IN GROUP <name>]
@@ -552,21 +552,17 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			rest = QuackapiTrim(rest.substr(token_end));
 			continue;
 		}
-		// [FORMAT json|ndjson|csv|parquet|arrow]
+		// [FORMAT json|ndjson|csv]
 		if (StringUtil::StartsWith(rest_upper, "FORMAT") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
 			rest = QuackapiTrim(rest.substr(6));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
-				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, parquet, or arrow");
+				return ParserExtensionParseResult("FORMAT expects json, ndjson, or csv");
 			}
 			auto fmt = StringUtil::Lower(rest.substr(0, token_end));
-			// "arrows" is a friendly alias of the nanoarrow COPY format name.
-			if (fmt == "arrows") {
-				fmt = "arrow";
-			}
-			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow") {
-				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, parquet, or arrow");
+			if (fmt != "json" && fmt != "ndjson" && fmt != "csv") {
+				return ParserExtensionParseResult("FORMAT must be json, ndjson, or csv");
 			}
 			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));
@@ -1209,7 +1205,6 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			if (bind_data.route.tags.empty() && !group.tags.empty()) {
 				bind_data.route.tags = group.tags;
 			}
-			// policy seam: group.policy reserved for future shared policy; unused in v1.
 		} else if (bind_data.route.pattern.empty() || bind_data.route.pattern[0] != '/') {
 			throw InvalidInputException("Route pattern must start with '/'");
 		}
@@ -1258,19 +1253,8 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			}
 			auto prepared = con.Prepare(bind_data.route.handler_sql);
 			if (prepared->HasError()) {
-				// Native libpq path (pg_dsn): handler SQL is Postgres dialect and may
-				// not prepare under DuckDB (domains, DO, INSERT…RETURNING, …). Allow
-				// CREATE when pg_dsn is configured; request time uses libpq, else 500.
-				auto err = prepared->GetError();
-				auto el = StringUtil::Lower(err);
-				bool pg_returning = StringUtil::Contains(el, "returning clause not yet supported") &&
-				                    StringUtil::Contains(el, "postgres");
-				Value pg_dsn_setting;
-				bool has_pg_dsn = context.TryGetCurrentSetting("quackapi_pg_dsn", pg_dsn_setting) &&
-				                  !pg_dsn_setting.IsNull() && !pg_dsn_setting.GetValue<string>().empty();
-				if (!pg_returning && !has_pg_dsn) {
-					throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name, err);
-				}
+				throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name,
+				                            prepared->GetError());
 			}
 		}
 		state.AddRoute(bind_data.route, bind_data.or_replace);
@@ -1377,7 +1361,7 @@ bool ParseQuotedString(const string &s, idx_t start, string &out, idx_t &end) {
 
 //! Grammar:
 //!   CREATE [OR REPLACE] [API] GROUP <name> WITH (
-//!     prefix='/abs', [auth=<name>|require=<name>], [tags='csv'], [policy=<name>]
+//!     prefix='/abs', [auth=<name>|require=<name>], [tags='csv']
 //!   )
 //!   DROP [API] GROUP <name>
 //!
@@ -1537,12 +1521,8 @@ ParserExtensionParseResult GroupDdlParse(ParserExtensionInfo *, const string &qu
 				group.require_auth = value;
 			} else if (key == "tags") {
 				group.tags = value;
-			} else if (key == "policy") {
-				// Seam for future shared policy; stored, unused at request time in v1.
-				group.policy = value;
 			} else {
-				return ParserExtensionParseResult("Unknown GROUP option \"" + key +
-				                                  "\" — expected prefix, auth, tags, policy");
+				return ParserExtensionParseResult("Unknown GROUP option \"" + key + "\" — expected prefix, auth, tags");
 			}
 		}
 		if (!have_prefix) {
@@ -1617,7 +1597,6 @@ unique_ptr<FunctionData> ApplyGroupBind(ClientContext &, TableFunctionBindInput 
 	bind_data->group.prefix = input.inputs[3].GetValue<string>();
 	bind_data->group.require_auth = input.inputs[4].GetValue<string>();
 	bind_data->group.tags = input.inputs[5].GetValue<string>();
-	bind_data->group.policy = input.inputs[6].GetValue<string>();
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
@@ -1648,7 +1627,7 @@ void ApplyGroupExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyGroupFunction() {
 	return MakeApplyDdlFunction("quackapi_apply_group",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                            ApplyGroupExec, ApplyGroupBind);
 }
 
@@ -1663,7 +1642,6 @@ ParserExtensionPlanResult GroupDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.group.prefix));
 	result.parameters.push_back(Value(data.group.require_auth));
 	result.parameters.push_back(Value(data.group.tags));
-	result.parameters.push_back(Value(data.group.policy));
 	FinishDdlPlan(result);
 	return result;
 }

@@ -119,56 +119,6 @@ statement ok
 DROP ROUTE mover;
 
 # ---------------------------------------------------------------------------
-# Bug: CREATE GRAPHQL FOR TABLE a, b half-applied when a later name failed
-# (missing table or duplicate) — earlier tables stayed on the allowlist.
-# ---------------------------------------------------------------------------
-statement ok
-CREATE TABLE users AS SELECT 1 AS id;
-
-statement ok
-CREATE TABLE posts AS SELECT 1 AS id;
-
-statement error
-CREATE GRAPHQL FOR TABLE users, no_such_table;
-----
-not found
-
-query I
-SELECT count(*) FROM quackapi_graphql_tables() WHERE table_name = 'users';
-----
-0
-
-statement ok
-CREATE GRAPHQL FOR TABLE users;
-
-statement error
-CREATE GRAPHQL FOR TABLE posts, users;
-----
-already registered
-
-query I
-SELECT count(*) FROM quackapi_graphql_tables() WHERE table_name = 'posts';
-----
-0
-
-statement ok
-DROP GRAPHQL FOR TABLE users;
-
-# ---------------------------------------------------------------------------
-# Bug: CREATE API FOR TABLE skipped handler validation — missing table still
-# registered list/get routes that 500'd on first request.
-# ---------------------------------------------------------------------------
-statement error
-CREATE API FOR TABLE no_such_table;
-----
-Invalid handler SQL
-
-query I
-SELECT count(*) FROM quackapi_routes() WHERE name IN ('no_such_table_list', 'no_such_table_get');
-----
-0
-
-# ---------------------------------------------------------------------------
 # Bug: serve(health_routes=true) → stop → serve(health_routes=false) left
 # __quackapi_health* in the registry (RegisterQuackapiHealthRoutes no-op).
 # ---------------------------------------------------------------------------
