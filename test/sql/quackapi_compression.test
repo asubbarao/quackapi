@@ -2,6 +2,7 @@
 # description: response compression mode and threshold configuration
 # group: [sql]
 
+require json
 require quackapi
 
 query I
