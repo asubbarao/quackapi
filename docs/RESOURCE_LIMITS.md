@@ -41,15 +41,36 @@ queue slots are full, caller-side backpressure applies. This setting bounds the
 POST transport only; it does not schedule route SQL or change transaction
 semantics.
 
+Query cancellation promptly removes queued POSTs. A provider call already in
+progress may still complete at the remote server. Database shutdown waits for
+active provider calls to return so their worker state stays valid; without a
+caller deadline, the outbound request timeout defaults to 600 seconds.
+
 ## Ordinary SQL concurrency
 
 Handlers execute ordinary SQL against DuckDB. Concurrent HTTP requests do not
 create an ADBC connection pool, per-request database server, or multiple-writer
-mode. The usual DuckDB transaction and database-file locking rules remain in
-force. Treat this as an embedded analytical database with an HTTP interface,
-not as a high-write OLTP service.
+mode. DuckDB permits concurrent writes from threads in one process when
+transactions do not conflict on the same rows. Separate processes may open a
+database read-only; multi-process writes require a client/server protocol.
+QuackAPI's POST worker setting does not change those rules.
 
-See [DuckDB concurrency guidance](https://duckdb.org/docs/stable/connect/concurrency)
-for the database's ordinary SQL concurrency behavior. Arrow Flight and ADBC
-are separate client/protocol surfaces; neither changes QuackAPI route SQL or
-adds a Flight server here.
+ADBC can connect directly to DuckDB for ordinary SQL, for example:
+
+```python
+import adbc_driver_duckdb.dbapi
+
+with adbc_driver_duckdb.dbapi.connect("analytics.duckdb") as connection:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM events")
+        print(cursor.fetchone())
+```
+
+Use one ADBC connection per concurrent worker. If a connection or statement is
+shared, serialize access; DuckDB's ADBC implementation does not require either
+to be thread-safe ([connection](https://github.com/duckdb/duckdb/blob/v1.5.6/src/include/duckdb/common/adbc/adbc.h#L783-L784),
+[statement](https://github.com/duckdb/duckdb/blob/v1.5.6/src/include/duckdb/common/adbc/adbc.h#L821-L823)).
+The optional [`duckflight` extension](https://duckdb.org/community_extensions/extensions/duckflight)
+serves PostgreSQL and Arrow Flight SQL endpoints as a separate protocol; it is
+not required by QuackAPI. See [DuckDB concurrency](https://duckdb.org/docs/current/connect/concurrency)
+and [DuckDB ADBC](https://duckdb.org/docs/stable/clients/adbc).

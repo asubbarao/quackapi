@@ -31,8 +31,10 @@ and supported schemes come from the loaded DuckDB extension.
 ## Send an outbound POST
 
 `quackapi_post` uses DuckDB's HTTPUtil provider and requires a POST-capable
-provider to be explicitly loaded. `curl_httpfs` is recommended; `httpfs` is
-also supported.
+provider to be explicitly loaded. The patched `curl_httpfs` and HTTPFS-Curl
+providers are under upstream review; released community binaries are not yet
+supported provider builds for this contract. See
+[Outbound POST providers](../curl_httpfs.md) for pinned revisions.
 
 ```sql
 LOAD json;
@@ -56,16 +58,19 @@ requests. See [Outbound POST providers](../curl_httpfs.md).
 
 `CREATE AUTH` and `REQUIRE` decide whether a caller may invoke a route. They do
 not apply row filters to arbitrary SQL. Put tenant constraints in the handler
-query or a scoped view and use DuckDB privileges for database access. There is
-no built-in row-access or masking-policy rewrite.
+query or a scoped view. There is no built-in row-access or masking-policy
+rewrite.
 
 ## Protocol boundaries
 
 QuackAPI currently serves ordinary bounded HTTP route responses in JSON,
 NDJSON, and CSV. The extension does not host GraphQL, SSE, WebSocket, Arrow
-Flight, or PostgreSQL protocols. DuckDB Flight/ADBC clients and the `radio`
-message-bus extension can be composed separately, but they do not add those
-protocols to the QuackAPI listener. In particular, `radio` does not implement
+Flight, or PostgreSQL protocols. DuckDB's optional `duckflight` extension
+serves Flight SQL as a separate protocol; it is not a QuackAPI dependency.
+ADBC clients can connect directly to DuckDB and run ordinary SQL, but do not
+add an ADBC endpoint to QuackAPI. The `radio` message-bus extension can be
+composed separately, but it does not add protocols to the QuackAPI listener.
+In particular, `radio` does not implement
 the durable queue lease, acknowledgement, and retry behavior of the removed
 QuackAPI queue prototype.
 

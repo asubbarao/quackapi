@@ -75,7 +75,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache
+          sudo apt-get install -y ninja-build ccache libssl-dev
 
       - name: Setup Ccache
         uses: hendrikmuhs/ccache-action@main
@@ -95,21 +95,66 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_lifetime_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-lifetime-test
           /tmp/quackapi-lifetime-test
 
-      - name: Verify outbound POST over real HTTP
+      - name: Build pinned curl_httpfs POST provider
+        uses: actions/checkout@v4
+        with:
+          repository: asubbarao-ifr/duckdb-curl-filesystem
+          ref: a48f83c6198a0252672f6f696e446e1525745a8a
+          path: provider-curl-httpfs
+          submodules: recursive
+
+      - name: Build pinned HTTPFS-Curl POST provider
+        uses: actions/checkout@v4
+        with:
+          repository: asubbarao-ifr/duckdb-httpfs
+          ref: 748f5ac8dddee531384d9901387d43b0f6a2db43
+          path: provider-httpfs-curl
+          submodules: recursive
+
+      - name: Build provider artifacts against the tested DuckDB core
         run: |
-          extension_dir="$PWD/build/release/post_http_extensions"
-          ./build/release/duckdb -unsigned -c "SET extension_directory='$extension_dir'; INSTALL curl_httpfs FROM community;"
-          duckdb_platform="$(./build/release/duckdb -unsigned -noheader -list -c 'SELECT platform();')"
-          provider_artifact="$extension_dir/v1.5.6/$duckdb_platform/curl_httpfs.duckdb_extension"
+          duckdb_core="$PWD/build/release/src/libduckdb_static.a"
+          test -f "$duckdb_core"
+          test "$(git -C provider-curl-httpfs rev-parse HEAD)" = a48f83c6198a0252672f6f696e446e1525745a8a
+          test "$(git -C provider-httpfs-curl rev-parse HEAD)" = 748f5ac8dddee531384d9901387d43b0f6a2db43
+          test "$(git -C provider-curl-httpfs/duckdb rev-parse HEAD)" = 069cc9f9b5be802405797faecc284961b07c70ef
+          test "$(git -C provider-httpfs-curl/duckdb rev-parse HEAD)" = 069cc9f9b5be802405797faecc284961b07c70ef
+          make -C provider-curl-httpfs release -j"$(nproc)" \
+            EXTENSION_STATIC_BUILD=1 \
+            EXT_FLAGS="-DPREBUILT_BINARY=$duckdb_core" \
+            OVERRIDE_GIT_DESCRIBE=v1.5.6
+          make -C provider-httpfs-curl release -j"$(nproc)" \
+            EXTENSION_STATIC_BUILD=1 \
+            EXT_FLAGS="-DPREBUILT_BINARY=$duckdb_core" \
+            OVERRIDE_GIT_DESCRIBE=v1.5.6
+
+      - name: Verify outbound POST over real HTTP with both providers
+        run: |
           quackapi_artifact="$PWD/build/release/extension/quackapi/quackapi.duckdb_extension"
           quackapi_version="$(git rev-parse --short HEAD)"
-          cmake -S test/cpp -B build/post_http_test \
+          curl_provider="$PWD/provider-curl-httpfs/build/release/extension/curl_httpfs/curl_httpfs.duckdb_extension"
+          httpfs_provider="$PWD/provider-httpfs-curl/build/release/extension/httpfs/httpfs.duckdb_extension"
+          cmake -S test/cpp -B build/post_http_test_curl \
             -DQUACKAPI_EXTENSION="$quackapi_artifact" \
             -DQUACKAPI_VERSION="$quackapi_version" \
-            -DPOST_PROVIDER_EXTENSION="$provider_artifact" \
-            -DPOST_PROVIDER_VERSION=v0.4.5
-          cmake --build build/post_http_test -j"$(nproc)"
-          ctest --test-dir build/post_http_test --output-on-failure
+            -DPOST_PROVIDER_EXTENSION="$curl_provider" \
+            -DPOST_PROVIDER_NAME=curl_httpfs \
+            -DPOST_PROVIDER_VERSION=v0.4.5 \
+            -DENABLE_PROVIDER_REPLACEMENT=ON \
+            -DCURL_HTTPFS_EXTENSION="$curl_provider" \
+            -DCURL_HTTPFS_VERSION=v0.4.5 \
+            -DHTTPFS_EXTENSION="$httpfs_provider" \
+            -DHTTPFS_VERSION=b26737e
+          cmake --build build/post_http_test_curl -j"$(nproc)"
+          ctest --test-dir build/post_http_test_curl --output-on-failure
+          cmake -S test/cpp -B build/post_http_test_httpfs \
+            -DQUACKAPI_EXTENSION="$quackapi_artifact" \
+            -DQUACKAPI_VERSION="$quackapi_version" \
+            -DPOST_PROVIDER_EXTENSION="$httpfs_provider" \
+            -DPOST_PROVIDER_NAME=httpfs \
+            -DPOST_PROVIDER_VERSION=b26737e
+          cmake --build build/post_http_test_httpfs -j"$(nproc)"
+          ctest --test-dir build/post_http_test_httpfs --output-on-failure
 
       - name: Verify benchmark correctness gates
         run: |

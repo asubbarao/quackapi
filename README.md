@@ -39,18 +39,19 @@ deadlines, and response-size limits are served by the same DuckDB process.
 Route responses support JSON, NDJSON, and CSV, with JSON as the default. Arrow
 and Parquet are not HTTP response formats in this version.
 
-Route authentication controls access to an endpoint. It does not add
-database-wide row-level security or rewrite arbitrary SQL by tenant. Put tenant
-predicates in the handler query or a scoped view, and use DuckDB privileges for
-database access.
+Route authentication controls access to an endpoint. It does not filter rows
+or rewrite arbitrary SQL by tenant. Put tenant predicates in the handler query
+or use a scoped view.
 
 ## Outbound POST
 
 `quackapi_post(url, body[, content_type[, headers]])` performs one POST for each
 non-NULL URL row. Its result fields are `status`, `reason`, `body`, `headers`,
 `error`, and `reused_connection`; all overloads are volatile. Load a supported
-DuckDB HTTPUtil provider explicitly before use. `curl_httpfs` is recommended;
-`httpfs` is also supported. QuackAPI does not install providers automatically.
+DuckDB HTTPUtil provider explicitly before use. The patched `curl_httpfs` and
+HTTPFS-Curl providers are under upstream review; released community binaries
+are not yet supported provider builds for this contract. QuackAPI does not
+install providers automatically. See [provider status](docs/curl_httpfs.md).
 
 ```sql
 LOAD curl_httpfs;
@@ -98,7 +99,8 @@ masking policies, SSE streams, GraphQL, native PostgreSQL execution, generated
 table APIs, source importers, or Arrow/Parquet response encoders. The `radio`
 extension is a separate message bus and does not provide the queue lease and
 acknowledgement semantics formerly prototyped here. Arrow Flight is a separate
-protocol and is not a mandatory QuackAPI dependency. See the
+protocol; DuckDB's optional `duckflight` extension serves Flight SQL separately
+and is not a mandatory QuackAPI dependency. See the
 [migration guide](docs/MIGRATION.md) for SQL names and migration boundaries.
 
 ## Build and documentation
