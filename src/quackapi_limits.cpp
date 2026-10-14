@@ -29,7 +29,8 @@ static void RegisterDeadline(ClientContext *context, const std::shared_ptr<Quack
 	}
 	std::lock_guard<std::mutex> guard(deadline_registry_mutex);
 	auto &stack = deadline_registry[context];
-	stack.erase(std::remove_if(stack.begin(), stack.end(), [](const auto &entry) { return entry.expired(); }),
+	stack.erase(std::remove_if(stack.begin(), stack.end(),
+	                           [](const std::weak_ptr<QuackapiDeadlineState> &entry) { return entry.expired(); }),
 	            stack.end());
 	stack.push_back(state);
 }
@@ -45,7 +46,9 @@ static void UnregisterDeadline(ClientContext *context, const std::shared_ptr<Qua
 	}
 	auto &stack = found->second;
 	stack.erase(std::remove_if(stack.begin(), stack.end(),
-	                           [&](const auto &entry) { return entry.expired() || entry.lock() == state; }),
+	                           [&](const std::weak_ptr<QuackapiDeadlineState> &entry) {
+		                           return entry.expired() || entry.lock() == state;
+	                           }),
 	            stack.end());
 	if (stack.empty()) {
 		deadline_registry.erase(found);
@@ -108,7 +111,8 @@ static DeadlineWatchdog &Watchdog() {
 	return watchdog;
 }
 
-QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, int64_t timeout_ms) : previous(current_deadline) {
+QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, int64_t timeout_ms)
+    : context(connection.context.get()), previous(current_deadline) {
 	state = std::make_shared<QuackapiDeadlineState>();
 	state->connection = &connection;
 	const auto context_deadline = connection.context ? QuackapiCurrentDeadline(*connection.context)
@@ -116,11 +120,11 @@ QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, int64_t tim
 	state->deadline = std::min(std::min(previous, context_deadline),
 	                           std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
 	current_deadline = state->deadline;
-	RegisterDeadline(connection.context.get(), state);
+	RegisterDeadline(context, state);
 	Watchdog().Add(state);
 }
 QuackapiQueryDeadline::~QuackapiQueryDeadline() {
-	UnregisterDeadline(connection.context.get(), state);
+	UnregisterDeadline(context, state);
 	{
 		std::lock_guard<std::mutex> guard(state->mutex);
 		state->connection = nullptr;

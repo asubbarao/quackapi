@@ -21,6 +21,7 @@ public:
 
 private:
 	std::shared_ptr<QuackapiDeadlineState> state;
+	ClientContext *context;
 	std::chrono::steady_clock::time_point previous;
 };
 
