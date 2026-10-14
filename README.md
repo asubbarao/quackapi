@@ -71,6 +71,29 @@ an explicit limit. A bounded waiting queue applies backpressure when workers
 and queue slots are occupied. This schedules HTTP work only; it does not change
 DuckDB's SQL transaction or database-file concurrency semantics.
 
+For a relation of requests, use the table overload. It keeps the input columns
+and appends a `response` STRUCT with the same fields as the scalar result:
+
+```sql
+SELECT request_id, response.status, response.body
+FROM quackapi_post((
+  SELECT request_id,
+         'https://api.example.test/items' AS url,
+         '{"name":"new item"}' AS body,
+         'application/json' AS content_type
+  FROM (VALUES (1), (2)) AS requests(request_id)
+));
+```
+
+The input relation needs `url` and `body` columns; `content_type` and
+`headers` are optional. Other columns pass through, so callers can retain a
+path or ordinal for row alignment. The table operator emits and consumes
+responses in batches of at most the effective POST concurrency. This bounds
+response retention per operator batch, not by bytes across concurrent queries.
+Responses are complete strings: the API does not stream HTTP bodies or spill
+them to disk. The scalar overload remains unchanged and materializes its result
+for the scalar input chunk.
+
 For GET requests from SQL, use DuckDB's HTTP readers such as `read_text` and
 `read_json` after loading the required reader extension. QuackAPI has no public
 GET function or connection-pool diagnostics.

@@ -2,6 +2,20 @@
 
 These SQL programs exercise one DuckDB instance calling its own QuackAPI listener. The CLI loads the chosen provider and QuackAPI artifacts, then the program starts `quackapi_serve(block := false)`, generates one literal reader query per real source file, calls `quackapi_post` on each row, consumes the complete response bodies, and stops the listener. There is no synthetic echo route, second client database, digest route, Python data script, or duplicate-path multiplier.
 
+The checked-in benchmark SQL currently uses the scalar overload, so the historical timing and memory figures below describe scalar response materialization. To consume results in bounded row batches, replace the `sent` CTE's scalar call with the table overload while preserving the caller's `ordinal` and `path` columns:
+
+```sql
+SELECT ordinal, path, response.status, response.error, response.body
+FROM quackapi_post((
+    SELECT ordinal, path,
+        'http://127.0.0.1:' || getenv('READER_BENCH_PORT') || '/dispatch' AS url,
+        json_object('sql', sql)::VARCHAR AS body
+    FROM statements
+));
+```
+
+This uses the same `/dispatch` route defined by the benchmark programs. The table operator emits at most the effective POST concurrency in each output batch and keeps the complete response bodies; it does not impose a byte budget across concurrent queries or stream/spill response bodies. The following measurements are not measurements of this table form.
+
 The source tree is the checked-out DuckDB submodule at `069cc9f9` under `READER_BENCH_SOURCE_ROOT`; both artifacts used that same tree. The file program deterministically takes the first 4,097 eligible distinct paths in sorted order from `duckdb/{src,test,tools,extension}`, excluding `third_party`, empty files, files over 128 KiB, and formats outside C/C++, Python, SQL, Markdown, JSON, YAML, and CSV. Ordinals select 3,073 `read_text` and 1,024 `read_blob` queries. The AST program takes the first 256 1–32 KiB C/C++ files under `duckdb/src` and returns every `read_ast` row and field. Each route runs `SELECT * FROM query($sql)`; every POST returns its full JSON payload to the caller. `reader_self_dispatch_verify_files.sql` compares each complete one-element typed `STRUCT(filename, content)[]` response to direct `read_blob` bytes (including exact BLOB escaping); `reader_self_dispatch_verify_ast.sql` compares each entire JSON AST array to direct `to_json(list(r ORDER BY node_id))`. `reader_self_dispatch_verify_structured.sql` does the same for CSV, JSON, and YAML readers. All three verification programs raise a DuckDB error and exit nonzero if the expected file/row counts, request status, or values differ; their error messages include the first failing path and a response sample.
 
 The tested artifacts were DuckDB `v1.5.6`/`069cc9f9`, baseline QuackAPI `6201b74`, cleanup QuackAPI `11440ba`, and patched `curl_httpfs` `v0.4.5` from combined source `a48f83c` (artifact SHA-256 `3e2b18e5a3a359eeea58809e7404dea3775ebb2e92e38a64271789c5b127d3a0`). Load the explicit QuackAPI and provider extension files before each program. For example, from this repository root:
@@ -36,3 +50,9 @@ The file-query difference is within a few milliseconds on this local run. The AS
 The 256-file AST query materializes 293.7 MB of response bodies. At a 256 MB DuckDB limit, even the transport-only `length(body)` variant fails at 242.1/244.1 MiB; at 1 GB it succeeds with a 323.6 MB peak buffer and no temp spill. The full `json_array_length(body::JSON)` reduction fails at 1 GB (945.5/953.6 MiB), while at 4 GB it succeeds with a 2.84 GB peak buffer and no temp spill. The distinction isolates response transport from JSON parsing; it does not imply that QuackAPI can spill those intermediate values to disk.
 
 After the response-lifetime fix in QuackAPI `cc69600`, the three exact-value verification programs were rerun against that final artifact and the same pinned source/provider: all 4,097 file contents, all 256 complete AST arrays (541,619 nodes), and the CSV/JSON/YAML results still matched direct readers. The timing and memory figures above belong to the pre-fix `11440ba` artifact; the final fix was not included in those comparative timing runs.
+
+## Table-valued POST memory check
+
+The table-overload version of the same AST workload was run against stock DuckDB JSON at a 1 GB memory limit and four DuckDB threads. At concurrency 32, it completed 256 distinct files (2,015,099 source bytes), returned 541,619 AST rows in 293,703,282 response-body bytes, and reported zero bad statuses or provider errors. One run took 0.9383 seconds; peak DuckDB buffer memory was 1,078,173,696 bytes and temporary-directory use was zero. At concurrency 4, one run returned the same row and body counts in 1.5149 seconds, with a 259,010,560-byte peak buffer and no temp spill. The scalar query at concurrency 4 OOMed on a 16 MiB allocation at 945.5/953.6 MiB. These are individual local runs, not an estimate of an optimal setting, a controlled latency comparison, or a CI guarantee. A separate full-value run at 4 GB matched all 256 response arrays byte-for-byte against direct `read_ast` results. The verifier itself OOMs at 1 GB because it retains both complete response arrays and the direct-reader comparison arrays; that does not change the 1 GB result for the table workload.
+
+A separate loopback contract check confirmed that the table call sent exactly one POST per input: 33 rows including a final partial batch produced 33 distinct server-side effects, and 4,097 rows spanning multiple input chunks produced 4,097. Returned ordinals and response rows remained aligned, including NULL URLs and transport errors.

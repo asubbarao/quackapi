@@ -57,8 +57,7 @@ DuckDB.
 
 ## Outbound POST
 
-`quackapi_post` remains a volatile scalar function, including its existing
-overloads and result shape:
+`quackapi_post` keeps its existing volatile scalar overloads and result shape:
 
 ```sql
 SELECT (quackapi_post(
@@ -95,6 +94,32 @@ requests. `0` uses DuckDB's configured thread count (minimum one); a positive
 value sets the limit. Its waiting queue is bounded, so callers may experience
 backpressure when all workers and queue slots are occupied. It does not change
 DuckDB's SQL execution or transaction model.
+
+For a request relation, an additive table overload emits the original input
+columns plus a `response` STRUCT with the same result fields. The input must
+include `url` and `body`; `content_type` and `headers` are optional. Input names
+are matched case-insensitively. For example, this retains a request key beside
+each complete response:
+
+```sql
+SELECT request_id, response.status, response.body
+FROM quackapi_post((
+  SELECT request_id,
+         'https://api.example.test/items' AS url,
+         '{"name":"new item"}' AS body,
+         'application/json' AS content_type
+  FROM (VALUES (1), (2)) AS requests(request_id)
+));
+```
+
+The table operator consumes the input in batches no larger than the effective
+POST concurrency, while its database-owned HTTP workers perform those requests
+in parallel. This bounds completed response rows retained by one operator
+batch; it is not a byte limit shared across queries. Each response body remains
+a complete VARCHAR, and neither overload streams HTTP bodies or spills them to
+disk. The scalar overload still returns its full result vector for each scalar
+input chunk. Use the table form when a query should consume responses in
+bounded row batches while preserving caller columns for alignment.
 
 ## Database execution and concurrency
 
