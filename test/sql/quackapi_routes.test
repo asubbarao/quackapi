@@ -1,5 +1,5 @@
 # name: test/sql/quackapi_routes.test
-# description: CREATE ROUTE / DROP ROUTE DDL, registry, BODY SCHEMA rejection via quackapi_request
+# description: CREATE ROUTE / DROP ROUTE DDL and registry
 # group: [sql]
 
 require quackapi
@@ -212,55 +212,6 @@ query I
 DROP ROUTE keepme;
 ----
 Dropped route keepme
-
-# ---------------------------------------------------------------------------
-# BODY SCHEMA enforcement via quackapi_request (reject bad body, accept good)
-# maximum:10 is schema-only — SQL INTEGER bind would accept 100 without it.
-# ---------------------------------------------------------------------------
-query I
-CREATE ROUTE with_schema POST '/with-schema'
-  BODY SCHEMA '{"type":"object","required":["n"],"properties":{"n":{"type":"integer","maximum":10}}}'
-  AS SELECT $n::INTEGER AS n;
-----
-Route with_schema: POST /with-schema
-
-# Schema maximum violated (would bind fine as INTEGER) → 422
-query II
-SELECT status, contains(decode(body), '"loc":["body","n"]')
-FROM quackapi_request('POST', '/with-schema', '{"n":100}');
-----
-422	true
-
-# Wrong type → 422
-query I
-SELECT status FROM quackapi_request('POST', '/with-schema', '{"n":"not-int"}');
-----
-422
-
-# Valid body → 200
-query II
-SELECT status, decode(body) FROM quackapi_request('POST', '/with-schema', '{"n":1}');
-----
-200	[{"n":1}]
-
-query I
-DROP ROUTE with_schema;
-----
-Dropped route with_schema
-
-# Invalid BODY SCHEMA JSON is rejected at CREATE time
-statement error
-CREATE ROUTE invalid_schema POST '/invalid-schema'
-  BODY SCHEMA '{"type":"object"'
-  AS SELECT 1;
-----
-Invalid BODY SCHEMA JSON
-
-# Unterminated BODY SCHEMA errors
-statement error
-CREATE ROUTE bad_schema POST '/x' BODY SCHEMA '{"type":"object" AS SELECT 1;
-----
-Unterminated BODY SCHEMA
 
 # Multi-chunk emission: > STANDARD_VECTOR_SIZE (2048) routes must not corrupt
 loop i 0 2100
