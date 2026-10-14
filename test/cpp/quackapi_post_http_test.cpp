@@ -224,7 +224,27 @@ int main(int argc, char **argv) {
 		          deadline_elapsed < std::chrono::milliseconds(600),
 		      "in-flight POST outlived its inbound route deadline: status=" +
 		          timed->GetValue(0, 0).ToString() + " elapsed_ms=" + std::to_string(deadline_ms));
-		std::cout << "POST HTTP integration passed: 107 requests, wide peak=" << peak.load() << '\n';
+		while (active.load() != 0) {
+			std::this_thread::yield();
+		}
+		Connection interrupted(database);
+		std::atomic<bool> active_failed {false};
+		std::thread active_call([&]() {
+			auto result = interrupted.Query("SELECT (quackapi_post(" + SqlQuote(slow_url) +
+			                                ", 'wide')).status");
+			active_failed.store(result->HasError());
+		});
+		while (active.load() == 0) {
+			std::this_thread::yield();
+		}
+		const auto active_at = std::chrono::steady_clock::now();
+		interrupted.Interrupt();
+		active_call.join();
+		const auto active_elapsed = std::chrono::steady_clock::now() - active_at;
+		const auto active_ms = std::chrono::duration_cast<std::chrono::milliseconds>(active_elapsed).count();
+		Check(active_failed.load() && active_elapsed < std::chrono::milliseconds(600),
+		      "active POST ignored caller interrupt: elapsed_ms=" + std::to_string(active_ms));
+		std::cout << "POST HTTP integration passed: 108 requests, wide peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
