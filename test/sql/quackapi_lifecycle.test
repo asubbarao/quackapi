@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 # ---------------------------------------------------------------------------
 # Bug: CREATE OR REPLACE AUTH API_KEY → JWT leaves hashed keys that resurrect
 # when replaced back to API_KEY (DropAuth clears keys; AddAuth did not).

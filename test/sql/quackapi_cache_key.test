@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 # Keep quackapi_request on one worker thread so TLS state is shared across calls.
 statement ok
 SET threads = 1;

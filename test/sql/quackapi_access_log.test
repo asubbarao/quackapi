@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 statement ok
 CREATE TABLE access_log (
   request_id VARCHAR,

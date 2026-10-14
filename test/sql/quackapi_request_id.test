@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 statement ok
 CREATE OR REPLACE ROUTE echo_rid GET '/echo-rid' AS
   SELECT $request_id::VARCHAR AS id;

@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 # --- DDL registration ---
 statement ok
 CREATE ROUTE rl1 GET '/rl1' RATE LIMIT 5 PER 10 AS SELECT 1 AS x;

@@ -16,6 +16,8 @@
 
 require quackapi
 
+require json
+
 # ---------------------------------------------------------------------------
 # 1) Thread-local static JSON body cache (ThreadRequestCache::static_json_bodies)
 #    Zero-param handlers must not freeze the first serialized body forever.

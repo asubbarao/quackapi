@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 # ---------------------------------------------------------------------------
 # Definitions are introspectable and OR REPLACE preserves creation order.
 # ---------------------------------------------------------------------------

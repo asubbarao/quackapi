@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 statement ok
 CREATE TABLE redaction_log (
   path VARCHAR,

@@ -103,10 +103,8 @@ public:
 		}
 		// json_object supplies DuckDB's own recursive serializer for every column
 		// type (including MAP, STRUCT, LIST, and JSON), rather than Value::ToString.
-		auto load = con.Query("LOAD json");
-		if (load->HasError()) {
-			throw InvalidInputException("JSON encoder: could not LOAD json: %s", load->GetError());
-		}
+		// The JSON extension is a declared runtime dependency; don't LOAD it while
+		// a route result is live.
 		vector<unique_ptr<Expression>> args;
 		for (auto col : data_cols) {
 			if (col >= names.size()) {
@@ -115,13 +113,15 @@ public:
 			args.push_back(make_uniq<BoundConstantExpression>(Value(names[col])));
 			args.push_back(make_uniq<BoundReferenceExpression>(types[col], UnsafeNumericCast<storage_t>(col)));
 		}
-		FunctionBinder binder(*con.context);
-		ErrorData error;
-		expression = binder.BindScalarFunction(DEFAULT_SCHEMA, "json_object", std::move(args), error);
-		if (!expression) {
-			throw InvalidInputException("JSON encoder: could not bind json_object: %s", error.Message());
-		}
-		executor = make_uniq<ExpressionExecutor>(*con.context, *expression);
+		con.context->RunFunctionInTransaction([&]() {
+			FunctionBinder binder(*con.context);
+			ErrorData error;
+			expression = binder.BindScalarFunction(DEFAULT_SCHEMA, "json_object", std::move(args), error);
+			if (!expression) {
+				throw InvalidInputException("JSON encoder: could not bind json_object: %s", error.Message());
+			}
+			executor = make_uniq<ExpressionExecutor>(*con.context, *expression);
+		});
 		if (mode == JsonRowMode::ARRAY) {
 			writer.Append("[");
 		}
@@ -217,38 +217,33 @@ public:
 		if (names.size() != types.size()) {
 			throw InvalidInputException("CSV encoder: result name/type count mismatch");
 		}
-		bool needs_json = false;
 		for (auto col : data_cols) {
 			if (col >= names.size()) {
 				throw InvalidInputException("CSV encoder: data column index is out of bounds");
 			}
-			needs_json = needs_json || IsNestedCsvCell(types[col]);
 		}
-		if (needs_json) {
-			auto load = con.Query("LOAD json");
-			if (load->HasError()) {
-				throw InvalidInputException("CSV encoder: could not LOAD json: %s", load->GetError());
-			}
-		}
-		for (auto col : data_cols) {
-			unique_ptr<Expression> cell =
-			    make_uniq<BoundReferenceExpression>(types[col], UnsafeNumericCast<storage_t>(col));
-			if (IsNestedCsvCell(types[col])) {
-				vector<unique_ptr<Expression>> args;
-				args.push_back(std::move(cell));
-				FunctionBinder binder(*con.context);
-				ErrorData error;
-				cell = binder.BindScalarFunction(DEFAULT_SCHEMA, "to_json", std::move(args), error);
-				if (!cell) {
-					throw InvalidInputException("CSV encoder: could not bind to_json: %s", error.Message());
+		con.context->RunFunctionInTransaction([&]() {
+			for (auto col : data_cols) {
+				unique_ptr<Expression> cell =
+				    make_uniq<BoundReferenceExpression>(types[col], UnsafeNumericCast<storage_t>(col));
+				if (IsNestedCsvCell(types[col])) {
+					vector<unique_ptr<Expression>> args;
+					args.push_back(std::move(cell));
+					FunctionBinder binder(*con.context);
+					ErrorData error;
+					cell = binder.BindScalarFunction(DEFAULT_SCHEMA, "to_json", std::move(args), error);
+					if (!cell) {
+						throw InvalidInputException("CSV encoder: could not bind to_json: %s", error.Message());
+					}
 				}
+				casts.push_back(
+				    BoundCastExpression::AddCastToType(*con.context, std::move(cell), LogicalType::VARCHAR));
+				output_types.push_back(LogicalType::VARCHAR);
 			}
-			casts.push_back(BoundCastExpression::AddCastToType(*con.context, std::move(cell), LogicalType::VARCHAR));
-			output_types.push_back(LogicalType::VARCHAR);
-		}
-		if (!casts.empty()) {
-			executor = make_uniq<ExpressionExecutor>(*con.context, casts);
-		}
+			if (!casts.empty()) {
+				executor = make_uniq<ExpressionExecutor>(*con.context, casts);
+			}
+		});
 		writer.options.null_str = {""};
 		writer.options.dialect_options.header = CSVOption<bool>(true, true);
 		writer.writer_options.newline_writing_mode = CSVNewLineMode::WRITE_AFTER;

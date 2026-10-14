@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 statement ok
 CREATE ROUTE resource_large GET '/resource-large' AS SELECT repeat('x', 4096) AS text;
 

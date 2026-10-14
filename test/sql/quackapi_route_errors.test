@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 query I
 CREATE OR REPLACE ROUTE sql POST '/sql' AS SELECT * FROM query($sql);
 ----
