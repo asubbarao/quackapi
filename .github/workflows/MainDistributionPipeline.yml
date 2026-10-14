@@ -173,6 +173,16 @@ jobs:
             -DHTTPFS_EXTENSION="$httpfs_provider" \
             -DHTTPFS_VERSION=748f5ac
           cmake --build build/post_http_test_curl -j"$(nproc)"
+          echo "DuckDB CLI identity:"
+          ./build/release/duckdb -c "PRAGMA version"
+          for test_binary in \
+            build/post_http_test_curl/quackapi_post_http_test \
+            build/post_http_test_curl/quackapi_post_tls_test \
+            build/post_http_test_curl/quackapi_provider_replacement_test; do
+            echo "Runtime dependencies for $test_binary:"
+            readelf -d "$test_binary" | grep -E 'NEEDED|RPATH|RUNPATH' || true
+            ldd "$test_binary" | grep -E 'duckdb|not found' || true
+          done
           ctest --test-dir build/post_http_test_curl --output-on-failure
           cmake -S test/cpp -B build/post_http_test_httpfs \
             -DQUACKAPI_EXTENSION="$quackapi_artifact" \
