@@ -79,3 +79,36 @@ add_test(
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/loopback.crt"
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/loopback.key")
 set_tests_properties(post_tls_contract PROPERTIES TIMEOUT 20)
+
+option(ENABLE_PROVIDER_REPLACEMENT "Build the two-provider lifetime contract"
+       OFF)
+if(ENABLE_PROVIDER_REPLACEMENT)
+  if(NOT EXISTS "${CURL_HTTPFS_EXTENSION}"
+     OR NOT EXISTS "${HTTPFS_EXTENSION}"
+     OR CURL_HTTPFS_VERSION STREQUAL ""
+     OR HTTPFS_VERSION STREQUAL "")
+    message(
+      FATAL_ERROR
+        "Provider replacement requires exact CURL_HTTPFS_EXTENSION/VERSION and HTTPFS_EXTENSION/VERSION"
+    )
+  endif()
+  add_executable(quackapi_provider_replacement_test
+                 quackapi_provider_replacement_test.cpp)
+  target_include_directories(
+    quackapi_provider_replacement_test SYSTEM
+    PRIVATE "${QUACKAPI_ROOT}/duckdb/src/include"
+            "${QUACKAPI_ROOT}/third_party/httplib")
+  target_link_libraries(quackapi_provider_replacement_test
+                        PRIVATE "${DUCKDB_LIBRARY}")
+  if(NOT WIN32)
+    target_link_libraries(quackapi_provider_replacement_test
+                          PRIVATE Threads::Threads)
+  endif()
+  add_test(
+    NAME provider_replacement_contract
+    COMMAND
+      quackapi_provider_replacement_test "${QUACKAPI_EXTENSION}"
+      "${QUACKAPI_VERSION}" "${CURL_HTTPFS_EXTENSION}" "${CURL_HTTPFS_VERSION}"
+      "${HTTPFS_EXTENSION}" "${HTTPFS_VERSION}")
+  set_tests_properties(provider_replacement_contract PROPERTIES TIMEOUT 20)
+endif()

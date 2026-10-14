@@ -2,12 +2,15 @@
 // database-wide concurrency limit. Arguments are explicit artifact paths and
 // their expected extension versions; this must never load an installed copy.
 #include "duckdb.hpp"
+#include "duckdb/common/http_util.hpp"
 #include "httplib.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <iostream>
 #include <iterator>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -58,14 +61,22 @@ int main(int argc, char **argv) {
 		Check(std::string(argv[4]) == "curl_httpfs" || std::string(argv[4]) == "httpfs",
 		      "expected curl_httpfs or httpfs provider");
 		std::atomic<int> received {0};
+		std::atomic<int> ambiguous_received {0};
 		std::atomic<int> active {0};
 		std::atomic<int> peak {0};
+		std::mutex peer_mutex;
+		std::set<int> reuse_peer_ports;
 		duckdb_httplib::Server server;
+		server.set_keep_alive_max_count(20);
 		server.new_task_queue = []() {
 			return new duckdb_httplib::ThreadPool(48);
 		};
 		server.Post("/echo", [&](const duckdb_httplib::Request &request, duckdb_httplib::Response &response) {
 			received.fetch_add(1);
+			if (request.body == "reuse") {
+				std::lock_guard<std::mutex> guard(peer_mutex);
+				reuse_peer_ports.insert(request.remote_port);
+			}
 			response.set_header("X-Echo-Content-Type", request.get_header_value("Content-Type"));
 			response.set_content(request.body, "text/plain");
 		});
@@ -75,6 +86,11 @@ int main(int argc, char **argv) {
 			response.set_content(request.get_header_value("Content-Type") + "|" + request.get_header_value("X-Trace") +
 			                         "|" + std::to_string(std::distance(content_types.first, content_types.second)),
 			                     "text/plain");
+		});
+		server.Post("/drop", [&](const duckdb_httplib::Request &, duckdb_httplib::Response &response) {
+			ambiguous_received.fetch_add(1);
+			response.set_content_provider(10, "text/plain",
+			                              [](size_t, size_t, duckdb_httplib::DataSink &) { return false; });
 		});
 		server.Post("/slow", [&](const duckdb_httplib::Request &request, duckdb_httplib::Response &response) {
 			received.fetch_add(1);
@@ -109,6 +125,9 @@ int main(int argc, char **argv) {
 		if (std::string(argv[4]) == "httpfs") {
 			Run(connection, "SET httpfs_client_implementation = 'curl'");
 		}
+		const auto expected_provider = std::string(argv[4]) == "httpfs" ? "HTTPFS-Curl" : "MultiCurl";
+		Check(HTTPUtil::Get(*connection.context->db).GetName() == expected_provider,
+		      "loaded artifact did not select the expected active HTTPUtil");
 		const std::string core_settings = "SELECT current_setting('threads')::VARCHAR || '|' || "
 		                                  "current_setting('memory_limit')::VARCHAR || '|' || "
 		                                  "current_setting('preserve_insertion_order')::VARCHAR || '|' || "
@@ -372,8 +391,9 @@ int main(int argc, char **argv) {
 		      "same-database HTTP loopback stalled or returned the wrong row");
 		Run(connection, "SELECT * FROM quackapi_stop(" + std::to_string(log_port) + ")");
 
-		// The SQL caller has already been interrupted, so database shutdown
-		// should not wait for an unrelated 900ms provider response to drain.
+		// The SQL caller has already been interrupted. Database shutdown must
+		// finish after the bounded provider response, even though it safely
+		// drains its DB-owned worker rather than detaching it.
 		auto closing_database = make_uniq<DuckDB>(nullptr, &config);
 		auto closing_connection = make_uniq<Connection>(*closing_database);
 		Run(*closing_connection, "LOAD " + SqlQuote(argv[3]));
@@ -397,11 +417,46 @@ int main(int argc, char **argv) {
 		const auto closing_at = std::chrono::steady_clock::now();
 		closing_database.reset();
 		const auto closing_elapsed = std::chrono::steady_clock::now() - closing_at;
-		Check(closing_elapsed < std::chrono::milliseconds(600),
-		      "database shutdown waited for an interrupted provider request: elapsed_ms=" +
+		Check(closing_elapsed < std::chrono::milliseconds(1500),
+		      "database shutdown outlived a bounded interrupted provider request: elapsed_ms=" +
 		          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(closing_elapsed).count()));
+		auto ambiguous = Run(connection, "SELECT receipt.status, receipt.error FROM "
+		                                 "(SELECT quackapi_post(" +
+		                                     SqlQuote("http://127.0.0.1:" + std::to_string(port) + "/drop") +
+		                                     ", 'unsafe') AS receipt)");
+		Check(ambiguous_received.load() == 1, "ambiguous POST transport failure was automatically replayed");
+		Check(!ambiguous->GetValue(1, 0).IsNull(), "ambiguous POST failure lost its row-local error");
+		Run(connection, "SET threads = 1");
+		Run(connection, "SET quackapi_post_concurrency = 0");
+		peak.store(0);
+		Check(concurrent(3, "x") == 3 && peak.load() == 1,
+		      "automatic POST concurrency did not follow the database's one thread");
+		DBConfig reuse_config;
+		reuse_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		DuckDB reuse_database(nullptr, &reuse_config);
+		Connection reuse_connection(reuse_database);
+		Run(reuse_connection, "LOAD " + SqlQuote(argv[3]));
+		Run(reuse_connection, "LOAD " + SqlQuote(argv[1]));
+		CheckExtension(reuse_connection, argv[4], argv[5]);
+		CheckExtension(reuse_connection, "quackapi", argv[2]);
+		if (std::string(argv[4]) == "httpfs") {
+			Run(reuse_connection, "SET httpfs_client_implementation = 'curl'");
+		}
+		Check(HTTPUtil::Get(*reuse_connection.context->db).GetName() == expected_provider,
+		      "reuse probe selected the wrong active HTTPUtil");
+		Run(reuse_connection, "SET threads = 1");
+		Run(reuse_connection, "SET quackapi_post_concurrency = 0");
+		for (int i = 0; i < 10; i++) {
+			auto reused = Run(reuse_connection, "SELECT (quackapi_post(" + SqlQuote(echo_url) + ", 'reuse')).status");
+			Check(reused->GetValue(0, 0).GetValue<int>() == 200, "sequential keep-alive POST failed");
+		}
+		{
+			std::lock_guard<std::mutex> guard(peer_mutex);
+			Check(reuse_peer_ports.size() == 1,
+			      "10 sequential POSTs used " + std::to_string(reuse_peer_ports.size()) + " peer ports");
+		}
 
-		std::cout << "POST HTTP integration passed: 114 requests, wide peak=" << peak.load() << '\n';
+		std::cout << "POST HTTP integration passed: 127 requests, auto peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
