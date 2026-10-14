@@ -23,10 +23,6 @@ struct JsonTree {
 	unordered_map<idx_t, vector<idx_t>> children_by_parent;
 };
 
-bool IsMissingJsonExtension(const string &error) {
-	return error.find("json extension") != string::npos;
-}
-
 JsonNodeKind JsonTypeToKind(const string &type) {
 	if (type == "OBJECT") {
 		return JsonNodeKind::OBJECT;
@@ -56,12 +52,6 @@ bool ReadJsonTree(Connection &con, const string &json, JsonTree &tree) {
 	                   "ELSE atom::VARCHAR END "
 	                   "FROM json_tree(?::JSON) ORDER BY id";
 	auto result = con.Query(sql, Value(json));
-	if (result->HasError() && IsMissingJsonExtension(result->GetError())) {
-		auto load = con.Query("LOAD json");
-		if (!load->HasError()) {
-			result = con.Query(sql, Value(json));
-		}
-	}
 	if (result->HasError()) {
 		return false;
 	}
