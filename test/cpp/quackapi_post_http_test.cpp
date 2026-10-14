@@ -347,13 +347,13 @@ int main(int argc, char **argv) {
 		                "(quackapi_post(" +
 		                    SqlQuote(slow_url) + ", 'wide')).status AS upstream_status");
 		const auto deadline_at = std::chrono::steady_clock::now();
-		auto timed = Run(connection, "SELECT status FROM quackapi_request('GET', '/post-deadline', "
+		auto timed = Run(connection, "SELECT status, decode(body) FROM quackapi_request('GET', '/post-deadline', "
 		                             "query_timeout_ms := 100)");
 		const auto deadline_elapsed = std::chrono::steady_clock::now() - deadline_at;
 		const auto deadline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_elapsed).count();
 		Check(timed->GetValue(0, 0).GetValue<int>() == 504 && deadline_elapsed < std::chrono::milliseconds(600),
 		      "in-flight POST outlived its inbound route deadline: status=" + timed->GetValue(0, 0).ToString() +
-		          " elapsed_ms=" + std::to_string(deadline_ms));
+		          " elapsed_ms=" + std::to_string(deadline_ms) + " body=" + timed->GetValue(1, 0).ToString());
 		while (active.load() != 0) {
 			std::this_thread::yield();
 		}
