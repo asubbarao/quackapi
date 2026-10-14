@@ -1,5 +1,8 @@
 # FastAPI developer-experience demand — 2026-09-07
 
+> Historical planning note, not a description of shipped features. For the
+> current supported API and removed surfaces, see [MIGRATION.md](MIGRATION.md).
+
 This is a prioritization for QuackAPI, not a claim of a popularity survey. The
 ordering weighs FastAPI's maintained roadmap, explicit developer requests, the
 size of the current QuackAPI gap, and whether the feature strengthens the

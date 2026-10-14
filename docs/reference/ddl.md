@@ -1,367 +1,125 @@
-# DDL reference — every CREATE noun
+# DDL reference
 
-Grammar below is taken from the parser extensions in `src/`. Examples were run against `build/release/duckdb -unsigned` with `LOAD quackapi;`.
-
-Drop forms exist for each noun unless noted.
-
----
-
-## 1. CREATE ROUTE
+Load QuackAPI before executing its DDL so DuckDB has registered the parser
+extensions. Load DuckDB's JSON extension before QuackAPI when the database will
+serve JSON routes or use JSON body validation:
 
 ```sql
-CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-  [STATUS <n>]
-  [REQUIRE <auth>]
-  [RATE LIMIT <n> PER <seconds> [BY ip|token|key]]
-  [FORMAT json|ndjson|csv|parquet|arrow]
-  [ENVELOPE array|object]
-  [EMPTY STATUS <n> [BODY '<json>']]
-  [TIMEOUT <n>|'30s'|'5m'|'1h']
-  [GROUP <group> | IN GROUP <group>]
+LOAD json;
+LOAD quackapi;
+```
+
+## `CREATE ROUTE`
+
+```sql
+CREATE [OR REPLACE] ROUTE <name> <method> '<path>'
+  [STATUS <status_code>]
+  [FORMAT json | ndjson | csv]
+  [EMPTY STATUS <status_code>]
+  [REQUIRE <auth_name>]
+  [GROUP <group_name>]
+  [SCHEDULE '<six-field-cron>']
   [BODY SCHEMA '<json-schema>']
-  [BODY TYPE '<duckdb-json-structure>']
-  [PARAM <name> [<type>] [HEADER|COOKIE|QUERY [wire-name]]
-         [DEFAULT <lit>] [GE|GT|LE|LT <n>] [MIN_LENGTH|MAX_LENGTH <n>] …]
-  [WITH (timeout_sec [=|:=] <n>|'30s')]
-  AS <select-or-dml>;
+  [BODY TYPE <duckdb-type>]
+  [PARAM <name> <duckdb-type>]
+AS <select_statement>;
 
 DROP ROUTE <name>;
 ```
 
-| Piece | Rules |
-|-------|--------|
-| **METHOD** | `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` |
-| **pattern** | Quoted. Must start with `/` unless the route is in a GROUP (relative join allowed). Captures: `:id` or `{id}` → `$id` |
-| **STATUS** | Integer 100–599. Default 200 |
-| **REQUIRE** | Auth scheme name (checked at request time) |
-| **RATE LIMIT** | Fixed-window limit; `BY ip` is the default, and `BY token` / `BY key` use the authenticated subject or credential digest. Exceeding the limit returns `429` with `Retry-After`. |
-| **FORMAT** | Response body for row data: `json` (default, array of objects), `ndjson` (`application/x-ndjson`), `csv` (`text/csv`), `parquet` (`application/vnd.apache.parquet` file bytes, magic `PAR1`), `arrow` (Arrow IPC stream via community `nanoarrow` `FORMAT ARROWS`, `application/vnd.apache.arrow.stream`, magic `0xFFFFFFFF`). Explicit `ndjson`/`csv`/`parquet`/`arrow` win over `Accept`; default/`json` allows Accept negotiation (`application/x-ndjson`, `application/jsonl`, `text/csv`, `application/vnd.apache.parquet`, `application/parquet`, `application/vnd.apache.arrow.stream`, `application/vnd.apache.arrow.file`). Column modes `html`/`text` still win. |
-| **ENVELOPE** | JSON shape for `FORMAT json`: `array` (default, `[{…}]`) or `object` (exactly one row → `{…}`; 0 rows → `null` unless `EMPTY STATUS`; >1 rows → 500). Only valid with `FORMAT json`. OpenAPI advertises `type: object` when set. |
-| **EMPTY STATUS** | When the handler returns **0 rows**, respond with this HTTP status instead of success `STATUS` + `[]`/`null`. Optional `BODY '<json>'` (default `{"detail":"Not Found"}`). Works with array or object envelope. Listed in OpenAPI responses. |
-| **TIMEOUT** / **WITH (timeout_sec)** | Per-request httplib socket read/write deadline in seconds (also `'30s'` / `'5m'` / `'1h'`, max 24h). Default omit/`0` = serve defaults (`quackapi_serve` `read_timeout_sec`/`write_timeout_sec`, usually 30). When set, the matched request extends `SocketStream` select timeouts and `SO_RCVTIMEO`/`SO_SNDTIMEO` on that connection through handler + response write. Synonyms: `TIMEOUT 180` or `WITH (timeout_sec := 180)`. |
-| **GROUP / IN GROUP** | Join group prefix + inherit auth/tags |
-| **BODY SCHEMA** | Quoted JSON Schema string; the `json_schema` extension is loaded when the route is created (and may be installed from community); may appear before or after PARAM |
-| **BODY TYPE** | Quoted DuckDB `json_transform` structure; native typed body validation; may appear before or after PARAM |
-| **PARAM** | Zero or more. Types: INTEGER/INT, BIGINT, VARCHAR/TEXT/STRING, BOOLEAN/BOOL, DOUBLE, FLOAT/REAL, HUGEINT, UBIGINT, UINTEGER |
-| **AS** | Any SQL returning a result; validated at CREATE time |
+Supported methods are GET, POST, PUT, PATCH, DELETE, and HEAD. Paths begin
+with `/`; named path components such as `'/items/:id'` bind to `$id` in the
+handler. Query parameters, selected headers/cookies, and request-body values
+can also be declared as handler parameters. Values are bound as prepared SQL
+parameters. See the [route guide](../guide/routes-and-params.md) for binding
+details.
 
-**Example:**
+The default response is JSON. `FORMAT` supports only `json`, `ndjson`, and
+`csv`; it does not encode Arrow or Parquet. `STATUS` selects the response
+status for a successful handler. `EMPTY STATUS` selects the status used when
+the handler returns no rows. `BODY SCHEMA` validates a JSON request body and
+requires the DuckDB `json` and `json_schema` extensions to be available; route
+DDL does not install them. `BODY TYPE` and `PARAM` declare typed inputs.
 
 ```sql
-CREATE ROUTE item GET '/items/:id'
-  PARAM pretty BOOLEAN DEFAULT false
-  AS
-SELECT $id::INTEGER AS id, $pretty AS pretty;
+CREATE ROUTE item GET '/items/:id' STATUS 200 AS
+  SELECT $id::INTEGER AS id;
+
+CREATE ROUTE create_item POST '/items'
+  BODY TYPE JSON
+  BODY SCHEMA '{"type":"object","required":["name"]}'
+AS
+  SELECT json_extract_string($body, '$.name') AS name;
 ```
 
-**Object envelope + empty → 404:**
+`SCHEDULE` accepts a six-field cron expression with seconds first. Scheduled
+routes cannot contain path parameters.
+
+## `CREATE AUTH`
 
 ```sql
-CREATE ROUTE health GET '/api/health'
-  ENVELOPE object
-  AS SELECT 'ok' AS status, 'sd-shelf' AS service;
--- GET → {"status":"ok","service":"sd-shelf"}
+CREATE [OR REPLACE] AUTH <name> AS API_KEY
+  [(HEADER '<header-name>')];
 
-CREATE ROUTE get_doc GET '/documents/:id'
-  ENVELOPE object
-  EMPTY STATUS 404 BODY '{"detail":"Not Found"}'
-  AS SELECT * FROM documents WHERE id = $id::INTEGER;
--- 1 row → {…}; 0 rows → 404 {"detail":"Not Found"}
-```
-
-**Long-running handler (extends socket IO past the serve default):**
-
-```sql
-CREATE ROUTE chrome_exhaust POST '/chrome/exhaust'
-  PARAM url_prefix VARCHAR
-  WITH (timeout_sec := 180)
-  AS SELECT chrome_exhaust($url_prefix) AS result;
--- equivalent: … TIMEOUT 180 AS SELECT …
-```
-
-**Response control columns:** `html`, `text`, `location`, `set_cookie` / `set-cookie` — see [headers guide](../guide/headers-cookies-redirects.md).
-
----
-
-## 2. CREATE AUTH
-
-```sql
-CREATE [OR REPLACE] AUTH <name> AS API_KEY [ ( HEADER '<header-name>' ) ];
-
-CREATE [OR REPLACE] AUTH <name> AS JWT (
-  SECRET '<secret>'
-  [, ALGORITHM HS256]
-);
+CREATE [OR REPLACE] AUTH <name> AS JWT
+  (SECRET '<secret>' [, ALGORITHM HS256]);
 
 DROP AUTH <name>;
 ```
 
-| Kind | Default header | Notes |
-|------|----------------|-------|
-| `API_KEY` | `X-API-Key` | Keys added via `quackapi_add_api_key` (SHA-256 stored) |
-| `JWT` | `Authorization` (Bearer) | **HS256 only** |
-
-**Example:**
+API keys default to the `X-API-Key` header. Add keys with
+`quackapi_add_api_key`; key inspection never returns the secret value. JWT
+authentication supports HS256. Apply an auth definition with `REQUIRE` on a
+route or as a group's inherited auth.
 
 ```sql
-CREATE AUTH site AS API_KEY;
-CREATE AUTH jwt_auth AS JWT ( SECRET 'conformance-secret' );
+CREATE AUTH api AS API_KEY;
+SELECT * FROM quackapi_add_api_key('api', 'secret-key', 'user-42');
+CREATE ROUTE me GET '/me' REQUIRE api AS SELECT $claims_sub AS subject;
 ```
 
----
+Route auth decides whether a request may reach its handler. It does not filter
+rows or rewrite arbitrary SQL by tenant. Put tenant predicates directly in
+the handler or use a scoped view.
 
-## 3. CREATE GROUP / CREATE API GROUP
+## `CREATE GROUP`
 
 ```sql
-CREATE [OR REPLACE] [API] GROUP <name>
-  WITH (
-    prefix='/absolute/path'
-    [, auth=<auth-name> | require=<auth-name>]
-    [, tags='csv,tags']
-  );
+CREATE [OR REPLACE] GROUP <name>
+  WITH (prefix = '<path-prefix>' [, auth = <auth-name>]
+       [, tags = '<tag>[, <tag>...]']);
 
--- Keyword form (no WITH):
-CREATE [OR REPLACE] API GROUP <name>
-  PREFIX '/p'
-  [TAGS 't']
-  [REQUIRE <auth>];
-
-DROP [API] GROUP <name>;
+DROP GROUP <name>;
 ```
 
-`CREATE GROUP` and `CREATE API GROUP` are synonyms. `auth=` and `require=` are synonyms.
-
-**Example:**
+A group prefixes route paths and can provide default auth and OpenAPI tags.
+A route's explicit `REQUIRE` takes precedence over inherited group auth.
 
 ```sql
-CREATE GROUP v1 WITH (prefix='/api/v1', auth=api, tags='items,v1');
-CREATE ROUTE items_list GET '/items' GROUP v1 AS SELECT 1 AS id;
+CREATE GROUP api_v1 WITH (prefix = '/api/v1', auth = api, tags = 'v1,public');
+CREATE ROUTE status GET '/status' GROUP api_v1 AS SELECT 'ok' AS status;
 ```
 
----
-
-## 4. CREATE API FOR TABLE
-
-```sql
-CREATE [OR REPLACE] API FOR TABLE <table>
-  [AT '<base_path>']
-  [KEY '<column>'];
-```
-
-| Clause | Default | Constraint |
-|--------|---------|------------|
-| table | — | Bare id or `"quoted""ident"` |
-| `AT` | `'/<table>'` | Quoted path starting with `/` |
-| `KEY` | `'id'` | Bare identifier → path param |
-
-Expands to:
-
-- `GET <base>` → `SELECT * FROM <table>`
-- `GET <base>/:<key>` → `SELECT * FROM <table> WHERE <key> = $<key>`
-
-Read-only. Generated names: `<table>_list`, `<table>_get`.
-
-**Example:**
-
-```sql
-CREATE API FOR TABLE documents AT '/api/documents' KEY 'doc_id';
-```
-
----
-
-## 5. CREATE GRAPHQL FOR TABLE
-
-Optional allowlist for the built-in thin GraphQL endpoint (`POST /graphql`, `GET /graphql/schema`). Empty allowlist = **open** mode (all main-schema tables). See [graphql-v0.md](../guide/graphql-v0.md).
-
-```sql
-CREATE [OR REPLACE] GRAPHQL FOR TABLE <table> [, <table> ...];
-
-DROP GRAPHQL FOR TABLE <table> [, <table> ...];
-
-DROP GRAPHQL ALL;   -- clear allowlist → open mode
-```
-
-| Piece | Rules |
-|-------|--------|
-| **table** | Bare id or `"quoted""ident"`; must exist in schema `main` at CREATE |
-| **OR REPLACE** | Idempotent re-register (no error if already listed) |
-| **DROP … ALL** | Clears entire allowlist |
-
-Inspect:
-
-```sql
-SELECT * FROM quackapi_graphql_tables();
--- open mode: one row mode='open', table_name NULL
--- allowlist: mode='allowlist', one row per table_name
-```
-
-**Example:**
-
-```sql
-CREATE GRAPHQL FOR TABLE users, posts;
-```
-
-### CREATE GRAPHQL ROUTE
-
-Named path mounts independent of the built-in `/graphql` allowlist. See [graphql-v0.md](../guide/graphql-v0.md).
-
-```sql
-CREATE [OR REPLACE] GRAPHQL ROUTE <name>
-  POST '<path>'
-  FROM <table> [, <table> ...]
-  [REQUIRE <auth>]
-  [LIMIT <n>];
-
-DROP GRAPHQL ROUTE <name>;
-```
-
-| Piece | Rules |
-|-------|--------|
-| **path** | Absolute; not reserved (`/graphql`, `/graphql/schema`); unique among GraphQL routes |
-| **FROM** | Required; tables must exist in `main` |
-| **REQUIRE** | Optional; auth scheme must already exist |
-| **LIMIT** | Optional 1..100000 (default 100) |
-
-Inspect:
-
-```sql
-SELECT * FROM quackapi_graphql_routes();
--- name, method, path, tables, require_auth, limit
-```
-
-HTTP: `POST <path>` (query body) and `GET <path>/schema`.
-
----
-
-## 6. CREATE QUEUE
-
-```sql
-CREATE [OR REPLACE] QUEUE <name>
-  [WITH (
-     max_attempts=<n>,                 -- default 3; range 1..1000
-     visibility_timeout='30s'|30,      -- s/m/h suffix or seconds
-     backoff_base_seconds=<n>          -- default 2; 0 = immediate
-  )];
-
-DROP QUEUE <name>;
-```
-
-Queue name: `[A-Za-z0-9_-]+`.
-
-Creates durable table **`quackapi_jobs`** on first use.
-
-**Example:**
-
-```sql
-CREATE QUEUE emails WITH (max_attempts=5, visibility_timeout='30s');
-```
-
----
-
-## 7. CREATE STREAM
-
-```sql
-CREATE [OR REPLACE] STREAM <name> GET '<path>'
-  [WITH (interval='1s'|2|'250ms')]
-  AS <select>;
-
-DROP STREAM <name>;
-```
-
-| Rule | Detail |
-|------|--------|
-| Method | **GET only** (SSE) |
-| Path | Must start with `/` |
-| interval | Polling period for long-lived streams |
-| WS / WEBSOCKET / WSS | **Rejected** with an explicit error |
-
-**Example:**
-
-```sql
-CREATE STREAM ticks GET '/ticks' AS
-SELECT i AS id, 'tick' AS msg FROM range(3) t(i);
-```
-
----
-
-## 8. CREATE ROW ACCESS POLICY
-
-```sql
-CREATE [OR REPLACE] ROW ACCESS POLICY <name>
-  AS (<col> [<type>] [, ...])
-  RETURNS BOOLEAN
-  USING (<boolean expression>);
-
-ALTER TABLE <table>
-  ADD ROW ACCESS POLICY <name> ON (<col> [, ...]);
-
-DROP ROW ACCESS POLICY <name>;
-```
-
-Expression may reference policy columns and `$claims_*`.
-
-**Example:**
-
-```sql
-CREATE ROW ACCESS POLICY tenant_isolation
-  AS (tenant_id VARCHAR) RETURNS BOOLEAN
-  USING (tenant_id = $claims_tenant OR $claims_role = 'admin');
-
-ALTER TABLE pol_orders
-  ADD ROW ACCESS POLICY tenant_isolation ON (tenant_id);
-```
-
----
-
-## 9. CREATE MASKING POLICY
-
-```sql
-CREATE [OR REPLACE] MASKING POLICY <name>
-  ON <type>
-  USING (<expression>);
-
-ALTER TABLE <table>
-  MODIFY COLUMN <col> SET MASKING POLICY <name>;
-
-DROP MASKING POLICY <name>;
-```
-
-Inside `USING`, **`val`** is the original column value. Claims bind as `$claims_*`.
-
-**Example:**
-
-```sql
-CREATE MASKING POLICY mask_email ON VARCHAR
-  USING (CASE WHEN $claims_role = 'admin' THEN val ELSE '***' END);
-
-ALTER TABLE pol_users
-  MODIFY COLUMN email SET MASKING POLICY mask_email;
-```
-
----
-
-## 10. CREATE MIDDLEWARE
+## `CREATE MIDDLEWARE`
 
 ```sql
 CREATE [OR REPLACE] MIDDLEWARE <name>
-  BEFORE|AFTER [GROUP <group>]
-  AS <select>;
+  BEFORE | AFTER [GROUP <group-name>]
+AS <select_statement>;
 
 DROP MIDDLEWARE <name>;
 ```
 
-`BEFORE` runs after route matching and authentication and before an ordinary
-route handler. `AFTER` runs after the handler. Middleware returns an `allow`
-boolean plus optional `status`, `body`, `header_name`, and `header_value`
-control columns. See [SQL middleware](../MIDDLEWARE.md) for limits and the
-execution paths that are intentionally separate.
+Middleware is SQL evaluated at its declared phase. The query must return the
+columns required by that phase; invalid or failed middleware blocks the
+request. Authentication checks for a protected route happen before its
+middleware. See the [middleware guide](../MIDDLEWARE.md).
 
----
+```sql
+CREATE MIDDLEWARE request_gate BEFORE AS
+  SELECT true AS allow;
+```
 
-## Lifecycle reminder
-
-| Object | Survives process restart? |
-|--------|---------------------------|
-| Routes, auth, groups, queues (options), streams, policies | **No** — re-run DDL after reopen (instance registry) |
-| `quackapi_jobs` rows | **Yes** — normal table in your `.db` file |
-| Table data | **Yes** |
+The former queue, row-access/masking policy, stream, GraphQL, table-generation,
+and native PostgreSQL DDL are not part of the current extension. See the
+[migration guide](../MIGRATION.md).

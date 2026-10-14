@@ -1,5 +1,8 @@
 # Gemini brainstorm × `ext_catalog_clean` — composition map
 
+> Historical catalog research. Its QuackAPI feature claims predate the API
+> cleanup; see the [current migration guide](MIGRATION.md).
+
 **Source:** live quack `:9494` `ext_catalog_clean` (2026-07-29).  
 **Method:** `ILIKE` on `extension_name` / `content`; samples only from `query IS NOT NULL` or README blocks — no invented signatures.  
 **Thesis:** compose first. Prefer a **recipe** (LOAD + `CREATE ROUTE` / `CREATE STREAM` / `CREATE QUEUE`) over new C++. Thin C++ only when the wire format or registry lives inside quackapi.

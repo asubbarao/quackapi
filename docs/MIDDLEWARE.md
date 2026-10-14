@@ -45,9 +45,7 @@ middleware applies only to member routes. Within a scope, creation order is
 stable and `CREATE OR REPLACE` preserves a definition's position. The full
 order is global then group for `BEFORE`, and group then global for `AFTER`.
 Middleware wraps ordinary `CREATE ROUTE` handlers and their in-process
-`quackapi_request` calls. Built-in health endpoints, named GraphQL routes, the
-built-in GraphQL endpoint, and SSE streams keep their dedicated execution
-paths and do not run SQL middleware yet.
+`quackapi_request` calls. Built-in health endpoints use their own handler.
 
 QuackAPI binds request data through DuckDB prepared-statement parameters. It
 never builds SQL from an HTTP value. Both phases may use `$request_id`,
@@ -68,8 +66,8 @@ to return the control columns.
 Output is deliberately bounded: 64 definitions per database, 16 KiB SQL per
 definition, 64 returned rows per invocation, 8 KiB per response header, and a
 1 MiB blocking body. Invalid control types, duplicate control columns, unsafe
-header names, CR/LF header values, hop-by-hop headers, SQL errors, policy
-rewrite failures, and deadline expiry fail closed with a sanitized response.
-Middleware SQL uses the same row-access and masking-policy rewrite as route
-SQL. Authentication always runs before middleware, so a middleware cannot
-bypass a route's auth requirement or manufacture claims.
+header names, CR/LF header values, hop-by-hop headers, SQL errors, and deadline
+expiry fail closed with a sanitized response. Authentication always runs
+before middleware, so a middleware cannot bypass a route's auth requirement or
+manufacture claims. Middleware does not add row filtering or rewrite arbitrary
+SQL; tenant predicates belong in the handler or an explicitly scoped view.

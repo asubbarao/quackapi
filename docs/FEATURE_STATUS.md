@@ -1,5 +1,9 @@
 # quackapi — Feature Ledger (authoritative)
 
+> Historical research snapshot. Its former “authoritative” feature ledger
+> predates the API cleanup; use the [migration guide](MIGRATION.md) and current
+> [function](reference/functions.md) and [DDL](reference/ddl.md) references.
+
 **Version:** 0.1.3 (repository `description.yml`)
 **Source of truth:** the current `main` source tree and versioned tests; cited report paths are historical evidence only.
 **Rule:** shipped claims below are backed by source or tests. Design studies and external packaging notes remain explicitly labelled.

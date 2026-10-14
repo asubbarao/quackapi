@@ -118,7 +118,9 @@ CREATE ROUTE me GET '/me' REQUIRE site AS
 SELECT $claims_sub AS user;
 ```
 
-Claims power [row access & masking policies](policies.md).
+Claims are available to the authenticated handler as SQL parameters. Route
+authentication does not filter rows or rewrite arbitrary SQL by tenant; add
+tenant predicates to the handler or an explicitly scoped view.
 
 ---
 
@@ -164,4 +166,4 @@ SELECT (quackapi_verify_auth('site', 'wrong')).ok;         -- false
 ## Next
 
 - [CREATE GROUP](groups.md) — shared auth on a prefix  
-- [Policies](policies.md) — claims-keyed row filters and masks
+- [Migration guide](../MIGRATION.md) — removed policy APIs and the current tenant-filter boundary

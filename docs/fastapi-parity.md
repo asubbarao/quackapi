@@ -1,5 +1,8 @@
 # FastAPI → quackapi parity
 
+> Historical scorecard. Its feature list predates the current API surface; see
+> the [current migration guide](MIGRATION.md).
+
 **Headline:** the versioned HTTP conformance harness scores **89 / 89 (100%)** against FastAPI-shaped expectations.
 
 | | |

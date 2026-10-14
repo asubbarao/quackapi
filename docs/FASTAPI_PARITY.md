@@ -1,5 +1,8 @@
 # quackapi ↔ FastAPI parity scorecard
 
+> Historical scorecard from 2026-07-19. API claims may predate the 2026 API
+> cleanup; see the [current migration guide](MIGRATION.md).
+
 **Source of truth:** [fastapi.tiangolo.com](https://fastapi.tiangolo.com/)  
 **Harness (versioned):** `test/conformance/`  
 **Method:** every PASS/FAIL is a **real HTTP request** against `quackapi_serve()` (FIFO interactive session — never `duckdb -c` for live serve).  

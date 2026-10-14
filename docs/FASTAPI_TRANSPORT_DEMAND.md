@@ -1,5 +1,9 @@
 # FastAPI transport and production demand
 
+> Historical planning note, not a description of shipped transports. See the
+> [current migration guide](MIGRATION.md) for supported response formats and
+> removed surfaces.
+
 This is a primary-source demand scan for the features that most often shape a
 FastAPI adoption decision. It is a product planning input, not a popularity
 survey: the signals below come from FastAPI's own documentation, repository

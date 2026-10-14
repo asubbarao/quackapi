@@ -1,5 +1,8 @@
 # How we beat FastAPI (ordered)
 
+> Historical product strategy. Its feature claims predate the API cleanup; use
+> [MIGRATION.md](MIGRATION.md) and the current API references instead.
+
 **Not optional ceremony.** Work that violates this order is wrong work.
 
 ```
