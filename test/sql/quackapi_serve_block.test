@@ -2,6 +2,7 @@
 # description: quackapi_serve(block := …) + quackapi_wait readiness
 # group: [sql]
 
+require json
 require quackapi
 
 # ---------------------------------------------------------------------------
