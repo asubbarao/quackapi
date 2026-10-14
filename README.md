@@ -1,559 +1,124 @@
 # quackapi
 
-**A FastAPI-class web framework that lives inside DuckDB.**
-
-Routes are DDL. Handlers are SQL. Request validation is the database type system.
-One process is the database, the HTTP server, and — when you load companion
-extensions — the PDF engine, HTML renderer, crawler, and fake-data generator.
-
-```
-browser ──► DuckDB [ quackapi · pdf · tera · fakeit · webbed · … ]
-```
-
-There is no app server, no ORM, and no schema re-declared in a second language.
-The query already types the response.
-
-> **Thesis:** the backend *is* the database.  
-> Prior art: PostgREST, Datasette, Hasura, Oracle APEX. The novel part is one
-> **embedded OLAP** process as DB + HTTP framework + (optional) PDF/renderer,
-> driven by `CREATE ROUTE` DDL.
->
-> **Inspiration:** quackapi was also inspired by the Query.Farm [`httpserver`](https://github.com/Query-farm/httpserver) DuckDB community extension.
-
----
-
-## Five-line quickstart
-
-Requires **DuckDB v1.5.6** (linux, macOS, windows_amd64).
+QuackAPI serves HTTP routes whose handlers are DuckDB SQL. Request values bind
+as prepared parameters, DuckDB types validate them, and query results become
+HTTP responses.
 
 ```sql
 INSTALL quackapi FROM community;
+LOAD json;
 LOAD quackapi;
 
-CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
-CREATE ROUTE item  GET '/items/:id' AS SELECT $id::INTEGER AS id;
+CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS message;
+CREATE ROUTE item GET '/items/:id' AS SELECT $id::INTEGER AS id;
 
 SELECT * FROM quackapi_serve(8000);
--- returns immediately; pass block := true to hold until stop / SIGINT / SIGTERM
-
--- Readiness (replaces sleep/lsof/curl loops):
--- SELECT ready, listen_url FROM quackapi_wait(8000, 5000);
 ```
 
 ```sh
 curl http://127.0.0.1:8000/hello
-# [{"msg":"world"}]
+# [{"message":"world"}]
 
 curl http://127.0.0.1:8000/items/42
 # [{"id":42}]
-
-curl http://127.0.0.1:8000/items/abc
-# {"detail":[{"loc":["path","id"],"msg":"…","type":"type_error"}]}
-# HTTP 422 — FastAPI-shaped validation error
 ```
 
-> **Parser note:** `CREATE ROUTE` is registered when you `LOAD quackapi`. Feed
-> `LOAD` first in a sequential session (interactive shell or stdin), then the
-> DDL. Putting `LOAD` and `CREATE ROUTE` in one `duckdb -c "…"` string can parse
-> the route before the extension is loaded.
+Use a sequential session: load QuackAPI before its DDL so DuckDB has registered
+the parser extension. QuackAPI targets DuckDB v1.5.6.
 
----
+## Routes, authentication, and responses
 
-## CREATE ROUTE — the model
+`CREATE ROUTE` supports GET, POST, PUT, PATCH, DELETE, and HEAD. Path, query,
+header, cookie, and request-body values bind through named SQL parameters.
+Invalid casts and constraints return a structured 422 response. `CREATE AUTH`
+defines API-key or HS256 JWT authentication, and `REQUIRE` applies it to a
+route. `CREATE GROUP` adds a path prefix, default authentication, and OpenAPI
+tags. OpenAPI, Swagger UI, ReDoc, static files, CORS, compression, query
+deadlines, and response-size limits are served by the same DuckDB process.
+
+Route responses support JSON, NDJSON, and CSV, with JSON as the default. Arrow
+and Parquet are not HTTP response formats in this version.
+
+Route authentication controls access to an endpoint. It does not add
+database-wide row-level security or rewrite arbitrary SQL by tenant. Put tenant
+predicates in the handler query or a scoped view, and use DuckDB privileges for
+database access.
+
+## Outbound POST
+
+`quackapi_post(url, body[, content_type[, headers]])` performs one POST for each
+non-NULL URL row. Its result fields are `status`, `reason`, `body`, `headers`,
+`error`, and `reused_connection`; all overloads are volatile. Load a supported
+DuckDB HTTPUtil provider explicitly before use. `curl_httpfs` is recommended;
+`httpfs` is also supported. QuackAPI does not install providers automatically.
 
 ```sql
-CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-  [STATUS <n>]
-  [REQUIRE <auth>]
-  [SCHEDULE '<6-field cron expression, seconds first>']
-  [GROUP <group> | IN GROUP <group>]
-  [BODY SCHEMA '<json-schema>']
-  [BODY TYPE '<duckdb-json-transform-structure>']
-  [PARAM <name> [<type>] [HEADER|COOKIE|QUERY [wire-name]]
-         [DEFAULT <lit>] [GE|GT|LE|LT <n>] [MIN_LENGTH|MAX_LENGTH <n>] …]
-  AS <select>;
-
-DROP ROUTE <name>;
-```
-
-| Piece | Behavior |
-|-------|----------|
-| **Method** | `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` |
-| **Path** | Must start with `/` (unless joined via `GROUP`). `:param` and `{param}` bind to `$param` |
-| **Handler** | Any SQL statement that returns a result (typically `SELECT` / `INSERT … RETURNING` / `COPY`) |
-| **Params** | Cast to the types the prepared handler expects; failures → **422** with FastAPI-shaped `detail` |
-| **Success status** | Default `200`; override with `STATUS 201` (etc.) |
-| **Auth** | `REQUIRE <scheme>` runs a `CREATE AUTH` scheme before the handler |
-| **Schedule** | Optional six-field cron expression (`seconds minutes hours day-of-month month day-of-week`); stored on the route and registered by the community `cronjob` extension |
-
-Live updates: a route created after `quackapi_serve()` is served immediately.
-Handler SQL is validated at `CREATE` time (broken SQL fails at create, not on
-first request). `CREATE OR REPLACE` does not leave a half-applied route on
-failure.
-
-### Scheduled routes
-
-quackapi stores `SCHEDULE` metadata but does not run a scheduler. Timing stays
-with the community `cronjob` extension. Scheduled routes must be callable
-without path parameters: a `:param` or `{param}` in the final route pattern is
-rejected at `CREATE` time. `SCHEDULE` is route-only; `CREATE GROUP` does not
-accept it. A route may join a group and schedule its own parameter-free,
-group-expanded path.
-
-At application startup, load `cronjob` and register each scheduled route with
-its own `cron()` statement. `quackapi_request` executes the route handler
-in-process, so no HTTP listener or external request is needed:
-
-```sql
-INSTALL cronjob FROM community;
-LOAD cronjob;
-
--- one statement per route
-SELECT cron('SELECT * FROM quackapi_request(''POST'', ''/jobs/refresh'')', '0 */5 * * * *');
-```
-
-Register one route per `cron()` call. With the `cronjob` extension on DuckDB
-1.5.x, a single `SELECT cron(query, schedule) FROM quackapi_routes() WHERE
-schedule IS NOT NULL` over several rows registers every job with the **first
-row's schedule**, so generate the statements from `quackapi_routes()` and run
-them one at a time (self-dispatch):
-
-```sql
-SELECT 'SELECT cron(' || chr(39) || 'SELECT * FROM quackapi_request('
-    || chr(39) || chr(39) || method || chr(39) || chr(39) || ', '
-    || chr(39) || chr(39) || pattern || chr(39) || chr(39) || ')' || chr(39)
-    || ', ' || chr(39) || schedule || chr(39) || ');' AS statement
-FROM quackapi_routes()
-WHERE schedule IS NOT NULL;
-```
-
-The optional `test/sql/quackapi_schedule_cronjob.test` SQLLogic case asserts
-a single-route registration when `cronjob` is available; otherwise run the
-statements above manually in the same DuckDB v1.5.6 environment.
-
-### Response modes (column names)
-
-| Column name | Response |
-|-------------|----------|
-| *(default)* | JSON **array of row objects** — types follow DuckDB column types |
-| single column `html` | `text/html; charset=utf-8` (raw string body) |
-| single column `text` | `text/plain; charset=utf-8` |
-| `location` | `Location` header (use with `STATUS 3xx` for redirects) |
-| `set_cookie` / `set-cookie` | `Set-Cookie` header (stripped from JSON body) |
-
-### JSON route
-
-```sql
-CREATE ROUTE get_doc GET '/api/documents/:id' AS
-SELECT * FROM documents WHERE id = $id::INTEGER;
-```
-
-### HTML route (`html` column)
-
-```sql
--- With the community tera extension:
--- INSTALL tera FROM community; LOAD tera;
-CREATE ROUTE dashboard GET '/cases/:id' AS
-SELECT tera_render(template, ctx) AS html
-FROM app_templates, …
-WHERE name = 'case.html';
-```
-
-Without tera, any string column named `html` works:
-
-```sql
-CREATE ROUTE home GET '/' AS
-SELECT '<h1>quackapi</h1>' AS html;
-```
-
-### Static files
-
-```sql
-SELECT * FROM quackapi_serve(
-  8000,
-  host := '127.0.0.1',
-  static_dir := './static'   -- unrouted GETs served from this directory
-);
-```
-
-### Typed params + 422 validation
-
-```sql
-CREATE ROUTE search GET '/search'
-  PARAM limit INTEGER DEFAULT 10 LE 100
-  AS
-SELECT id, name FROM users
-WHERE name ILIKE $q::VARCHAR || '%'
-ORDER BY id
-LIMIT $limit::INTEGER;
-```
-
-```sh
-curl 'http://127.0.0.1:8000/search?q=a&limit=101'
-# 422  loc=["query","limit"]  type=less_than_equal
-
-curl 'http://127.0.0.1:8000/search?q=a&limit=abc'
-# 422  loc=["query","limit"]  type=type_error
-```
-
-Path / query / JSON body / form / multipart all bind into the same `$name`
-namespace. JSON object fields become params; `$body` binds the raw payload when
-the handler declares it. Missing required params → 422; unknown path → 404;
-wrong method → 405 (+ `Allow`).
-
-### POST mutation
-
-```sql
-CREATE ROUTE decide POST '/api/suggestions/:id/decision' STATUS 201
-  PARAM status VARCHAR
-  PARAM actor  VARCHAR DEFAULT 'reviewer'
-  AS
-INSERT INTO decisions BY NAME
-SELECT $id::INTEGER AS suggestion_id,
-       $status AS status,
-       $actor  AS actor
-RETURNING *;
-```
-
-```sh
-curl -X POST http://127.0.0.1:8000/api/suggestions/1/decision \
-  -H 'Content-Type: application/json' \
-  -d '{"status":"accepted"}'
-```
-
----
-
-## Showcase: Closure (one process)
-
-**Closure** (companion app in the same workspace) — an AI-assisted PDF redaction-review
-app — runs entirely as **one DuckDB process**:
-
-| Concern | Implementation |
-|---------|----------------|
-| HTTP routes | quackapi `CREATE ROUTE` + `quackapi_serve` |
-| PDF words / redact | community `pdf` (`read_pdf_words`, `pdf_redact`, …) |
-| HTML UI | community `tera` (`tera_render(…) AS html`) |
-| Data + audit | ordinary DuckDB tables / views |
-| Static page images | `static_dir` |
-
-HTML dashboards, JSON APIs, and POST decision endpoints are all SQL. Calling
-the “PDF service” is a function call in the same address space — not an RPC.
-
----
-
-## Function & DDL reference
-
-### Serving
-
-| Surface | Signature / form | Returns |
-|---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)` | `listen_url` |
-| `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
-| `quackapi_stop` | `([port])` — omit port to stop all | `status` |
-| `quackapi_telemetry_flush` | `([port])` — drain pending sink rows without stopping | `status` |
-| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule` |
-| `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
-| Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
-| Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
-| Setting | `SET quackapi_log_level = 'silent' \| 'error' \| 'warn' \| 'info' \| 'debug'` | default `info` |
-| Setting | `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | default `auto`; legacy booleans map to `auto`/`off` |
-| Setting | `SET quackapi_compression_min_bytes = N` | default `1024` |
-| Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | auto=prefer+loud fallback; curl=require; httplib=force stock |
-| Setting | `SET quackapi_pg_dsn = 'postgresql://…'` | empty = DuckDB handler path |
-| Setting | `SET quackapi_query_timeout_ms = N` | default `30000` |
-| Setting | `SET quackapi_max_response_bytes = N` | default `16777216` uncompressed bytes |
-| Setting | `SET quackapi_max_pending_requests = N` | default `256` |
-| Setting | `SET quackapi_graphql_allow_all = true\|false` | default `false`; legacy GraphQL open mode |
-
-`access_log` defaults to structured stderr JSON; `false` disables it and a table
-name enables asynchronous table-backed logging. Table writes batch up to 100
-rows or one second; `quackapi_telemetry_flush` drains pending rows without
-stopping the server. The queue uses 10,000 entries and reports overflow in
-`/healthz` as `access_log_overflow_count`. Compression defaults to `auto`,
-negotiates client q-values with zstd winning ties, skips bodies below 1024 bytes,
-and adds `Vary: Accept-Encoding` to responses eligible for compression.
-
-Built-in OpenAPI (not listed in `quackapi_routes()`):
-
-- `GET /openapi.json` — OpenAPI 3.1 from the live registry  
-- `GET /docs` — Swagger UI  
-- `GET /redoc` — ReDoc  
-
-**Serve memory limit** (never silently clobbers an operator setting):
-
-1. `memory_limit := '…'` named parameter on `quackapi_serve` wins  
-2. else `SET quackapi_memory_limit = '…'`  
-3. else if DuckDB already has a **non-default** `memory_limit` → leave it alone  
-4. else apply the safe default of **256MB**
-
-```sql
--- App that needs headroom (PDF/HTML workloads, large joins, etc.)
-SELECT * FROM quackapi_serve(8000, memory_limit := '4GB');
-
--- Or configure once for the session, then serve:
-SET quackapi_memory_limit = '4GB';
-SELECT * FROM quackapi_serve(8000);
-
--- Or set DuckDB's limit yourself — serve will not overwrite it:
-SET memory_limit = '4GB';
-SELECT * FROM quackapi_serve(8000);
-```
-
-Request body limit: **8 MiB** (`413` when exceeded).
-
-### Auth
-
-```sql
-CREATE [OR REPLACE] AUTH <name> AS API_KEY [( HEADER 'X-Custom-Key' )];
-CREATE [OR REPLACE] AUTH <name> AS JWT ( SECRET '…' [, ALGORITHM HS256] );
-DROP AUTH <name>;
-
-SELECT * FROM quackapi_add_api_key('site', 'raw-key', 'alice');  -- stores SHA-256 only
-SELECT * FROM quackapi_auths();   -- name, kind, header — never secrets/hashes
-```
-
-Verified JWT/API-key claims bind as `$claims_<name>` (missing claim → SQL `NULL`,
-not 422). Bridge scalars for the core quack RPC: `quackapi_authentication`,
-`quackapi_authorization`, `quackapi_verify_auth`.
-
-### Route groups (APIRouter-style)
-
-```sql
-CREATE GROUP v1 WITH (prefix='/api/v1', auth=api, tags='items,v1');
-CREATE ROUTE items_list GET '/items' GROUP v1 AS SELECT …;
--- served at GET /api/v1/items, inherits auth + tags
-SELECT * FROM quackapi_groups();
-```
-
-### Table API (read-only scaffold)
-
-```sql
-CREATE API FOR TABLE documents [AT '/docs'] [KEY 'id'];
--- registers GET /docs and GET /docs/:id only (no write routes)
-```
-
-### Durable job queue (broker-less)
-
-Jobs live in the ordinary table `quackapi_jobs` in your `.db` file — no Redis.
-
-```sql
-CREATE QUEUE emails WITH (max_attempts=5, visibility_timeout='30s');
-
-CREATE ROUTE enqueue POST '/jobs' STATUS 201 PARAM payload VARCHAR AS
-SELECT quackapi_enqueue('emails', $payload) AS job_id;
-
-SELECT id, payload, quackapi_ack('emails', id, delivery_generation) AS acked
-FROM quackapi_dequeue('emails', 10);
-```
-
-| Function | Role |
-|----------|------|
-| `quackapi_enqueue(queue, payload [, max_attempts])` | → `job_id` |
-| `quackapi_dequeue(queue [, n])` | claim with a visibility lease and delivery generation |
-| `quackapi_ack` / `quackapi_nack` / `quackapi_renew` | complete, retry, or renew the matching delivery |
-| `quackapi_queues()` | depth, in_flight, dead, options |
-
-Worker = compose community `cronjob` (or a drain route). See [`docs/QUEUE.md`](docs/QUEUE.md).
-
-### SSE streams
-
-```sql
-CREATE STREAM ticks GET '/events' AS SELECT …;   -- text/event-stream
--- WebSocket methods are rejected (bundled httplib has no Upgrade API)
-SELECT * FROM quackapi_streams();
-```
-
-### Row-access & masking policies
-
-```sql
-CREATE ROW ACCESS POLICY tenant_isolation AS (tenant_id) RETURNS BOOLEAN
-  USING (tenant_id = $claims_tenant);
-CREATE MASKING POLICY mask_email ON VARCHAR USING (…);
-ALTER TABLE … ADD ROW ACCESS POLICY …;
-SELECT * FROM quackapi_policies();
-```
-
-### Outbound HTTP
-
-A handler that calls an upstream API — an LLM, a payment gateway, a webhook —
-gets a **pooled** connection. The pool lives for the process, so the second
-request to a host does not re-dial.
-
-```sql
-CREATE ROUTE ask POST '/ask' AS
-  SELECT (quackapi_post(
-    'http://127.0.0.1:11434/api/generate',
-    to_json({model: $model::VARCHAR, prompt: $prompt::VARCHAR, stream: false})::VARCHAR
-  )).body AS answer;
-```
-
-| Function | Role |
-|----------|------|
-| `quackapi_fetch(url[, headers])` | GET → `STRUCT(status, reason, body, headers, error, reused_connection)` |
-| `quackapi_post(url, body[, content_type[, headers]])` | POST, same result shape (`content_type` defaults to `application/json`) |
-| `quackapi_http_pool()` | per-origin `host, idle, dialed, reused` |
-
-Why this exists: `HTTPUtil::Request(request)` — and the community `http_client`
-extension — build a fresh client per call and drop it, so connections are only
-reused *within* one query execution. A route handler is exactly one execution,
-so every request paid a full dial. Against an ollama endpoint whose floor is
-12.7ms/call that cost **39.1ms p50**; through the pool the same route measures
-**13.2ms p50 / 13.8ms p90**.
-
-`http://` uses the vendored httplib client, which implements POST — no companion
-extension needed. `https://` goes through `HTTPUtil`, pooled the same way, so
-`LOAD curl_httpfs` (or `httpfs`) supplies TLS.
-
-Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
-`FROM range(1000)` would issue one request while reporting 1000 rows.
-
-### Diagnostics
-
-| Function | Role |
-|----------|------|
-| `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
-
-Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
-`quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async).
-`http_client := 'auto'` falls back to httplib with a loud `http_client_reason` on
-`/healthz` / `quackapi_servers()`; `http_client := 'curl'` **fails serve** if
-curl_httpfs cannot INSTALL/LOAD — see [`docs/curl_httpfs.md`](docs/curl_httpfs.md).
-
----
-
-## Install & load
-
-### Community (preferred — signed)
-
-Page: [duckdb.org/community_extensions/extensions/quackapi](https://duckdb.org/community_extensions/extensions/quackapi)
-
-```sql
-INSTALL quackapi FROM community;
+LOAD curl_httpfs;
 LOAD quackapi;
+
+SELECT (quackapi_post(
+  'https://api.example.test/items',
+  '{"name":"new item"}',
+  'application/json',
+  MAP {'Authorization': 'Bearer …'}
+)).status;
 ```
 
-| Requirement | Detail |
-|-------------|--------|
-| **DuckDB** | **v1.5.6 only** |
-| **CI / platforms** | linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64 |
-| **Community CDN** | `…/v1.5.6/{platform}/quackapi.duckdb_extension.gz` |
-| **Wasm** | excluded (no server sockets) |
+The database-wide setting `quackapi_post_concurrency` bounds active requests.
+`0` uses DuckDB's configured thread count (minimum one); positive values select
+an explicit limit. A bounded waiting queue applies backpressure when workers
+and queue slots are occupied. This schedules HTTP work only; it does not change
+DuckDB's SQL transaction or database-file concurrency semantics.
 
-See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
+For GET requests from SQL, use DuckDB's HTTP readers such as `read_text` and
+`read_json` after loading the required reader extension. QuackAPI has no public
+GET function or connection-pool diagnostics.
 
-### Direct download (offline / unsigned)
-
-Release assets: https://github.com/asubbarao/quackapi/releases  
-
-```text
-quackapi-duckdb-v1.5.6-linux_amd64.duckdb_extension
-quackapi-duckdb-v1.5.6-windows_amd64.duckdb_extension
-quackapi-duckdb-v1.5.6-osx_arm64.duckdb_extension
-…
-```
-
-```sh
-curl -fsSL -o quackapi.duckdb_extension \
-  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v1.5.6-osx_arm64.duckdb_extension"
-duckdb -unsigned -c "LOAD '$(pwd)/quackapi.duckdb_extension';"
-```
-
-### From source
-
-```sh
-git clone --recurse-submodules https://github.com/asubbarao/quackapi
-cd quackapi
-GEN=ninja make release
-./build/release/duckdb -unsigned
-```
+## Server controls
 
 ```sql
-LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
+SELECT ready, listen_url FROM quackapi_wait(8000, 5000);
+SELECT * FROM quackapi_routes();
+SELECT * FROM quackapi_servers();
+SELECT * FROM quackapi_stop(8000);
 ```
 
-**Target DuckDB:** **v1.5.6 only.** Dependencies: DuckDB’s bundled
-**httplib** + **mbedtls** only — no vcpkg, no libcurl. The extension is built as
-C++11 by the repository CMake configuration.
+`quackapi_serve` binds to `127.0.0.1` by default. Use `host := '0.0.0.0'` only
+when the routes and network boundary are configured for remote access. There
+is no in-process TLS termination; use a reverse proxy for HTTPS termination.
 
----
+DuckDB ordinary SQL concurrency rules still apply. Concurrent HTTP requests do
+not turn one DuckDB database file into a multi-writer OLTP service. See
+[Concurrency and limits](docs/RESOURCE_LIMITS.md).
 
-## Behavior notes
+## Removed surfaces
 
-- **Response envelope:** default is a JSON **array** of row objects for
-  multi-column / non-`html`/`text` handlers. Opt in with `ENVELOPE object`
-  for a bare JSON object (exactly one row) and `EMPTY STATUS 404` for 0-row
-  → HTTP 404 instead of `[]` / `null`.
-- **CORS:** off by default; enable with `cors_origins` / `SET quackapi_cors_origins`.
-- **Registry lifecycle:** routes, auth schemes, groups, queues, streams live on
-  the **database instance** (not the catalog). Re-run DDL after reopen.
-- **Queue jobs** (`quackapi_jobs`) *are* catalog tables and survive restart.
-- **Concurrency:** DuckDB single-writer per file — fine for a few concurrent
-  reviewers; not a high-write multi-tenant OLTP app server.
-- **FastAPI parity:** real-HTTP conformance suite in `test/conformance/` and
-  `test/http/` — see [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md).
+QuackAPI no longer includes its experimental durable job queue, row-access and
+masking policies, SSE streams, GraphQL, native PostgreSQL execution, generated
+table APIs, source importers, or Arrow/Parquet response encoders. The `radio`
+extension is a separate message bus and does not provide the queue lease and
+acknowledgement semantics formerly prototyped here. Arrow Flight is a separate
+protocol and is not a mandatory QuackAPI dependency. See the
+[migration guide](docs/MIGRATION.md) for SQL names and migration boundaries.
 
----
-
-## Security
-
-- **Default bind is `127.0.0.1`** — the server is loopback-only unless you opt
-  in with `host := '0.0.0.0'`.
-- **Binding a non-loopback host exposes your SQL-backed routes to the
-  network.** Anything a route's SQL can read, a caller can read. Before doing
-  so, put `CREATE AUTH` (API key or JWT) plus `CREATE GROUP` / row policies in
-  front of every route, or terminate at a reverse proxy that handles TLS and
-  auth.
-- **No TLS termination in-process** — use a reverse proxy (nginx/caddy) for
-  HTTPS.
-- Treat the extension as **experimental**: don't point it at production data
-  on an exposed interface.
-
----
-
-## Honest limits
-
-- **Write concurrency / OLTP:** single-writer semantics; not a replacement for
-  a connection-pooled app tier under heavy concurrent writes.
-- **Platform coverage:** **DuckDB v1.5.6** on linux/macOS/windows_amd64 only.
-  Older DuckDB versions are unsupported — upgrade the host.
-- **Serve memory default:** `quackapi_serve` applies a 256MB `memory_limit`
-  only when nothing was configured (no `memory_limit` / `quackapi_memory_limit`
-  and DuckDB is still at its system default). Prefer
-  `memory_limit := '4GB'` (or `SET quackapi_memory_limit`) for large PDF/HTML
-  workloads — it will never clobber an explicit operator `SET memory_limit`.
-- **No WebSocket routes** on the HTTP transport (SSE via `CREATE STREAM` only).
-- **`CREATE API FOR TABLE`** scaffolds **GET list + GET by key** only.
-- **JWT:** HS256 only (`ALGORITHM HS256`); no RS256 / OIDC discovery yet.
-- **Not a general multi-tenant SaaS framework:** policies are claims-keyed
-  helpers, not a full RBAC product.
-
----
-
-## Build & test
+## Build and documentation
 
 ```sh
 GEN=ninja make release
-make test                          # SQL unit tests
-bash test/conformance/run.sh       # real-HTTP contract suite (needs release build)
+make test
+bash test/conformance/run.sh
 ```
 
-## Docs in this repo
+The build declares DuckDB JSON as an extension dependency. Load `json` before
+starting a server that uses JSON routes; QuackAPI does not install it as a side
+effect. `BODY SCHEMA` additionally requires `json_schema` to be available
+locally before the route is created, and route DDL never installs it.
 
-| Doc | Content |
-|-----|---------|
-| [`docs/index.md`](docs/index.md) | Guided tour (start here) |
-| [`docs/guide/extension-composition.md`](docs/guide/extension-composition.md) | Compose companions: gateway, SSE, `quack_from_x`, mesh, PDF |
-| [`docs/community-page.md`](docs/community-page.md) | Community-extensions page copy |
-| [`packaging/description.yml`](packaging/description.yml) / [`description.yml`](description.yml) | Community submission manifest |
-| [`docs/FASTAPI_PARITY.md`](docs/FASTAPI_PARITY.md) | Scorecard vs FastAPI |
-| [`docs/SUPERIORITY_ORDER.md`](docs/SUPERIORITY_ORDER.md) | Equivalence → slaughter → leapfrog (work order) |
-| [`docs/QUEUE.md`](docs/QUEUE.md) | Job queue semantics |
-| [`docs/PYDANTIC_PARITY.md`](docs/PYDANTIC_PARITY.md) | Native typed bodies, validation errors, nulls, and OpenAPI |
-| [`docs/MIDDLEWARE.md`](docs/MIDDLEWARE.md) | SQL request and response middleware |
-| [`docs/RESOURCE_LIMITS.md`](docs/RESOURCE_LIMITS.md) | Query deadlines, response caps, admission, and rate limits |
-| [`docs/REVIEW_2026_09_07.md`](docs/REVIEW_2026_09_07.md) | Security and robustness review with remediation status |
-| [`docs/curl_httpfs.md`](docs/curl_httpfs.md) | Outbound HTTP via curl_httpfs |
-
-## License
-
-MIT — Copyright (c) 2026 Alok Subbarao
+- [Guided tour](docs/index.md)
+- [Function reference](docs/reference/functions.md)
+- [DDL reference](docs/reference/ddl.md)
+- [Route guide](docs/guide/routes-and-params.md)
+- [Authentication](docs/guide/auth.md)
+- [Outbound POST providers](docs/curl_httpfs.md)
+- [Migration guide](docs/MIGRATION.md)
+- [Community extension description](docs/community-page.md)

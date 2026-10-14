@@ -1,5 +1,8 @@
 # FastAPI versus QuackAPI: production matrix
 
+> Historical comparison plan. Its feature dimensions predate the API cleanup;
+> use [MIGRATION.md](MIGRATION.md) and current references for supported APIs.
+
 The repository now has a paired HTTP corpus under
 [`test/ultra`](../test/ultra). It runs the
 same cases against a FastAPI reference app and a QuackAPI SQL fixture, then

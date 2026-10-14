@@ -138,7 +138,7 @@ SELECT $title::VARCHAR AS title,
 
 ## BODY SCHEMA (JSON Schema validation)
 
-Add `BODY SCHEMA '<json-schema>'` to validate the JSON object **before** the handler runs. This uses DuckDB’s `json_schema` machinery under the hood. The `json_schema` extension is loaded when the route is created (and installed from community if needed), so request handling never performs an installation.
+Add `BODY SCHEMA '<json-schema>'` to validate the JSON object **before** the handler runs. This uses DuckDB’s `json_schema` extension. Make both `json` and `json_schema` available locally before creating the route; QuackAPI never installs either extension as a side effect.
 
 ```sql
 CREATE ROUTE create_user POST '/users' STATUS 201
