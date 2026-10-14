@@ -48,7 +48,15 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto responses = QuackapiPostExecutor::Execute(context, std::move(requests), skip);
 
 	for (idx_t i = 0; i < count; i++) {
-		result.SetValue(i, skip[i] ? Value(QuackapiHttpFetchResultType()) : QuackapiHttpFetchResultValue(responses[i]));
+		if (skip[i]) {
+			result.SetValue(i, Value(QuackapiHttpFetchResultType()));
+			continue;
+		}
+		// Move each response out of the batch before copying it into the output
+		// vector. Keeping the whole responses vector alive here duplicates every
+		// body while the result vector is being populated.
+		auto response = std::move(responses[i]);
+		result.SetValue(i, QuackapiHttpFetchResultValue(response));
 	}
 }
 
