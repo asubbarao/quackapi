@@ -1,7 +1,6 @@
 #pragma once
 
 #include "duckdb/common/types.hpp"
-#include "duckdb/common/types/value.hpp"
 #include "httplib.hpp"
 #include <memory>
 
@@ -23,7 +22,6 @@ public:
 	explicit QuackapiResponseWriter(idx_t max_bytes);
 	bool Append(const char *data, idx_t length);
 	bool Append(const string &data);
-	bool SetMaxBytes(idx_t max_bytes);
 	idx_t BytesWritten() const;
 	bool ExceededLimit() const;
 	const string &Data() const;
@@ -76,7 +74,6 @@ private:
 	unique_ptr<State> state;
 };
 
-string ValueToJson(const Value &value);
 bool IsSpecialResponseColumn(const string &name);
 void SetJson(duckdb_httplib::Response &res, int status, const string &body);
 void SetInternalError(duckdb_httplib::Response &res, const string &server_side_detail);

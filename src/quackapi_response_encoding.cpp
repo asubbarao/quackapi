@@ -1,6 +1,5 @@
 #include "quackapi_response_encoding.hpp"
 
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -71,14 +70,6 @@ bool QuackapiResponseWriter::Append(const char *append_data, idx_t length) {
 
 bool QuackapiResponseWriter::Append(const string &append_data) {
 	return Append(append_data.data(), append_data.size());
-}
-
-bool QuackapiResponseWriter::SetMaxBytes(idx_t max_bytes) {
-	this->max_bytes = max_bytes;
-	if (bytes_written > max_bytes) {
-		exceeded_limit = true;
-	}
-	return !exceeded_limit;
 }
 
 idx_t QuackapiResponseWriter::BytesWritten() const {
@@ -319,66 +310,6 @@ void QuackapiCsvChunkEncoder::AppendChunk(DataChunk &chunk) {
 
 void QuackapiCsvChunkEncoder::Finish() {
 	state->Finish();
-}
-
-//! Render a DuckDB Value as JSON. The database typed the column — the JSON
-//! representation follows the type, not string-formatting heuristics.
-string ValueToJson(const Value &value) {
-	if (value.IsNull()) {
-		return "null";
-	}
-	auto &type = value.type();
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return value.GetValue<bool>() ? "true" : "false";
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::DECIMAL:
-		return value.ToString();
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE: {
-		auto d = value.GetValue<double>();
-		if (std::isnan(d) || std::isinf(d)) {
-			// JSON has no NaN/Infinity — mirror FastAPI/ujson and emit null
-			return "null";
-		}
-		return value.ToString();
-	}
-	case LogicalTypeId::LIST: {
-		auto &children = ListValue::GetChildren(value);
-		string result = "[";
-		for (idx_t i = 0; i < children.size(); i++) {
-			if (i > 0) {
-				result += ",";
-			}
-			result += ValueToJson(children[i]);
-		}
-		result += "]";
-		return result;
-	}
-	case LogicalTypeId::STRUCT: {
-		auto &children = StructValue::GetChildren(value);
-		auto &child_types = StructType::GetChildTypes(type);
-		string result = "{";
-		for (idx_t i = 0; i < children.size(); i++) {
-			if (i > 0) {
-				result += ",";
-			}
-			result += "\"" + QuackapiJsonEscape(child_types[i].first) + "\":" + ValueToJson(children[i]);
-		}
-		result += "}";
-		return result;
-	}
-	default:
-		return "\"" + QuackapiJsonEscape(value.ToString()) + "\"";
-	}
 }
 
 //! True if column name is a special response control column (stripped from body).

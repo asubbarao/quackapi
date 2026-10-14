@@ -3005,7 +3005,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		string location_value;
 		vector<string> set_cookie_values;
-		idx_t header_value_bytes = 0;
 		idx_t rows_fetched = 0;
 		bool limit_exceeded = false;
 		while (true) {
@@ -3018,37 +3017,19 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 			// Keep response-control columns outside the body while reading them
 			// from every chunk, matching the old first-Location/all-Cookies rules.
-			for (idx_t row = 0; row < chunk->size() && !limit_exceeded; row++) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
 				if (location_col < chunk->ColumnCount()) {
 					auto value = chunk->GetValue(location_col, row);
-					if (!value.IsNull()) {
-						auto text = value.ToString();
-						if (text.size() > max_response_bytes - header_value_bytes) {
-							limit_exceeded = true;
-						} else {
-							header_value_bytes += text.size();
-							if (location_value.empty() && !text.empty()) {
-								location_value = text;
-							}
-						}
+					if (location_value.empty() && !value.IsNull()) {
+						location_value = value.ToString();
 					}
 				}
 				if (set_cookie_col < chunk->ColumnCount()) {
 					auto value = chunk->GetValue(set_cookie_col, row);
 					if (!value.IsNull()) {
-						auto text = value.ToString();
-						if (text.size() > max_response_bytes - header_value_bytes) {
-							limit_exceeded = true;
-						} else {
-							header_value_bytes += text.size();
-							set_cookie_values.push_back(std::move(text));
-						}
+						set_cookie_values.push_back(value.ToString());
 					}
 				}
-			}
-			if (limit_exceeded || !response_writer.SetMaxBytes(max_response_bytes - header_value_bytes)) {
-				limit_exceeded = true;
-				break;
 			}
 
 			if (mode == ResponseMode::HTML || mode == ResponseMode::TEXT) {
@@ -3100,7 +3081,13 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 		// 0-row EMPTY STATUS: override success STATUS (any FORMAT / html/text).
 		if (rows_fetched == 0 && match.route.empty_status != 0) {
-			SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
+			auto empty_body = EmptyResultBody(match.route);
+			if (empty_body.size() > max_response_bytes) {
+				SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+				finish();
+				return;
+			}
+			SetJson(res, match.route.empty_status, empty_body);
 			finish();
 			return;
 		}
