@@ -40,7 +40,6 @@
 #include "quackapi_graphql.hpp"
 #include "quackapi_openapi.hpp"
 #include "quackapi_pg.hpp"
-#include "quackapi_policy.hpp"
 #include "quackapi_limits.hpp"
 #include "quackapi_middleware.hpp"
 #include "quackapi_state.hpp"
@@ -2331,7 +2330,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			try {
 				GraphqlExecOptions opts;
 				opts.allowed_tables = &gql_route.tables;
-				opts.authenticated = !gql_route.require_auth.empty() && auth_result.ok;
 				opts.claims = &auth_result.claims;
 				opts.query_timeout_ms = options.query_timeout_ms;
 				opts.max_response_bytes = options.max_response_bytes;
@@ -2368,7 +2366,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				GraphqlExecOptions opts;
 				opts.allowed_tables = &gql_route.tables;
 				opts.mode = "route";
-				opts.authenticated = !gql_route.require_auth.empty() && auth_result.ok;
 				opts.claims = &auth_result.claims;
 				opts.query_timeout_ms = options.query_timeout_ms;
 				opts.max_response_bytes = options.max_response_bytes;
@@ -2676,15 +2673,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		route_name = stream_match.stream.name;
 		route_path = stream_match.stream.pattern;
 		try {
-			bool policy_denied = false;
-			string stream_policy_error;
-			const auto stream_sql = RewriteHandlerWithPolicies(*db, stream_match.stream.handler_sql, false,
-			                                                   policy_denied, stream_policy_error);
-			if (policy_denied || !stream_policy_error.empty()) {
-				SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
-				finish();
-				return;
-			}
+			const auto &stream_sql = stream_match.stream.handler_sql;
 			auto headers = CollectHeaders(req);
 			// HEAD: headers only — do not install a long-lived provider.
 			if (req.method == "HEAD") {
@@ -2935,19 +2924,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 	}
 	// auth_result.claims is ready for $claims_<k> binding below.
 
-	// ---- ROW ACCESS + MASKING (claims-keyed policies on tables) ----
-	// When the handler references a table with RAP/masking bindings, wrap
-	// table refs as secure subqueries. Unauthenticated requests fail closed.
 	bool authenticated = !match.route.require_auth.empty() && auth_result.ok;
-	bool deny_unauth = false;
-	string policy_error;
-	string handler_sql =
-	    RewriteHandlerWithPolicies(*db, match.route.handler_sql, authenticated, deny_unauth, policy_error);
-	if (deny_unauth || !policy_error.empty()) {
-		SetJson(res, 403, "{\"detail\":\"Policy denies unauthenticated access\"}");
-		finish();
-		return;
-	}
+	string handler_sql = match.route.handler_sql;
 
 	try {
 		// Destroy the connection before leaving the request. Retaining it in TLS

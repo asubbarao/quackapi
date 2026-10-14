@@ -76,20 +76,6 @@ struct QuackapiParamSpec {
 	idx_t max_length = 0;
 };
 
-//! One durable job queue registered via CREATE QUEUE.
-//! Jobs live in the shared `quackapi_jobs` table (survives restart in the .db
-//! file). Queue options live on the DatabaseInstance (like routes) and must be
-//! re-declared after reopen — same lifecycle as CREATE ROUTE.
-struct QuackapiQueue {
-	string name;
-	//! Attempts before a job is moved to status='dead' (dead-letter).
-	int32_t max_attempts = 3;
-	//! Lease duration in seconds after a successful claim (visibility timeout).
-	int32_t visibility_timeout_sec = 30;
-	//! Base delay in seconds for exponential nack backoff: base^min(attempts,6).
-	int32_t backoff_base_sec = 2;
-};
-
 //! One registered route group (FastAPI APIRouter-style prefix + default auth).
 //! Expanded into routes at CREATE ROUTE time — runtime registry stays flat.
 struct QuackapiGroup {
@@ -169,42 +155,6 @@ struct QuackapiRoute {
 	//! Optional six-field cron expression (seconds first), owned by cronjob.
 	//! Empty means this route is not scheduled.
 	string schedule;
-};
-
-//! Row-access policy: predicate over table columns + $claims_* (JWT/auth claims).
-//! CREATE ROW ACCESS POLICY name AS (col [type], ...) RETURNS BOOLEAN USING (expr)
-struct QuackapiRowAccessPolicy {
-	string name;
-	//! Argument column names from the AS (...) signature (order preserved).
-	vector<string> arg_columns;
-	//! Optional type names parallel to arg_columns (may be empty strings).
-	vector<string> arg_types;
-	//! Boolean SQL expression; may reference arg column names and $claims_*.
-	string expression;
-};
-
-//! Dynamic data masking policy: rewrite a column value from claims context.
-//! CREATE MASKING POLICY name ON <type> USING (expr) — `val` is the column value.
-struct QuackapiMaskingPolicy {
-	string name;
-	string value_type; // e.g. VARCHAR, INTEGER
-	//! SQL expression returning the same type; use identifier `val` for the raw value.
-	string expression;
-};
-
-//! Table binding for a row-access policy (ALTER TABLE … ADD ROW ACCESS POLICY).
-struct QuackapiRowAccessBinding {
-	string table_name;
-	string policy_name;
-	//! Table columns mapped onto the policy signature (same arity as policy args).
-	vector<string> columns;
-};
-
-//! Column binding for a masking policy (ALTER TABLE … SET MASKING POLICY).
-struct QuackapiMaskingBinding {
-	string table_name;
-	string column_name;
-	string policy_name;
 };
 
 //! Transport for CREATE STREAM. SSE is first-class on cpp-httplib; WebSocket is
@@ -290,20 +240,6 @@ public:
 	//! Snapshot of stored keys for an auth (hashes only — never raw keys).
 	vector<QuackapiApiKeyEntry> SnapshotApiKeys(const string &auth_name);
 
-	//! CREATE [OR REPLACE] QUEUE. Throws on duplicate name unless or_replace.
-	void AddQueue(const QuackapiQueue &queue, bool or_replace);
-	//! DROP QUEUE. Returns false if no such queue. Does not delete job rows.
-	bool DropQueue(const string &name);
-	//! Lookup by name. Returns false if not registered.
-	bool GetQueue(const string &name, QuackapiQueue &out);
-	vector<QuackapiQueue> SnapshotQueues();
-	//! Shared queue delivery fence for this database. It serializes dequeue,
-	//! expiry recovery, acknowledgement, retry, and lease renewal across static
-	//! and loadable copies of the extension.
-	std::mutex &DequeueClaimMutex() {
-		return dequeue_claim_mutex;
-	}
-
 	//! Start serving on host:port. Throws if a server already listens there.
 	void StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts);
 	//! Stop the server on port (any host). Returns false if none.
@@ -325,26 +261,6 @@ public:
 	//! Flush queued telemetry for one running server. Port 0 means the only server.
 	//! A port is required when more than one server is running.
 	bool FlushTelemetry(int port = 0);
-
-	// --- Row access + masking policies (JWT/claims keyed, not DB roles) ---
-	void AddRowAccessPolicy(const QuackapiRowAccessPolicy &policy, bool or_replace);
-	bool DropRowAccessPolicy(const string &name);
-	bool GetRowAccessPolicy(const string &name, QuackapiRowAccessPolicy &out);
-	vector<QuackapiRowAccessPolicy> SnapshotRowAccessPolicies();
-
-	void AddMaskingPolicy(const QuackapiMaskingPolicy &policy, bool or_replace);
-	bool DropMaskingPolicy(const string &name);
-	bool GetMaskingPolicy(const string &name, QuackapiMaskingPolicy &out);
-	vector<QuackapiMaskingPolicy> SnapshotMaskingPolicies();
-
-	//! Bind / unbind row-access policy on a table. Throws if policy missing or arity mismatch.
-	void BindRowAccessPolicy(const QuackapiRowAccessBinding &binding, bool or_replace);
-	bool UnbindRowAccessPolicy(const string &table_name, const string &policy_name);
-	vector<QuackapiRowAccessBinding> SnapshotRowAccessBindings();
-
-	void BindMaskingPolicy(const QuackapiMaskingBinding &binding, bool or_replace);
-	bool UnbindMaskingPolicy(const string &table_name, const string &column_name);
-	vector<QuackapiMaskingBinding> SnapshotMaskingBindings();
 
 	// --- Thin GraphQL v0 table allowlist (built-in POST /graphql) ---
 	// Empty allowlist = open mode (all main-schema tables, v0 default).
@@ -409,19 +325,6 @@ private:
 	std::mutex auths_mutex;
 	vector<QuackapiAuth> auths;
 	vector<QuackapiApiKeyEntry> api_keys;
-
-	std::mutex queues_mutex;
-	vector<QuackapiQueue> queues;
-	//! Serialize queue delivery transitions for this database. Function-local
-	//! statics are unsafe: static+loadable extension copies would each get an
-	//! independent mutex, allowing concurrent HTTP workers to bypass the fence.
-	std::mutex dequeue_claim_mutex;
-
-	std::mutex policies_mutex;
-	vector<QuackapiRowAccessPolicy> row_access_policies;
-	vector<QuackapiMaskingPolicy> masking_policies;
-	vector<QuackapiRowAccessBinding> row_access_bindings;
-	vector<QuackapiMaskingBinding> masking_bindings;
 
 	//! GraphQL allowlist (case-sensitive catalog names, like duckdb_tables).
 	std::mutex graphql_mutex;

@@ -35,8 +35,6 @@ set(EXTENSION_SOURCES
     src/quackapi_table_api.cpp
     src/quackapi_openapi.cpp
     src/quackapi_graphql.cpp
-    src/quackapi_queue.cpp
-    src/quackapi_policy.cpp
     src/quackapi_stream.cpp
     src/quackapi_from_x.cpp
     src/quackapi_util.cpp

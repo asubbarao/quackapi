@@ -14,7 +14,6 @@
 #include "duckdb/parser/parser_extension.hpp"
 
 #include "quackapi_limits.hpp"
-#include "quackapi_policy.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
 
@@ -1135,13 +1134,6 @@ string ExecuteGraphqlQuery(DatabaseInstance &db, const string &query, const Grap
 			source_sql += QuoteIdent(field.columns[c]);
 		}
 		source_sql += " FROM " + QuoteGraphqlObject(object->second) + " LIMIT " + std::to_string(limit);
-		bool deny_unauthenticated = false;
-		string policy_error;
-		source_sql =
-		    RewriteHandlerWithPolicies(db, source_sql, options.authenticated, deny_unauthenticated, policy_error);
-		if (deny_unauthenticated || !policy_error.empty()) {
-			return GraphqlError("access denied by table policy");
-		}
 		string err;
 		string rows_json = SelectTableJson(con, source_sql, field.columns, options, err);
 		if (!err.empty()) {
@@ -1210,12 +1202,6 @@ string BuildGraphqlSchema(DatabaseInstance &db, const GraphqlExecOptions &option
 	std::sort(names.begin(), names.end());
 	for (auto &table : names) {
 		if ((route_mode || allowlist) && !TableInList(allowed, table)) {
-			continue;
-		}
-		// Schema discovery follows the same policy gate as execution. A public
-		// GraphQL endpoint must not reveal a protected table or view name.
-		if (!options.authenticated &&
-		    HandlerTouchesPoliciedTable(db, "SELECT * FROM " + QuoteGraphqlObject(catalog[table]))) {
 			continue;
 		}
 		if (!first_table) {

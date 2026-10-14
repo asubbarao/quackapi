@@ -24,8 +24,6 @@
 #include "quackapi_from_x.hpp"
 #include "quackapi_graphql.hpp"
 #include "quackapi_http_fetch.hpp"
-#include "quackapi_queue.hpp"
-#include "quackapi_policy.hpp"
 #include "quackapi_server.hpp"
 #include "quackapi_state.hpp"
 #include "quackapi_stream.hpp"
@@ -1328,9 +1326,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetQuackapiAuthsFunction());
 	loader.RegisterFunction(GetQuackapiAddApiKeyFunction());
 
-	// Row-access + masking policy inspection (claims-keyed, not DB roles).
-	loader.RegisterFunction(GetQuackapiPoliciesFunction());
-
 	// quack auth bridge: quackapi_authentication / quackapi_authorization /
 	// quackapi_verify_auth — same signatures as quack_check_token /
 	// quack_nop_authorization so they can be SET as quack_*_function.
@@ -1353,9 +1348,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quackapi_http_fetch.hpp for why the un-pooled path costs ~27ms a call.
 	RegisterQuackapiHttpFetchFunctions(loader);
 
-	// Durable broker-less job queue (CREATE QUEUE + enqueue/dequeue/ack/nack).
-	// Backing store is the plain quackapi_jobs table; worker = compose cronjob.
-	RegisterQuackapiQueueFunctions(loader);
 	loader.RegisterFunction(GetApplyMiddlewareFunction());
 	loader.RegisterFunction(GetQuackapiMiddlewaresFunction());
 
@@ -1366,16 +1358,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Thin GraphQL allowlist + named route inspection (CREATE GRAPHQL … DDL).
 	RegisterQuackapiGraphqlFunctions(loader);
 
-	// CREATE ROUTE / GROUP / AUTH / QUEUE / POLICY / STREAM / API FOR TABLE /
+	// CREATE ROUTE / GROUP / AUTH / STREAM / API FOR TABLE /
 	// GRAPHQL FOR TABLE / GRAPHQL ROUTE — all first-class nouns registered.
 	ExtensionCallbackManager::Get(db).Register(RouteDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(GroupDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(AuthDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(TableApiDdlParserExtension());
-	ExtensionCallbackManager::Get(db).Register(QueueDdlParserExtension());
 	ExtensionCallbackManager::Get(db).Register(MiddlewareDdlParserExtension());
-	// CREATE ROW ACCESS / MASKING POLICY + ALTER TABLE policy bind
-	ExtensionCallbackManager::Get(db).Register(PolicyDdlParserExtension());
 	// CREATE STREAM (SSE)
 	ExtensionCallbackManager::Get(db).Register(StreamDdlParserExtension());
 	// CREATE / DROP GRAPHQL FOR TABLE (+ DROP GRAPHQL ALL) + GRAPHQL ROUTE

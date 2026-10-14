@@ -15,7 +15,6 @@
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 
 #include "quackapi_limits.hpp"
-#include "quackapi_policy.hpp"
 #include "quackapi_util.hpp"
 
 namespace duckdb {
@@ -455,24 +454,11 @@ vector<QuackapiMiddleware> QuackapiMiddlewareRegistry::SnapshotAll() {
 bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, QuackapiMiddlewarePhase phase,
                                const string &group_name, QuackapiMiddlewareContext &context, bool authenticated,
                                const unordered_map<string, string> &claims) {
+	(void)authenticated;
 	try {
 		auto middleware = QuackapiMiddlewareRegistry::Get(db).Snapshot(phase, group_name);
 		for (auto &definition : middleware) {
-			bool deny_unauthenticated = false;
-			string policy_error;
-			auto handler_sql = RewriteHandlerWithPolicies(db, definition.handler_sql, authenticated,
-			                                              deny_unauthenticated, policy_error);
-			if (deny_unauthenticated) {
-				context.status = 401;
-				context.response_body = "{\"detail\":\"Not authenticated\"}";
-				return false;
-			}
-			if (!policy_error.empty()) {
-				SetMiddlewareFailure(context);
-				return false;
-			}
-
-			auto prepared = connection.Prepare(handler_sql);
+			auto prepared = connection.Prepare(definition.handler_sql);
 			if (prepared->HasError()) {
 				SetMiddlewareFailure(context);
 				return false;
