@@ -37,9 +37,7 @@
 #include "duckdb/parser/parser.hpp"
 
 #include "quackapi_auth.hpp"
-#include "quackapi_graphql.hpp"
 #include "quackapi_openapi.hpp"
-#include "quackapi_pg.hpp"
 #include "quackapi_limits.hpp"
 #include "quackapi_middleware.hpp"
 #include "quackapi_state.hpp"
@@ -719,28 +717,6 @@ vector<bool> ProtectedSqlText(const string &sql) {
 	return protected_text;
 }
 
-//! Parse request SQL without executing it. The /sql route delegates the
-//! submitted text to a dynamic SQL table function; some remote query paths
-//! report parser failures as an empty result instead of an error result.
-//! Extracting each statement preserves valid multi-statement input without
-//! binding against the route server's catalog instead of the remote database.
-bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
-	try {
-		auto statements = con.ExtractStatements(sql);
-		if (statements.empty()) {
-			error = "No statement to parse!";
-			return false;
-		}
-		return true;
-	} catch (std::exception &ex) {
-		error = ex.what();
-		return false;
-	} catch (...) {
-		error = "unknown SQL validation error";
-		return false;
-	}
-}
-
 //! Resolve the native DuckDB type represented by a BODY TYPE declaration.
 //! This lets route SQL use $body.items directly: the server inserts the cast
 //! from the one declaration before DuckDB prepares the handler.
@@ -809,41 +785,6 @@ struct RouteMatch {
 	// captured path params (name -> raw value)
 	vector<std::pair<string, string>> path_params;
 };
-
-struct StreamMatch {
-	bool matched = false;
-	QuackapiStream stream;
-	vector<std::pair<string, string>> path_params;
-};
-
-//! Format one SSE event from a result row. Includes `id:` when a column named
-//! `id` (case-insensitive) is present and non-null.
-string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
-	string event;
-	idx_t id_col = names.size();
-	for (idx_t c = 0; c < names.size(); c++) {
-		if (StringUtil::Lower(names[c]) == "id") {
-			id_col = c;
-			break;
-		}
-	}
-	if (id_col < cols.size() && !cols[id_col].IsNull()) {
-		event += "id: ";
-		event += cols[id_col].ToString();
-		event += "\n";
-	}
-	event += "data: {";
-	bool first = true;
-	for (idx_t c = 0; c < names.size() && c < cols.size(); c++) {
-		if (!first) {
-			event += ",";
-		}
-		first = false;
-		event += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
-	}
-	event += "}\n\n";
-	return event;
-}
 
 vector<string> SplitPath(const string &path) {
 	vector<string> segments;
@@ -1620,8 +1561,7 @@ void QuackapiHttpServer::Dispatch(const duckdb_httplib::Request &req, duckdb_htt
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path_in, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers,
-                              unordered_map<string, string> *headers_out, const string &pg_dsn,
-                              const QuackapiServeOptions *request_options) {
+                              unordered_map<string, string> *headers_out, const QuackapiServeOptions *request_options) {
 	// Quiet defaults for SQL tests unless request_options explicitly enables logging.
 	QuackapiServeOptions opts;
 	if (request_options) {
@@ -1631,7 +1571,6 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 	}
 	opts.compression = QuackapiCompressionMode::OFF;
 	opts.health_routes = true;
-	opts.pg_dsn = pg_dsn;
 	// No TCP — Dispatch only.
 	QuackapiHttpServer server(db, "127.0.0.1", 0, opts, /*bind_and_listen=*/false);
 
@@ -2273,21 +2212,14 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			auto telemetry_status = SnapshotTelemetryStatus();
 			auto access_log_overflow_count = AccessLogOverflowCount();
 			if (ready) {
-				// Surface active outbound HTTP client + reason so operators /
-				// readiness probes can confirm batteries applied. auto fallback
-				// is never silent: reason=curl_httpfs_unavailable when httplib.
-				const string http_client =
-				    options.http_client_active.empty() ? string("httplib") : options.http_client_active;
 				SetJson(
 				    res, 200,
 				    StringUtil::Format(
 				        "{\"status\":\"ok\",\"version\":\"%s\",\"uptime_sec\":%lld,"
-				        "\"request_id_source\":\"%s\",\"http_client\":\"%s\","
-				        "\"http_client_reason\":\"%s\",\"access_log_overflow_count\":%llu,"
+				        "\"request_id_source\":\"%s\",\"access_log_overflow_count\":%llu,"
 				        "\"telemetry\":%s}",
 				        QuackapiJsonEscape(version), (long long)uptime_sec,
 				        QuackapiJsonEscape(options.request_id_source.empty() ? "uuidv7" : options.request_id_source),
-				        QuackapiJsonEscape(http_client), QuackapiJsonEscape(options.http_client_reason),
 				        (unsigned long long)access_log_overflow_count, TelemetryHealthJson(telemetry_status)));
 			} else {
 				SetJson(res, 503, "{\"status\":\"not_ready\",\"detail\":\"database handle check failed\"}");
@@ -2295,154 +2227,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			finish();
 			return;
 		}
-	}
-
-	// Named GraphQL mounts (CREATE GRAPHQL ROUTE) — before built-in /graphql.
-	// POST <path> + GET <path>/schema; optional REQUIRE auth; per-route tables.
-	{
-		auto &gql_state = QuackapiState::Get(*db);
-		QuackapiGraphqlRoute gql_route;
-		if (req.method == "POST" && gql_state.GetGraphqlRouteByPath(req.path, req.method, gql_route)) {
-			route_name = gql_route.name;
-			route_path = gql_route.path;
-			QuackapiAuthResult auth_result;
-			if (!gql_route.require_auth.empty()) {
-				QuackapiRoute auth_probe;
-				auth_probe.require_auth = gql_route.require_auth;
-				auto headers = CollectHeaders(req);
-				auth_result = CheckAuth(*db, auth_probe, headers);
-				if (!auth_result.ok) {
-					if (!auth_result.www_authenticate.empty()) {
-						res.set_header("WWW-Authenticate", auth_result.www_authenticate);
-					}
-					SetJson(res, auth_result.status, auth_result.body);
-					finish();
-					return;
-				}
-			}
-			string gql_query;
-			string gql_err;
-			if (!GraphqlExtractQuery(*db, req.body, gql_query, gql_err)) {
-				SetJson(res, 400, gql_err);
-				finish();
-				return;
-			}
-			try {
-				GraphqlExecOptions opts;
-				opts.allowed_tables = &gql_route.tables;
-				opts.claims = &auth_result.claims;
-				opts.query_timeout_ms = options.query_timeout_ms;
-				opts.max_response_bytes = options.max_response_bytes;
-				opts.limit = gql_route.limit == 0 ? QUACKAPI_GRAPHQL_DEFAULT_LIMIT : gql_route.limit;
-				SetJson(res, 200, ExecuteGraphqlQuery(*db, gql_query, opts));
-			} catch (std::exception &ex) {
-				SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
-			} catch (...) {
-				SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql execution failed\"}]}");
-			}
-			finish();
-			return;
-		}
-		if ((req.method == "GET" || req.method == "HEAD") &&
-		    gql_state.GetGraphqlRouteBySchemaPath(req.path, gql_route)) {
-			route_name = gql_route.name + ".schema";
-			route_path = gql_route.path + "/schema";
-			QuackapiAuthResult auth_result;
-			if (!gql_route.require_auth.empty()) {
-				QuackapiRoute auth_probe;
-				auth_probe.require_auth = gql_route.require_auth;
-				auto headers = CollectHeaders(req);
-				auth_result = CheckAuth(*db, auth_probe, headers);
-				if (!auth_result.ok) {
-					if (!auth_result.www_authenticate.empty()) {
-						res.set_header("WWW-Authenticate", auth_result.www_authenticate);
-					}
-					SetJson(res, auth_result.status, auth_result.body);
-					finish();
-					return;
-				}
-			}
-			try {
-				GraphqlExecOptions opts;
-				opts.allowed_tables = &gql_route.tables;
-				opts.mode = "route";
-				opts.claims = &auth_result.claims;
-				opts.query_timeout_ms = options.query_timeout_ms;
-				opts.max_response_bytes = options.max_response_bytes;
-				opts.route_name = gql_route.name;
-				SetJson(res, 200, BuildGraphqlSchema(*db, opts));
-			} catch (std::exception &ex) {
-				SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
-			} catch (...) {
-				SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql schema failed\"}]}");
-			}
-			finish();
-			return;
-		}
-	}
-
-	// Built-in thin GraphQL v0 (catalog-only table selection; not full GraphQL).
-	// POST /graphql  — JSON body {"query":"query { table { col } }"}
-	// GET  /graphql/schema — main-schema tables → column names
-	// Public in v0 (no auth). Not listed in quackapi_routes().
-	if (req.path == "/graphql" || req.path == "/graphql/") {
-		route_name = "graphql";
-		route_path = "/graphql";
-		if (req.method == "POST") {
-			string gql_query;
-			string gql_err;
-			if (!GraphqlExtractQuery(*db, req.body, gql_query, gql_err)) {
-				SetJson(res, 400, gql_err);
-				finish();
-				return;
-			}
-			try {
-				GraphqlExecOptions opts;
-				opts.query_timeout_ms = options.query_timeout_ms;
-				opts.max_response_bytes = options.max_response_bytes;
-				SetJson(res, 200, ExecuteGraphqlQuery(*db, gql_query, opts));
-			} catch (std::exception &ex) {
-				SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
-			} catch (...) {
-				SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql execution failed\"}]}");
-			}
-			finish();
-			return;
-		}
-		if (req.method == "OPTIONS") {
-			if (cors_origins.empty()) {
-				res.set_header("Allow", "POST");
-				SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
-			} else {
-				res.status = 204;
-				res.set_header("Allow", "POST, OPTIONS");
-				res.body.clear();
-			}
-			finish();
-			return;
-		}
-		// GET /graphql without schema path → 405 with Allow: POST
-		res.set_header("Allow", "POST");
-		SetJson(res, 405, "{\"detail\":\"Method Not Allowed\"}");
-		finish();
-		return;
-	}
-	if ((req.method == "GET" || req.method == "HEAD") &&
-	    (req.path == "/graphql/schema" || req.path == "/graphql/schema/")) {
-		route_name = "graphql.schema";
-		route_path = "/graphql/schema";
-		try {
-			GraphqlExecOptions opts;
-			opts.query_timeout_ms = options.query_timeout_ms;
-			opts.max_response_bytes = options.max_response_bytes;
-			SetJson(res, 200, BuildGraphqlSchema(*db, opts));
-		} catch (std::exception &ex) {
-			SetJson(res, 200, string("{\"errors\":[{\"message\":\"") + QuackapiJsonEscape(ex.what()) + "\"}]}");
-		} catch (...) {
-			SetJson(res, 200, "{\"errors\":[{\"message\":\"graphql schema failed\"}]}");
-		}
-		finish();
-		return;
 	}
 
 	// Built-in docs routes (always present while serving; not in quackapi_routes()).
@@ -2500,16 +2284,12 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 	// Find a route: method + pattern. Collect methods for Allow on 405.
 	// HEAD automatically matches GET when no explicit HEAD route exists.
-	// Streams (CREATE STREAM) are matched the same way; ordinary routes win
-	// when both register the same path+method.
 	RouteMatch match;
-	StreamMatch stream_match;
 	bool path_matched_other_method = false;
 	vector<string> methods_for_path;
 	auto &qa_state = QuackapiState::Get(*db);
 	// Live shared views — no per-request deep copy of the full registry.
 	auto routes = qa_state.LiveRoutes();
-	auto streams = qa_state.LiveStreams();
 	for (auto &route : *routes) {
 		vector<std::pair<string, string>> captures;
 		if (MatchPattern(route.pattern, req.path, captures)) {
@@ -2527,27 +2307,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 	}
-	for (auto &stream : *streams) {
-		vector<std::pair<string, string>> captures;
-		if (MatchPattern(stream.pattern, req.path, captures)) {
-			if (!MethodListContains(methods_for_path, stream.method)) {
-				methods_for_path.push_back(stream.method);
-			}
-			if (stream.method == req.method) {
-				// Only take the stream if no ordinary route already matched.
-				if (!match.matched && !stream_match.matched) {
-					stream_match.matched = true;
-					stream_match.stream = stream;
-					stream_match.path_params = std::move(captures);
-				}
-			} else if (!match.matched && !stream_match.matched) {
-				path_matched_other_method = true;
-			}
-		}
-	}
-	// Auto-HEAD: if HEAD and no explicit HEAD route, reuse the GET handler
-	// (routes first, then streams).
-	if (!match.matched && !stream_match.matched && req.method == "HEAD") {
+	// Auto-HEAD: if HEAD and no explicit HEAD route, reuse the GET handler.
+	if (!match.matched && req.method == "HEAD") {
 		for (auto &route : *routes) {
 			vector<std::pair<string, string>> captures;
 			if (MatchPattern(route.pattern, req.path, captures) && route.method == "GET") {
@@ -2558,20 +2319,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					methods_for_path.push_back("HEAD");
 				}
 				break;
-			}
-		}
-		if (!match.matched) {
-			for (auto &stream : *streams) {
-				vector<std::pair<string, string>> captures;
-				if (MatchPattern(stream.pattern, req.path, captures) && stream.method == "GET") {
-					stream_match.matched = true;
-					stream_match.stream = stream;
-					stream_match.path_params = std::move(captures);
-					if (!MethodListContains(methods_for_path, "HEAD")) {
-						methods_for_path.push_back("HEAD");
-					}
-					break;
-				}
 			}
 		}
 	}
@@ -2607,9 +2354,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		return;
 	}
 
-	if (!match.matched && !stream_match.matched) {
+	if (!match.matched) {
 		// Starlette redirect_slashes: if the alternate trailing-slash form would
-		// match a registered route or stream, 307 to that path (preserve query).
+		// match a registered route, 307 to that path (preserve query).
 		// Built-in docs paths already accept both forms above.
 		if (!path_matched_other_method && methods_for_path.empty() && req.path != "/") {
 			string alt_path;
@@ -2627,15 +2374,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				// Any method registration is enough to redirect (Starlette).
 				alt_matches = true;
 				break;
-			}
-			if (!alt_matches) {
-				for (auto &stream : *streams) {
-					vector<std::pair<string, string>> captures;
-					if (MatchPattern(stream.pattern, alt_path, captures)) {
-						alt_matches = true;
-						break;
-					}
-				}
 			}
 			if (alt_matches) {
 				string location = alt_path;
@@ -2666,220 +2404,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 		finish();
 		return;
-	}
-
-	// ---- CREATE STREAM (SSE) path — no auth schemes on streams in v1 ----
-	if (!match.matched && stream_match.matched) {
-		route_name = stream_match.stream.name;
-		route_path = stream_match.stream.pattern;
-		try {
-			const auto &stream_sql = stream_match.stream.handler_sql;
-			auto headers = CollectHeaders(req);
-			// HEAD: headers only — do not install a long-lived provider.
-			if (req.method == "HEAD") {
-				res.status = 200;
-				res.set_header("Content-Type", "text/event-stream");
-				res.set_header("Cache-Control", "no-cache");
-				res.set_header("X-Accel-Buffering", "no");
-				res.body.clear();
-				finish();
-				return;
-			}
-
-			// Bind path + query (+ Last-Event-ID → $last_id) before installing provider.
-			auto con = make_shared_ptr<Connection>(*db);
-			QuackapiQueryDeadline initial_deadline(*con, options.query_timeout_ms);
-			auto prepared = con->Prepare(stream_sql);
-			if (prepared->HasError()) {
-				SetInternalError(res, prepared->GetError());
-				finish();
-				return;
-			}
-
-			case_insensitive_map_t<string> provided;
-			for (auto &kv : req.params) {
-				provided[kv.first] = kv.second;
-			}
-			for (auto &kv : stream_match.path_params) {
-				provided[kv.first] = kv.second;
-			}
-			provided["request_id"] = request_id;
-			provided["trace_id"] = trace_id;
-			provided["span_id"] = span_id;
-			// Last-Event-ID header → last_id (query ?last_id= wins if both set).
-			if (provided.find("last_id") == provided.end()) {
-				string last_event_id;
-				if (FindHeaderValue(headers, "Last-Event-ID", last_event_id) && !last_event_id.empty()) {
-					provided["last_id"] = last_event_id;
-				}
-			}
-
-			auto expected_types = prepared->GetExpectedParameterTypes();
-			case_insensitive_map_t<BoundParameterData> named_values;
-			for (auto &entry : prepared->named_param_map) {
-				auto &param_name = entry.first;
-				auto type_it = expected_types.find(param_name);
-				LogicalType expected = LogicalType::UNKNOWN;
-				if (type_it != expected_types.end()) {
-					expected = type_it->second;
-				}
-				auto it = provided.find(param_name);
-				if (it == provided.end()) {
-					// Optional last_id: missing → SQL NULL so WHERE id > $last_id works with COALESCE.
-					if (param_name == "last_id") {
-						named_values[param_name] = BoundParameterData(Value());
-						continue;
-					}
-					string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
-					SetJson(res, 422, ValidationErrorJson(loc, param_name, "Field required", "missing"));
-					finish();
-					return;
-				}
-				string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
-				BoundParameterData bound;
-				string err_json;
-				if (!BindParamValue(it->second, expected, loc, param_name, bound, err_json)) {
-					SetJson(res, 422, err_json);
-					finish();
-					return;
-				}
-				named_values[param_name] = bound;
-			}
-
-			// Prove the first execute works before committing to chunked transfer.
-			auto first_result = prepared->Execute(named_values, true);
-			if (first_result->HasError()) {
-				SetInternalError(res, first_result->GetError());
-				finish();
-				return;
-			}
-
-			struct SseProviderState {
-				shared_ptr<Connection> con;
-				string handler_sql;
-				case_insensitive_map_t<BoundParameterData> named_values;
-				int64_t interval_ms = 0;
-				unique_ptr<PreparedStatement> prepared;
-				unique_ptr<QueryResult> result;
-				bool need_execute = false;
-				bool closed = false;
-				int64_t query_timeout_ms = 30000;
-				idx_t max_bytes = 0;
-				idx_t sent_bytes = 0;
-			};
-			auto state = make_shared_ptr<SseProviderState>();
-			state->con = con;
-			state->handler_sql = stream_sql;
-			state->query_timeout_ms = options.query_timeout_ms;
-			state->max_bytes = options.max_response_bytes;
-			state->named_values = std::move(named_values);
-			state->interval_ms = stream_match.stream.interval_ms;
-			// Carry the first execution into the provider; never execute side effects twice.
-			state->prepared = std::move(prepared);
-			state->result = std::move(first_result);
-
-			res.status = 200;
-			res.set_header("Cache-Control", "no-cache");
-			res.set_header("X-Accel-Buffering", "no");
-			// CORS before provider install — headers already on res when provider runs.
-			ApplyCorsHeaders(req, res);
-
-			res.set_chunked_content_provider(
-			    "text/event-stream",
-			    [state](size_t /*offset*/, duckdb_httplib::DataSink &sink) -> bool {
-				    if (state->closed) {
-					    sink.done();
-					    return true;
-				    }
-				    try {
-					    QuackapiQueryDeadline deadline(*state->con, state->query_timeout_ms);
-					    if (state->need_execute) {
-						    state->result = state->prepared->Execute(state->named_values, true);
-						    if (state->result->HasError()) {
-							    fprintf(stderr, "quackapi stream execute error: %s\n",
-							            state->result->GetError().c_str());
-							    state->closed = true;
-							    return false;
-						    }
-						    state->need_execute = false;
-					    }
-
-					    auto chunk = state->result->Fetch();
-					    if (!chunk || chunk->size() == 0) {
-						    state->result.reset();
-						    if (state->interval_ms <= 0) {
-							    state->closed = true;
-							    sink.done();
-							    return true;
-						    }
-						    // Polling interval: sleep then re-run SELECT (compose cron-style).
-						    // Split sleep so disconnect can surface via write fail next loop.
-						    auto remaining = state->interval_ms;
-						    while (remaining > 0) {
-							    auto step = remaining > 100 ? 100 : remaining;
-							    std::this_thread::sleep_for(std::chrono::milliseconds(step));
-							    remaining -= step;
-							    if (!sink.is_writable()) {
-								    state->closed = true;
-								    return false;
-							    }
-						    }
-						    state->need_execute = true;
-						    return true;
-					    }
-
-					    auto &names = state->result->names;
-					    string buf;
-					    for (idx_t row = 0; row < chunk->size(); row++) {
-						    vector<Value> cols(chunk->ColumnCount());
-						    for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-							    cols[col] = chunk->GetValue(col, row);
-						    }
-						    auto event = FormatSseEvent(names, cols);
-						    if (state->sent_bytes + buf.size() + event.size() > state->max_bytes) {
-							    state->closed = true;
-							    return false;
-						    }
-						    buf += event;
-					    }
-					    state->sent_bytes += buf.size();
-					    if (!buf.empty() && !sink.write(buf.data(), buf.size())) {
-						    state->closed = true;
-						    return false;
-					    }
-					    return true;
-				    } catch (std::exception &ex) {
-					    fprintf(stderr, "quackapi stream provider exception: %s\n", ex.what());
-					    state->closed = true;
-					    return false;
-				    } catch (...) {
-					    fprintf(stderr, "quackapi stream provider: unknown exception\n");
-					    state->closed = true;
-					    return false;
-				    }
-			    },
-			    [state](bool /*success*/) {
-				    try {
-					    if (state->con) {
-						    state->con->Interrupt();
-					    }
-				    } catch (...) {
-				    }
-				    state->result.reset();
-				    state->prepared.reset();
-				    state->closed = true;
-			    });
-			// Do not call finish() again — CORS already applied; provider owns body.
-			return;
-		} catch (std::exception &ex) {
-			SetInternalError(res, ex.what());
-			finish();
-			return;
-		} catch (...) {
-			SetInternalError(res, "unknown exception");
-			finish();
-			return;
-		}
 	}
 
 	// Per-route IO timeout (CREATE ROUTE … TIMEOUT / WITH (timeout_sec := N)).
@@ -3041,9 +2565,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		}
 
 		// ---- REQUEST BODY BINDING (POST/PUT/PATCH) ----
-		// Body fills `provided` BEFORE prepare + before optional libpq path.
-		// INSERT…RETURNING cannot prepare via DuckDB ATTACH; libpq handles it.
-		// Named params inferred from handler SQL (prepare may never run).
+		// Body fills `provided` before handler preparation.
+		// Named params are inferred from handler SQL.
 		bool body_method = IsBodyMethod(req.method);
 		bool has_body_named = false;
 		bool needs_json_field_extraction = false;
@@ -3189,33 +2712,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 		}
 
-		// Native Postgres path (optional): same model as FastAPI+psycopg —
-		// thread-local libpq, fresh PQexecParams per request. BEFORE DuckDB
-		// prepare so INSERT…RETURNING and other ATTACH-hostile SQL still work.
-		if (!options.pg_dsn.empty()) {
-			string pg_body, pg_err;
-			auto pg_result =
-			    QuackapiTryPgNative(options.pg_dsn, handler_sql, provided, options.max_response_bytes, pg_body, pg_err);
-			if (pg_result == QuackapiPgNativeResult::SUCCESS) {
-				SetJson(res, match.route.status, pg_body);
-				finish();
-				return;
-			}
-			if (pg_result == QuackapiPgNativeResult::FAILED) {
-				if (pg_err == "PostgreSQL deadline exceeded") {
-					SetJson(res, 504, "{\"detail\":\"Query execution deadline exceeded\"}");
-				} else if (pg_err == "PostgreSQL response exceeds configured byte limit") {
-					SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
-				} else {
-					SetJson(res, 502, "{\"detail\":\"Upstream database request failed\"}");
-				}
-				finish();
-				return;
-			}
-			// Fall through only when native execution is proven inapplicable.
-		}
-
-		// DuckDB prepare (after libpq short-circuit). Fresh prepare every request:
+		// DuckDB prepare. Fresh prepare every request:
 		// no SQL-keyed body/plan cache — mutable tables and volatile functions
 		// (now/uuid) must re-execute.
 		if (has_body_named && !match.route.body_type.empty()) {
@@ -3467,21 +2964,6 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			SetJson(res, 422, QuackapiValidationErrorsJson(validation_issues));
 			finish();
 			return;
-		}
-
-		// The SQL route delegates the body value to a dynamic SQL function. Validate
-		// it locally first so remote parser/binder failures cannot become 200 []
-		// when the delegate reports an empty result instead of an error.
-		if (match.route.pattern == "/sql") {
-			auto sql_it = provided.find("sql");
-			if (sql_it != provided.end()) {
-				string sql_error;
-				if (!ValidateRequestSql(con, sql_it->second.second, sql_error)) {
-					SetJson(res, 422, ValidationErrorJson("body", "sql", sql_error, "value_error"));
-					finish();
-					return;
-				}
-			}
 		}
 
 		auto execute_started = std::chrono::steady_clock::now();
