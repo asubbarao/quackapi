@@ -190,10 +190,45 @@ int main(int argc, char **argv) {
 		Check(concurrent(36, "wide") == 36, "wide POST batch lost a request");
 		Check(peak.load() > 32 && peak.load() <= 40, "POST concurrency was capped at 32");
 		Check(received.load() == 106, "wide POST batch retried or lost requests");
+		DBConfig other_config;
+		other_config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		DuckDB other_database(nullptr, &other_config);
+		Connection other_setup(other_database);
+		Run(other_setup, "LOAD " + SqlQuote(argv[3]));
+		Run(other_setup, "LOAD " + SqlQuote(argv[1]));
+		CheckExtension(other_setup, "curl_httpfs", argv[4]);
+		CheckExtension(other_setup, "quackapi", argv[2]);
+		Run(connection, "SET quackapi_post_concurrency = 1");
+		Run(other_setup, "SET quackapi_post_concurrency = 1");
+		peak.store(0);
+		std::atomic<int> independent_ready {0};
+		std::atomic<bool> independent_go {false};
+		std::atomic<int> independent_passed {0};
+		auto call_database = [&](DuckDB &target) {
+			Connection caller(target);
+			independent_ready.fetch_add(1);
+			while (!independent_go.load()) {
+				std::this_thread::yield();
+			}
+			auto result = caller.Query("SELECT (quackapi_post(" + SqlQuote(slow_url) + ", 'wide')).status");
+			if (!result->HasError() && result->GetValue(0, 0).GetValue<int>() == 200) {
+				independent_passed.fetch_add(1);
+			}
+		};
+		std::thread first_database_call([&]() { call_database(database); });
+		std::thread second_database_call([&]() { call_database(other_database); });
+		while (independent_ready.load() != 2) {
+			std::this_thread::yield();
+		}
+		independent_go.store(true);
+		first_database_call.join();
+		second_database_call.join();
+		Check(independent_passed.load() == 2 && peak.load() == 2,
+		      "independent databases shared one POST concurrency limit");
+		Check(received.load() == 108, "independent databases lost or retried a request");
 
 		// Interrupt a request waiting behind the sole active worker. It must
 		// leave the queue promptly and never reach the HTTP fixture.
-		Run(connection, "SET quackapi_post_concurrency = 1");
 		Connection first(database);
 		Connection queued(database);
 		std::atomic<bool> first_ok {false};
@@ -218,7 +253,7 @@ int main(int argc, char **argv) {
 		Check(first_ok.load(), "active POST did not finish after peer cancellation");
 		Check(queued_failed.load() && queued_elapsed < std::chrono::milliseconds(600),
 		      "queued POST did not cancel promptly");
-		Check(received.load() == 107, "cancelled queued POST reached the server");
+		Check(received.load() == 109, "cancelled queued POST reached the server");
 
 		// The inbound route deadline must bound its outbound POST, even after
 		// the provider has started receiving a slow response.
@@ -253,7 +288,7 @@ int main(int argc, char **argv) {
 		const auto active_ms = std::chrono::duration_cast<std::chrono::milliseconds>(active_elapsed).count();
 		Check(active_failed.load() && active_elapsed < std::chrono::milliseconds(600),
 		      "active POST ignored caller interrupt: elapsed_ms=" + std::to_string(active_ms));
-		std::cout << "POST HTTP integration passed: 109 requests, wide peak=" << peak.load() << '\n';
+		std::cout << "POST HTTP integration passed: 111 requests, wide peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
