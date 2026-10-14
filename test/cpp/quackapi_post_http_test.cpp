@@ -62,6 +62,7 @@ int main(int argc, char **argv) {
 		      "expected curl_httpfs or httpfs provider");
 		std::atomic<int> received {0};
 		std::atomic<int> ambiguous_received {0};
+		std::atomic<int> redirect_received {0};
 		std::atomic<int> active {0};
 		std::atomic<int> peak {0};
 		std::mutex peer_mutex;
@@ -91,6 +92,10 @@ int main(int argc, char **argv) {
 			ambiguous_received.fetch_add(1);
 			response.set_content_provider(10, "text/plain",
 			                              [](size_t, size_t, duckdb_httplib::DataSink &) { return false; });
+		});
+		server.Post("/redirect", [&](const duckdb_httplib::Request &, duckdb_httplib::Response &response) {
+			redirect_received.fetch_add(1);
+			response.set_redirect("/echo", 307);
 		});
 		server.Post("/slow", [&](const duckdb_httplib::Request &request, duckdb_httplib::Response &response) {
 			received.fetch_add(1);
@@ -457,7 +462,14 @@ int main(int argc, char **argv) {
 		}
 
 		Check(received.load() == 126, "bounded HTTP fixture lost or retried a request");
-		std::cout << "POST HTTP integration passed: 126 requests, auto peak=" << peak.load() << '\n';
+		auto redirect = Run(connection, "SELECT receipt.status, receipt.body FROM "
+		                                "(SELECT quackapi_post(" +
+		                                    SqlQuote("http://127.0.0.1:" + std::to_string(port) + "/redirect") +
+		                                    ", 'redirect') AS receipt)");
+		Check(redirect->GetValue(0, 0).GetValue<int>() == 200 && redirect->GetValue(1, 0).ToString() == "redirect" &&
+		          redirect_received.load() == 1 && received.load() == 127,
+		      "HTTP 307 POST redirect did not reach its target exactly once");
+		std::cout << "POST HTTP integration passed: 127 requests, auto peak=" << peak.load() << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';

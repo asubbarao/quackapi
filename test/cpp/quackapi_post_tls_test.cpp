@@ -35,6 +35,7 @@ int main(int argc, char **argv) {
 		Check(argc == 8, "usage: post_tls_test QUACKAPI_PATH QUACKAPI_VERSION PROVIDER_PATH PROVIDER_NAME "
 		                 "PROVIDER_VERSION TEST_CERT TEST_KEY");
 		std::atomic<int> received {0};
+		std::atomic<int> redirects {0};
 		duckdb_httplib_openssl::SSLServer server(argv[6], argv[7]);
 		Check(server.is_valid(), "test TLS certificate or key is invalid");
 		server.Post("/headers", [&](const duckdb_httplib_openssl::Request &request,
@@ -50,6 +51,11 @@ int main(int argc, char **argv) {
 			            received.fetch_add(1);
 			            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 			            response.set_content(request.body, "text/plain");
+		            });
+		server.Post("/redirect",
+		            [&](const duckdb_httplib_openssl::Request &, duckdb_httplib_openssl::Response &response) {
+			            redirects.fetch_add(1);
+			            response.set_redirect("/headers", 307);
 		            });
 		const int port = server.bind_to_any_port("127.0.0.1");
 		Check(port > 0, "could not bind loopback TLS fixture");
@@ -114,7 +120,14 @@ int main(int argc, char **argv) {
 		Check(timed->GetValue(0, 0).GetValue<int>() == 504 && elapsed < std::chrono::milliseconds(1400),
 		      "HTTPS POST exceeded its 750ms route deadline");
 		Check(received.load() == 3, "HTTPS timed POST was replayed");
-		std::cout << "HTTPS provider contract passed: 3 requests\n";
+		auto redirect = Run(connection, "SELECT receipt.status, receipt.body FROM "
+		                                "(SELECT quackapi_post(" +
+		                                    Quote(url + "/redirect") + ", '{}') AS receipt)");
+		Check(redirect->GetValue(0, 0).GetValue<int>() == 200 &&
+		          redirect->GetValue(1, 0).ToString() == "application/json||1" && redirects.load() == 1 &&
+		          received.load() == 4,
+		      "HTTPS 307 POST redirect did not reach its target exactly once");
+		std::cout << "HTTPS provider contract passed: 4 requests\n";
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << '\n';
