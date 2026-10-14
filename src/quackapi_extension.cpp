@@ -1011,7 +1011,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// SET quackapi_cors_origins = '*' | 'https://app.example,https://admin.example'
 	// Default empty = CORS off. Serve-time cors_origins := '…' overrides this SET.
 	auto &db = loader.GetDatabaseInstance();
-	if (!ExtensionHelper::TryAutoLoadAvailableExtension(db, "json")) {
+	// Load a statically linked DuckDB JSON extension through its generated
+	// loader first, then accept an already available loadable extension. Neither
+	// path installs a dependency as a side effect of LOAD quackapi.
+	DuckDB duckdb(db);
+	const auto json_load = ExtensionHelper::LoadExtension(duckdb, "json");
+	if (json_load != ExtensionLoadResult::LOADED_EXTENSION &&
+	    !ExtensionHelper::TryAutoLoadAvailableExtension(db, "json")) {
 		throw IOException("QuackAPI requires the DuckDB JSON extension to be available and loadable before loading "
 		                  "quackapi");
 	}
