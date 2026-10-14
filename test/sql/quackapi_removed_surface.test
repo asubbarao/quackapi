@@ -4,6 +4,8 @@
 
 require quackapi
 
+require json
+
 # Verify the live catalog after loading QuackAPI. A stale registration would
 # otherwise remain callable even if its implementation source was deleted.
 query I
