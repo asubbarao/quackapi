@@ -109,7 +109,7 @@ public:
 
 	vector<QuackapiHttpFetchResult> Execute(ClientContext &context, vector<QuackapiPostRequest> requests,
 	                                        const vector<bool> &skip) {
-		const auto deadline = QuackapiCurrentDeadline();
+		const auto deadline = QuackapiCurrentDeadline(context);
 		auto batch = make_shared_ptr<PostBatch>();
 		batch->results.resize(requests.size());
 		batch->cancellation_flags.resize(requests.size());
