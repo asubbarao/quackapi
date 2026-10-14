@@ -19,6 +19,9 @@ set(EXTENSION_SOURCES
     src/quackapi_extension.cpp
     src/quackapi_registry.cpp
     src/quackapi_server.cpp
+    src/quackapi_request_binding.cpp
+    src/quackapi_response_encoding.cpp
+    src/quackapi_logging.cpp
     src/quackapi_validation.cpp
     src/quackapi_batteries.cpp
     src/quackapi_ddl.cpp
