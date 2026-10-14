@@ -206,15 +206,6 @@ public:
 	bool GetServerHost(int port, string &host_out);
 	//! (host, port) for each running server.
 	vector<std::pair<string, int>> ListServers();
-	//! Snapshot one server's request ring; port 0 means the only running server.
-	//! A port is required when more than one server is running.
-	vector<QuackapiRequestRecord> SnapshotRequests(int port = 0);
-	//! Snapshot telemetry sinks; port 0 means the only running server.
-	//! A port is required when more than one server is running.
-	vector<QuackapiTelemetryStatus> SnapshotTelemetryStatus(int port = 0);
-	//! Flush queued telemetry for one running server. Port 0 means the only server.
-	//! A port is required when more than one server is running.
-	bool FlushTelemetry(int port = 0);
 
 private:
 	void PublishRoutes();

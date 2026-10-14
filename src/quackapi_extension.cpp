@@ -96,7 +96,7 @@ struct ServeBindData : public TableFunctionData {
 	//! Empty (default) = CORS off. Pass '*' or a comma-separated origin list.
 	string cors_origins;
 	string log_level = "info";
-	string access_log = "true";
+	bool access_log = true;
 	bool health_routes = true;
 	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
@@ -113,33 +113,26 @@ struct ServeBindData : public TableFunctionData {
 	//! First Exec emitted listen_url; second Exec blocks when block=true.
 	bool started = false;
 	bool finished = false;
-	int64_t request_ring = 10000;
 };
 
-static void ParseAccessLogString(const string &raw, bool &enabled, string &table) {
-	auto value = StringUtil::Lower(raw);
-	if (value == "true") {
-		enabled = true;
-		table.clear();
-	} else if (value == "false") {
-		enabled = false;
-		table.clear();
-	} else if (!raw.empty()) {
-		enabled = true;
-		table = raw;
-	} else {
-		throw InvalidInputException("quackapi_serve: access_log must be true, false, or a table name");
-	}
-}
-
-static string AccessLogValueString(const Value &value) {
+static bool AccessLogValue(const Value &value) {
 	if (value.IsNull()) {
-		throw InvalidInputException("quackapi_serve: access_log must not be NULL");
+		throw InvalidInputException("access_log must not be NULL");
+	}
+	if (value.type().id() == LogicalTypeId::BOOLEAN) {
+		return value.GetValue<bool>();
 	}
 	if (value.type().id() == LogicalTypeId::VARCHAR) {
-		return value.GetValue<string>();
+		auto raw = StringUtil::Lower(value.GetValue<string>());
+		StringUtil::Trim(raw);
+		if (raw == "true") {
+			return true;
+		}
+		if (raw == "false") {
+			return false;
+		}
 	}
-	return value.ToString();
+	throw InvalidInputException("access_log must be true or false; table sinks are no longer supported");
 }
 
 static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
@@ -235,26 +228,9 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			}
 		}
 	}
-	// request_ring named param wins; else SET quackapi_request_ring.
-	auto ring_entry = input.named_parameters.find("request_ring");
-	if (ring_entry != input.named_parameters.end()) {
-		bind_data->request_ring = ring_entry->second.GetValue<int64_t>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_request_ring", setting) && !setting.IsNull()) {
-			bind_data->request_ring = setting.GetValue<int64_t>();
-		}
-	}
-	// The ring is allocated up front at serve time, so bound it to keep a typo from exhausting memory.
-	if (bind_data->request_ring < 0 || bind_data->request_ring > 1000000) {
-		throw InvalidInputException("quackapi_serve: request_ring must be between 0 and 1000000");
-	}
 	auto access_entry = input.named_parameters.find("access_log");
 	if (access_entry != input.named_parameters.end()) {
-		bind_data->access_log = AccessLogValueString(access_entry->second);
-		bool enabled;
-		string table;
-		ParseAccessLogString(bind_data->access_log, enabled, table);
+		bind_data->access_log = AccessLogValue(access_entry->second);
 	}
 	auto health_entry = input.named_parameters.find("health_routes");
 	if (health_entry != input.named_parameters.end()) {
@@ -368,8 +344,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.static_dir = bind_data.static_dir;
 	opts.cors_origins = bind_data.cors_origins;
 	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
-	opts.request_ring = bind_data.request_ring;
-	ParseAccessLogString(bind_data.access_log, opts.access_log, opts.access_log_table);
+	opts.access_log = bind_data.access_log;
 	opts.health_routes = bind_data.health_routes;
 	opts.worker_threads = bind_data.worker_threads;
 	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
@@ -551,8 +526,8 @@ struct RequestBindData : public TableFunctionData {
 	string path;
 	string body;
 	unordered_map<string, string> req_headers;
-	//! Empty (default) keeps in-process requests quiet. Otherwise true, false, or a table name.
-	string access_log;
+	//! In-process requests are quiet by default; access_log := true opts into native logging.
+	bool access_log = false;
 	string log_level = "info";
 	bool finished = false;
 };
@@ -586,10 +561,7 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 	}
 	auto access_entry = input.named_parameters.find("access_log");
 	if (access_entry != input.named_parameters.end()) {
-		bind_data->access_log = AccessLogValueString(access_entry->second);
-		bool enabled;
-		string table;
-		ParseAccessLogString(bind_data->access_log, enabled, table);
+		bind_data->access_log = AccessLogValue(access_entry->second);
 	}
 	// log_level named param wins; otherwise use SET quackapi_log_level.
 	auto log_entry = input.named_parameters.find("log_level");
@@ -628,10 +600,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 	unordered_map<string, string> resp_headers;
 	QuackapiServeOptions opts = bind_data.limits;
 	opts.log_level = ParseQuackapiLogLevel(bind_data.log_level);
-	opts.access_log = false;
-	if (!bind_data.access_log.empty()) {
-		ParseAccessLogString(bind_data.access_log, opts.access_log, opts.access_log_table);
-	}
+	opts.access_log = bind_data.access_log;
 	QuackapiInProcessRequest(*context.db, bind_data.method, bind_data.path, bind_data.body, status, body, content_type,
 	                         &bind_data.req_headers, &resp_headers, &opts);
 	output.SetValue(0, 0, Value::INTEGER(status));
@@ -767,243 +736,6 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 }
 
 //===--------------------------------------------------------------------===//
-// quackapi_requests([port]) — recent TCP requests from the in-memory ring
-//===--------------------------------------------------------------------===//
-
-struct RequestsBindData : public TableFunctionData {
-	int32_t port = 0;
-};
-
-struct RequestsGlobalState : public GlobalTableFunctionState {
-	vector<QuackapiRequestRecord> records;
-	idx_t offset = 0;
-};
-
-static Value RequestsValue(const QuackapiRequestRecord &record, idx_t column) {
-	switch (column) {
-	case 0:
-		return Value(record.request_id);
-	case 1:
-		return Value::TIMESTAMP(timestamp_t(record.received_at_micros));
-	case 2:
-		return Value(record.method);
-	case 3:
-		return Value(record.path);
-	case 4:
-		return record.route_name.empty() ? Value() : Value(record.route_name);
-	case 5:
-		return record.route_path.empty() ? Value() : Value(record.route_path);
-	case 6:
-		return Value::INTEGER(record.status);
-	case 7:
-		return Value::DOUBLE(record.duration_ms);
-	case 8:
-		return record.sql_prepare_ms < 0 ? Value() : Value::DOUBLE(record.sql_prepare_ms);
-	case 9:
-		return record.sql_execute_ms < 0 ? Value() : Value::DOUBLE(record.sql_execute_ms);
-	case 10:
-		return record.rows_out < 0 ? Value() : Value::BIGINT(record.rows_out);
-	case 11:
-		return Value::BIGINT(record.bytes_in);
-	case 12:
-		return Value::BIGINT(record.bytes_out);
-	case 13:
-		return Value(record.client_ip);
-	case 14:
-		return Value(record.user_agent);
-	case 15:
-		return record.http_version.empty() ? Value() : Value(record.http_version);
-	case 16:
-		return record.error_type.empty() ? Value() : Value(record.error_type);
-	case 17:
-		return record.error_message.empty() ? Value() : Value(record.error_message);
-	case 18:
-		return record.trace_id.empty() ? Value() : Value(record.trace_id);
-	case 19:
-		return record.span_id.empty() ? Value() : Value(record.span_id);
-	case 20:
-		return record.parent_span_id.empty() ? Value() : Value(record.parent_span_id);
-	case 21:
-		return Value::BOOLEAN(record.sampled);
-	case 22:
-		return QuackapiRequestHeadersValue(record);
-	case 23:
-		return QuackapiRequestQueryValue(record);
-	default:
-		throw InternalException("unknown quackapi request column");
-	}
-}
-
-static unique_ptr<FunctionData> RequestsBind(ClientContext &, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
-	auto bind_data = make_uniq<RequestsBindData>();
-	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
-	if (has_port) {
-		bind_data->port = input.inputs[0].GetValue<int32_t>();
-	}
-	if (has_port && (bind_data->port < 1 || bind_data->port > 65535)) {
-		throw InvalidInputException("quackapi_requests: port must be between 1 and 65535");
-	}
-	const LogicalType types[] = {LogicalType::VARCHAR,
-	                             LogicalType::TIMESTAMP,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::INTEGER,
-	                             LogicalType::DOUBLE,
-	                             LogicalType::DOUBLE,
-	                             LogicalType::DOUBLE,
-	                             LogicalType::BIGINT,
-	                             LogicalType::BIGINT,
-	                             LogicalType::BIGINT,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR,
-	                             LogicalType::BOOLEAN,
-	                             LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
-	                             LogicalType::VARCHAR};
-	const char *const columns[] = {"request_id",     "received_at", "method",        "path",           "route_name",
-	                               "route_path",     "status",      "duration_ms",   "sql_prepare_ms", "sql_execute_ms",
-	                               "rows_out",       "bytes_in",    "bytes_out",     "client_ip",      "user_agent",
-	                               "http_version",   "error_type",  "error_message", "trace_id",       "span_id",
-	                               "parent_span_id", "sampled",     "headers",       "query"};
-	for (idx_t i = 0; i < 24; i++) {
-		return_types.emplace_back(types[i]);
-		names.emplace_back(columns[i]);
-	}
-	return std::move(bind_data);
-}
-
-static unique_ptr<GlobalTableFunctionState> RequestsInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto state = make_uniq<RequestsGlobalState>();
-	auto &bind_data = input.bind_data->Cast<RequestsBindData>();
-	state->records = QuackapiState::Get(*context.db).SnapshotRequests(bind_data.port);
-	return std::move(state);
-}
-
-static void RequestsExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-	auto &state = data_p.global_state->Cast<RequestsGlobalState>();
-	idx_t row = 0;
-	while (state.offset < state.records.size() && row < STANDARD_VECTOR_SIZE) {
-		auto &record = state.records[state.offset];
-		for (idx_t column = 0; column < 24; column++) {
-			output.SetValue(column, row, RequestsValue(record, column));
-		}
-		row++;
-		state.offset++;
-	}
-	output.SetCardinality(row);
-}
-
-//===--------------------------------------------------------------------===//
-// Keep sink health queryable without making the writer implementation public.
-//===--------------------------------------------------------------------===//
-
-struct TelemetryStatusBindData : public TableFunctionData {
-	int32_t port = 0;
-};
-
-struct TelemetryStatusGlobalState : public GlobalTableFunctionState {
-	vector<QuackapiTelemetryStatus> statuses;
-	idx_t offset = 0;
-};
-
-static unique_ptr<FunctionData> TelemetryStatusBind(ClientContext &, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	auto bind_data = make_uniq<TelemetryStatusBindData>();
-	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
-	if (has_port) {
-		bind_data->port = input.inputs[0].GetValue<int32_t>();
-	}
-	if (has_port && (bind_data->port < 1 || bind_data->port > 65535)) {
-		throw InvalidInputException("quackapi_telemetry_status: port must be between 1 and 65535");
-	}
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("sink");
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("target");
-	return_types.emplace_back(LogicalType::BIGINT);
-	names.emplace_back("queued");
-	return_types.emplace_back(LogicalType::BIGINT);
-	names.emplace_back("exported_total");
-	return_types.emplace_back(LogicalType::BIGINT);
-	names.emplace_back("dropped_total");
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("last_error");
-	return_types.emplace_back(LogicalType::BIGINT);
-	names.emplace_back("last_export_age_ms");
-	return std::move(bind_data);
-}
-
-static unique_ptr<GlobalTableFunctionState> TelemetryStatusInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto state = make_uniq<TelemetryStatusGlobalState>();
-	auto &bind_data = input.bind_data->Cast<TelemetryStatusBindData>();
-	state->statuses = QuackapiState::Get(*context.db).SnapshotTelemetryStatus(bind_data.port);
-	return std::move(state);
-}
-
-static void TelemetryStatusExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-	auto &state = data_p.global_state->Cast<TelemetryStatusGlobalState>();
-	idx_t row = 0;
-	while (state.offset < state.statuses.size() && row < STANDARD_VECTOR_SIZE) {
-		auto &status = state.statuses[state.offset];
-		output.SetValue(0, row, Value(status.sink));
-		output.SetValue(1, row, Value(status.target));
-		output.SetValue(2, row, Value::BIGINT(static_cast<int64_t>(status.queued)));
-		output.SetValue(3, row, Value::BIGINT(static_cast<int64_t>(status.exported_total)));
-		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(status.dropped_total)));
-		output.SetValue(5, row, Value(status.last_error));
-		output.SetValue(6, row, Value::BIGINT(status.last_export_age_ms));
-		row++;
-		state.offset++;
-	}
-	output.SetCardinality(row);
-}
-
-struct TelemetryFlushBindData : public TableFunctionData {
-	int32_t port = 0;
-	bool finished = false;
-};
-
-static unique_ptr<FunctionData> TelemetryFlushBind(ClientContext &, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
-	auto bind_data = make_uniq<TelemetryFlushBindData>();
-	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
-	if (has_port) {
-		bind_data->port = input.inputs[0].GetValue<int32_t>();
-	}
-	if (has_port && (bind_data->port < 1 || bind_data->port > 65535)) {
-		throw InvalidInputException("quackapi_telemetry_flush: port must be between 1 and 65535");
-	}
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("status");
-	return std::move(bind_data);
-}
-
-static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->CastNoConst<TelemetryFlushBindData>();
-	if (bind_data.finished) {
-		return;
-	}
-	if (!QuackapiState::Get(*context.db).FlushTelemetry(bind_data.port)) {
-		output.SetValue(0, 0, Value("No quackapi server to flush"));
-	} else if (bind_data.port == 0) {
-		output.SetValue(0, 0, Value("Flushed telemetry for all quackapi servers"));
-	} else {
-		output.SetValue(0, 0,
-		                Value(StringUtil::Format("Flushed telemetry for quackapi server on port %d", bind_data.port)));
-	}
-	output.SetCardinality(1);
-	bind_data.finished = true;
-}
-
-//===--------------------------------------------------------------------===//
 // Load
 //===--------------------------------------------------------------------===//
 
@@ -1030,19 +762,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Requests at or above this duration are logged at warn level. "
 	                          "Default 1000ms. Overridden by slow_request_ms named parameter.",
 	                          LogicalType::BIGINT, Value::BIGINT(1000));
-	config.AddExtensionOption("quackapi_request_ring",
-	                          "Number of recent TCP requests retained by quackapi_requests(). "
-	                          "Default 10000; zero disables the in-memory ring. Overridden by request_ring named "
-	                          "parameter.",
-	                          LogicalType::BIGINT, Value::BIGINT(10000));
 	config.AddExtensionOption("quackapi_log_headers",
-	                          "Comma-separated request-header allowlist for access-log maps; empty (default) "
-	                          "avoids retaining headers. Overridden by log_headers named parameter.",
+	                          "Comma-separated request-header allowlist for native access logs; empty (default) "
+	                          "omits headers. Overridden by log_headers named parameter.",
 	                          LogicalType::VARCHAR, Value(""));
-	config.AddExtensionOption("quackapi_log_query",
-	                          "Preserve a redacted raw query string in access logs; default false. Overridden by "
-	                          "log_query named parameter.",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(
+	    "quackapi_log_query",
+	    "Preserve a redacted raw query string in native access logs; default false. Overridden by "
+	    "log_query named parameter.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// SET quackapi_compression = 'auto'|'gzip'|'zstd'|'off'.
 	// Default auto. Legacy true/false values map to auto/off.
 	config.AddExtensionOption("quackapi_compression",
@@ -1071,7 +799,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
 	serve.named_parameters["log_level"] = LogicalType::VARCHAR;
 	serve.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
-	serve.named_parameters["request_ring"] = LogicalType::BIGINT;
 	serve.named_parameters["log_headers"] = LogicalType::VARCHAR;
 	serve.named_parameters["log_query"] = LogicalType::BOOLEAN;
 	serve.named_parameters["access_log"] = LogicalType::ANY;
@@ -1139,26 +866,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));
 	loader.RegisterFunction(TableFunction("quackapi_servers", {}, ServersExec, ServersBind, ServersInit));
-	TableFunctionSet requests_set("quackapi_requests");
-	TableFunction requests1("quackapi_requests", {LogicalType::INTEGER}, RequestsExec, RequestsBind, RequestsInit);
-	requests_set.AddFunction(requests1);
-	requests1.arguments.clear();
-	requests_set.AddFunction(requests1);
-	loader.RegisterFunction(requests_set);
-	TableFunctionSet telemetry_status_set("quackapi_telemetry_status");
-	TableFunction telemetry_status1("quackapi_telemetry_status", {LogicalType::INTEGER}, TelemetryStatusExec,
-	                                TelemetryStatusBind, TelemetryStatusInit);
-	telemetry_status_set.AddFunction(telemetry_status1);
-	telemetry_status1.arguments.clear();
-	telemetry_status_set.AddFunction(telemetry_status1);
-	loader.RegisterFunction(telemetry_status_set);
-	TableFunctionSet telemetry_flush_set("quackapi_telemetry_flush");
-	TableFunction telemetry_flush1("quackapi_telemetry_flush", {LogicalType::INTEGER}, TelemetryFlushExec,
-	                               TelemetryFlushBind);
-	telemetry_flush_set.AddFunction(telemetry_flush1);
-	telemetry_flush1.arguments.clear();
-	telemetry_flush_set.AddFunction(telemetry_flush1);
-	loader.RegisterFunction(telemetry_flush_set);
 	loader.RegisterFunction(GetQuackapiGroupsFunction());
 
 	// Auth inspection + API key management (secrets/hashes never exposed).
