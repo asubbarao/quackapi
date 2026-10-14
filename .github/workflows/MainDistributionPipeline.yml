@@ -90,15 +90,24 @@ jobs:
       - name: Run quackapi SQLLogic
         run: ./build/release/test/unittest "test/sql/quackapi*"
 
-      - name: Install optional json_schema for BODY SCHEMA coverage
-        run: ./build/release/duckdb -no-stdin -c "INSTALL json_schema FROM community; LOAD json_schema;"
-
-      - name: Run BODY SCHEMA SQLLogic coverage with skip detection
-        env:
-          DUCKDB_TEST_AUTOLOADING: available
+      - name: Run BODY SCHEMA SQLLogic coverage with local json_schema
         run: |
+          set -euo pipefail
+          extension_repo="$PWD/build/release/repository"
+          community_extension_dir="$RUNNER_TEMP/quackapi-community-extensions"
+          test_extension_dir="$RUNNER_TEMP/quackapi-test-extensions"
+          test_config="$RUNNER_TEMP/quackapi-test-config.json"
+          mkdir -p "$community_extension_dir" "$test_extension_dir" "$extension_repo/v1.5.6/linux_amd64"
+          ./build/release/duckdb -no-stdin -c "SET extension_directory='$community_extension_dir'; INSTALL json_schema FROM community;"
+          cp "$community_extension_dir/v1.5.6/linux_amd64/json_schema.duckdb_extension" \
+            "$extension_repo/v1.5.6/linux_amd64/"
+          cat > "$test_config" <<EOF
+          {"autoloading":"available","settings":[{"name":"extension_directory","value":"$test_extension_dir"}]}
+          EOF
           log_file="$(mktemp)"
-          ./build/release/test/unittest "test/sql/quackapi_body_schema.test" 2>&1 | tee "$log_file"
+          LOCAL_EXTENSION_REPO="$extension_repo" ./build/release/test/unittest \
+            --test-dir "$PWD" --test-config "$test_config" \
+            "test/sql/quackapi_body_schema.test" 2>&1 | tee "$log_file"
           if grep -Eiq "skip.*require json_schema|require json_schema.*skip" "$log_file"; then
             echo "BODY SCHEMA coverage was skipped because json_schema was unavailable" >&2
             exit 1
