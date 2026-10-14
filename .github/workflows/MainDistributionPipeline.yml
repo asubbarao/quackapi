@@ -90,6 +90,24 @@ jobs:
       - name: Run quackapi SQLLogic
         run: ./build/release/test/unittest "test/sql/quackapi*"
 
+      - name: Install optional json_schema for BODY SCHEMA coverage
+        run: ./build/release/duckdb -no-stdin -c "INSTALL json_schema FROM community; LOAD json_schema;"
+
+      - name: Run BODY SCHEMA SQLLogic coverage with skip detection
+        env:
+          DUCKDB_TEST_AUTOLOADING: available
+        run: |
+          log_file="$(mktemp)"
+          ./build/release/test/unittest "test/sql/quackapi_body_schema.test" 2>&1 | tee "$log_file"
+          if grep -Eiq "skip.*require json_schema|require json_schema.*skip" "$log_file"; then
+            echo "BODY SCHEMA coverage was skipped because json_schema was unavailable" >&2
+            exit 1
+          fi
+          if ! grep -Eq "16 assertions" "$log_file"; then
+            echo "Expected all 16 BODY SCHEMA assertions to run" >&2
+            exit 1
+          fi
+
       - name: Verify request database lifetime
         run: |
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_lifetime_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-lifetime-test
