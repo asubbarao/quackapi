@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
@@ -29,6 +30,14 @@ static std::unique_ptr<MaterializedQueryResult> Run(Connection &connection, cons
 static std::string Quote(const std::string &value) {
 	Check(value.find('\'') == std::string::npos, "artifact path contains SQL quote");
 	return "'" + value + "'";
+}
+
+// The test core has no built-in extensions, so load the JSON artifact QuackAPI
+// requires explicitly instead of relying on autoload from the user directory.
+static std::string LoadQuackapiSql(const std::string &quackapi_path) {
+	const char *json_path = std::getenv("QUACKAPI_TEST_JSON_EXTENSION");
+	Check(json_path && *json_path, "QUACKAPI_TEST_JSON_EXTENSION is not set");
+	return "LOAD " + Quote(json_path) + "; LOAD " + Quote(quackapi_path);
 }
 
 static void CheckExtensionsInitiallyUnloaded(Connection &connection) {
@@ -94,7 +103,7 @@ int main(int argc, char **argv) {
 		          "069cc9f9b5be802405797faecc284961b07c70ef");
 		CheckExtensionsInitiallyUnloaded(connection);
 		Run(connection, "LOAD " + Quote(argv[3]));
-		Run(connection, "LOAD " + Quote(argv[1]));
+		Run(connection, LoadQuackapiSql(argv[1]));
 		auto loaded = Run(connection, "SELECT extension_name, extension_version FROM duckdb_extensions() "
 		                              "WHERE extension_name IN ('quackapi', " +
 		                                  Quote(argv[4]) + ") AND loaded ORDER BY extension_name");

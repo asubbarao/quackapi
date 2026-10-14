@@ -13,6 +13,9 @@ set(QUACKAPI_BUILD_ROOT
 set(QUACKAPI_EXTENSION
     "${QUACKAPI_BUILD_ROOT}/extension/quackapi/quackapi.duckdb_extension"
     CACHE FILEPATH "Exact QuackAPI loadable artifact")
+set(JSON_EXTENSION
+    "${QUACKAPI_BUILD_ROOT}/extension/json/json.duckdb_extension"
+    CACHE FILEPATH "Exact JSON loadable artifact QuackAPI requires")
 set(POST_PROVIDER_EXTENSION
     ""
     CACHE FILEPATH "Exact HTTP provider loadable artifact")
@@ -27,6 +30,7 @@ set(POST_PROVIDER_VERSION
     CACHE STRING "Expected HTTP provider extension_version")
 
 if(NOT EXISTS "${QUACKAPI_EXTENSION}"
+   OR NOT EXISTS "${JSON_EXTENSION}"
    OR NOT EXISTS "${POST_PROVIDER_EXTENSION}"
    OR QUACKAPI_VERSION STREQUAL ""
    OR POST_PROVIDER_NAME STREQUAL ""
@@ -69,7 +73,10 @@ add_test(
     quackapi_post_http_test "${QUACKAPI_EXTENSION}" "${QUACKAPI_VERSION}"
     "${POST_PROVIDER_EXTENSION}" "${POST_PROVIDER_NAME}"
     "${POST_PROVIDER_VERSION}")
-set_tests_properties(post_http_contract PROPERTIES TIMEOUT 30)
+set_tests_properties(
+  post_http_contract
+  PROPERTIES TIMEOUT 30 ENVIRONMENT
+             "QUACKAPI_TEST_JSON_EXTENSION=${JSON_EXTENSION}")
 add_test(
   NAME post_tls_contract
   COMMAND
@@ -78,7 +85,9 @@ add_test(
     "${POST_PROVIDER_VERSION}"
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/loopback.crt"
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/loopback.key")
-set_tests_properties(post_tls_contract PROPERTIES TIMEOUT 20)
+set_tests_properties(
+  post_tls_contract PROPERTIES TIMEOUT 20 ENVIRONMENT
+                               "QUACKAPI_TEST_JSON_EXTENSION=${JSON_EXTENSION}")
 
 option(ENABLE_PROVIDER_REPLACEMENT "Build the two-provider lifetime contract"
        OFF)

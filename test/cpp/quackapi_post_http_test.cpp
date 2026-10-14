@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <iterator>
 #include <mutex>
@@ -42,6 +43,14 @@ static std::unique_ptr<MaterializedQueryResult> Run(Connection &connection, cons
 static std::string SqlQuote(const std::string &value) {
 	Check(value.find('\'') == std::string::npos, "artifact path contains a SQL quote");
 	return "'" + value + "'";
+}
+
+// The test core has no built-in extensions, so load the JSON artifact QuackAPI
+// requires explicitly instead of relying on autoload from the user directory.
+static std::string LoadQuackapiSql(const std::string &quackapi_path) {
+	const char *json_path = std::getenv("QUACKAPI_TEST_JSON_EXTENSION");
+	Check(json_path && *json_path, "QUACKAPI_TEST_JSON_EXTENSION is not set");
+	return "LOAD " + SqlQuote(json_path) + "; LOAD " + SqlQuote(quackapi_path);
 }
 
 static void CheckExtension(Connection &connection, const std::string &name, const std::string &expected_version) {
@@ -179,7 +188,7 @@ int main(int argc, char **argv) {
 		    "FROM duckdb_extensions() WHERE installed AND extension_name != 'quackapi'";
 		const auto settings_before = Run(connection, core_settings)->GetValue(0, 0).ToString();
 		const auto extensions_before = Run(connection, installed_extensions)->GetValue(0, 0).ToString();
-		Run(connection, "LOAD " + SqlQuote(argv[1]));
+		Run(connection, LoadQuackapiSql(argv[1]));
 		CheckExtension(connection, "quackapi", argv[2]);
 		Check(Run(connection, core_settings)->GetValue(0, 0).ToString() == settings_before,
 		      "loading QuackAPI changed unrelated DuckDB settings");
@@ -279,7 +288,7 @@ int main(int argc, char **argv) {
 		DuckDB other_database(nullptr, &other_config);
 		Connection other_setup(other_database);
 		Run(other_setup, "LOAD " + SqlQuote(argv[3]));
-		Run(other_setup, "LOAD " + SqlQuote(argv[1]));
+		Run(other_setup, LoadQuackapiSql(argv[1]));
 		CheckExtension(other_setup, argv[4], argv[5]);
 		CheckExtension(other_setup, "quackapi", argv[2]);
 		if (std::string(argv[4]) == "httpfs") {
@@ -439,7 +448,7 @@ int main(int argc, char **argv) {
 		auto closing_database = make_uniq<DuckDB>(nullptr, &config);
 		auto closing_connection = make_uniq<Connection>(*closing_database);
 		Run(*closing_connection, "LOAD " + SqlQuote(argv[3]));
-		Run(*closing_connection, "LOAD " + SqlQuote(argv[1]));
+		Run(*closing_connection, LoadQuackapiSql(argv[1]));
 		if (std::string(argv[4]) == "httpfs") {
 			Run(*closing_connection, "SET httpfs_client_implementation = 'curl'");
 		}
@@ -478,7 +487,7 @@ int main(int argc, char **argv) {
 		DuckDB reuse_database(nullptr, &reuse_config);
 		Connection reuse_connection(reuse_database);
 		Run(reuse_connection, "LOAD " + SqlQuote(argv[3]));
-		Run(reuse_connection, "LOAD " + SqlQuote(argv[1]));
+		Run(reuse_connection, LoadQuackapiSql(argv[1]));
 		CheckExtension(reuse_connection, argv[4], argv[5]);
 		CheckExtension(reuse_connection, "quackapi", argv[2]);
 		if (std::string(argv[4]) == "httpfs") {
@@ -633,7 +642,7 @@ int main(int argc, char **argv) {
 		DuckDB memory_database(nullptr, &memory_config);
 		Connection memory_connection(memory_database);
 		Run(memory_connection, "LOAD " + SqlQuote(argv[3]));
-		Run(memory_connection, "LOAD " + SqlQuote(argv[1]));
+		Run(memory_connection, LoadQuackapiSql(argv[1]));
 		CheckExtension(memory_connection, argv[4], argv[5]);
 		CheckExtension(memory_connection, "quackapi", argv[2]);
 		if (std::string(argv[4]) == "httpfs") {
