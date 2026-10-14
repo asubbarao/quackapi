@@ -1,0 +1,59 @@
+# name: test/sql/quackapi_post_surface.test
+# description: Frozen outbound POST signatures, provider boundary and concurrency setting
+# group: [sql]
+
+require quackapi
+
+require json
+
+# Applications depend on these exact overloads and a side-effecting function.
+query I
+SELECT len(array_agg(parameter_types ORDER BY len(parameter_types), parameter_types::VARCHAR))
+FROM duckdb_functions()
+WHERE function_name = 'quackapi_post'
+  AND stability = 'VOLATILE'
+  AND return_type =
+      'STRUCT(status INTEGER, reason VARCHAR, body VARCHAR, headers MAP(VARCHAR, VARCHAR), "error" VARCHAR, reused_connection BOOLEAN)';
+----
+4
+
+query I
+SELECT (quackapi_post(NULL::VARCHAR, '{}')).status IS NULL;
+----
+true
+
+query I
+SELECT quackapi_post(NULL::VARCHAR, '{}'::JSON) IS NULL;
+----
+true
+
+# Loading QuackAPI alone must not silently install or select an HTTP provider.
+statement error
+SELECT quackapi_post('http://127.0.0.1:9/', '{}');
+----
+requires an explicitly loaded HTTPUtil provider
+
+statement ok
+SET quackapi_post_concurrency = 64;
+
+query I
+SELECT current_setting('quackapi_post_concurrency');
+----
+64
+
+statement error
+SET quackapi_post_concurrency = -1;
+----
+must be 0 or a positive integer
+
+# Removed entry points must fail at binding/parsing, rather than shadowing the
+# retained route and POST surface with stale registrations.
+statement error
+SELECT quackapi_fetch('http://127.0.0.1:9/');
+----
+quackapi_fetch
+
+statement error
+SELECT * FROM quackapi_http_pool();
+----
+quackapi_http_pool
