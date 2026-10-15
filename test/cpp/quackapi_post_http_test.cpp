@@ -430,6 +430,12 @@ int main(int argc, char **argv) {
 		          access_log.find("trace-42") != std::string::npos &&
 		          access_log.find("normal=yes") != std::string::npos,
 		      "native access log did not redact credentials while preserving allowed metadata");
+		// The interrupted 'wide' POST above still drains in this database's only
+		// POST worker (concurrency 1). Let it finish so the loopback's own POST
+		// does not queue behind it and spend its 1000 ms budget waiting.
+		while (active.load() != 0) {
+			std::this_thread::yield();
+		}
 		Run(connection, "CREATE ROUTE loopback_inner POST '/loopback-inner' AS SELECT 9 AS value");
 		Run(connection, "CREATE ROUTE loopback_outer GET '/loopback-outer' AS SELECT "
 		                "(quackapi_post('http://127.0.0.1:" +
