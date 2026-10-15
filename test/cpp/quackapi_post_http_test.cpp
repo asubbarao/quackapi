@@ -432,7 +432,12 @@ int main(int argc, char **argv) {
 		      "native access log did not redact credentials while preserving allowed metadata");
 		// The interrupted 'wide' POST above still drains in this database's only
 		// POST worker (concurrency 1). Let it finish so the loopback's own POST
-		// does not queue behind it and spend its 1000 ms budget waiting.
+		// does not queue behind it and spend its budget waiting. Note `active`
+		// is the fixture-side counter: it hits 0 when the fixture finishes
+		// sleeping, which races the worker actually releasing its slot, so the
+		// loopback can still briefly queue behind the drain on a loaded runner.
+		// The 10 s budget absorbs that; the tight 100 ms deadline checks above
+		// still cover real deadline behavior.
 		while (active.load() != 0) {
 			std::this_thread::yield();
 		}
@@ -441,7 +446,7 @@ int main(int argc, char **argv) {
 		                "(quackapi_post('http://127.0.0.1:" +
 		                    std::to_string(log_port) + "/loopback-inner', '{}')).status AS upstream_status");
 		auto loopback = Run(connection, "SELECT status, decode(body) FROM quackapi_request('GET', '/loopback-outer', "
-		                                "query_timeout_ms := 1000)");
+		                                "query_timeout_ms := 10000)");
 		Check(loopback->GetValue(0, 0).GetValue<int>() == 200 &&
 		          loopback->GetValue(1, 0).ToString() == "[{\"upstream_status\":200}]",
 		      "same-database HTTP loopback stalled or returned the wrong row: status=" +
