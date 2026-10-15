@@ -999,6 +999,13 @@ bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
 //! answers with the first statement that produces rows, a batch such as
 //! `CREATE …; INSERT …; SELECT …` answers with its final SELECT.
 bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error) {
+	// DuckDB's statement extraction truncates at the first null byte, which
+	// would silently drop the tail of the batch while executing the prefix.
+	// Null bytes are never legitimate in request SQL text.
+	if (sql.find('\0') != string::npos) {
+		error = "SQL text must not contain null bytes";
+		return false;
+	}
 	vector<unique_ptr<SQLStatement>> statements;
 	try {
 		statements = con.ExtractStatements(sql);
