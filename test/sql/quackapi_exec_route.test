@@ -1,0 +1,339 @@
+# name: test/sql/quackapi_exec_route.test
+# description: An exec route (AS $sql) runs the request's SQL text directly: every statement in order, the last one answers
+# group: [sql]
+
+require quackapi
+
+require json
+
+# The handler is exactly one parameter: no CREATE-time prepare, nothing to validate.
+query I
+CREATE OR REPLACE ROUTE sql POST '/sql' AS $sql;
+----
+Route sql: POST /sql
+
+query II
+SELECT name, handler FROM quackapi_routes() WHERE name = 'sql';
+----
+sql	$sql
+
+# Anything other than one bare parameter is still an ordinary, validated handler.
+statement error
+CREATE OR REPLACE ROUTE not_exec POST '/not_exec' AS $sql $other;
+----
+Invalid handler SQL
+
+# $claims_* is server-bound, never request SQL.
+statement error
+CREATE OR REPLACE ROUTE claims_exec POST '/claims_exec' AS $claims_sub;
+----
+Invalid handler SQL
+
+# ---------------------------------------------------------------------------
+# Single SELECT
+# ---------------------------------------------------------------------------
+query III
+SELECT status, content_type, decode(body)
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 42 AS answer"}');
+----
+200	application/json	[{"answer":42}]
+
+# A zero-row SELECT is an empty array.
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1 AS x WHERE false"}');
+----
+200	[]
+
+# ---------------------------------------------------------------------------
+# Several statements: all run, in order; the LAST statement answers
+# ---------------------------------------------------------------------------
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1 AS first; SELECT 2 AS second; SELECT 3 AS third"}');
+----
+200	[{"third":3}]
+
+# DDL, then DML, then SELECT on the same request connection.
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql',
+  '{"sql":"CREATE TABLE exec_t (id INTEGER, name VARCHAR); INSERT INTO exec_t VALUES (1, ''a''), (2, ''b''); SELECT id, name FROM exec_t ORDER BY id"}');
+----
+200	[{"id":1,"name":"a"},{"id":2,"name":"b"}]
+
+# The DDL is real: it is visible to the database after the request.
+query I
+SELECT list(id ORDER BY id) FROM exec_t;
+----
+[1, 2]
+
+# Connection-local state (a TEMP table) is shared by the statements of one request.
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql',
+  '{"sql":"CREATE TEMP TABLE exec_tmp AS SELECT 7 AS v; SELECT v FROM exec_tmp"}');
+----
+200	[{"v":7}]
+
+# ... and is gone with the request's connection.
+statement error
+SELECT v FROM exec_tmp;
+----
+exec_tmp
+
+# A trailing SET (no result columns) answers with an empty array, not an empty body.
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1 AS x; SET search_path = ''main''"}');
+----
+200	[]
+
+# ---------------------------------------------------------------------------
+# Each statement runs exactly once (side-effect counter + DuckDB query log)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE exec_hits (n INTEGER);
+
+statement ok
+CALL enable_logging('QueryLog');
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql',
+  '{"sql":"INSERT INTO exec_hits VALUES (1); PRAGMA disable_checkpoint_on_shutdown; INSERT INTO exec_hits VALUES (2); SELECT list(n ORDER BY n) AS hits FROM exec_hits"}');
+----
+200	[{"hits":[1,2]}]
+
+statement ok
+CALL disable_logging();
+
+# The PRAGMA reached DuckDB's query log exactly once.
+query I
+SELECT list(trim(message)) FROM duckdb_logs
+WHERE type = 'QueryLog' AND trim(message) = 'PRAGMA disable_checkpoint_on_shutdown';
+----
+[PRAGMA disable_checkpoint_on_shutdown]
+
+# ---------------------------------------------------------------------------
+# A failing statement: 422 with FastAPI-shaped detail; later statements do not run
+# ---------------------------------------------------------------------------
+query III
+SELECT status,
+       json_extract_string(decode(body), '$.detail[0].loc'),
+       json_extract_string(decode(body), '$.detail[0].type')
+FROM quackapi_request('POST', '/sql',
+  '{"sql":"INSERT INTO exec_hits VALUES (3); SELECT nope FROM nowhere; INSERT INTO exec_hits VALUES (4)"}');
+----
+422	["body","sql"]	value_error
+
+query II
+SELECT contains(msg, 'Statement 2 of 3 failed'), contains(msg, 'nowhere')
+FROM (
+  SELECT json_extract_string(decode(body), '$.detail[0].msg') AS msg
+  FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1; SELECT nope FROM nowhere; SELECT 2"}')
+);
+----
+true	true
+
+# Statement 1 committed before the failure; statement 3 never ran.
+query I
+SELECT list(n ORDER BY n) FROM exec_hits;
+----
+[1, 2, 3]
+
+# Parser errors are 422 before anything runs.
+query II
+SELECT status, contains(decode(body), 'SELEC')
+FROM quackapi_request('POST', '/sql', '{"sql":"INSERT INTO exec_hits VALUES (9); SELEC 1"}');
+----
+422	true
+
+query I
+SELECT list(n ORDER BY n) FROM exec_hits;
+----
+[1, 2, 3]
+
+# Conversion errors are client errors too.
+query II
+SELECT status, contains(decode(body), 'Conversion Error')
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT CAST(''nope'' AS INTEGER)"}');
+----
+422	true
+
+# Empty SQL and a missing sql field are 422.
+query II
+SELECT status, json_extract_string(decode(body), '$.detail[0].loc')
+FROM quackapi_request('POST', '/sql', '{"sql":"  ;  "}');
+----
+422	["body","sql"]
+
+query II
+SELECT status, json_extract_string(decode(body), '$.detail[0].type')
+FROM quackapi_request('POST', '/sql', '{"other":"SELECT 1"}');
+----
+422	missing
+
+# ---------------------------------------------------------------------------
+# Response format negotiation on the last result: JSON default, CSV / NDJSON via Accept
+# (Arrow needs the community nanoarrow extension; covered over real HTTP in
+# test/conformance)
+# ---------------------------------------------------------------------------
+query II
+SELECT status, starts_with(content_type, 'text/csv')
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 0 AS z; SELECT 1 AS a, ''x'' AS b UNION ALL SELECT 2, ''y'' ORDER BY a"}',
+  headers := MAP {'Accept': 'text/csv'});
+----
+200	true
+
+query I
+SELECT replace(replace(decode(body), E'\r', ''), E'\n', '|')
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 0 AS z; SELECT 1 AS a, ''x'' AS b UNION ALL SELECT 2, ''y'' ORDER BY a"}',
+  headers := MAP {'Accept': 'text/csv'});
+----
+a,b|1,x|2,y|
+
+query II
+SELECT status, starts_with(content_type, 'application/x-ndjson')
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1 AS a"}',
+  headers := MAP {'Accept': 'application/x-ndjson'});
+----
+200	true
+
+# html / text column modes still apply to the last result.
+query III
+SELECT status, content_type, decode(body)
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1; SELECT ''<b>hi</b>'' AS html"}');
+----
+200	text/html; charset=utf-8	<b>hi</b>
+
+# ---------------------------------------------------------------------------
+# PARAM validation still applies to the SQL parameter
+# ---------------------------------------------------------------------------
+query I
+CREATE OR REPLACE ROUTE sql_min POST '/sql_min' PARAM sql VARCHAR MIN_LENGTH 10 AS $sql;
+----
+Route sql_min: POST /sql_min
+
+query II
+SELECT status, json_extract_string(decode(body), '$.detail[0].type')
+FROM quackapi_request('POST', '/sql_min', '{"sql":"SELECT 1"}');
+----
+422	string_too_short
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql_min', '{"sql":"SELECT 1 AS long_enough"}');
+----
+200	[{"long_enough":1}]
+
+# A query-string parameter works too (GET).
+query I
+CREATE OR REPLACE ROUTE sql_get GET '/sql_get' AS $q;
+----
+Route sql_get: GET /sql_get
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/sql_get?q=SELECT%2042%20AS%20n');
+----
+200	[{"n":42}]
+
+query II
+SELECT status, json_extract_string(decode(body), '$.detail[0].loc')
+FROM quackapi_request('GET', '/sql_get?q=SELEC');
+----
+422	["query","q"]
+
+# ---------------------------------------------------------------------------
+# REQUIRE auth runs before any request SQL
+# ---------------------------------------------------------------------------
+statement ok
+CREATE AUTH exec_key AS API_KEY;
+
+statement ok
+SELECT * FROM quackapi_add_api_key('exec_key', 'exec-secret', 'alice');
+
+query I
+CREATE OR REPLACE ROUTE sql_auth POST '/sql_auth' REQUIRE exec_key AS $sql;
+----
+Route sql_auth: POST /sql_auth
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql_auth', '{"sql":"INSERT INTO exec_hits VALUES (100); SELECT 1 AS x"}');
+----
+401	{"detail":"Not authenticated"}
+
+query I
+SELECT list(n ORDER BY n) FROM exec_hits;
+----
+[1, 2, 3]
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('POST', '/sql_auth', '{"sql":"SELECT 1 AS x"}',
+  headers := MAP {'X-API-Key': 'exec-secret'});
+----
+200	[{"x":1}]
+
+# ---------------------------------------------------------------------------
+# Row-access policies cannot rewrite arbitrary SQL: an exec route fails closed
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE exec_secret (tenant VARCHAR, v INTEGER);
+
+statement ok
+CREATE ROW ACCESS POLICY exec_tenant AS (tenant VARCHAR) RETURNS BOOLEAN USING (tenant = $claims_sub);
+
+statement ok
+ALTER TABLE exec_secret ADD ROW ACCESS POLICY exec_tenant ON (tenant);
+
+query I
+SELECT status FROM quackapi_request('POST', '/sql', '{"sql":"SELECT v FROM exec_secret"}');
+----
+403
+
+statement ok
+ALTER TABLE exec_secret DROP ROW ACCESS POLICY exec_tenant;
+
+query I
+SELECT status FROM quackapi_request('POST', '/sql', '{"sql":"SELECT v FROM exec_secret"}');
+----
+200
+
+# ---------------------------------------------------------------------------
+# query_timeout_ms bounds the whole batch
+# ---------------------------------------------------------------------------
+statement ok
+SET quackapi_query_timeout_ms = 200;
+
+query I
+SELECT status
+FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1; SELECT sum(a.range) FROM range(100000000000) a"}');
+----
+504
+
+statement ok
+RESET quackapi_query_timeout_ms;
+
+# ---------------------------------------------------------------------------
+# OpenAPI documents the exec parameter
+# ---------------------------------------------------------------------------
+query I
+SELECT json_extract_string(decode(body), '$.paths./sql_min.post.parameters') IS NOT NULL
+    OR json_extract_string(decode(body), '$.paths./sql_min.post.requestBody') IS NOT NULL
+FROM quackapi_request('GET', '/openapi.json');
+----
+true
+
+statement ok
+DROP ROUTE sql;
+
+statement ok
+DROP ROUTE sql_min;
+
+statement ok
+DROP ROUTE sql_get;
+
+statement ok
+DROP ROUTE sql_auth;

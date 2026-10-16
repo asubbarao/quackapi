@@ -207,10 +207,16 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		case_insensitive_map_t<LogicalType> expected_types;
 		vector<string> named_params;
 
-		auto prepared = con.Prepare(route.handler_sql);
+		// An exec route (`AS $sql`) documents its one parameter; its response
+		// columns depend on the request, so it advertises none.
+		string exec_param;
+		const bool exec_route = QuackapiExecRouteParam(route.handler_sql, exec_param);
+		auto prepared = con.Prepare(exec_route ? "SELECT $" + exec_param + "::VARCHAR" : route.handler_sql);
 		if (!prepared->HasError()) {
-			col_names = prepared->GetNames();
-			col_types = prepared->GetTypes();
+			if (!exec_route) {
+				col_names = prepared->GetNames();
+				col_types = prepared->GetTypes();
+			}
 			expected_types = prepared->GetExpectedParameterTypes();
 			for (auto &entry : prepared->named_param_map) {
 				named_params.push_back(entry.first);

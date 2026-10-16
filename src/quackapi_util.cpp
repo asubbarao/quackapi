@@ -19,6 +19,30 @@ string QuackapiTrim(const string &input) {
 	return input.substr(begin, end - begin);
 }
 
+bool QuackapiExecRouteParam(const string &handler_sql, string &param_name) {
+	auto handler = QuackapiTrim(handler_sql);
+	if (handler.size() < 2 || handler[0] != '$') {
+		return false;
+	}
+	auto is_start = [](char c) {
+		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+	};
+	if (!is_start(handler[1])) {
+		return false;
+	}
+	for (idx_t i = 2; i < handler.size(); i++) {
+		if (!is_start(handler[i]) && !(handler[i] >= '0' && handler[i] <= '9')) {
+			return false;
+		}
+	}
+	auto name = handler.substr(1);
+	if (StringUtil::StartsWith(StringUtil::Lower(name), "claims_")) {
+		return false;
+	}
+	param_name = name;
+	return true;
+}
+
 string QuackapiJsonEscape(const string &input) {
 	string result;
 	result.reserve(input.size() + 2);
