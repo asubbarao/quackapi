@@ -4124,8 +4124,8 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				Value utf8_probe(raw);
 				(void)utf8_probe;
 			} catch (std::exception &) {
-				validation_issues.push_back({ValidationLocJson(loc_kind, param_name),
-			                                     "Input should be valid UTF-8 text", "type_error"});
+				validation_issues.push_back(
+				    {ValidationLocJson(loc_kind, param_name), "Input should be valid UTF-8 text", "type_error"});
 				continue;
 			}
 
