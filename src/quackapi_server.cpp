@@ -4166,6 +4166,21 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				raw = it->second.second;
 			}
 
+			// Client bytes are not guaranteed valid UTF-8 (query/form/header/
+			// cookie decoders pass bytes through). DuckDB's Value(string)
+			// throws Invalid Input on invalid UTF-8, which would otherwise
+			// escape as a 500 with a serialized-exception body. Probe once
+			// here so malformed bytes become a 422 on the parameter that
+			// carried them.
+			try {
+				Value utf8_probe(raw);
+				(void)utf8_probe;
+			} catch (std::exception &) {
+				validation_issues.push_back(
+				    {ValidationLocJson(loc_kind, param_name), "Input should be valid UTF-8 text", "type_error"});
+				continue;
+			}
+
 			// Strict integral check even when type is UNKNOWN: if the raw value
 			// is number-like but not a strict integer, and a cast-to-int would
 			// succeed via DuckDB rounding (1.5→2, 1e2→100), reject now.
