@@ -35,10 +35,12 @@
  * Configuration
  */
 
+// quackapi links into libduckdb next to DuckDB's own, different httplib (duckdb_httplib), so this copy has its own
+// namespace: two class layouts under one name made the server free a Response it never allocated.
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-#define CPPHTTPLIB_NAMESPACE duckdb_httplib_openssl
+#define CPPHTTPLIB_NAMESPACE quackapi_httplib_openssl
 #else
-#define CPPHTTPLIB_NAMESPACE duckdb_httplib
+#define CPPHTTPLIB_NAMESPACE quackapi_httplib
 #endif
 
 #ifndef CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND

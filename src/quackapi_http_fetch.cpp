@@ -63,7 +63,7 @@ QuackapiHttpFetchResult FromResponse(unique_ptr<HTTPResponse> response) {
 // and parallelism — the same shape as httpx's pool on the FastAPI side.
 
 struct PooledPlain {
-	unique_ptr<duckdb_httplib::Client> client;
+	unique_ptr<quackapi_httplib::Client> client;
 };
 
 struct PooledUtil {
@@ -202,13 +202,13 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 		return out;
 	}
 
-	duckdb_httplib::Error conn_error = duckdb_httplib::Error::Success;
-	auto sock = duckdb_httplib::detail::create_client_socket(
-	    host, "", port, AF_UNSPEC, /*tcp_nodelay=*/true, /*ipv6_v6only=*/false, duckdb_httplib::default_socket_options,
-	    OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0, /*intf=*/"",
-	    conn_error);
+	quackapi_httplib::Error conn_error = quackapi_httplib::Error::Success;
+	auto sock = quackapi_httplib::detail::create_client_socket(
+	    host, "", port, AF_UNSPEC, /*tcp_nodelay=*/true, /*ipv6_v6only=*/false,
+	    quackapi_httplib::default_socket_options, OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0,
+	    OUTBOUND_TIMEOUT_SECONDS, 0, /*intf=*/"", conn_error);
 	if (sock == INVALID_SOCKET) {
-		out.request_error = "stall_ms connect: " + duckdb_httplib::to_string(conn_error);
+		out.request_error = "stall_ms connect: " + quackapi_httplib::to_string(conn_error);
 		return out;
 	}
 
@@ -225,9 +225,9 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	const char *send_ptr = req.data();
 	size_t send_left = req.size();
 	while (send_left > 0) {
-		auto n = duckdb_httplib::detail::send_socket(sock, send_ptr, send_left, CPPHTTPLIB_SEND_FLAGS);
+		auto n = quackapi_httplib::detail::send_socket(sock, send_ptr, send_left, CPPHTTPLIB_SEND_FLAGS);
 		if (n <= 0) {
-			duckdb_httplib::detail::close_socket(sock);
+			quackapi_httplib::detail::close_socket(sock);
 			out.request_error = "stall_ms: send failed";
 			return out;
 		}
@@ -242,13 +242,13 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	string raw;
 	char buf[16384];
 	while (true) {
-		auto n = duckdb_httplib::detail::read_socket(sock, buf, sizeof(buf), CPPHTTPLIB_RECV_FLAGS);
+		auto n = quackapi_httplib::detail::read_socket(sock, buf, sizeof(buf), CPPHTTPLIB_RECV_FLAGS);
 		if (n <= 0) {
 			break;
 		}
 		raw.append(buf, static_cast<size_t>(n));
 	}
-	duckdb_httplib::detail::close_socket(sock);
+	quackapi_httplib::detail::close_socket(sock);
 
 	if (raw.empty()) {
 		out.request_error = "stall_ms: empty response (peer closed during stall)";
@@ -258,8 +258,8 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	return out;
 }
 
-unique_ptr<duckdb_httplib::Client> DialPlain(const string &origin) {
-	auto client = make_uniq<duckdb_httplib::Client>(origin);
+unique_ptr<quackapi_httplib::Client> DialPlain(const string &origin) {
+	auto client = make_uniq<quackapi_httplib::Client>(origin);
 	client->set_keep_alive(true);
 	// Same Nagle/delayed-ACK deadlock the server side hit (quackapi_server.cpp:917),
 	// just on the other end of the socket: without this a small POST body waits on
@@ -273,18 +273,18 @@ unique_ptr<duckdb_httplib::Client> DialPlain(const string &origin) {
 	return client;
 }
 
-duckdb_httplib::Headers ToHttplibHeaders(const unordered_map<string, string> &extra) {
-	duckdb_httplib::Headers headers;
+quackapi_httplib::Headers ToHttplibHeaders(const unordered_map<string, string> &extra) {
+	quackapi_httplib::Headers headers;
 	for (auto &kv : extra) {
 		headers.emplace(kv.first, kv.second);
 	}
 	return headers;
 }
 
-QuackapiHttpFetchResult FromHttplibResult(const duckdb_httplib::Result &res) {
+QuackapiHttpFetchResult FromHttplibResult(const quackapi_httplib::Result &res) {
 	QuackapiHttpFetchResult out;
-	if (res.error() != duckdb_httplib::Error::Success) {
-		out.request_error = duckdb_httplib::to_string(res.error());
+	if (res.error() != quackapi_httplib::Error::Success) {
+		out.request_error = quackapi_httplib::to_string(res.error());
 		return out;
 	}
 	auto &response = res.value();
@@ -303,7 +303,7 @@ QuackapiHttpFetchResult FromHttplibResult(const duckdb_httplib::Result &res) {
 //! healthy — a broken socket must not be handed to the next request.
 template <class CALL>
 QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
-	unique_ptr<duckdb_httplib::Client> client;
+	unique_ptr<quackapi_httplib::Client> client;
 	bool reused = false;
 	{
 		auto &pool = ConnectionPool::Get();
@@ -334,7 +334,7 @@ QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
 	bool healthy = false;
 	try {
 		auto res = call(*client);
-		healthy = res.error() == duckdb_httplib::Error::Success;
+		healthy = res.error() == quackapi_httplib::Error::Success;
 		result = FromHttplibResult(res);
 	} catch (...) {
 		// Drop the client on the floor; a half-written socket is not reusable.
@@ -423,7 +423,7 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const strin
 		string origin, path;
 		SplitURL(url, origin, path);
 		auto headers = ToHttplibHeaders(extra_headers);
-		return WithPlainClient(origin, [&](duckdb_httplib::Client &client) { return client.Get(path, headers); });
+		return WithPlainClient(origin, [&](quackapi_httplib::Client &client) { return client.Get(path, headers); });
 	}
 
 	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
@@ -447,7 +447,7 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 		auto headers = ToHttplibHeaders(extra_headers);
 		const auto &ct = content_type.empty() ? string("application/octet-stream") : content_type;
 		return WithPlainClient(origin,
-		                       [&](duckdb_httplib::Client &client) { return client.Post(path, headers, body, ct); });
+		                       [&](quackapi_httplib::Client &client) { return client.Post(path, headers, body, ct); });
 	}
 
 	// Built-In HTTPLibClient does not implement POST (http_util.cpp). Surface a
