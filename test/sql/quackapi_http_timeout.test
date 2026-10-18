@@ -1,0 +1,56 @@
+# name: test/sql/quackapi_http_timeout.test
+# description: quackapi_http_timeout_ms bounds an outbound call to a peer that does not answer
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE ROUTE slow POST '/slow' AS SELECT sleep_ms(1500) AS slept;
+
+statement ok
+CREATE ROUTE slow_get GET '/slow_get' AS SELECT sleep_ms(1500) AS slept;
+
+query I
+SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29302
+
+# Shorter than the peer: the call comes back as a transport error instead of waiting.
+statement ok
+SET quackapi_http_timeout_ms = 300;
+
+query II
+SELECT (r).status IS DISTINCT FROM 200, (r).error IS NOT NULL
+FROM (SELECT quackapi_post('http://127.0.0.1:29302/slow', '{}') AS r);
+----
+true	true
+
+query I
+SELECT (quackapi_fetch('http://127.0.0.1:29302/slow_get')).error IS NOT NULL;
+----
+true
+
+# Longer than the peer: the same call answers.
+statement ok
+SET quackapi_http_timeout_ms = 5000;
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29302/slow', '{}')).status;
+----
+200
+
+statement ok
+SET quackapi_http_timeout_ms = 0;
+
+statement error
+SELECT quackapi_post('http://127.0.0.1:29302/slow', '{}');
+----
+quackapi_http_timeout_ms must be > 0
+
+statement ok
+RESET quackapi_http_timeout_ms;
+
+statement ok
+SELECT * FROM quackapi_stop(29302);
