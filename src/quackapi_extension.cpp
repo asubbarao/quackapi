@@ -1209,6 +1209,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	config.AddExtensionOption("quackapi_query_timeout_ms", "Maximum query execution time in milliseconds",
 	                          LogicalType::BIGINT, Value::BIGINT(30000));
+	config.AddExtensionOption("quackapi_http_timeout_ms",
+	                          "Maximum time for one outbound quackapi_fetch / quackapi_post call in milliseconds",
+	                          LogicalType::BIGINT, Value::BIGINT(600000));
 	config.AddExtensionOption("quackapi_max_response_bytes", "Maximum uncompressed response bytes", LogicalType::BIGINT,
 	                          Value::BIGINT(16 * 1024 * 1024));
 	config.AddExtensionOption("quackapi_max_pending_requests", "Maximum queued HTTP connections", LogicalType::BIGINT,
