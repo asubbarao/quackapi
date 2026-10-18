@@ -70,6 +70,17 @@ echo "quackapi listening on $BASE (pid $DPID)"
 
 mkdir -p "$RESULTS_DIR"
 export QUACKAPI_BASE="$BASE"
+# Community extensions are only published for released DuckDB versions. On a dev/alpha
+# build (e.g. the 2.0 alpha) INSTALL fails, so a case that needs one is N/A there, not
+# FAIL. Probe every extension the cases require and hand the missing set to driver.py.
+MISSING_EXTS=""
+for ext in $(grep -o '"requires_ext": *"[^"]*"' "$CONF/cases.jsonl" | sed 's/.*: *"\([^"]*\)"/\1/' | sort -u); do
+  if ! "$DUCK" -unsigned -c "INSTALL $ext FROM community;" >/dev/null 2>&1; then
+    echo "community extension '$ext' not installable for this DuckDB build; its cases will be N/A" >&2
+    MISSING_EXTS="$MISSING_EXTS $ext"
+  fi
+done
+export QUACKAPI_MISSING_EXTS="$MISSING_EXTS"
 DRIVER_RC=0
 python3 "$CONF/driver.py" --base "$BASE" --cases "$CONF/cases.jsonl" --out "$RESULTS_DIR/results.jsonl" || DRIVER_RC=$?
 

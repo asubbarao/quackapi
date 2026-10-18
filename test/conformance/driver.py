@@ -355,6 +355,16 @@ def main() -> int:
     results = []
     counts = {"PASS": 0, "FAIL": 0, "N/A": 0}
     classes: Dict[str, int] = {}
+
+    # Community extensions are not published for dev/alpha DuckDB builds; a case whose
+    # requires_ext is in QUACKAPI_MISSING_EXTS (probed by run.sh) is N/A, not FAIL.
+    missing_exts = set(os.environ.get("QUACKAPI_MISSING_EXTS", "").split())
+    for case in cases:
+        req = case.get("requires_ext")
+        if req and req in missing_exts:
+            case["skip_run"] = True
+            suffix = f"community extension '{req}' not installable for this DuckDB build"
+            case["notes"] = (case.get("notes") + " — " if case.get("notes") else "") + suffix
     groups: Dict[str, Dict[str, int]] = {}
 
     jwt_token = make_jwt()
