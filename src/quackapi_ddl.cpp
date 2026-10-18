@@ -1258,6 +1258,29 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			}
 			// An exec route (`AS $sql`) has no SQL of its own to validate: the
 			// request supplies it, and each request reports its own errors.
+			// $claims_* is server-bound (verified auth claims), never request SQL:
+			// reject a bare one explicitly instead of relying on Prepare to fail
+			// on the unbound named parameter, which is a DuckDB-version detail.
+			{
+				string bare = QuackapiTrim(bind_data.route.handler_sql);
+				if (bare.size() > 8 && bare[0] == '$' &&
+				    StringUtil::StartsWith(StringUtil::Lower(bare.substr(1, 7)), "claims_")) {
+					bool ident = true;
+					for (idx_t i = 1; i < bare.size(); i++) {
+						char c = bare[i];
+						if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' ||
+						      (c >= '0' && c <= '9'))) {
+							ident = false;
+							break;
+						}
+					}
+					if (ident) {
+						throw InvalidInputException(
+						    "Invalid handler SQL for route \"%s\": $claims_* is server-bound, never request SQL",
+						    bind_data.route.name);
+					}
+				}
+			}
 			string exec_param;
 			auto prepared = QuackapiExecRouteParam(bind_data.route.handler_sql, exec_param)
 			                    ? unique_ptr<PreparedStatement>()
