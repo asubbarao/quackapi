@@ -1,0 +1,358 @@
+# name: test/sql/quackapi_token_rebuild.test
+# description: DuckDB 2.0 hands quackapi the tokens of a statement, not its text. The statement is rebuilt from them,
+# group: [sql]
+
+# and a handler must keep the parse tree it was written with - every literal byte for byte, only whitespace and
+# comments between tokens may differ. The statements are the ones dev boots (duckdb-skills server/setup.sql and
+# server/profile.sql) plus the token forms that are easy to get wrong.
+
+require quackapi
+
+require json
+
+# The parse tree of a statement without source locations, which move when whitespace does.
+statement ok
+CREATE MACRO parse_tree(q) AS TABLE
+SELECT fullkey, value::VARCHAR AS value FROM json_tree(json_serialize_sql(q))
+WHERE type NOT IN ('OBJECT', 'ARRAY') AND key NOT IN ('query_location', 'query_location_length');
+
+# Rows of one tree missing from the other, both ways, and whether the original parsed at all.
+statement ok
+CREATE MACRO tree_diff(original, rebuilt) AS TABLE
+WITH want AS (FROM parse_tree(original)), got AS (FROM parse_tree(rebuilt)),
+missing AS (FROM want EXCEPT ALL FROM got), extra AS (FROM got EXCEPT ALL FROM want)
+SELECT (SELECT count(*) FROM missing) + (SELECT count(*) FROM extra) AS differences,
+       (SELECT value FROM want WHERE fullkey = '$.error') AS original_error;
+
+# Stand-ins for the dev functions the handlers call, so CREATE can prepare them.
+statement ok
+CREATE MACRO selfdispatch(sql) AS quackapi_post('http://127.0.0.1:1/sql', json_object('sql', sql)::VARCHAR);
+
+statement ok
+CREATE MACRO quote_literal(s) AS concat(chr(39), s, chr(39));
+
+statement ok
+CREATE MACRO tera_render(template, data, autoescape := true) AS template;
+
+statement ok
+CREATE MACRO quack_query(target, sql, token := NULL) AS TABLE SELECT '{}'::VARCHAR AS explain_value, 1 AS x;
+
+# ── setup.sql ───────────────────────────────────────────────────────────────
+
+statement ok
+CREATE QUEUE inbox;
+
+query I
+SELECT name FROM quackapi_queues();
+----
+inbox
+
+statement ok
+CREATE OR REPLACE ROUTE sql POST '/sql' AS SELECT * FROM quack_query('quack:localhost:9494', $sql, token := getenv('QUACK_TOKEN'));
+
+statement ok
+SET VARIABLE got = (SELECT handler FROM quackapi_routes() WHERE name = 'sql');
+
+query II
+FROM tree_diff($orig$SELECT * FROM quack_query('quack:localhost:9494', $sql, token := getenv('QUACK_TOKEN'))$orig$, getvariable('got'));
+----
+0	false
+
+statement ok
+CREATE OR REPLACE ROUTE inbox POST '/inbox' STATUS 201 AS SELECT quackapi_enqueue('inbox', $body::JSON) AS id;
+
+statement ok
+SET VARIABLE got = (SELECT handler FROM quackapi_routes() WHERE name = 'inbox');
+
+query II
+FROM tree_diff($orig$SELECT quackapi_enqueue('inbox', $body::JSON) AS id$orig$, getvariable('got'));
+----
+0	false
+
+query II
+SELECT method, status FROM quackapi_routes() WHERE name = 'inbox';
+----
+POST	201
+
+statement ok
+CREATE GROUP mcp WITH (prefix='/mcp');
+
+query I
+SELECT prefix FROM quackapi_groups() WHERE name = 'mcp';
+----
+/mcp
+
+statement ok
+CREATE OR REPLACE ROUTE mcp POST '/' IN GROUP mcp AS SELECT '' AS text;
+
+query III
+SELECT pattern, group_name, handler FROM quackapi_routes() WHERE name = 'mcp';
+----
+/mcp/	mcp	SELECT '' AS text
+
+statement ok
+CREATE OR REPLACE MIDDLEWARE mcp BEFORE GROUP mcp AS
+WITH msg AS (
+    SELECT $body::JSON -> '$.id' AS id, $body::JSON ->> '$.method' AS method,
+           coalesce($body::JSON ->> '$.params.arguments.sql', $body::JSON ->> '$.params.arguments.statement') AS sql
+), posted AS (
+    SELECT id, method, array_agg(selfdispatch(sql)) AS receipts
+    FROM msg WHERE method = 'tools/call' GROUP BY id, method
+), called AS (
+    SELECT id, method FROM msg WHERE method IS DISTINCT FROM 'tools/call'
+    UNION ALL BY NAME
+    SELECT id, method,
+           coalesce(try_cast(r.body AS JSON), json_object('detail', coalesce(r.error, r.body))) AS reply,
+           CASE WHEN r.status = 200 THEN coalesce(json_exists(reply, '$.detail'), false) ELSE true END AS failed
+    FROM posted CROSS JOIN UNNEST(receipts) AS t(r)
+)
+SELECT false AS allow, CASE WHEN id IS NULL THEN 202 ELSE 200 END AS status,
+       json_object('jsonrpc', '2.0', 'id', id, 'result', coalesce(
+           MAP {'initialize': '{"protocolVersion": "2025-06-18", "serverInfo": {"name": "dev", "version": "1"}, "capabilities": {"tools": {}}}',
+                'ping': '{}',
+                'tools/list': '{"tools": [{"name": "query", "description": "Run any SQL on dev, reads and writes. Returns the rows as JSON; a failure returns the DuckDB error.", "inputSchema": {"type": "object", "properties": {"sql": {"type": "string"}}, "required": ["sql"]}}, {"name": "execute", "description": "Same as query, for callers that name it execute.", "inputSchema": {"type": "object", "properties": {"statement": {"type": "string"}}, "required": ["statement"]}}]}'}[method]::JSON,
+           json_object('content', [json_object('type', 'text', 'text', reply::VARCHAR)], 'isError', failed)))::VARCHAR AS body,
+       NULL::VARCHAR AS header_name, NULL::VARCHAR AS header_value
+FROM called;
+
+statement ok
+SET VARIABLE got = (SELECT handler_sql FROM quackapi_middlewares() WHERE name = 'mcp');
+
+query II
+FROM tree_diff($orig$WITH msg AS (
+    SELECT $body::JSON -> '$.id' AS id, $body::JSON ->> '$.method' AS method,
+           coalesce($body::JSON ->> '$.params.arguments.sql', $body::JSON ->> '$.params.arguments.statement') AS sql
+), posted AS (
+    SELECT id, method, array_agg(selfdispatch(sql)) AS receipts
+    FROM msg WHERE method = 'tools/call' GROUP BY id, method
+), called AS (
+    SELECT id, method FROM msg WHERE method IS DISTINCT FROM 'tools/call'
+    UNION ALL BY NAME
+    SELECT id, method,
+           coalesce(try_cast(r.body AS JSON), json_object('detail', coalesce(r.error, r.body))) AS reply,
+           CASE WHEN r.status = 200 THEN coalesce(json_exists(reply, '$.detail'), false) ELSE true END AS failed
+    FROM posted CROSS JOIN UNNEST(receipts) AS t(r)
+)
+SELECT false AS allow, CASE WHEN id IS NULL THEN 202 ELSE 200 END AS status,
+       json_object('jsonrpc', '2.0', 'id', id, 'result', coalesce(
+           MAP {'initialize': '{"protocolVersion": "2025-06-18", "serverInfo": {"name": "dev", "version": "1"}, "capabilities": {"tools": {}}}',
+                'ping': '{}',
+                'tools/list': '{"tools": [{"name": "query", "description": "Run any SQL on dev, reads and writes. Returns the rows as JSON; a failure returns the DuckDB error.", "inputSchema": {"type": "object", "properties": {"sql": {"type": "string"}}, "required": ["sql"]}}, {"name": "execute", "description": "Same as query, for callers that name it execute.", "inputSchema": {"type": "object", "properties": {"statement": {"type": "string"}}, "required": ["statement"]}}]}'}[method]::JSON,
+           json_object('content', [json_object('type', 'text', 'text', reply::VARCHAR)], 'isError', failed)))::VARCHAR AS body,
+       NULL::VARCHAR AS header_name, NULL::VARCHAR AS header_value
+FROM called$orig$, getvariable('got'));
+----
+0	false
+
+# The MAP of JSON strings survives byte for byte, not just as an equal parse tree.
+query I
+SELECT contains(getvariable('got'), '''{"protocolVersion": "2025-06-18", "serverInfo": {"name": "dev", "version": "1"}, "capabilities": {"tools": {}}}''');
+----
+true
+
+# ── profile.sql: nested dollar quotes ($t$, and $profile$ inside $copy$), comments inside the body ──
+
+statement ok
+CREATE OR REPLACE ROUTE profile GET '/profile' AS
+WITH run AS (
+    SELECT explain_value::JSON AS profile, explain_value AS profile_text,
+           '~/.duck/logs/profiles/' || strftime(now(), '%Y%m%dT%H%M%S.%fZ') || '.json' AS path, quote_literal(path) AS target
+    FROM quack_query('quack:localhost:9494', 'EXPLAIN (ANALYZE, FORMAT json) ' || $sql, token := getenv('QUACK_TOKEN'))
+), saved AS (
+    SELECT *, selfdispatch(tera_render($copy$
+COPY (SELECT $profile${{ profile_text }}$profile$) TO {{ target }} (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+$copy$, c::JSON, autoescape := false)).status::VARCHAR AS saved_status
+    FROM run c
+), node AS (   -- every operator in the profile, in order; depth is how many children its path has
+    SELECT saved.profile, saved.path, saved.saved_status, t.id AS idx, t.value ->> 'operator_name' AS name, len(string_split(t.path, 'children')) - 3 AS depth,
+           (t.value ->> 'operator_timing')::DOUBLE AS seconds, (t.value ->> 'operator_cardinality')::UBIGINT AS card,
+           (t.value ->> 'operator_rows_scanned')::UBIGINT AS scanned, (t.value -> 'extra_info' ->> 'Estimated Cardinality') AS est,
+           list_transform(list_filter(json_keys(t.value -> 'extra_info'), lambda k: k <> 'Estimated Cardinality'), lambda k: k || ': ' || (t.value -> 'extra_info' ->> k)) AS extra
+    FROM saved CROSS JOIN LATERAL json_tree(saved.profile) t
+    WHERE json_exists(t.value, '$.operator_name') AND (t.value ->> 'operator_type') <> 'EXPLAIN_ANALYZE'
+), share AS (
+    SELECT *, seconds / sum(seconds) OVER () AS part FROM node
+), phase AS (
+    SELECT profile, path, saved_status, name, sum(seconds) AS seconds, sum(part) AS part, count(idx) AS nodes,
+           list({idx: idx, name: name, indent: depth * 18, seconds: printf('%.6f', seconds), pct: printf('%.1f%%', part * 100),
+                 card: printf('%,d', card), est: coalesce(est, '?'), scanned: printf('%,d', scanned), extra: coalesce(extra, []), hot: part >= 0.25}) AS members
+    FROM share GROUP BY ALL
+)
+SELECT tera_render($t$<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Query profile</title><style>
+:root{--bg:#fafaf7;--card:#fff;--ink:#1c1c19;--mute:#6b6a62;--line:#e3e1d8;--hot:#d97706;--bar:#f6e3c3;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#121210;--card:#1b1b18;--ink:#ecebe4;--mute:#a3a299;--line:#34332e;--hot:#f59e0b;--bar:#4a3410}}
+:root[data-theme="dark"]{--bg:#121210;--card:#1b1b18;--ink:#ecebe4;--mute:#a3a299;--line:#34332e;--hot:#f59e0b;--bar:#4a3410}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif}
+main{max-width:980px;margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 8px}h2{font-size:16px;margin:28px 0 8px}
+code,pre,.m,td{font-family:var(--mono)}code{font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:16px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.card b{display:block;font-size:11px;color:var(--mute);font-weight:500;text-transform:uppercase;letter-spacing:.05em}.card span{font:600 17px var(--mono)}
+pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;overflow-x:auto;font-size:13px;white-space:pre-wrap}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:right}th:first-child,td:first-child{text-align:left}th{color:var(--mute);font-weight:500}
+.tree{overflow-x:auto;padding-bottom:8px}
+.op{border-left:3px solid var(--line);margin:3px 0;padding:6px 10px;border-radius:4px;min-width:260px;
+    background:linear-gradient(90deg,var(--bar) var(--share),var(--card) var(--share));box-shadow:inset 0 0 0 1px var(--line)}
+.op.hot{border-left-color:var(--hot)}.op .n{font-weight:600}.m{font-size:12px;color:var(--mute)}
+details summary{cursor:pointer;color:var(--mute);font-size:12px}.hot-text{color:var(--hot);font-weight:600}
+</style></head><body><main>
+{% set top = phases | first %}<h1>Query profile</h1>
+<p><span class="hot-text">{{ top.name }}</span> takes {{ top.pct }} of operator CPU time ({{ top.seconds }} s of {{ cpu }} s, summed over threads, across {{ nodes | length }} operators);
+the query ran {{ latency }} s end to end. {% if saved == "200" %}Profile saved to <code>{{ path }}</code>.{% else %}The profile was not saved (status {{ saved }}).{% endif %}</p>
+<section class="grid">{% for c in cards %}<div class="card"><b>{{ c.t }}</b><span>{{ c.v }}</span></div>{% endfor %}</section>
+<details><summary>SQL</summary><pre>{{ sql }}</pre></details>
+<h2>Time by operator</h2><table><tr><th>Operator</th><th>Nodes</th><th>Seconds</th><th>Share</th></tr>
+{% for p in phases %}<tr><td>{{ p.name }}</td><td>{{ p.nodes }}</td><td>{{ p.seconds }}</td><td>{{ p.pct }}</td></tr>{% endfor %}</table>
+<h2>Operator tree</h2><div class="tree">{% for n in nodes %}
+<div class="op{% if n.hot %} hot{% endif %}" style="margin-left:{{ n.indent }}px;--share:{{ n.pct }}"><span class="n">{{ n.name }}</span>
+<span class="m">{{ n.seconds }} s · {{ n.pct }} · {{ n.card }} rows · est {{ n.est }}{% if n.scanned != "0" %} · scanned {{ n.scanned }}{% endif %}</span>
+{% if n.extra %}<details><summary>extra info</summary><div class="m">{% for e in n.extra %}{{ e }}<br>{% endfor %}</div></details>{% endif %}</div>{% endfor %}
+</div></main></body></html>$t$, json_object(
+    'sql', $sql, 'path', path, 'saved', saved_status, 'cpu', printf('%.4f', sum(seconds)),
+    'latency', printf('%.4f', (profile ->> 'latency')::DOUBLE),
+    'phases', list({name: name, nodes: nodes, seconds: printf('%.6f', seconds), pct: printf('%.1f%%', part * 100)} ORDER BY seconds DESC),
+    'nodes', list_sort(flatten(list(members))),
+    'cards', [{t: 'Latency', v: printf('%.4f s', (profile ->> 'latency')::DOUBLE)},
+              {t: 'Operator CPU', v: printf('%.4f s', sum(seconds))},
+              {t: 'Rows scanned', v: printf('%,d', (profile ->> 'cumulative_rows_scanned')::BIGINT)},
+              {t: 'Read', v: format_bytes((profile ->> 'total_bytes_read')::BIGINT)},
+              {t: 'Written', v: format_bytes((profile ->> 'total_bytes_written')::BIGINT)},
+              {t: 'Peak buffer memory', v: format_bytes((profile ->> 'system_peak_buffer_memory')::BIGINT)},
+              {t: 'Peak temp dir', v: format_bytes((profile ->> 'system_peak_temp_dir_size')::BIGINT)},
+              {t: 'Memory allocated', v: format_bytes((profile ->> 'total_memory_allocated')::BIGINT)}])) AS html
+FROM phase GROUP BY profile, path, saved_status;
+
+statement ok
+SET VARIABLE got = (SELECT handler FROM quackapi_routes() WHERE name = 'profile');
+
+query II
+FROM tree_diff($orig$WITH run AS (
+    SELECT explain_value::JSON AS profile, explain_value AS profile_text,
+           '~/.duck/logs/profiles/' || strftime(now(), '%Y%m%dT%H%M%S.%fZ') || '.json' AS path, quote_literal(path) AS target
+    FROM quack_query('quack:localhost:9494', 'EXPLAIN (ANALYZE, FORMAT json) ' || $sql, token := getenv('QUACK_TOKEN'))
+), saved AS (
+    SELECT *, selfdispatch(tera_render($copy$
+COPY (SELECT $profile${{ profile_text }}$profile$) TO {{ target }} (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+$copy$, c::JSON, autoescape := false)).status::VARCHAR AS saved_status
+    FROM run c
+), node AS (   -- every operator in the profile, in order; depth is how many children its path has
+    SELECT saved.profile, saved.path, saved.saved_status, t.id AS idx, t.value ->> 'operator_name' AS name, len(string_split(t.path, 'children')) - 3 AS depth,
+           (t.value ->> 'operator_timing')::DOUBLE AS seconds, (t.value ->> 'operator_cardinality')::UBIGINT AS card,
+           (t.value ->> 'operator_rows_scanned')::UBIGINT AS scanned, (t.value -> 'extra_info' ->> 'Estimated Cardinality') AS est,
+           list_transform(list_filter(json_keys(t.value -> 'extra_info'), lambda k: k <> 'Estimated Cardinality'), lambda k: k || ': ' || (t.value -> 'extra_info' ->> k)) AS extra
+    FROM saved CROSS JOIN LATERAL json_tree(saved.profile) t
+    WHERE json_exists(t.value, '$.operator_name') AND (t.value ->> 'operator_type') <> 'EXPLAIN_ANALYZE'
+), share AS (
+    SELECT *, seconds / sum(seconds) OVER () AS part FROM node
+), phase AS (
+    SELECT profile, path, saved_status, name, sum(seconds) AS seconds, sum(part) AS part, count(idx) AS nodes,
+           list({idx: idx, name: name, indent: depth * 18, seconds: printf('%.6f', seconds), pct: printf('%.1f%%', part * 100),
+                 card: printf('%,d', card), est: coalesce(est, '?'), scanned: printf('%,d', scanned), extra: coalesce(extra, []), hot: part >= 0.25}) AS members
+    FROM share GROUP BY ALL
+)
+SELECT tera_render($t$<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Query profile</title><style>
+:root{--bg:#fafaf7;--card:#fff;--ink:#1c1c19;--mute:#6b6a62;--line:#e3e1d8;--hot:#d97706;--bar:#f6e3c3;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#121210;--card:#1b1b18;--ink:#ecebe4;--mute:#a3a299;--line:#34332e;--hot:#f59e0b;--bar:#4a3410}}
+:root[data-theme="dark"]{--bg:#121210;--card:#1b1b18;--ink:#ecebe4;--mute:#a3a299;--line:#34332e;--hot:#f59e0b;--bar:#4a3410}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif}
+main{max-width:980px;margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 8px}h2{font-size:16px;margin:28px 0 8px}
+code,pre,.m,td{font-family:var(--mono)}code{font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:16px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.card b{display:block;font-size:11px;color:var(--mute);font-weight:500;text-transform:uppercase;letter-spacing:.05em}.card span{font:600 17px var(--mono)}
+pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;overflow-x:auto;font-size:13px;white-space:pre-wrap}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:right}th:first-child,td:first-child{text-align:left}th{color:var(--mute);font-weight:500}
+.tree{overflow-x:auto;padding-bottom:8px}
+.op{border-left:3px solid var(--line);margin:3px 0;padding:6px 10px;border-radius:4px;min-width:260px;
+    background:linear-gradient(90deg,var(--bar) var(--share),var(--card) var(--share));box-shadow:inset 0 0 0 1px var(--line)}
+.op.hot{border-left-color:var(--hot)}.op .n{font-weight:600}.m{font-size:12px;color:var(--mute)}
+details summary{cursor:pointer;color:var(--mute);font-size:12px}.hot-text{color:var(--hot);font-weight:600}
+</style></head><body><main>
+{% set top = phases | first %}<h1>Query profile</h1>
+<p><span class="hot-text">{{ top.name }}</span> takes {{ top.pct }} of operator CPU time ({{ top.seconds }} s of {{ cpu }} s, summed over threads, across {{ nodes | length }} operators);
+the query ran {{ latency }} s end to end. {% if saved == "200" %}Profile saved to <code>{{ path }}</code>.{% else %}The profile was not saved (status {{ saved }}).{% endif %}</p>
+<section class="grid">{% for c in cards %}<div class="card"><b>{{ c.t }}</b><span>{{ c.v }}</span></div>{% endfor %}</section>
+<details><summary>SQL</summary><pre>{{ sql }}</pre></details>
+<h2>Time by operator</h2><table><tr><th>Operator</th><th>Nodes</th><th>Seconds</th><th>Share</th></tr>
+{% for p in phases %}<tr><td>{{ p.name }}</td><td>{{ p.nodes }}</td><td>{{ p.seconds }}</td><td>{{ p.pct }}</td></tr>{% endfor %}</table>
+<h2>Operator tree</h2><div class="tree">{% for n in nodes %}
+<div class="op{% if n.hot %} hot{% endif %}" style="margin-left:{{ n.indent }}px;--share:{{ n.pct }}"><span class="n">{{ n.name }}</span>
+<span class="m">{{ n.seconds }} s · {{ n.pct }} · {{ n.card }} rows · est {{ n.est }}{% if n.scanned != "0" %} · scanned {{ n.scanned }}{% endif %}</span>
+{% if n.extra %}<details><summary>extra info</summary><div class="m">{% for e in n.extra %}{{ e }}<br>{% endfor %}</div></details>{% endif %}</div>{% endfor %}
+</div></main></body></html>$t$, json_object(
+    'sql', $sql, 'path', path, 'saved', saved_status, 'cpu', printf('%.4f', sum(seconds)),
+    'latency', printf('%.4f', (profile ->> 'latency')::DOUBLE),
+    'phases', list({name: name, nodes: nodes, seconds: printf('%.6f', seconds), pct: printf('%.1f%%', part * 100)} ORDER BY seconds DESC),
+    'nodes', list_sort(flatten(list(members))),
+    'cards', [{t: 'Latency', v: printf('%.4f s', (profile ->> 'latency')::DOUBLE)},
+              {t: 'Operator CPU', v: printf('%.4f s', sum(seconds))},
+              {t: 'Rows scanned', v: printf('%,d', (profile ->> 'cumulative_rows_scanned')::BIGINT)},
+              {t: 'Read', v: format_bytes((profile ->> 'total_bytes_read')::BIGINT)},
+              {t: 'Written', v: format_bytes((profile ->> 'total_bytes_written')::BIGINT)},
+              {t: 'Peak buffer memory', v: format_bytes((profile ->> 'system_peak_buffer_memory')::BIGINT)},
+              {t: 'Peak temp dir', v: format_bytes((profile ->> 'system_peak_temp_dir_size')::BIGINT)},
+              {t: 'Memory allocated', v: format_bytes((profile ->> 'total_memory_allocated')::BIGINT)}])) AS html
+FROM phase GROUP BY profile, path, saved_status$orig$, getvariable('got'));
+----
+0	false
+
+# The nested dollar-quoted body, newlines and all, comes back verbatim.
+query I
+SELECT contains(getvariable('got'), $orig$$copy$
+COPY (SELECT $profile${{ profile_text }}$profile$) TO {{ target }} (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+$copy$$orig$);
+----
+true
+
+# ── token forms ────────────────────────────────────────────────────────────
+
+# Quoted identifiers, '' inside a literal, E'' escapes, a /* */ comment, casts, a list subscript, a $1-style parameter
+# and an exec-route parameter keep their meaning.
+statement ok
+CREATE OR REPLACE ROUTE forms GET '/forms' AS SELECT "odd name"."col x" AS "a b", 'it''s' AS q, E'tab\there' AS e, /* note */ [1, 2, 3][2] AS i, 1.5e3::INTEGER AS n, -1 AS neg FROM (SELECT 1 AS "col x") "odd name";
+
+statement ok
+SET VARIABLE got = (SELECT handler FROM quackapi_routes() WHERE name = 'forms');
+
+query II
+FROM tree_diff($orig$SELECT "odd name"."col x" AS "a b", 'it''s' AS q, E'tab\there' AS e, /* note */ [1, 2, 3][2] AS i, 1.5e3::INTEGER AS n, -1 AS neg FROM (SELECT 1 AS "col x") "odd name"$orig$, getvariable('got'));
+----
+0	false
+
+statement ok
+CREATE OR REPLACE ROUTE exec POST '/exec' AS $sql;
+
+query I
+SELECT handler FROM quackapi_routes() WHERE name = 'exec';
+----
+$sql
+
+# A statement ends at its own ';': the next one runs as ordinary SQL.
+statement ok
+CREATE OR REPLACE ROUTE first GET '/first' AS SELECT ';' AS semi; CREATE OR REPLACE ROUTE second GET '/second' AS SELECT 2 AS two;
+
+query II
+SELECT name, handler FROM quackapi_routes() WHERE name IN ('first', 'second') ORDER BY name;
+----
+first	SELECT ';' AS semi
+second	SELECT 2 AS two
+
+# Two adjacent string literals concatenate only across a newline, which the token view does not carry: refused, not
+# guessed.
+statement error
+CREATE OR REPLACE ROUTE adjacent GET '/adjacent' AS SELECT 'a'
+'b' AS ab;
+----
+cannot rebuild adjacent string literals
+
+statement ok
+DROP ROUTE first;
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name = 'first';
+----
+0

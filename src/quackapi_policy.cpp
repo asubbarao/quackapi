@@ -629,7 +629,7 @@ vector<string> SplitCsv(const string &csv) {
 }
 
 unique_ptr<FunctionData> ApplyPolicyBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyPolicyBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -763,7 +763,7 @@ struct PoliciesGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> PoliciesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -865,7 +865,7 @@ void PoliciesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 } // namespace
@@ -913,15 +913,16 @@ string CurrentCatalog(Connection &con) {
 
 PolicyTableIdentity IdentityFromBaseRef(const BaseTableRef &ref, const string &default_catalog) {
 	PolicyTableIdentity identity;
-	identity.catalog = ref.catalog_name.empty() ? default_catalog : ref.catalog_name;
-	identity.schema = ref.schema_name.empty() ? "main" : ref.schema_name;
-	identity.table = ref.table_name;
+	auto &name = ref.GetQualifiedName();
+	identity.catalog = name.Catalog().empty() ? default_catalog : name.Catalog().GetIdentifierName();
+	identity.schema = name.Schema().empty() ? "main" : name.Schema().GetIdentifierName();
+	identity.table = name.Name().GetIdentifierName();
 	return identity;
 }
 
 bool ParsePolicyTableIdentity(const string &table_name, const string &default_catalog, PolicyTableIdentity &identity) {
 	try {
-		Parser parser;
+		auto parser = Parser::GetBuiltinParser();
 		parser.ParseQuery("SELECT * FROM " + table_name);
 		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 			return false;
@@ -1038,7 +1039,7 @@ bool IsCatalogView(PolicyRewriteContext &ctx, const PolicyTableIdentity &identit
 
 bool ParseSecureSubquery(const string &sql, unique_ptr<SelectStatement> &out) {
 	try {
-		Parser parser;
+		auto parser = Parser::GetBuiltinParser();
 		parser.ParseQuery(sql);
 		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 			return false;
@@ -1064,7 +1065,7 @@ bool RewritePolicyExpression(ParsedExpression &expression, PolicyRewriteContext 
 	try {
 		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 			auto &subquery = expression.Cast<SubqueryExpression>();
-			if (!subquery.subquery || !RewritePolicySelect(*subquery.subquery, ctx)) {
+			if (!subquery.Subquery() || !RewritePolicySelect(*subquery.SubqueryMutable(), ctx)) {
 				if (ctx.error.empty()) {
 					ctx.Reject("policy enforcement could not inspect a nested subquery");
 				}
@@ -1203,7 +1204,7 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 			ctx.Reject("policy enforcement could not construct a secure subquery");
 			return false;
 		}
-		string alias = ref->alias.empty() ? base.table_name : ref->alias;
+		Identifier alias = ref->alias.empty() ? base.Table() : ref->alias;
 		auto replacement = make_uniq<SubqueryRef>(std::move(secure_query), alias);
 		ref->CopyProperties(*replacement);
 		replacement->alias = alias;
@@ -1256,7 +1257,7 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 
 bool RewritePolicyQueryNode(QueryNode &node, PolicyRewriteContext &ctx) {
 	for (auto &entry : node.cte_map.map) {
-		if (!entry.second || !entry.second->query || !RewritePolicySelect(*entry.second->query, ctx)) {
+		if (!entry.second || !entry.second->query_node || !RewritePolicyQueryNode(*entry.second->query_node, ctx)) {
 			ctx.Reject("policy enforcement could not inspect a common table expression");
 			return false;
 		}
@@ -1314,7 +1315,7 @@ bool RewriteHandlerWithPoliciesAst(DatabaseInstance &db, const string &handler_s
 	}
 	PolicyRewriteContext ctx(db, rap_bindings, mask_bindings, authenticated);
 	try {
-		Parser parser;
+		auto parser = Parser::GetBuiltinParser();
 		parser.ParseQuery(handler_sql);
 		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 			ctx.Reject("policy enforcement supports one SELECT statement per handler");
@@ -1356,7 +1357,7 @@ string RewriteHandlerWithPolicies(DatabaseInstance &db, const string &handler_sq
 }
 
 PolicyDdlParserExtension::PolicyDdlParserExtension() {
-	parse_function = PolicyDdlParse;
+	parse_function = QuackapiTokenParse<PolicyDdlParse>;
 	plan_function = PolicyDdlPlan;
 }
 

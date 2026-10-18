@@ -1,6 +1,7 @@
 #include "quackapi_http_fetch.hpp"
 #include "quackapi_thread_join.hpp"
 #include "quackapi_limits.hpp"
+#include "quackapi_util.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -744,7 +745,7 @@ struct FetchTableBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> PoolBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
 	names = {"host", "idle", "dialed", "reused"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
 	return nullptr;
@@ -768,7 +769,7 @@ void PoolExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 //! Concurrent GETs — the seam SQLLogic needs for claim-race / fan-out tests.
@@ -792,7 +793,7 @@ struct ParallelFetchGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ParallelFetchBind(ClientContext &, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<ParallelFetchBindData>();
 	bind->url = input.inputs[0].GetValue<string>();
 	bind->n = input.inputs[1].GetValue<int32_t>();
@@ -851,7 +852,7 @@ void ParallelFetchExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 } // namespace
@@ -867,21 +868,21 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	// any benchmark built on it.
 	ScalarFunctionSet fetch_set("quackapi_fetch");
 	ScalarFunction fetch1("quackapi_fetch", {LogicalType::VARCHAR}, result_type, FetchScalar);
-	fetch1.stability = FunctionStability::VOLATILE;
+	fetch1.SetVolatile();
 	ScalarFunction fetch2("quackapi_fetch", {LogicalType::VARCHAR, header_type}, result_type, FetchScalar);
-	fetch2.stability = FunctionStability::VOLATILE;
+	fetch2.SetVolatile();
 	// stall_ms: after send, wait N ms before reading (socket write-timeout test seam).
 	ScalarFunction fetch_stall("quackapi_fetch", {LogicalType::VARCHAR, LogicalType::INTEGER}, result_type,
 	                           FetchScalar);
-	fetch_stall.stability = FunctionStability::VOLATILE;
+	fetch_stall.SetVolatile();
 	ScalarFunction fetch_hdr_stall("quackapi_fetch", {LogicalType::VARCHAR, header_type, LogicalType::INTEGER},
 	                               result_type, FetchScalar);
-	fetch_hdr_stall.stability = FunctionStability::VOLATILE;
+	fetch_hdr_stall.SetVolatile();
 	fetch_set.AddFunction(fetch1);
 	fetch_set.AddFunction(fetch2);
 	fetch_set.AddFunction(fetch_stall);
 	fetch_set.AddFunction(fetch_hdr_stall);
-	loader.RegisterFunction(fetch_set);
+	RegisterFallible(loader, fetch_set);
 
 	// Table form exposes named stall_ms := N (scalars have no named_parameters).
 	TableFunction fetch_tf(
@@ -897,11 +898,11 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    for (idx_t c = 0; c < children.size(); c++) {
 			    output.SetValue(c, 0, children[c]);
 		    }
-		    output.SetCardinality(1);
+		    output.SetChildCardinality(1);
 		    bind.finished = true;
 	    },
 	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-	       vector<string> &names) -> unique_ptr<FunctionData> {
+	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
 		    auto bind = make_uniq<FetchTableBindData>();
 		    if (input.inputs.empty() || input.inputs[0].IsNull()) {
 			    throw InvalidInputException("quackapi_fetch(url, stall_ms := N): url must be non-NULL");
@@ -922,27 +923,27 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    }
 		    return std::move(bind);
 	    });
-	fetch_tf.named_parameters["headers"] = header_type;
-	fetch_tf.named_parameters["stall_ms"] = LogicalType::INTEGER;
+	AddNamedParameter(fetch_tf, "headers", header_type);
+	AddNamedParameter(fetch_tf, "stall_ms", LogicalType::INTEGER);
 	loader.RegisterFunction(fetch_tf);
 
 	ScalarFunctionSet post_set("quackapi_post");
 	ScalarFunction post2("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR}, result_type, PostScalar);
-	post2.stability = FunctionStability::VOLATILE;
+	post2.SetVolatile();
 	ScalarFunction post2j("quackapi_post", {LogicalType::VARCHAR, LogicalType::JSON()}, result_type, PostScalar);
-	post2j.stability = FunctionStability::VOLATILE;
+	post2j.SetVolatile();
 	ScalarFunction post3("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     result_type, PostScalar);
-	post3.stability = FunctionStability::VOLATILE;
+	post3.SetVolatile();
 	ScalarFunction post4("quackapi_post",
 	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, header_type}, result_type,
 	                     PostScalar);
-	post4.stability = FunctionStability::VOLATILE;
+	post4.SetVolatile();
 	post_set.AddFunction(post2);
 	post_set.AddFunction(post2j);
 	post_set.AddFunction(post3);
 	post_set.AddFunction(post4);
-	loader.RegisterFunction(post_set);
+	RegisterFallible(loader, post_set);
 
 	loader.RegisterFunction(TableFunction("quackapi_http_pool", {}, PoolExec, PoolBind, PoolInit));
 

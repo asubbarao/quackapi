@@ -286,7 +286,7 @@ struct ApplyStreamBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyStreamBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyStreamBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -368,7 +368,7 @@ struct StreamsGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> StreamsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -404,13 +404,13 @@ void StreamsExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output)
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 } // namespace
 
 StreamDdlParserExtension::StreamDdlParserExtension() {
-	parse_function = StreamDdlParse;
+	parse_function = QuackapiTokenParse<StreamDdlParse>;
 	plan_function = StreamDdlPlan;
 }
 

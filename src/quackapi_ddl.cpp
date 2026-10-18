@@ -1126,7 +1126,7 @@ struct ApplyRouteBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyRouteBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -1614,7 +1614,7 @@ struct ApplyGroupBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyGroupBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyGroupBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -1686,7 +1686,7 @@ struct GroupsGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> GroupsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                    vector<string> &names) {
+                                    vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -1731,13 +1731,13 @@ void GroupsExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) 
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 } // namespace
 
 RouteDdlParserExtension::RouteDdlParserExtension() {
-	parse_function = RouteDdlParse;
+	parse_function = QuackapiTokenParse<RouteDdlParse>;
 	plan_function = RouteDdlPlan;
 }
 
@@ -1746,7 +1746,7 @@ TableFunction GetApplyRouteFunction() {
 }
 
 GroupDdlParserExtension::GroupDdlParserExtension() {
-	parse_function = GroupDdlParse;
+	parse_function = QuackapiTokenParse<GroupDdlParse>;
 	plan_function = GroupDdlPlan;
 }
 

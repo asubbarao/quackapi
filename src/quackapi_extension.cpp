@@ -30,6 +30,7 @@
 #include "quackapi_state.hpp"
 #include "quackapi_stream.hpp"
 #include "quackapi_table_api.hpp"
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
@@ -62,7 +63,7 @@ static void QuackapiEnsureSignalHandlers() {
 #endif
 
 static bool QuackapiStopRequested(ClientContext &context) {
-	return context.interrupted || quackapi_signal_stop.load();
+	return context.IsInterrupted() || quackapi_signal_stop.load();
 }
 
 //! Hold until the server on port is gone, or SIGINT/SIGTERM / query interrupt.
@@ -84,7 +85,7 @@ static void QuackapiBlockUntilStopped(ClientContext &context, int32_t port) {
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
-	if (context.interrupted) {
+	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 }
@@ -162,13 +163,13 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
 		Value setting;
 		int64_t value = fallback;
-		auto named = input.named_parameters.find(name);
+		auto named = input.named_parameters.find(Identifier(name));
 		if (named != input.named_parameters.end()) {
 			if (named->second.IsNull()) {
 				throw InvalidInputException("%s must not be NULL", name);
 			}
 			value = named->second.GetValue<int64_t>();
-		} else if (context.TryGetCurrentSetting("quackapi_" + name, setting) && !setting.IsNull()) {
+		} else if (context.TryGetCurrentSetting(Identifier("quackapi_" + name), setting) && !setting.IsNull()) {
 			value = setting.GetValue<int64_t>();
 		}
 		if (value <= 0 || value > maximum) {
@@ -210,7 +211,7 @@ static void BindAccessLogPrivacy(ClientContext &context, TableFunctionBindInput 
 }
 
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ServeBindData>();
 	BindResourceLimits(context, input, bind_data->limits);
 	BindAccessLogPrivacy(context, input, bind_data->limits);
@@ -486,7 +487,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.compression_min_bytes = bind_data.compression_min_bytes;
 	QuackapiState::Get(*context.db).StartServer(*context.db, bind_data.host, bind_data.port, opts);
 	output.SetValue(0, 0, Value(StringUtil::Format("http://%s:%d", bind_data.host, bind_data.port)));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	bind_data.started = true;
 	// Emit listen_url now; block on the next Exec so the row reaches the client
 	// before we hold the query open (supervised-process / launchd recipe).
@@ -505,7 +506,7 @@ struct StopBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> StopBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<StopBindData>();
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
@@ -531,7 +532,7 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 		message = StringUtil::Format("No quackapi server on port %d", bind_data.port);
 	}
 	output.SetValue(0, 0, Value(message));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	bind_data.finished = true;
 }
 
@@ -549,7 +550,7 @@ struct WaitBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> WaitBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs.empty()) {
 		throw InvalidInputException("quackapi_wait(port [, timeout_ms]) requires a port");
 	}
@@ -598,7 +599,7 @@ static void WaitExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	while (true) {
 		if (QuackapiStopRequested(context)) {
 			quackapi_signal_stop.store(false);
-			if (context.interrupted) {
+			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
 			break;
@@ -619,7 +620,7 @@ static void WaitExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	} else {
 		output.SetValue(1, 0, Value());
 	}
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	bind_data.finished = true;
 }
 
@@ -643,7 +644,7 @@ struct RequestBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs.size() < 2 || input.inputs.size() > 3) {
 		throw InvalidInputException(
 		    "quackapi_request(method, path [, body] [, headers := MAP] [, pg_dsn := VARCHAR]) expects 2 or 3 "
@@ -742,7 +743,7 @@ static void RequestExec(ClientContext &context, TableFunctionInput &data_p, Data
 		hv.emplace_back(kv.second);
 	}
 	output.SetValue(3, 0, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, hk, hv));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	bind_data.finished = true;
 }
 
@@ -758,7 +759,7 @@ struct RoutesGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> RoutesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                           vector<string> &names) {
+                                           vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -815,7 +816,7 @@ static void RoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 //===--------------------------------------------------------------------===//
@@ -830,7 +831,7 @@ struct ServersGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> ServersBind(ClientContext &, TableFunctionBindInput &,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("host");
 	return_types.emplace_back(LogicalType::INTEGER);
@@ -867,7 +868,7 @@ static void ServersExec(ClientContext &, TableFunctionInput &data_p, DataChunk &
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 //===--------------------------------------------------------------------===//
@@ -939,7 +940,7 @@ static Value RequestsValue(const QuackapiRequestRecord &record, idx_t column) {
 }
 
 static unique_ptr<FunctionData> RequestsBind(ClientContext &, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<RequestsBindData>();
 	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
 	if (has_port) {
@@ -1002,7 +1003,7 @@ static void RequestsExec(ClientContext &, TableFunctionInput &data_p, DataChunk 
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1019,7 +1020,7 @@ struct TelemetryStatusGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> TelemetryStatusBind(ClientContext &, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<TelemetryStatusBindData>();
 	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
 	if (has_port) {
@@ -1067,7 +1068,7 @@ static void TelemetryStatusExec(ClientContext &, TableFunctionInput &data_p, Dat
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 struct TelemetryFlushBindData : public TableFunctionData {
@@ -1076,7 +1077,7 @@ struct TelemetryFlushBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> TelemetryFlushBind(ClientContext &, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<TelemetryFlushBindData>();
 	const bool has_port = !input.inputs.empty() && !input.inputs[0].IsNull();
 	if (has_port) {
@@ -1103,7 +1104,7 @@ static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_
 		output.SetValue(0, 0,
 		                Value(StringUtil::Format("Flushed telemetry for quackapi server on port %d", bind_data.port)));
 	}
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	bind_data.finished = true;
 }
 
@@ -1113,9 +1114,9 @@ static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_
 // When curl_httpfs is LOADed this is typically "MultiCurl". Same underlying
 // DBConfig::GetHTTPUtil().GetName() that curl_httpfs_http_util_name() reads.
 
-static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &result) {
+static void HttpUtilNameFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
-	result.Reference(Value(QuackapiHttpFetch::ActiveHttpUtilName(db)));
+	result.Reference(Value(QuackapiHttpFetch::ActiveHttpUtilName(db)), count_t(args.size()));
 }
 
 //===--------------------------------------------------------------------===//
@@ -1125,9 +1126,9 @@ static void HttpUtilNameFunction(DataChunk &, ExpressionState &state, Vector &re
 // write_timeout_sec when no route override ran, or the route timeout_sec when
 // ApplyRouteIoTimeout extended the socket deadlines. Not a registry lookup.
 
-static void LastWriteTimeoutSecFunction(DataChunk &, ExpressionState &state, Vector &result) {
+static void LastWriteTimeoutSecFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &qa = QuackapiState::Get(*state.GetContext().db);
-	result.Reference(Value::INTEGER(qa.GetLastEffectiveWriteTimeoutSec()));
+	result.Reference(Value::INTEGER(qa.GetLastEffectiveWriteTimeoutSec()), count_t(args.size()));
 }
 
 //===--------------------------------------------------------------------===//
@@ -1220,83 +1221,81 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Also carries compression + compression_min_bytes + http_client.
 	TableFunctionSet serve_set("quackapi_serve");
 	TableFunction serve("quackapi_serve", {LogicalType::INTEGER}, ServeExec, ServeBind);
-	serve.named_parameters["host"] = LogicalType::VARCHAR;
-	serve.named_parameters["static_dir"] = LogicalType::VARCHAR;
-	serve.named_parameters["cors_origins"] = LogicalType::VARCHAR;
-	serve.named_parameters["memory_limit"] = LogicalType::VARCHAR;
-	serve.named_parameters["log_level"] = LogicalType::VARCHAR;
-	serve.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
-	serve.named_parameters["request_ring"] = LogicalType::BIGINT;
-	serve.named_parameters["log_headers"] = LogicalType::VARCHAR;
-	serve.named_parameters["log_query"] = LogicalType::BOOLEAN;
-	serve.named_parameters["access_log"] = LogicalType::ANY;
-	serve.named_parameters["enable_logging"] = LogicalType::BOOLEAN;
-	serve.named_parameters["health_routes"] = LogicalType::BOOLEAN;
-	serve.named_parameters["threads"] = LogicalType::VARCHAR;
-	serve.named_parameters["preserve_insertion_order"] = LogicalType::BOOLEAN;
-	serve.named_parameters["enable_http_metadata_cache"] = LogicalType::BOOLEAN;
-	serve.named_parameters["worker_threads"] = LogicalType::INTEGER;
-	serve.named_parameters["keep_alive_max_count"] = LogicalType::INTEGER;
-	serve.named_parameters["keep_alive_timeout_sec"] = LogicalType::INTEGER;
-	serve.named_parameters["read_timeout_sec"] = LogicalType::INTEGER;
-	serve.named_parameters["write_timeout_sec"] = LogicalType::INTEGER;
-	serve.named_parameters["compression"] = LogicalType::ANY;
-	serve.named_parameters["compression_min_bytes"] = LogicalType::BIGINT;
-	serve.named_parameters["http_client"] = LogicalType::VARCHAR;
-	serve.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
-	serve.named_parameters["block"] = LogicalType::BOOLEAN;
-	serve.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
-	serve.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
-	serve.named_parameters["max_pending_requests"] = LogicalType::BIGINT;
+	AddNamedParameter(serve, "host", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "static_dir", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "cors_origins", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "memory_limit", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "log_level", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "slow_request_ms", LogicalType::BIGINT);
+	AddNamedParameter(serve, "request_ring", LogicalType::BIGINT);
+	AddNamedParameter(serve, "log_headers", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "log_query", LogicalType::BOOLEAN);
+	AddNamedParameter(serve, "access_log", LogicalType::ANY);
+	AddNamedParameter(serve, "enable_logging", LogicalType::BOOLEAN);
+	AddNamedParameter(serve, "health_routes", LogicalType::BOOLEAN);
+	AddNamedParameter(serve, "threads", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "preserve_insertion_order", LogicalType::BOOLEAN);
+	AddNamedParameter(serve, "enable_http_metadata_cache", LogicalType::BOOLEAN);
+	AddNamedParameter(serve, "worker_threads", LogicalType::INTEGER);
+	AddNamedParameter(serve, "keep_alive_max_count", LogicalType::INTEGER);
+	AddNamedParameter(serve, "keep_alive_timeout_sec", LogicalType::INTEGER);
+	AddNamedParameter(serve, "read_timeout_sec", LogicalType::INTEGER);
+	AddNamedParameter(serve, "write_timeout_sec", LogicalType::INTEGER);
+	AddNamedParameter(serve, "compression", LogicalType::ANY);
+	AddNamedParameter(serve, "compression_min_bytes", LogicalType::BIGINT);
+	AddNamedParameter(serve, "http_client", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "pg_dsn", LogicalType::VARCHAR);
+	AddNamedParameter(serve, "block", LogicalType::BOOLEAN);
+	AddNamedParameter(serve, "query_timeout_ms", LogicalType::BIGINT);
+	AddNamedParameter(serve, "max_response_bytes", LogicalType::BIGINT);
+	AddNamedParameter(serve, "max_pending_requests", LogicalType::BIGINT);
 	serve_set.AddFunction(serve);
-	serve.arguments.clear();
-	serve_set.AddFunction(serve);
+	serve_set.AddFunction(WithoutPositionalArguments(serve));
 	loader.RegisterFunction(serve_set);
 
 	// quackapi_stop() / quackapi_stop(port)
 	TableFunctionSet stop_set("quackapi_stop");
 	TableFunction stop("quackapi_stop", {LogicalType::INTEGER}, StopExec, StopBind);
 	stop_set.AddFunction(stop);
-	stop.arguments.clear();
-	stop_set.AddFunction(stop);
+	stop_set.AddFunction(WithoutPositionalArguments(stop));
 	loader.RegisterFunction(stop_set);
 
 	// quackapi_wait(port) / quackapi_wait(port, timeout_ms) — readiness probe
 	TableFunctionSet wait_set("quackapi_wait");
 	TableFunction wait1("quackapi_wait", {LogicalType::INTEGER}, WaitExec, WaitBind);
-	wait1.named_parameters["host"] = LogicalType::VARCHAR;
-	wait1.named_parameters["timeout_ms"] = LogicalType::BIGINT;
+	AddNamedParameter(wait1, "host", LogicalType::VARCHAR);
+	AddNamedParameter(wait1, "timeout_ms", LogicalType::BIGINT);
 	wait_set.AddFunction(wait1);
 	TableFunction wait2("quackapi_wait", {LogicalType::INTEGER, LogicalType::BIGINT}, WaitExec, WaitBind);
-	wait2.named_parameters["host"] = LogicalType::VARCHAR;
-	wait2.named_parameters["timeout_ms"] = LogicalType::BIGINT;
+	AddNamedParameter(wait2, "host", LogicalType::VARCHAR);
+	AddNamedParameter(wait2, "timeout_ms", LogicalType::BIGINT);
 	wait_set.AddFunction(wait2);
 	loader.RegisterFunction(wait_set);
 
 	// quackapi_request — SQLLogic TestClient (no TCP, no .sh).
 	TableFunctionSet request_set("quackapi_request");
 	TableFunction request2("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RequestExec, RequestBind);
-	request2.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-	request2.named_parameters["access_log"] = LogicalType::ANY;
-	request2.named_parameters["log_level"] = LogicalType::VARCHAR;
-	request2.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
-	request2.named_parameters["log_headers"] = LogicalType::VARCHAR;
-	request2.named_parameters["log_query"] = LogicalType::BOOLEAN;
-	request2.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
-	request2.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
-	request2.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
+	AddNamedParameter(request2, "headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
+	AddNamedParameter(request2, "access_log", LogicalType::ANY);
+	AddNamedParameter(request2, "log_level", LogicalType::VARCHAR);
+	AddNamedParameter(request2, "slow_request_ms", LogicalType::BIGINT);
+	AddNamedParameter(request2, "log_headers", LogicalType::VARCHAR);
+	AddNamedParameter(request2, "log_query", LogicalType::BOOLEAN);
+	AddNamedParameter(request2, "pg_dsn", LogicalType::VARCHAR);
+	AddNamedParameter(request2, "query_timeout_ms", LogicalType::BIGINT);
+	AddNamedParameter(request2, "max_response_bytes", LogicalType::BIGINT);
 	request_set.AddFunction(request2);
 	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       RequestExec, RequestBind);
-	request3.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-	request3.named_parameters["access_log"] = LogicalType::ANY;
-	request3.named_parameters["log_level"] = LogicalType::VARCHAR;
-	request3.named_parameters["slow_request_ms"] = LogicalType::BIGINT;
-	request3.named_parameters["log_headers"] = LogicalType::VARCHAR;
-	request3.named_parameters["log_query"] = LogicalType::BOOLEAN;
-	request3.named_parameters["pg_dsn"] = LogicalType::VARCHAR;
-	request3.named_parameters["query_timeout_ms"] = LogicalType::BIGINT;
-	request3.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
+	AddNamedParameter(request3, "headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
+	AddNamedParameter(request3, "access_log", LogicalType::ANY);
+	AddNamedParameter(request3, "log_level", LogicalType::VARCHAR);
+	AddNamedParameter(request3, "slow_request_ms", LogicalType::BIGINT);
+	AddNamedParameter(request3, "log_headers", LogicalType::VARCHAR);
+	AddNamedParameter(request3, "log_query", LogicalType::BOOLEAN);
+	AddNamedParameter(request3, "pg_dsn", LogicalType::VARCHAR);
+	AddNamedParameter(request3, "query_timeout_ms", LogicalType::BIGINT);
+	AddNamedParameter(request3, "max_response_bytes", LogicalType::BIGINT);
 	request_set.AddFunction(request3);
 	loader.RegisterFunction(request_set);
 
@@ -1305,22 +1304,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunctionSet requests_set("quackapi_requests");
 	TableFunction requests1("quackapi_requests", {LogicalType::INTEGER}, RequestsExec, RequestsBind, RequestsInit);
 	requests_set.AddFunction(requests1);
-	requests1.arguments.clear();
-	requests_set.AddFunction(requests1);
+	requests_set.AddFunction(WithoutPositionalArguments(requests1));
 	loader.RegisterFunction(requests_set);
 	TableFunctionSet telemetry_status_set("quackapi_telemetry_status");
 	TableFunction telemetry_status1("quackapi_telemetry_status", {LogicalType::INTEGER}, TelemetryStatusExec,
 	                                TelemetryStatusBind, TelemetryStatusInit);
 	telemetry_status_set.AddFunction(telemetry_status1);
-	telemetry_status1.arguments.clear();
-	telemetry_status_set.AddFunction(telemetry_status1);
+	telemetry_status_set.AddFunction(WithoutPositionalArguments(telemetry_status1));
 	loader.RegisterFunction(telemetry_status_set);
 	TableFunctionSet telemetry_flush_set("quackapi_telemetry_flush");
 	TableFunction telemetry_flush1("quackapi_telemetry_flush", {LogicalType::INTEGER}, TelemetryFlushExec,
 	                               TelemetryFlushBind);
 	telemetry_flush_set.AddFunction(telemetry_flush1);
-	telemetry_flush1.arguments.clear();
-	telemetry_flush_set.AddFunction(telemetry_flush1);
+	telemetry_flush_set.AddFunction(WithoutPositionalArguments(telemetry_flush1));
 	loader.RegisterFunction(telemetry_flush_set);
 	loader.RegisterFunction(GetQuackapiGroupsFunction());
 
