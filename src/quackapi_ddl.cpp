@@ -1268,8 +1268,7 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 					bool ident = true;
 					for (idx_t i = 1; i < bare.size(); i++) {
 						char c = bare[i];
-						if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' ||
-						      (c >= '0' && c <= '9'))) {
+						if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || (c >= '0' && c <= '9'))) {
 							ident = false;
 							break;
 						}

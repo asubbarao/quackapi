@@ -6,6 +6,19 @@ set(TARGET_NAME quackapi)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
+set(NANOARROW_SOURCES
+    third_party/nanoarrow/src/nanoarrow/common/array.c
+    third_party/nanoarrow/src/nanoarrow/common/array_stream.c
+    third_party/nanoarrow/src/nanoarrow/common/schema.c
+    third_party/nanoarrow/src/nanoarrow/common/utils.c
+    third_party/nanoarrow/src/nanoarrow/ipc/codecs.c
+    third_party/nanoarrow/src/nanoarrow/ipc/decoder.c
+    third_party/nanoarrow/src/nanoarrow/ipc/encoder.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/builder.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/emitter.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/refmap.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/verifier.c)
+
 project(${TARGET_NAME})
 
 # Match DuckDB (C++11). C++17 on these TUs emits inline FileFlags/LogicalType
@@ -36,7 +49,8 @@ set(EXTENSION_SOURCES
     src/quackapi_stream.cpp
     src/quackapi_from_x.cpp
     src/quackapi_util.cpp
-    src/quackapi_pg.cpp)
+    src/quackapi_pg.cpp
+    ${NANOARROW_SOURCES})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -53,6 +67,22 @@ target_include_directories(
 target_include_directories(
   ${LOADABLE_EXTENSION_NAME} BEFORE
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
+
+target_include_directories(
+  ${EXTENSION_NAME}
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/thirdparty/flatcc/include)
+target_include_directories(
+  ${LOADABLE_EXTENSION_NAME}
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/thirdparty/flatcc/include)
+
+target_compile_definitions(${EXTENSION_NAME}
+                           PRIVATE NANOARROW_NAMESPACE=QuackapiNanoarrow)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME}
+                           PRIVATE NANOARROW_NAMESPACE=QuackapiNanoarrow)
 
 # The vendored httplib default backlog is 5. That drops loopback connections
 # when the outbound pool fans out to its 32-client cap before the server can

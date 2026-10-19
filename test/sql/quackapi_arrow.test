@@ -1,0 +1,22 @@
+# name: test/sql/quackapi_arrow.test
+# description: Arrow IPC stream route through the in-process request function
+# group: [sql]
+
+require quackapi
+
+query I
+CREATE ROUTE arrow GET '/arrow' FORMAT ARROW AS
+SELECT 1 AS value;
+----
+Route arrow: GET /arrow
+
+query I
+SELECT status FROM quackapi_request('GET', '/arrow');
+----
+200
+
+query I
+SELECT starts_with(hex(body), 'FFFFFFFF')
+FROM quackapi_request('GET', '/arrow');
+----
+true

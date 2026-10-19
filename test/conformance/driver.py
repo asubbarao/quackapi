@@ -116,6 +116,39 @@ def header_get(headers: Dict[str, str], name: str) -> Optional[str]:
     return None
 
 
+def normalize_arrow_value(value: Any) -> Any:
+    """Make pyarrow scalar values comparable to JSON case expectations."""
+    if isinstance(value, dict):
+        return {key: normalize_arrow_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [normalize_arrow_value(item) for item in value]
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def check_arrow(case: dict, body: bytes, failures: List[str]) -> None:
+    """Decode an Arrow IPC stream and check its schema and rows."""
+    try:
+        import pyarrow as pa
+
+        table = pa.ipc.open_stream(body).read_all()
+        schema = [{"name": field.name, "type": str(field.type)} for field in table.schema]
+        rows = [normalize_arrow_value(row) for row in table.to_pylist()]
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"arrow decode: {exc}")
+        return
+
+    expected_schema = case.get("expect_arrow_schema")
+    if expected_schema is not None and schema != expected_schema:
+        failures.append(f"arrow schema: observed={schema!r} expected={expected_schema!r}")
+    expected_rows = case.get("expect_arrow_rows")
+    if expected_rows is not None and rows != expected_rows:
+        failures.append(f"arrow rows: observed={rows!r} expected={expected_rows!r}")
+
+
 def classify(case: dict, verdict: str, notes: str) -> str:
     if verdict == "N/A":
         return case.get("class_hint") or "NOT-BUILT-YET"
@@ -173,6 +206,9 @@ def evaluate(case: dict, status: int, headers: Dict[str, str], body: bytes) -> T
     if case.get("expect_ct_substr"):
         if case["expect_ct_substr"] not in ct:
             failures.append(f"content-type: observed={ct!r} expected substr={case['expect_ct_substr']!r}")
+
+    if case.get("expect_arrow_schema") is not None or case.get("expect_arrow_rows") is not None:
+        check_arrow(case, body, failures)
 
     if case.get("expect_header_present"):
         if header_get(headers, case["expect_header_present"]) is None:

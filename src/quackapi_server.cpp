@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -29,6 +30,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 
@@ -46,6 +48,9 @@
 #include "zstd.h"
 #include "quackapi_util.hpp"
 #include "quackapi_validation.hpp"
+
+#include "nanoarrow/nanoarrow.h"
+#include "nanoarrow/nanoarrow_ipc.h"
 
 namespace duckdb {
 
@@ -1670,48 +1675,118 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 	return ReadAndRemoveFileBytes(con, path);
 }
 
-//! Ensure community nanoarrow is available (LOAD, else INSTALL FROM community).
-void EnsureNanoarrowLoaded(Connection &con) {
-	auto load = con.Query("LOAD nanoarrow");
-	if (!load->HasError()) {
-		return;
-	}
-	auto inst = con.Query("INSTALL nanoarrow FROM community");
-	if (inst->HasError()) {
-		throw InvalidInputException(
-		    "arrow serialize: nanoarrow not available (%s). INSTALL nanoarrow FROM community and retry.",
-		    inst->GetError());
-	}
-	load = con.Query("LOAD nanoarrow");
-	if (load->HasError()) {
-		throw InvalidInputException("arrow serialize: could not LOAD nanoarrow: %s", load->GetError());
-	}
-}
-
-//! Serialize result rows as Arrow IPC stream bytes (nanoarrow FORMAT ARROWS).
-//! Magic is 0xFFFFFFFF stream continuation (not ARROW1 file). Content-Type:
-//! application/vnd.apache.arrow.stream. Same TEMP+COPY+read pattern as parquet.
+//! Serialize result rows as Arrow IPC stream bytes using DuckDB's Arrow C data
+//! converter and the vendored nanoarrow IPC encoder. Magic is 0xFFFFFFFF
+//! stream continuation (not ARROW1 file). Content-Type:
+//! application/vnd.apache.arrow.stream.
 string SerializeRowsArrow(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
                           const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
 	if (data_cols.empty()) {
 		throw InvalidInputException("arrow serialize: no data columns");
 	}
-	EnsureNanoarrowLoaded(con);
-	auto &fs = FileSystem::GetFileSystem(*con.context);
-	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
-	string table = "qa_arrow_" + uid;
-	string path = SerdesTempFilePath(fs, table + ".arrows");
-
-	FillTempTableForSerdes(con, table, names, types, data_cols, rows, "arrow");
-
-	auto copy_res = con.Query("COPY " + table + " TO '" + SqlQuotePath(path) + "' (FORMAT ARROWS)");
-	if (copy_res->HasError()) {
-		con.Query("DROP TABLE IF EXISTS " + table);
-		fs.TryRemoveFile(path);
-		throw InvalidInputException("arrow serialize COPY: %s", copy_res->GetError());
+	vector<string> arrow_names;
+	vector<LogicalType> arrow_types;
+	for (auto col : data_cols) {
+		arrow_names.push_back(names[col]);
+		arrow_types.push_back(types[col]);
 	}
-	con.Query("DROP TABLE IF EXISTS " + table);
-	return ReadAndRemoveFileBytes(con, path);
+
+	ClientProperties properties = con.context->GetClientProperties();
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*con.context, arrow_types);
+	ArrowSchema schema;
+	ArrowSchemaInit(&schema);
+	ArrowIpcEncoder encoder;
+	memset(&encoder, 0, sizeof(encoder));
+	ArrowBuffer output;
+	ArrowBuffer body;
+	ArrowBufferInit(&output);
+	ArrowBufferInit(&body);
+	ArrowError error;
+	ArrowErrorInit(&error);
+	bool encoder_initialized = false;
+
+	auto check_arrow = [&](ArrowErrorCode code, const char *operation) {
+		if (code != NANOARROW_OK) {
+			throw InvalidInputException("arrow serialize %s: %s", operation, ArrowErrorMessage(&error));
+		}
+	};
+
+	try {
+		ArrowConverter::ToArrowSchema(&schema, arrow_types, arrow_names, properties);
+		check_arrow(ArrowIpcEncoderInit(&encoder), "encoder init");
+		encoder_initialized = true;
+
+		check_arrow(ArrowIpcEncoderEncodeSchema(&encoder, &schema, &error), "schema encode");
+		check_arrow(ArrowIpcEncoderFinalizeBuffer(&encoder, 1, &output), "schema finalize");
+
+		for (idx_t offset = 0; offset < rows.size(); offset += STANDARD_VECTOR_SIZE) {
+			idx_t batch_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, rows.size() - offset);
+			DataChunk input;
+			input.Initialize(*con.context, arrow_types, batch_size);
+			for (idx_t row = 0; row < batch_size; row++) {
+				for (idx_t col = 0; col < data_cols.size(); col++) {
+					auto source_col = data_cols[col];
+					input.data[col].SetValue(
+					    row, source_col < rows[offset + row].size() ? rows[offset + row][source_col] : Value());
+				}
+			}
+			input.SetCardinality(batch_size);
+
+			ArrowArray array;
+			array.Init();
+			ArrowArrayView view;
+			memset(&view, 0, sizeof(view));
+			bool view_initialized = false;
+			try {
+				ArrowConverter::ToArrowArray(input, &array, properties, extension_types);
+				check_arrow(ArrowArrayViewInitFromSchema(&view, &schema, &error), "array view init");
+				view_initialized = true;
+				check_arrow(ArrowArrayViewSetArray(&view, &array, &error), "array view set");
+				check_arrow(ArrowIpcEncoderEncodeSimpleRecordBatch(&encoder, &view, &body, &error),
+				            "record batch encode");
+				check_arrow(ArrowIpcEncoderFinalizeBuffer(&encoder, 1, &output), "record batch finalize");
+				check_arrow(ArrowBufferAppend(&output, body.data, body.size_bytes), "record batch append");
+			} catch (...) {
+				if (view_initialized) {
+					ArrowArrayViewReset(&view);
+				}
+				if (array.release) {
+					ArrowArrayRelease(&array);
+				}
+				throw;
+			}
+			if (view_initialized) {
+				ArrowArrayViewReset(&view);
+			}
+			if (array.release) {
+				ArrowArrayRelease(&array);
+			}
+			ArrowBufferReset(&body);
+		}
+
+		const uint8_t end_of_stream[] = {0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0};
+		check_arrow(ArrowBufferAppend(&output, end_of_stream, sizeof(end_of_stream)), "end-of-stream append");
+		string result(reinterpret_cast<const char *>(output.data), output.size_bytes);
+		if (encoder_initialized) {
+			ArrowIpcEncoderReset(&encoder);
+		}
+		ArrowBufferReset(&body);
+		ArrowBufferReset(&output);
+		if (schema.release) {
+			ArrowSchemaRelease(&schema);
+		}
+		return result;
+	} catch (...) {
+		if (encoder_initialized) {
+			ArrowIpcEncoderReset(&encoder);
+		}
+		ArrowBufferReset(&body);
+		ArrowBufferReset(&output);
+		if (schema.release) {
+			ArrowSchemaRelease(&schema);
+		}
+		throw;
+	}
 }
 
 void SetInternalError(quackapi_httplib::Response &res, const string &server_side_detail) {

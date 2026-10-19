@@ -82,7 +82,7 @@ for ext in $(grep -o '"requires_ext": *"[^"]*"' "$CONF/cases.jsonl" | sed 's/.*:
 done
 export QUACKAPI_MISSING_EXTS="$MISSING_EXTS"
 DRIVER_RC=0
-python3 "$CONF/driver.py" --base "$BASE" --cases "$CONF/cases.jsonl" --out "$RESULTS_DIR/results.jsonl" || DRIVER_RC=$?
+uv run --python 3.13 --with pyarrow python "$CONF/driver.py" --base "$BASE" --cases "$CONF/cases.jsonl" --out "$RESULTS_DIR/results.jsonl" || DRIVER_RC=$?
 
 echo "SELECT * FROM quackapi_stop();" >&3
 exec 3>&-
