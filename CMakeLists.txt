@@ -84,6 +84,14 @@ target_compile_definitions(${EXTENSION_NAME}
 target_compile_definitions(${LOADABLE_EXTENSION_NAME}
                            PRIVATE NANOARROW_NAMESPACE=QuackapiNanoarrow)
 
+# nanoarrow 0.9.0's bundled flatcc pendian.h maps bswap32/64 to TinyCC's
+# tcc_bswap32/64 under GCC, which nothing defines; libduckdb.so then fails to
+# link on Linux. Its #ifndef guards take these compiler builtins instead.
+set_source_files_properties(
+  ${NANOARROW_SOURCES}
+  PROPERTIES COMPILE_DEFINITIONS
+             "bswap32=__builtin_bswap32;bswap64=__builtin_bswap64")
+
 # The vendored httplib default backlog is 5. That drops loopback connections
 # when the outbound pool fans out to its 32-client cap before the server can
 # accept them. Use the platform's full listen backlog for both extension forms.
