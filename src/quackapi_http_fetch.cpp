@@ -590,8 +590,36 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
 //!
 //! The single-request case — what a route handler doing one upstream call per
 //! request looks like — stays fully inline. No thread is created for it.
+//! The caller's deadline, tightened by the session's quackapi_http_timeout_ms. Outside a served
+//! request there is no other deadline, so this is what stops a call to a peer that went silent.
+std::chrono::steady_clock::time_point OutboundDeadline(ClientContext &context) {
+	auto deadline = QuackapiCurrentDeadline();
+	Value setting;
+	if (context.TryGetCurrentSetting("quackapi_http_timeout_ms", setting) && !setting.IsNull()) {
+		const auto timeout_ms = setting.GetValue<int64_t>();
+		if (timeout_ms <= 0) {
+			throw InvalidInputException("quackapi_http_timeout_ms must be > 0");
+		}
+		deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+	}
+	return deadline;
+}
+
+//! Restores the calling thread's deadline when an inline request returns or throws.
+struct ScopedOutboundDeadline {
+	explicit ScopedOutboundDeadline(ClientContext &context) : previous(QuackapiCurrentDeadline()) {
+		QuackapiSetCurrentDeadline(OutboundDeadline(context));
+	}
+	~ScopedOutboundDeadline() {
+		QuackapiSetCurrentDeadline(previous);
+	}
+	std::chrono::steady_clock::time_point previous;
+};
+
 template <class PERFORM>
-void FanOutRequests(idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out, PERFORM &&perform) {
+void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out,
+                    PERFORM &&perform) {
+	ScopedOutboundDeadline scoped(context);
 	const auto deadline = QuackapiCurrentDeadline();
 	auto run_one = [&](idx_t i) {
 		QuackapiSetCurrentDeadline(deadline);
@@ -683,7 +711,7 @@ void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 
 	vector<QuackapiHttpFetchResult> out(count);
-	FanOutRequests(count, skip, out,
+	FanOutRequests(state.GetContext(), count, skip, out,
 	               [&](idx_t i) { return QuackapiHttpFetch::Get(db, urls[i], headers[i], stalls[i]); });
 
 	for (idx_t i = 0; i < count; i++) {
@@ -723,7 +751,7 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 
 	vector<QuackapiHttpFetchResult> out(count);
-	FanOutRequests(count, skip, out, [&](idx_t i) {
+	FanOutRequests(state.GetContext(), count, skip, out, [&](idx_t i) {
 		return QuackapiHttpFetch::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
 	});
 
@@ -812,7 +840,7 @@ unique_ptr<GlobalTableFunctionState> ParallelFetchInit(ClientContext &context, T
 	auto &bind = input.bind_data->Cast<ParallelFetchBindData>();
 	auto state = make_uniq<ParallelFetchGlobalState>();
 	state->rows.resize(NumericCast<idx_t>(bind.n));
-	const auto deadline = QuackapiCurrentDeadline();
+	const auto deadline = OutboundDeadline(context);
 	auto &db = *context.db;
 	vector<std::thread> threads;
 	threads.reserve(NumericCast<idx_t>(bind.n));
@@ -892,6 +920,7 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    if (bind.finished) {
 			    return;
 		    }
+		    ScopedOutboundDeadline scoped(context);
 		    auto result = QuackapiHttpFetch::Get(*context.db, bind.url, bind.headers, bind.stall_ms);
 		    auto value = ToValue(result);
 		    auto &children = StructValue::GetChildren(value);
