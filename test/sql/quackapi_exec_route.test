@@ -293,6 +293,14 @@ SELECT status FROM quackapi_request('POST', '/sql', '{"sql":"SELECT v FROM exec_
 ----
 403
 
+# Authenticated requests fail closed too: the policy cannot be applied to
+# arbitrary request SQL, so the route 403s instead of running it unfiltered.
+query I
+SELECT status FROM quackapi_request('POST', '/sql_auth', '{"sql":"SELECT v FROM exec_secret"}',
+  headers := MAP {'X-API-Key': 'exec-secret'});
+----
+403
+
 statement ok
 ALTER TABLE exec_secret DROP ROW ACCESS POLICY exec_tenant;
 

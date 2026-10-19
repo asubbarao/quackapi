@@ -1313,6 +1313,23 @@ bool RewriteHandlerWithPoliciesAst(DatabaseInstance &db, const string &handler_s
 		rewritten_sql = handler_sql;
 		return true;
 	}
+	// An exec route's handler is the request's SQL text (a bare $param), not a
+	// SELECT the rewriter can inspect: no table refs are visible at CREATE
+	// time, so no row-access or masking policy can be applied to it. Fail the
+	// route closed instead of running request SQL unfiltered. (This used to
+	// fall out of the parser rejecting a bare $param; DuckDB main parses it
+	// as a SELECT, so the fail-closed is now explicit. Mirrors Reject():
+	// error always set, deny only when unauthenticated — the route handler
+	// 403s on either.)
+	string exec_param;
+	if (QuackapiExecRouteParam(handler_sql, exec_param)) {
+		policy_error = "policy enforcement cannot rewrite exec-route request SQL; fails closed";
+		if (!authenticated) {
+			deny_unauthenticated = true;
+		}
+		rewritten_sql = handler_sql;
+		return true;
+	}
 	PolicyRewriteContext ctx(db, rap_bindings, mask_bindings, authenticated);
 	try {
 		auto parser = Parser::GetBuiltinParser();
