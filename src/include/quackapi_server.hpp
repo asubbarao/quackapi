@@ -11,11 +11,11 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 
-namespace duckdb_httplib {
+namespace quackapi_httplib {
 class Server;
 struct Request;
 struct Response;
-} // namespace duckdb_httplib
+} // namespace quackapi_httplib
 
 namespace duckdb {
 
@@ -274,7 +274,7 @@ public:
 	//! Mirrors QuackServer::Close.
 	void Close();
 	//! Same handler path as the TCP server — for quackapi_request() tests.
-	void Dispatch(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
+	void Dispatch(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
 
 	const string &Host() const {
 		return host;
@@ -307,11 +307,11 @@ public:
 
 private:
 	static void ListenThread(QuackapiHttpServer *server);
-	void HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
-	void ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
+	void HandleRequest(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
+	void ApplyCorsHeaders(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
 	string NextRequestId(DatabaseInstance &db);
 	void EmitAccessLog(const QuackapiRequestRecord &entry);
-	void MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res);
+	void MaybeCompressResponse(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
 
 	weak_ptr<DatabaseInstance> db_ptr;
 	string host;
@@ -321,7 +321,7 @@ private:
 	std::chrono::steady_clock::time_point started_at;
 	QuackapiCompressionMode compression = QuackapiCompressionMode::AUTO;
 	idx_t compression_min_bytes = 1024;
-	unique_ptr<duckdb_httplib::Server> server;
+	unique_ptr<quackapi_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
 	unique_ptr<QuackapiRequestRing> request_ring;

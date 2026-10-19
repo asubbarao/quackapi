@@ -110,8 +110,8 @@ CALL disable_logging();
 
 # The PRAGMA reached DuckDB's query log exactly once.
 query I
-SELECT list(trim(message)) FROM duckdb_logs
-WHERE type = 'QueryLog' AND trim(message) = 'PRAGMA disable_checkpoint_on_shutdown';
+SELECT list(trim(message, ' ;')) FROM duckdb_logs
+WHERE type = 'QueryLog' AND trim(message, ' ;') = 'PRAGMA disable_checkpoint_on_shutdown';
 ----
 [PRAGMA disable_checkpoint_on_shutdown]
 

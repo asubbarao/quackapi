@@ -6,11 +6,26 @@ set(TARGET_NAME quackapi)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
+set(NANOARROW_SOURCES
+    third_party/nanoarrow/src/nanoarrow/common/array.c
+    third_party/nanoarrow/src/nanoarrow/common/array_stream.c
+    third_party/nanoarrow/src/nanoarrow/common/schema.c
+    third_party/nanoarrow/src/nanoarrow/common/utils.c
+    third_party/nanoarrow/src/nanoarrow/ipc/codecs.c
+    third_party/nanoarrow/src/nanoarrow/ipc/decoder.c
+    third_party/nanoarrow/src/nanoarrow/ipc/encoder.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/builder.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/emitter.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/refmap.c
+    third_party/nanoarrow/thirdparty/flatcc/src/runtime/verifier.c)
+
 project(${TARGET_NAME})
 
 # Match DuckDB (C++11). C++17 on these TUs emits inline FileFlags/LogicalType
 # symbols that already live in libduckdb_static — Linux link then fails.
-set(CMAKE_CXX_STANDARD "11" CACHE STRING "C++ standard to enforce")
+set(CMAKE_CXX_STANDARD
+    "11"
+    CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
@@ -35,102 +50,147 @@ set(EXTENSION_SOURCES
     src/quackapi_from_x.cpp
     src/quackapi_util.cpp
     src/quackapi_pg.cpp
-)
+    ${NANOARROW_SOURCES})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# The HTTP *server* uses the VENDORED copy in third_party/httplib (patched —
-# see the header of that file for the RFC 7230 §3.3.3 empty-body fix).
-# BEFORE: duckdb's global include_directories already list duckdb/third_party/httplib;
+# The HTTP *server* uses the VENDORED copy in third_party/httplib (patched — see
+# the header of that file for the RFC 7230 §3.3.3 empty-body fix). BEFORE:
+# duckdb's global include_directories already list duckdb/third_party/httplib;
 # prepend ours so #include "httplib.hpp" resolves the patched vendored header.
-# Outbound HTTP uses DuckDB's HTTPUtil (core) and is upgraded at runtime by
-# LOAD curl_httpfs / LOAD httpfs — quackapi does NOT link libcurl.
-target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
-target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
+# Outbound HTTP uses DuckDB's HTTPUtil (core) and is upgraded at runtime by LOAD
+# curl_httpfs / LOAD httpfs — quackapi does NOT link libcurl.
+target_include_directories(
+  ${EXTENSION_NAME} BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
+target_include_directories(
+  ${LOADABLE_EXTENSION_NAME} BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)
+
+target_include_directories(
+  ${EXTENSION_NAME}
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/thirdparty/flatcc/include)
+target_include_directories(
+  ${LOADABLE_EXTENSION_NAME}
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanoarrow/thirdparty/flatcc/include)
+
+target_compile_definitions(${EXTENSION_NAME}
+                           PRIVATE NANOARROW_NAMESPACE=QuackapiNanoarrow)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME}
+                           PRIVATE NANOARROW_NAMESPACE=QuackapiNanoarrow)
+
+# nanoarrow 0.9.0's bundled flatcc pendian.h maps bswap32/64 to TinyCC's
+# tcc_bswap32/64 under GCC, which nothing defines; libduckdb.so then fails to
+# link on Linux. Its #ifndef guards take these compiler builtins instead.
+set_source_files_properties(
+  ${NANOARROW_SOURCES}
+  PROPERTIES COMPILE_DEFINITIONS
+             "bswap32=__builtin_bswap32;bswap64=__builtin_bswap64")
 
 # The vendored httplib default backlog is 5. That drops loopback connections
 # when the outbound pool fans out to its 32-client cap before the server can
 # accept them. Use the platform's full listen backlog for both extension forms.
-target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
-target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
+target_compile_definitions(${EXTENSION_NAME}
+                           PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME}
+                           PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=SOMAXCONN)
 
 # Auth crypto uses DuckDB's bundled mbedtls (third_party/mbedtls), the SAME
 # static library httpfs and parquet link as `duckdb_mbedtls`.
 #
 # Citations (verified in this tree / upstream):
-#   duckdb/third_party/mbedtls/CMakeLists.txt
-#     → add_library(duckdb_mbedtls STATIC … sha256.cpp md.cpp base64.cpp …)
-#   duckdb/extension/parquet/CMakeLists.txt
-#     → target_link_libraries(parquet_loadable_extension duckdb_mbedtls …)
-#   duckdb-httpfs CMakeLists.txt (GIT_URL in duckdb/.github/config/extensions/httpfs.cmake)
-#     → target_link_libraries(httpfs_loadable_extension duckdb_mbedtls …)
-#     → target_link_libraries(httpfs_extension duckdb_mbedtls …)
-#   duckdb/CMakeLists.txt
-#     → include_directories(third_party/mbedtls/include)
-#     → add_third_party(mbedtls)
+# duckdb/third_party/mbedtls/CMakeLists.txt → add_library(duckdb_mbedtls STATIC
+# … sha256.cpp md.cpp base64.cpp …) duckdb/extension/parquet/CMakeLists.txt →
+# target_link_libraries(parquet_loadable_extension duckdb_mbedtls …)
+# duckdb-httpfs CMakeLists.txt (GIT_URL in
+# duckdb/.github/config/extensions/httpfs.cmake) →
+# target_link_libraries(httpfs_loadable_extension duckdb_mbedtls …) →
+# target_link_libraries(httpfs_extension duckdb_mbedtls …) duckdb/CMakeLists.txt
+# → include_directories(third_party/mbedtls/include) → add_third_party(mbedtls)
 #
-# Headers: mbedtls/sha256.h, mbedtls/md.h, mbedtls/base64.h, mbedtls/constant_time.h
-target_include_directories(${EXTENSION_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/mbedtls/include)
-target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/mbedtls/include)
+# Headers: mbedtls/sha256.h, mbedtls/md.h, mbedtls/base64.h,
+# mbedtls/constant_time.h
+target_include_directories(
+  ${EXTENSION_NAME}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/mbedtls/include)
+target_include_directories(
+  ${LOADABLE_EXTENSION_NAME}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/mbedtls/include)
 
 # Link the bundled target into BOTH the static and loadable extension objects,
 # matching httpfs (links both) rather than only the loadable (parquet).
 target_link_libraries(${EXTENSION_NAME} duckdb_mbedtls)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mbedtls)
 
-# Optional libpq — pure-HTTP Postgres path (same idea as FastAPI+psycopg).
-# When pg_dsn is set on quackapi_serve, simple routes run via PQexecParams
-# instead of DuckDB ATTACH. Soft: build still succeeds without libpq.
+# Optional libpq — pure-HTTP Postgres path (same idea as FastAPI+psycopg). When
+# pg_dsn is set on quackapi_serve, simple routes run via PQexecParams instead of
+# DuckDB ATTACH. Soft: build still succeeds without libpq.
 #
-# Never link a host-only Homebrew dylib into a cross-arch build (CI osx_amd64
-# on arm64 runners finds /opt/homebrew arm64 libpq → link fails).
+# Never link a host-only Homebrew dylib into a cross-arch build (CI osx_amd64 on
+# arm64 runners finds /opt/homebrew arm64 libpq → link fails).
 set(QUACKAPI_TRY_LIBPQ ON)
-if (APPLE AND CMAKE_OSX_ARCHITECTURES)
-	if (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" AND
-	    NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i386")
-		set(QUACKAPI_TRY_LIBPQ OFF)
-		message(STATUS "quackapi: skip libpq (target x86_64, host ${CMAKE_HOST_SYSTEM_PROCESSOR})")
-	elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" AND
-	        NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-		set(QUACKAPI_TRY_LIBPQ OFF)
-		message(STATUS "quackapi: skip libpq (target arm64, host ${CMAKE_HOST_SYSTEM_PROCESSOR})")
-	endif()
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+  if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64"
+     AND NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i386")
+    set(QUACKAPI_TRY_LIBPQ OFF)
+    message(
+      STATUS
+        "quackapi: skip libpq (target x86_64, host ${CMAKE_HOST_SYSTEM_PROCESSOR})"
+    )
+  elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"
+         AND NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(QUACKAPI_TRY_LIBPQ OFF)
+    message(
+      STATUS
+        "quackapi: skip libpq (target arm64, host ${CMAKE_HOST_SYSTEM_PROCESSOR})"
+    )
+  endif()
 endif()
-if (QUACKAPI_TRY_LIBPQ)
-	find_path(QUACKAPI_LIBPQ_INCLUDE libpq-fe.h
-	    HINTS /opt/homebrew/opt/libpq/include /usr/local/opt/libpq/include /usr/include/postgresql)
-	find_library(QUACKAPI_LIBPQ_LIB pq
-	    HINTS /opt/homebrew/opt/libpq/lib /usr/local/opt/libpq/lib)
+if(QUACKAPI_TRY_LIBPQ)
+  find_path(QUACKAPI_LIBPQ_INCLUDE libpq-fe.h
+            HINTS /opt/homebrew/opt/libpq/include /usr/local/opt/libpq/include
+                  /usr/include/postgresql)
+  find_library(QUACKAPI_LIBPQ_LIB pq HINTS /opt/homebrew/opt/libpq/lib
+                                           /usr/local/opt/libpq/lib)
 endif()
-if (QUACKAPI_TRY_LIBPQ AND QUACKAPI_LIBPQ_INCLUDE AND QUACKAPI_LIBPQ_LIB)
-	message(STATUS "quackapi: libpq found — native Postgres path enabled")
-	target_include_directories(${EXTENSION_NAME} PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
-	target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
-	target_link_libraries(${EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
-	target_link_libraries(${LOADABLE_EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
-	target_compile_definitions(${EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
-	target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
+if(QUACKAPI_TRY_LIBPQ
+   AND QUACKAPI_LIBPQ_INCLUDE
+   AND QUACKAPI_LIBPQ_LIB)
+  message(STATUS "quackapi: libpq found — native Postgres path enabled")
+  target_include_directories(${EXTENSION_NAME}
+                             PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
+  target_include_directories(${LOADABLE_EXTENSION_NAME}
+                             PRIVATE ${QUACKAPI_LIBPQ_INCLUDE})
+  target_link_libraries(${EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} ${QUACKAPI_LIBPQ_LIB})
+  target_compile_definitions(${EXTENSION_NAME} PRIVATE QUACKAPI_HAS_LIBPQ=1)
+  target_compile_definitions(${LOADABLE_EXTENSION_NAME}
+                             PRIVATE QUACKAPI_HAS_LIBPQ=1)
 else()
-	message(STATUS "quackapi: libpq not found — native Postgres path disabled")
+  message(STATUS "quackapi: libpq not found — native Postgres path disabled")
 endif()
 
 # Response compression: DuckDB-bundled zstd + miniz (gzip). NO new dependencies.
 # Citations (verified in this tree / upstream):
-#   duckdb/third_party/zstd/CMakeLists.txt → add_library(duckdb_zstd STATIC …)
-#   duckdb/third_party/miniz/CMakeLists.txt → add_library(duckdb_miniz STATIC …)
-#   duckdb/CMakeLists.txt → include_directories(third_party/zstd/include)
-#                         → include_directories(third_party/miniz)
-#                         → add_third_party(zstd) / add_third_party(miniz)
-#   parquet column_reader.cpp uses duckdb_zstd::ZSTD_* and MiniZStream (gzip)
-target_include_directories(${EXTENSION_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/zstd/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
-target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/zstd/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
+# duckdb/third_party/zstd/CMakeLists.txt → add_library(duckdb_zstd STATIC …)
+# duckdb/third_party/miniz/CMakeLists.txt → add_library(duckdb_miniz STATIC …)
+# duckdb/CMakeLists.txt → include_directories(third_party/zstd/include) →
+# include_directories(third_party/miniz) → add_third_party(zstd) /
+# add_third_party(miniz) parquet column_reader.cpp uses duckdb_zstd::ZSTD_* and
+# MiniZStream (gzip)
+target_include_directories(
+  ${EXTENSION_NAME}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/zstd/include
+          ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
+target_include_directories(
+  ${LOADABLE_EXTENSION_NAME}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/zstd/include
+          ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
 target_link_libraries(${EXTENSION_NAME} duckdb_zstd duckdb_miniz)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_zstd duckdb_miniz)
 

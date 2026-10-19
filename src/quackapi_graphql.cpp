@@ -371,20 +371,20 @@ string SelectTableJson(Connection &con, const string &source_sql, const vector<s
 		err = prepared->GetError();
 		return {};
 	}
-	case_insensitive_map_t<BoundParameterData> values;
-	for (auto &entry : prepared->named_param_map) {
-		auto param = entry.first;
+	identifier_map_t<BoundParameterData> values;
+	for (auto &entry : prepared->GetNamedParameterMap()) {
+		auto param = entry.first.GetIdentifierName();
 		if (!StringUtil::StartsWith(StringUtil::Lower(param), "claims_")) {
 			err = "unexpected parameter in GraphQL query";
 			return {};
 		}
 		string claim_name = param.substr(7);
 		if (!options.claims) {
-			values[param] = BoundParameterData(Value());
+			values[Identifier(param)] = BoundParameterData(Value());
 			continue;
 		}
 		auto claim = options.claims->find(claim_name);
-		values[param] =
+		values[Identifier(param)] =
 		    claim == options.claims->end() ? BoundParameterData(Value()) : BoundParameterData(Value(claim->second));
 	}
 	auto res = prepared->Execute(values);
@@ -790,7 +790,7 @@ struct ApplyGraphqlBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyGraphqlBind(ClientContext &, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyGraphqlBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -999,7 +999,7 @@ struct GraphqlTablesGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> GraphqlTablesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                           vector<string> &names) {
+                                           vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("mode");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -1026,7 +1026,7 @@ void GraphqlTablesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		}
 		output.SetValue(0, 0, Value(state.legacy_open ? "open" : "disabled"));
 		output.SetValue(1, 0, Value());
-		output.SetCardinality(1);
+		output.SetChildCardinality(1);
 		state.emitted_mode = true;
 		return;
 	}
@@ -1037,7 +1037,7 @@ void GraphqlTablesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 } // namespace
@@ -1239,7 +1239,7 @@ string BuildGraphqlSchema(DatabaseInstance &db, const GraphqlExecOptions &option
 }
 
 GraphqlDdlParserExtension::GraphqlDdlParserExtension() {
-	parse_function = GraphqlDdlParse;
+	parse_function = QuackapiTokenParse<GraphqlDdlParse>;
 	plan_function = GraphqlDdlPlan;
 }
 
@@ -1255,7 +1255,7 @@ struct GraphqlRoutesGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> GraphqlRoutesBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                           vector<string> &names) {
+                                           vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -1295,7 +1295,7 @@ void GraphqlRoutesExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 void RegisterQuackapiGraphqlFunctions(ExtensionLoader &loader) {

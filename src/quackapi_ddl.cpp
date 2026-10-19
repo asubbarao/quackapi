@@ -1126,7 +1126,7 @@ struct ApplyRouteBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyRouteBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -1258,6 +1258,28 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			}
 			// An exec route (`AS $sql`) has no SQL of its own to validate: the
 			// request supplies it, and each request reports its own errors.
+			// $claims_* is server-bound (verified auth claims), never request SQL:
+			// reject a bare one explicitly instead of relying on Prepare to fail
+			// on the unbound named parameter, which is a DuckDB-version detail.
+			{
+				string bare = QuackapiTrim(bind_data.route.handler_sql);
+				if (bare.size() > 8 && bare[0] == '$' &&
+				    StringUtil::StartsWith(StringUtil::Lower(bare.substr(1, 7)), "claims_")) {
+					bool ident = true;
+					for (idx_t i = 1; i < bare.size(); i++) {
+						char c = bare[i];
+						if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || (c >= '0' && c <= '9'))) {
+							ident = false;
+							break;
+						}
+					}
+					if (ident) {
+						throw InvalidInputException(
+						    "Invalid handler SQL for route \"%s\": $claims_* is server-bound, never request SQL",
+						    bind_data.route.name);
+					}
+				}
+			}
 			string exec_param;
 			auto prepared = QuackapiExecRouteParam(bind_data.route.handler_sql, exec_param)
 			                    ? unique_ptr<PreparedStatement>()
@@ -1614,7 +1636,7 @@ struct ApplyGroupBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyGroupBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyGroupBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -1686,7 +1708,7 @@ struct GroupsGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> GroupsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                    vector<string> &names) {
+                                    vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -1731,13 +1753,13 @@ void GroupsExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) 
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 } // namespace
 
 RouteDdlParserExtension::RouteDdlParserExtension() {
-	parse_function = RouteDdlParse;
+	parse_function = QuackapiTokenParse<RouteDdlParse>;
 	plan_function = RouteDdlPlan;
 }
 
@@ -1746,7 +1768,7 @@ TableFunction GetApplyRouteFunction() {
 }
 
 GroupDdlParserExtension::GroupDdlParserExtension() {
-	parse_function = GroupDdlParse;
+	parse_function = QuackapiTokenParse<GroupDdlParse>;
 	plan_function = GroupDdlPlan;
 }
 
