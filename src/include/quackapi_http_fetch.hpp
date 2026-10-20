@@ -46,6 +46,8 @@ struct QuackapiHttpFetchResult {
 	HTTPHeaders headers;
 	//! True when this call reused a pooled connection rather than dialling.
 	bool reused_connection = false;
+	//! Final absolute GET URL, empty when no response was received (or for POST).
+	string url_effective;
 
 	bool Ok() const {
 		return success && request_error.empty();
@@ -70,7 +72,8 @@ struct QuackapiHttpFetch {
 	//! write-timeout / per-route timeout_sec — a compute-bound handler cannot
 	//! trip socket IO deadlines.
 	static QuackapiHttpFetchResult Get(DatabaseInstance &db, const string &url,
-	                                   const unordered_map<string, string> &extra_headers = {}, int32_t stall_ms = 0);
+	                                   const unordered_map<string, string> &extra_headers = {}, int32_t stall_ms = 0,
+	                                   int64_t timeout_ms = 0, int64_t max_response_bytes = 0);
 
 	//! POST url with a raw body and Content-Type.
 	//! http:// needs nothing loaded; https:// requires httpfs / curl_httpfs.

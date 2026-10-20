@@ -1,0 +1,215 @@
+# name: test/sql/quackapi_fetch_effective_url.test
+# description: GET effective URLs follow bounded RFC 3986 redirect chains
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE ROUTE final GET '/nfl/' AS SELECT 'ad1/' AS link;
+
+statement ok
+CREATE ROUTE start GET '/start' STATUS 302 AS SELECT '/chain/step' AS location;
+
+statement ok
+CREATE ROUTE step GET '/chain/step' STATUS 307 AS SELECT '../nfl/?league=nfl#fragment' AS location;
+
+statement ok
+CREATE ROUTE absolute GET '/absolute' STATUS 301 AS SELECT 'http://127.0.0.1:29302/start' AS location;
+
+statement ok
+CREATE ROUTE query_only GET '/query' STATUS 302 PARAM done VARCHAR DEFAULT '' AS SELECT CASE WHEN $done = '' THEN '?done=yes' ELSE NULL END AS location;
+
+statement ok
+CREATE ROUTE scheme_relative GET '/scheme-relative' STATUS 302 AS SELECT '//127.0.0.1:29302/nfl/?encoded=%2F' AS location;
+
+statement ok
+CREATE ROUTE dots GET '/dots' STATUS 302 AS SELECT '/one/./../nfl/.' AS location;
+
+statement ok
+CREATE ROUTE cross_origin GET '/cross-origin' STATUS 302 AS SELECT 'http://127.0.0.1:29303/headers' AS location;
+
+statement ok
+CREATE ROUTE headers GET '/headers' PARAM authorization VARCHAR HEADER DEFAULT '' PARAM cookie VARCHAR HEADER DEFAULT '' AS SELECT $authorization AS auth, $cookie AS cookie;
+
+statement ok
+CREATE ROUTE loop GET '/loop' STATUS 302 AS SELECT '#again' AS location;
+
+statement ok
+CREATE ROUTE unsupported GET '/unsupported' STATUS 302 AS SELECT 'file:///tmp/nope' AS location;
+
+statement ok
+CREATE ROUTE missing GET '/missing' STATUS 404 AS SELECT 'missing' AS text;
+
+statement ok
+CREATE ROUTE forbidden GET '/forbidden' STATUS 403 AS SELECT 'forbidden' AS text;
+
+statement ok
+CREATE ROUTE not_modified GET '/not-modified' STATUS 304 AS SELECT '/nfl/' AS location;
+
+statement ok
+CREATE ROUTE post POST '/post' AS SELECT 'ok' AS text;
+
+statement ok
+CREATE ROUTE large GET '/large' AS SELECT repeat('x', 4096) AS text;
+
+statement ok
+CREATE ROUTE slow GET '/slow' AS SELECT sleep_ms(100);
+
+statement ok
+CREATE ROUTE slow_chain GET '/slow-chain' STATUS 302 AS SELECT '/slow' AS location, sleep_ms(100) AS waited;
+
+statement ok
+CREATE ROUTE fetch_page GET '/fetch-page' PARAM target VARCHAR AS SELECT status, url_effective FROM quackapi_fetch($target, timeout_ms := 30000, max_response_bytes := 16777216);
+
+query I
+SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29302
+
+query I
+SELECT * FROM quackapi_serve(29303, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29303
+
+# Alias expansion must evaluate the volatile fetch once for every input row.
+query II
+WITH fetched AS (SELECT quackapi_fetch('http://127.0.0.1:29302/nfl/?league=nfl') AS response)
+SELECT response.status, response.url_effective FROM fetched;
+----
+200	http://127.0.0.1:29302/nfl/?league=nfl
+
+query I
+SELECT dialed + reused = 1 FROM quackapi_http_pool() WHERE host = 'http://127.0.0.1:29302';
+----
+true
+
+query II
+SELECT status, url_effective FROM quackapi_fetch('127.0.0.1:29302/nfl/');
+----
+200	http://127.0.0.1:29302/nfl/
+
+query II
+SELECT status, url_effective FROM quackapi_fetch('http://127.0.0.1:29302/query');
+----
+302	http://127.0.0.1:29302/query?done=yes
+
+query II
+SELECT status, url_effective FROM quackapi_fetch('http://127.0.0.1:29302/scheme-relative');
+----
+200	http://127.0.0.1:29302/nfl/?encoded=%2F
+
+query II
+SELECT status, url_effective FROM quackapi_fetch('http://127.0.0.1:29302/dots');
+----
+200	http://127.0.0.1:29302/nfl/
+
+query II
+WITH fetched AS (SELECT quackapi_fetch('http://127.0.0.1:29302/cross-origin', MAP{'Authorization': 'secret', 'Cookie': 'session=secret'}) AS r)
+SELECT r.body, r.url_effective FROM fetched;
+----
+[{"auth":"","cookie":""}]	http://127.0.0.1:29303/headers
+
+query III
+WITH fetched AS (SELECT quackapi_fetch('http://127.0.0.1:29302/absolute') AS r)
+SELECT r.status, r.body, r.url_effective FROM fetched;
+----
+200	[{"link":"ad1/"}]	http://127.0.0.1:29302/nfl/?league=nfl
+
+# Table and scalar forms share the appended type and preserve existing fields.
+query III
+SELECT status, error IS NULL, url_effective FROM quackapi_fetch('http://127.0.0.1:29302/start');
+----
+200	true	http://127.0.0.1:29302/nfl/?league=nfl
+
+query III
+SELECT status, error IS NULL, url_effective FROM quackapi_fetch('http://127.0.0.1:29302/missing');
+----
+404	true	http://127.0.0.1:29302/missing
+
+query IIII
+SELECT status, body, error IS NULL, url_effective FROM quackapi_fetch('http://127.0.0.1:29302/forbidden');
+----
+403	forbidden	true	http://127.0.0.1:29302/forbidden
+
+query II
+SELECT status, url_effective FROM quackapi_fetch('http://127.0.0.1:29302/not-modified');
+----
+304	http://127.0.0.1:29302/not-modified
+
+query II
+SELECT error, url_effective IS NULL FROM quackapi_fetch('http://127.0.0.1:29302/loop');
+----
+Maximum redirect count exceeded	true
+
+query II
+SELECT error IS NOT NULL, url_effective IS NULL FROM quackapi_fetch('http://127.0.0.1:29399/nope');
+----
+true	true
+
+query I
+SELECT quackapi_fetch(NULL::VARCHAR).url_effective IS NULL;
+----
+true
+
+query IIII
+SELECT status, body, error, url_effective IS NULL FROM quackapi_fetch('http://127.0.0.1:29302/large', max_response_bytes := 1024);
+----
+0	(empty)	quackapi_fetch max_response_bytes exceeded	true
+
+query III
+SELECT status, len(body), error IS NULL FROM quackapi_fetch('http://127.0.0.1:29302/large', max_response_bytes := 4096, timeout_ms := 10000);
+----
+200	4096	true
+
+query II
+SELECT error IS NOT NULL, url_effective IS NULL FROM quackapi_fetch('http://127.0.0.1:29302/slow', timeout_ms := 10);
+----
+true	true
+
+query II
+SELECT status, error IS NOT NULL FROM quackapi_fetch('http://127.0.0.1:29302/slow-chain', timeout_ms := 150);
+----
+0	true
+
+statement error
+SELECT * FROM quackapi_fetch('http://127.0.0.1:29302/nfl/', timeout_ms := 0);
+----
+timeout_ms must be > 0
+
+statement error
+SELECT * FROM quackapi_fetch('http://127.0.0.1:29302/nfl/', timeout_ms := -1);
+----
+timeout_ms must be > 0
+
+statement error
+SELECT * FROM quackapi_fetch('http://127.0.0.1:29302/nfl/', max_response_bytes := 0);
+----
+max_response_bytes must be > 0
+
+statement error
+SELECT * FROM quackapi_fetch('http://127.0.0.1:29302/nfl/', max_response_bytes := -1);
+----
+max_response_bytes must be > 0
+
+query II
+SELECT r.status, r.url_effective IS NULL FROM (SELECT quackapi_post('http://127.0.0.1:29302/post', '') AS r);
+----
+200	true
+
+query I
+SELECT body FROM quackapi_fetch('http://127.0.0.1:29302/fetch-page?target=http://127.0.0.1:29302/start');
+----
+[{"status":200,"url_effective":"http://127.0.0.1:29302/nfl/?league=nfl"}]
+
+statement error
+SELECT * FROM quackapi_fetch('http://127.0.0.1:29302/unsupported');
+----
+unsupported redirect URL scheme
+
+statement ok
+SELECT * FROM quackapi_stop(29302);
+
+statement ok
+SELECT * FROM quackapi_stop(29303);

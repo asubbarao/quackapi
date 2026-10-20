@@ -407,8 +407,9 @@ string QuackapiHttpFetch::ActiveHttpUtilName(DatabaseInstance &db) {
 	return HTTPUtil::Get(db).GetName();
 }
 
-QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const string &url,
-                                               const unordered_map<string, string> &extra_headers, int32_t stall_ms) {
+static QuackapiHttpFetchResult GetOnce(DatabaseInstance &db, const string &url,
+                                       const unordered_map<string, string> &extra_headers, int32_t stall_ms,
+                                       int64_t max_response_bytes, bool bounded) {
 	if (stall_ms < 0) {
 		throw InvalidInputException("quackapi_fetch stall_ms must be >= 0");
 	}
@@ -418,21 +419,196 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const strin
 		}
 		return PlainGetWithStall(url, extra_headers, stall_ms);
 	}
+	string body;
+	bool oversized = false;
+	auto receive = [&](const char *data, size_t size) {
+		if (max_response_bytes > 0 && size > static_cast<uint64_t>(max_response_bytes) - body.size()) {
+			oversized = true;
+			return false;
+		}
+		if (std::chrono::steady_clock::now() >= QuackapiCurrentDeadline()) {
+			return false;
+		}
+		body.append(data, size);
+		return true;
+	};
+	auto finish = [&](QuackapiHttpFetchResult result) {
+		if (oversized) {
+			result = QuackapiHttpFetchResult();
+			result.request_error = "quackapi_fetch max_response_bytes exceeded";
+		}
+		if (result.request_error.empty()) {
+			result.body = std::move(body);
+		}
+		return result;
+	};
 	if (IsPlainHTTP(url)) {
 		string origin, path;
 		SplitURL(url, origin, path);
 		auto headers = ToHttplibHeaders(extra_headers);
-		return WithPlainClient(origin, [&](duckdb_httplib::Client &client) { return client.Get(path, headers); });
+		return finish(WithPlainClient(origin, [&](duckdb_httplib::Client &client) {
+			client.set_follow_location(false);
+			auto response = client.Get(path, headers, receive);
+			client.set_follow_location(true);
+			return response;
+		}));
 	}
 
-	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+	return finish(WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+		params.follow_location = false;
+		if (bounded) {
+			// Retries include backoff sleeps outside the transport's timeout.
+			params.retries = 0;
+		}
+		if (client) {
+			client->Initialize(params);
+		}
 		HTTPHeaders headers(db);
 		InsertExtraHeaders(headers, extra_headers);
-		GetRequestInfo request(url, headers, params, /*response_handler=*/nullptr,
-		                       /*content_handler=*/nullptr);
+		GetRequestInfo request(
+		    url, headers, params,
+		    [&](const HTTPResponse &) {
+			    body.clear();
+			    return true;
+		    },
+		    [&](const_data_ptr_t data, idx_t size) { return receive(reinterpret_cast<const char *>(data), size); });
 		request.try_request = true;
 		return FromResponse(http_util.Request(request, client));
-	});
+	}));
+}
+
+//! RFC 3986 section 5.2.4, preserving empty segments and escaped characters.
+static string RemoveDotSegments(string input) {
+	string output;
+	while (!input.empty()) {
+		if (StringUtil::StartsWith(input, "../")) {
+			input.erase(0, 3);
+		} else if (StringUtil::StartsWith(input, "./")) {
+			input.erase(0, 2);
+		} else if (StringUtil::StartsWith(input, "/./") || input == "/.") {
+			input.replace(0, 3, "/");
+		} else if (StringUtil::StartsWith(input, "/../") || input == "/..") {
+			input.replace(0, 4, "/");
+			auto slash = output.rfind('/');
+			output.erase(slash == string::npos ? 0 : slash);
+		} else if (input == "." || input == "..") {
+			input.clear();
+		} else {
+			auto slash = input.find('/', input.front() == '/' ? 1 : 0);
+			output += input.substr(0, slash);
+			input.erase(0, slash == string::npos ? input.size() : slash);
+		}
+	}
+	return output;
+}
+
+static string ResolveRedirect(const string &base, string reference) {
+	// Fragments never travel in HTTP request targets.
+	reference = reference.substr(0, reference.find('#'));
+	string origin, path;
+	SplitURL(base, origin, path);
+	if (StringUtil::StartsWith(reference, "//")) {
+		reference = base.substr(0, base.find(':') + 1) + reference;
+	}
+	auto colon = reference.find(':');
+	auto separator = reference.find_first_of("/?");
+	if (colon != string::npos && (separator == string::npos || colon < separator)) {
+		auto scheme = StringUtil::Lower(reference.substr(0, colon));
+		if (scheme != "http" && scheme != "https") {
+			throw InvalidInputException("unsupported redirect URL scheme: %s", scheme);
+		}
+		auto path_start = reference.find('/', colon + 3);
+		auto query_start = reference.find('?', colon + 3);
+		if (path_start == string::npos || (query_start != string::npos && query_start < path_start)) {
+			reference.insert(query_start == string::npos ? reference.size() : query_start, "/");
+		}
+		SplitURL(reference, origin, path);
+	} else if (reference.empty()) {
+		return base.substr(0, base.find('#'));
+	} else if (reference.front() == '?') {
+		path = path.substr(0, path.find('?')) + reference;
+	} else if (reference.front() == '/') {
+		path = reference;
+	} else {
+		path = path.substr(0, path.find('?'));
+		path = path.substr(0, path.rfind('/') + 1) + reference;
+	}
+	auto query = path.find('?');
+	return origin + RemoveDotSegments(path.substr(0, query)) + (query == string::npos ? "" : path.substr(query));
+}
+
+QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const string &url,
+                                               const unordered_map<string, string> &extra_headers, int32_t stall_ms,
+                                               int64_t timeout_ms, int64_t max_response_bytes) {
+	struct RestoreDeadline {
+		std::chrono::steady_clock::time_point previous = QuackapiCurrentDeadline();
+		~RestoreDeadline() {
+			QuackapiSetCurrentDeadline(previous);
+		}
+	} restore;
+	if (timeout_ms > 0) {
+		if (timeout_ms > std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::time_point::max() - std::chrono::steady_clock::now())
+		                     .count()) {
+			throw InvalidInputException("quackapi_fetch timeout_ms is too large");
+		}
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+		if (restore.previous != std::chrono::steady_clock::time_point() && restore.previous < deadline) {
+			deadline = restore.previous;
+		}
+		QuackapiSetCurrentDeadline(deadline);
+	}
+	string current = url.substr(0, url.find('#'));
+	string initial_origin, initial_path;
+	SplitURL(current, initial_origin, initial_path);
+	current = initial_origin + initial_path;
+	auto headers = extra_headers;
+	for (idx_t redirects = 0;; redirects++) {
+		if (timeout_ms > 0 && std::chrono::steady_clock::now() >= QuackapiCurrentDeadline()) {
+			QuackapiHttpFetchResult failure;
+			failure.request_error = "quackapi_fetch timeout_ms exceeded";
+			return failure;
+		}
+		auto result =
+		    GetOnce(db, current, headers, stall_ms, max_response_bytes, timeout_ms > 0 || max_response_bytes > 0);
+		if (timeout_ms > 0 && std::chrono::steady_clock::now() >= QuackapiCurrentDeadline()) {
+			result = QuackapiHttpFetchResult();
+			result.request_error = "quackapi_fetch timeout_ms exceeded";
+		}
+		if (!result.request_error.empty()) {
+			return result;
+		}
+		result.url_effective = current;
+		auto status = static_cast<int32_t>(result.status);
+		bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+		if (stall_ms > 0 || !redirect || !result.headers.HasHeader("Location")) {
+			return result;
+		}
+		auto location = result.headers.GetHeaderValue("Location");
+		if (location.empty()) {
+			return result;
+		}
+		if (redirects == 20) {
+			QuackapiHttpFetchResult failure;
+			failure.request_error = "Maximum redirect count exceeded";
+			return failure;
+		}
+		auto next = ResolveRedirect(current, location);
+		string origin, path, next_origin, next_path;
+		SplitURL(current, origin, path);
+		SplitURL(next, next_origin, next_path);
+		if (origin != next_origin) {
+			for (auto it = headers.begin(); it != headers.end();) {
+				auto name = StringUtil::Lower(it->first);
+				if (name == "authorization" || name == "cookie" || name == "proxy-authorization" || name == "host") {
+					it = headers.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		current = std::move(next);
+	}
 }
 
 QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const string &url, const string &body,
@@ -462,6 +638,9 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 	}
 
 	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
+		if (client) {
+			client->Initialize(params);
+		}
 		HTTPHeaders headers(db);
 		if (!content_type.empty()) {
 			headers.Insert("Content-Type", content_type);
@@ -523,6 +702,7 @@ LogicalType FetchResultType() {
 	children.emplace_back("headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
 	children.emplace_back("error", LogicalType::VARCHAR);
 	children.emplace_back("reused_connection", LogicalType::BOOLEAN);
+	children.emplace_back("url_effective", LogicalType::VARCHAR);
 	return LogicalType::STRUCT(std::move(children));
 }
 
@@ -542,6 +722,8 @@ Value ToValue(const QuackapiHttpFetchResult &result) {
 	children.emplace_back("error",
 	                      result.request_error.empty() ? Value(LogicalType::VARCHAR) : Value(result.request_error));
 	children.emplace_back("reused_connection", Value::BOOLEAN(result.reused_connection));
+	children.emplace_back("url_effective",
+	                      result.url_effective.empty() ? Value(LogicalType::VARCHAR) : Value(result.url_effective));
 	return Value::STRUCT(std::move(children));
 }
 
@@ -740,6 +922,8 @@ struct FetchTableBindData : public TableFunctionData {
 	string url;
 	unordered_map<string, string> headers;
 	int32_t stall_ms = 0;
+	int64_t timeout_ms = 0;
+	int64_t max_response_bytes = 0;
 	bool finished = false;
 };
 
@@ -891,7 +1075,16 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    if (bind.finished) {
 			    return;
 		    }
-		    auto result = QuackapiHttpFetch::Get(*context.db, bind.url, bind.headers, bind.stall_ms);
+		    QuackapiHttpFetchResult result;
+		    try {
+			    result = QuackapiHttpFetch::Get(*context.db, bind.url, bind.headers, bind.stall_ms, bind.timeout_ms,
+			                                    bind.max_response_bytes);
+		    } catch (std::exception &ex) {
+			    if (bind.timeout_ms == 0 && bind.max_response_bytes == 0) {
+				    throw;
+			    }
+			    result.request_error = ex.what();
+		    }
 		    auto value = ToValue(result);
 		    auto &children = StructValue::GetChildren(value);
 		    for (idx_t c = 0; c < children.size(); c++) {
@@ -915,6 +1108,24 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    if (stall_it != input.named_parameters.end() && !stall_it->second.IsNull()) {
 			    bind->stall_ms = stall_it->second.GetValue<int32_t>();
 		    }
+		    for (auto name : {"timeout_ms", "max_response_bytes"}) {
+			    auto option = input.named_parameters.find(name);
+			    if (option == input.named_parameters.end()) {
+				    continue;
+			    }
+			    if (option->second.IsNull() || option->second.GetValue<int64_t>() <= 0) {
+				    throw InvalidInputException("quackapi_fetch %s must be > 0", name);
+			    }
+			    auto value = option->second.GetValue<int64_t>();
+			    if (string(name) == "timeout_ms") {
+				    bind->timeout_ms = value;
+			    } else {
+				    bind->max_response_bytes = value;
+			    }
+		    }
+		    if (bind->stall_ms > 0 && (bind->timeout_ms > 0 || bind->max_response_bytes > 0)) {
+			    throw InvalidInputException("quackapi_fetch bounded options cannot be combined with stall_ms");
+		    }
 		    auto result_type = FetchResultType();
 		    for (auto &child : StructType::GetChildTypes(result_type)) {
 			    names.push_back(child.first);
@@ -924,6 +1135,8 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	    });
 	fetch_tf.named_parameters["headers"] = header_type;
 	fetch_tf.named_parameters["stall_ms"] = LogicalType::INTEGER;
+	fetch_tf.named_parameters["timeout_ms"] = LogicalType::BIGINT;
+	fetch_tf.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
 	loader.RegisterFunction(fetch_tf);
 
 	ScalarFunctionSet post_set("quackapi_post");
