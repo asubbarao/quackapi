@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -29,6 +30,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 
@@ -47,6 +49,9 @@
 #include "quackapi_util.hpp"
 #include "quackapi_validation.hpp"
 
+#include "nanoarrow/nanoarrow.h"
+#include "nanoarrow/nanoarrow_ipc.h"
+
 namespace duckdb {
 
 namespace {
@@ -54,40 +59,40 @@ namespace {
 //! Active connection for this httplib worker — set around process_request so a
 //! matched CREATE ROUTE … TIMEOUT can extend SocketStream + SO_*TIMEO deadlines.
 thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
-thread_local duckdb_httplib::Stream *quackapi_tls_stream = nullptr;
+thread_local quackapi_httplib::Stream *quackapi_tls_stream = nullptr;
 
 //! httplib Server subclass: stash the live Stream/socket for per-route IO timeouts.
-struct QuackapiHttplibServer : duckdb_httplib::Server {
+struct QuackapiHttplibServer : quackapi_httplib::Server {
 	bool process_and_close_socket(socket_t sock) override {
 		std::string remote_addr;
 		int remote_port = 0;
-		duckdb_httplib::detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
+		quackapi_httplib::detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
 
 		std::string local_addr;
 		int local_port = 0;
-		duckdb_httplib::detail::get_local_ip_and_port(sock, local_addr, local_port);
+		quackapi_httplib::detail::get_local_ip_and_port(sock, local_addr, local_port);
 
-		auto ret = duckdb_httplib::detail::process_server_socket(
+		auto ret = quackapi_httplib::detail::process_server_socket(
 		    svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_, read_timeout_sec_, read_timeout_usec_,
 		    write_timeout_sec_, write_timeout_usec_,
-		    [&](duckdb_httplib::Stream &strm, bool close_connection, bool &connection_closed) {
+		    [&](quackapi_httplib::Stream &strm, bool close_connection, bool &connection_closed) {
 			    quackapi_tls_sock = sock;
 			    quackapi_tls_stream = &strm;
 			    auto ok = process_request(strm, remote_addr, remote_port, local_addr, local_port, close_connection,
 			                              connection_closed, nullptr);
 			    // Restore accept-time SO_* after handler+write (per-route TIMEOUT may
 			    // have raised them). Next keep-alive SocketStream still uses serve defaults.
-			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, read_timeout_sec_,
-			                                                read_timeout_usec_);
-			    duckdb_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, write_timeout_sec_,
-			                                                write_timeout_usec_);
+			    quackapi_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, read_timeout_sec_,
+			                                                  read_timeout_usec_);
+			    quackapi_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, write_timeout_sec_,
+			                                                  write_timeout_usec_);
 			    quackapi_tls_stream = nullptr;
 			    quackapi_tls_sock = INVALID_SOCKET;
 			    return ok;
 		    });
 
-		duckdb_httplib::detail::shutdown_socket(sock);
-		duckdb_httplib::detail::close_socket(sock);
+		quackapi_httplib::detail::shutdown_socket(sock);
+		quackapi_httplib::detail::close_socket(sock);
 		return ret;
 	}
 };
@@ -104,14 +109,14 @@ void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
 	if (timeout_sec <= 0) {
 		return;
 	}
-	auto *stream = dynamic_cast<duckdb_httplib::detail::SocketStream *>(quackapi_tls_stream);
+	auto *stream = dynamic_cast<quackapi_httplib::detail::SocketStream *>(quackapi_tls_stream);
 	if (stream) {
 		stream->set_read_timeout(timeout_sec, 0);
 		stream->set_write_timeout(timeout_sec, 0);
 	}
 	if (quackapi_tls_sock != INVALID_SOCKET) {
-		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec, 0);
-		duckdb_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
+		quackapi_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec, 0);
+		quackapi_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
 	}
 	qa_state.SetLastEffectiveWriteTimeoutSec(static_cast<int32_t>(timeout_sec));
 }
@@ -146,7 +151,7 @@ double ParseEncodingQ(const string &token) {
 
 //! Negotiate Content-Encoding: choose the highest q-value, preferring zstd on ties.
 //! Missing Accept-Encoding → identity. q=0 rejects a coding. `*` accepts any.
-NegotiatedEncoding NegotiateContentEncoding(const duckdb_httplib::Request &req, QuackapiCompressionMode mode) {
+NegotiatedEncoding NegotiateContentEncoding(const quackapi_httplib::Request &req, QuackapiCompressionMode mode) {
 	auto it = req.headers.find("Accept-Encoding");
 	if (it == req.headers.end() || it->second.empty()) {
 		return NegotiatedEncoding::IDENTITY;
@@ -333,7 +338,8 @@ string ValueToJson(const Value &value) {
 			if (i > 0) {
 				result += ",";
 			}
-			result += "\"" + QuackapiJsonEscape(child_types[i].first) + "\":" + ValueToJson(children[i]);
+			result +=
+			    "\"" + QuackapiJsonEscape(child_types[i].first.GetIdentifierName()) + "\":" + ValueToJson(children[i]);
 		}
 		result += "}";
 		return result;
@@ -462,10 +468,10 @@ void ParseFormUrlEncoded(const string &body, case_insensitive_map_t<string> &out
 			auto eq = pair.find('=');
 			string key, val;
 			if (eq == string::npos) {
-				key = duckdb_httplib::decode_query_component(pair, true);
+				key = quackapi_httplib::decode_query_component(pair, true);
 			} else {
-				key = duckdb_httplib::decode_query_component(pair.substr(0, eq), true);
-				val = duckdb_httplib::decode_query_component(pair.substr(eq + 1), true);
+				key = quackapi_httplib::decode_query_component(pair.substr(0, eq), true);
+				val = quackapi_httplib::decode_query_component(pair.substr(eq + 1), true);
 			}
 			if (!key.empty()) {
 				out[key] = val;
@@ -877,7 +883,7 @@ bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, con
 	if (IsNumericType(bound.type()) || bound.type().id() == LogicalTypeId::BOOLEAN) {
 		Value dbl;
 		string cerr;
-		if (!bound.DefaultTryCastAs(LogicalType::DOUBLE, dbl, &cerr) || dbl.IsNull()) {
+		if (!QuackapiTryCast(bound, LogicalType::DOUBLE, dbl, &cerr) || dbl.IsNull()) {
 			return true; // non-numeric bound — skip numeric constraints
 		}
 		num = dbl.GetValue<double>();
@@ -927,7 +933,7 @@ bool BindParamValue(const string &raw, const LogicalType &expected, const string
 	if (expected.id() != LogicalTypeId::VARCHAR && expected.id() != LogicalTypeId::UNKNOWN) {
 		Value casted;
 		string cast_error;
-		if (!raw_value.DefaultTryCastAs(expected, casted, &cast_error)) {
+		if (!QuackapiTryCast(raw_value, expected, casted, &cast_error)) {
 			err_json = ValidationErrorJson(loc_kind, param_name, "Input should be a valid " + expected.ToString(),
 			                               "type_error");
 			return false;
@@ -1196,7 +1202,7 @@ bool MatchPattern(const string &pattern, const string &path, vector<std::pair<st
 }
 
 //! Rebuild query string from httplib params (order not guaranteed; fine for redirects).
-string BuildQueryString(const duckdb_httplib::Request &req) {
+string BuildQueryString(const quackapi_httplib::Request &req) {
 	if (req.params.empty()) {
 		return string();
 	}
@@ -1207,9 +1213,9 @@ string BuildQueryString(const duckdb_httplib::Request &req) {
 			qs += "&";
 		}
 		first = false;
-		qs += duckdb_httplib::encode_query_component(kv.first);
+		qs += quackapi_httplib::encode_query_component(kv.first);
 		qs += "=";
-		qs += duckdb_httplib::encode_query_component(kv.second);
+		qs += quackapi_httplib::encode_query_component(kv.second);
 	}
 	return qs;
 }
@@ -1292,7 +1298,7 @@ bool IsSpecialResponseColumn(const string &name) {
 	return lower == "location" || lower == "set_cookie" || lower == "set-cookie";
 }
 
-void SetJson(duckdb_httplib::Response &res, int status, const string &body) {
+void SetJson(quackapi_httplib::Response &res, int status, const string &body) {
 	res.status = status;
 	res.set_content(body, "application/json");
 }
@@ -1384,7 +1390,7 @@ double ParseAcceptQ(const string &token) {
 
 //! When route FORMAT is default/json, honor Accept for ndjson/csv/parquet/arrow/json.
 //! Explicit route FORMAT (ndjson|csv|parquet|arrow) always wins.
-BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const duckdb_httplib::Request &req) {
+BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const quackapi_httplib::Request &req) {
 	auto route_fmt = StringUtil::Lower(route.response_format.empty() ? "json" : route.response_format);
 	if (route_fmt == "ndjson" || route_fmt == "csv" || route_fmt == "parquet" || route_fmt == "arrow" ||
 	    route_fmt == "arrows") {
@@ -1584,7 +1590,7 @@ void FillTempTableForSerdes(Connection &con, const string &table, const vector<s
 	}
 
 	if (!rows.empty()) {
-		Appender appender(con, table);
+		Appender appender(con, Identifier(table));
 		for (auto &cols : rows) {
 			appender.BeginRow();
 			for (auto c : data_cols) {
@@ -1669,58 +1675,128 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 	return ReadAndRemoveFileBytes(con, path);
 }
 
-//! Ensure community nanoarrow is available (LOAD, else INSTALL FROM community).
-void EnsureNanoarrowLoaded(Connection &con) {
-	auto load = con.Query("LOAD nanoarrow");
-	if (!load->HasError()) {
-		return;
-	}
-	auto inst = con.Query("INSTALL nanoarrow FROM community");
-	if (inst->HasError()) {
-		throw InvalidInputException(
-		    "arrow serialize: nanoarrow not available (%s). INSTALL nanoarrow FROM community and retry.",
-		    inst->GetError());
-	}
-	load = con.Query("LOAD nanoarrow");
-	if (load->HasError()) {
-		throw InvalidInputException("arrow serialize: could not LOAD nanoarrow: %s", load->GetError());
-	}
-}
-
-//! Serialize result rows as Arrow IPC stream bytes (nanoarrow FORMAT ARROWS).
-//! Magic is 0xFFFFFFFF stream continuation (not ARROW1 file). Content-Type:
-//! application/vnd.apache.arrow.stream. Same TEMP+COPY+read pattern as parquet.
+//! Serialize result rows as Arrow IPC stream bytes using DuckDB's Arrow C data
+//! converter and the vendored nanoarrow IPC encoder. Magic is 0xFFFFFFFF
+//! stream continuation (not ARROW1 file). Content-Type:
+//! application/vnd.apache.arrow.stream.
 string SerializeRowsArrow(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
                           const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
 	if (data_cols.empty()) {
 		throw InvalidInputException("arrow serialize: no data columns");
 	}
-	EnsureNanoarrowLoaded(con);
-	auto &fs = FileSystem::GetFileSystem(*con.context);
-	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
-	string table = "qa_arrow_" + uid;
-	string path = SerdesTempFilePath(fs, table + ".arrows");
-
-	FillTempTableForSerdes(con, table, names, types, data_cols, rows, "arrow");
-
-	auto copy_res = con.Query("COPY " + table + " TO '" + SqlQuotePath(path) + "' (FORMAT ARROWS)");
-	if (copy_res->HasError()) {
-		con.Query("DROP TABLE IF EXISTS " + table);
-		fs.TryRemoveFile(path);
-		throw InvalidInputException("arrow serialize COPY: %s", copy_res->GetError());
+	vector<string> arrow_names;
+	vector<LogicalType> arrow_types;
+	for (auto col : data_cols) {
+		arrow_names.push_back(names[col]);
+		arrow_types.push_back(types[col]);
 	}
-	con.Query("DROP TABLE IF EXISTS " + table);
-	return ReadAndRemoveFileBytes(con, path);
+
+	ClientProperties properties = con.context->GetClientProperties();
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*con.context, arrow_types);
+	ArrowSchema schema;
+	ArrowSchemaInit(&schema);
+	ArrowIpcEncoder encoder;
+	memset(&encoder, 0, sizeof(encoder));
+	ArrowBuffer output;
+	ArrowBuffer body;
+	ArrowBufferInit(&output);
+	ArrowBufferInit(&body);
+	ArrowError error;
+	ArrowErrorInit(&error);
+	bool encoder_initialized = false;
+
+	auto check_arrow = [&](ArrowErrorCode code, const char *operation) {
+		if (code != NANOARROW_OK) {
+			throw InvalidInputException("arrow serialize %s: %s", operation, ArrowErrorMessage(&error));
+		}
+	};
+
+	try {
+		ArrowConverter::ToArrowSchema(&schema, arrow_types, arrow_names, properties);
+		check_arrow(ArrowIpcEncoderInit(&encoder), "encoder init");
+		encoder_initialized = true;
+
+		check_arrow(ArrowIpcEncoderEncodeSchema(&encoder, &schema, &error), "schema encode");
+		check_arrow(ArrowIpcEncoderFinalizeBuffer(&encoder, 1, &output), "schema finalize");
+
+		for (idx_t offset = 0; offset < rows.size(); offset += STANDARD_VECTOR_SIZE) {
+			idx_t batch_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, rows.size() - offset);
+			DataChunk input;
+			input.Initialize(*con.context, arrow_types, batch_size);
+			for (idx_t row = 0; row < batch_size; row++) {
+				for (idx_t col = 0; col < data_cols.size(); col++) {
+					auto source_col = data_cols[col];
+					input.data[col].SetValue(
+					    row, source_col < rows[offset + row].size() ? rows[offset + row][source_col] : Value());
+				}
+			}
+			input.SetCardinality(batch_size);
+
+			ArrowArray array;
+			array.Init();
+			ArrowArrayView view;
+			memset(&view, 0, sizeof(view));
+			bool view_initialized = false;
+			try {
+				ArrowConverter::ToArrowArray(input, &array, properties, extension_types);
+				check_arrow(ArrowArrayViewInitFromSchema(&view, &schema, &error), "array view init");
+				view_initialized = true;
+				check_arrow(ArrowArrayViewSetArray(&view, &array, &error), "array view set");
+				check_arrow(ArrowIpcEncoderEncodeSimpleRecordBatch(&encoder, &view, &body, &error),
+				            "record batch encode");
+				check_arrow(ArrowIpcEncoderFinalizeBuffer(&encoder, 1, &output), "record batch finalize");
+				check_arrow(ArrowBufferAppend(&output, body.data, body.size_bytes), "record batch append");
+			} catch (...) {
+				if (view_initialized) {
+					ArrowArrayViewReset(&view);
+				}
+				if (array.release) {
+					ArrowArrayRelease(&array);
+				}
+				throw;
+			}
+			if (view_initialized) {
+				ArrowArrayViewReset(&view);
+			}
+			if (array.release) {
+				ArrowArrayRelease(&array);
+			}
+			ArrowBufferReset(&body);
+		}
+
+		const uint8_t end_of_stream[] = {0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0};
+		check_arrow(ArrowBufferAppend(&output, end_of_stream, sizeof(end_of_stream)), "end-of-stream append");
+		string result(reinterpret_cast<const char *>(output.data), output.size_bytes);
+		if (encoder_initialized) {
+			ArrowIpcEncoderReset(&encoder);
+		}
+		ArrowBufferReset(&body);
+		ArrowBufferReset(&output);
+		if (schema.release) {
+			ArrowSchemaRelease(&schema);
+		}
+		return result;
+	} catch (...) {
+		if (encoder_initialized) {
+			ArrowIpcEncoderReset(&encoder);
+		}
+		ArrowBufferReset(&body);
+		ArrowBufferReset(&output);
+		if (schema.release) {
+			ArrowSchemaRelease(&schema);
+		}
+		throw;
+	}
 }
 
-void SetInternalError(duckdb_httplib::Response &res, const string &server_side_detail) {
+void SetInternalError(quackapi_httplib::Response &res, const string &server_side_detail) {
 	// Return DuckDB's diagnostic so clients can diagnose route execution failures.
 	fprintf(stderr, "quackapi: internal error: %s\n", server_side_detail.c_str());
 	SetJson(res, 500, "{\"detail\":\"" + QuackapiJsonEscape(server_side_detail) + "\"}");
 }
 
 //! Collect request headers into a case-insensitive map (first value wins).
-case_insensitive_map_t<string> CollectHeaders(const duckdb_httplib::Request &req) {
+case_insensitive_map_t<string> CollectHeaders(const quackapi_httplib::Request &req) {
 	case_insensitive_map_t<string> headers;
 	for (auto &kv : req.headers) {
 		if (headers.find(kv.first) == headers.end()) {
@@ -1896,22 +1972,22 @@ static vector<string> SplitAccessLogTable(const string &table) {
 
 static unique_ptr<TableDescription> AccessLogTableInfo(Connection &con, const vector<string> &parts) {
 	if (parts.size() == 1) {
-		return con.TableInfo(parts[0]);
+		return con.TableInfo(Identifier(parts[0]));
 	}
 	if (parts.size() == 2) {
-		return con.TableInfo(parts[0], parts[1]);
+		return con.TableInfo(Identifier(parts[0]), Identifier(parts[1]));
 	}
-	return con.TableInfo(parts[0], parts[1], parts[2]);
+	return con.TableInfo(Identifier(parts[0]), Identifier(parts[1]), Identifier(parts[2]));
 }
 
 static unique_ptr<Appender> AccessLogAppender(Connection &con, const vector<string> &parts) {
 	if (parts.size() == 1) {
-		return make_uniq<Appender>(con, parts[0]);
+		return make_uniq<Appender>(con, Identifier(parts[0]));
 	}
 	if (parts.size() == 2) {
-		return make_uniq<Appender>(con, parts[0], parts[1]);
+		return make_uniq<Appender>(con, Identifier(parts[0]), Identifier(parts[1]));
 	}
-	return make_uniq<Appender>(con, parts[0], parts[1], parts[2]);
+	return make_uniq<Appender>(con, Identifier(parts[0]), Identifier(parts[1]), Identifier(parts[2]));
 }
 
 static string JsonEscape(const string &value) {
@@ -2096,7 +2172,8 @@ private:
 		vector<QuackapiAccessLogColumn> selected;
 		for (idx_t i = 0; i < sizeof(QUACKAPI_ACCESS_LOG_COLUMNS) / sizeof(QUACKAPI_ACCESS_LOG_COLUMNS[0]); i++) {
 			for (auto &column : info->columns) {
-				if (!column.Generated() && StringUtil::CIEquals(column.Name(), QUACKAPI_ACCESS_LOG_COLUMNS[i])) {
+				if (!column.Generated() &&
+				    StringUtil::CIEquals(column.Name().GetIdentifierName(), QUACKAPI_ACCESS_LOG_COLUMNS[i])) {
 					appender->AddColumn(column.Name());
 					selected.push_back(static_cast<QuackapiAccessLogColumn>(i));
 					break;
@@ -2233,11 +2310,11 @@ private:
 string SanitizeClientRequestId(const string &s);
 static void MakeTraceContext(const string &traceparent, string &trace_id, string &span_id, string &parent_span_id,
                              bool &sampled);
-static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
-                                               const string &request_id, const string &route_name,
-                                               const string &route_path, double latency_ms, int64_t received_at_micros,
-                                               double sql_prepare_ms, double sql_execute_ms, int64_t rows_out,
-                                               const string &trace_id, const string &span_id,
+static QuackapiRequestRecord MakeRequestRecord(const quackapi_httplib::Request &req,
+                                               const quackapi_httplib::Response &res, const string &request_id,
+                                               const string &route_name, const string &route_path, double latency_ms,
+                                               int64_t received_at_micros, double sql_prepare_ms, double sql_execute_ms,
+                                               int64_t rows_out, const string &trace_id, const string &span_id,
                                                const string &parent_span_id, bool sampled,
                                                const QuackapiServeOptions &options);
 
@@ -2269,7 +2346,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	if (!opts.static_dir.empty() && !server->set_mount_point("/", opts.static_dir)) {
 		throw IOException("quackapi: static_dir \"%s\" is not a directory", opts.static_dir);
 	}
-	server->set_file_request_handler([this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+	server->set_file_request_handler([this](const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 		auto db = db_ptr.lock();
 		if (!db) {
 			return;
@@ -2284,7 +2361,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 		                                                std::chrono::steady_clock::now().time_since_epoch().count())));
 		res.set_header(QUACKAPI_STATIC_LOG_RECEIVED, std::to_string(Timestamp::GetCurrentTimestamp().value));
 	});
-	server->set_post_routing_handler([this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+	server->set_post_routing_handler([this](const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 		auto marker = res.headers.find(QUACKAPI_STATIC_LOG_MARKER);
 		if (marker == res.headers.end()) {
 			return;
@@ -2324,7 +2401,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	    opts.worker_threads > 0 ? opts.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	const auto max_pending = opts.max_pending_requests;
 	server->new_task_queue = [workers, max_pending] {
-		return new duckdb_httplib::ThreadPool(static_cast<size_t>(workers), static_cast<size_t>(max_pending));
+		return new quackapi_httplib::ThreadPool(static_cast<size_t>(workers), static_cast<size_t>(max_pending));
 	};
 	server->set_keep_alive_max_count(opts.keep_alive_max_count > 0 ? static_cast<size_t>(opts.keep_alive_max_count)
 	                                                               : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
@@ -2338,7 +2415,7 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	// Cap request bodies to avoid unbounded memory DoS (httplib default is SIZE_MAX).
 	server->set_payload_max_length(QUACKAPI_PAYLOAD_MAX_LENGTH);
 
-	auto handler = [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+	auto handler = [this](const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 		HandleRequest(req, res);
 	};
 	// Route matching happens against the live registry per request, so routes
@@ -2366,12 +2443,12 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	listen_threads.emplace_back(ListenThread, this);
 }
 
-void QuackapiHttpServer::Dispatch(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+void QuackapiHttpServer::Dispatch(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 	HandleRequest(req, res);
 }
 
 //! Parse application/x-www-form-urlencoded query into httplib Params.
-void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &params) {
+void ParseQueryStringIntoParams(const string &query, quackapi_httplib::Params &params) {
 	if (query.empty()) {
 		return;
 	}
@@ -2388,10 +2465,10 @@ void ParseQueryStringIntoParams(const string &query, duckdb_httplib::Params &par
 		}
 		auto eq = pair.find('=');
 		if (eq == string::npos) {
-			params.emplace(duckdb_httplib::decode_query_component(pair, true), string());
+			params.emplace(quackapi_httplib::decode_query_component(pair, true), string());
 		} else {
-			params.emplace(duckdb_httplib::decode_query_component(pair.substr(0, eq), true),
-			               duckdb_httplib::decode_query_component(pair.substr(eq + 1), true));
+			params.emplace(quackapi_httplib::decode_query_component(pair.substr(0, eq), true),
+			               quackapi_httplib::decode_query_component(pair.substr(eq + 1), true));
 		}
 	}
 }
@@ -2414,7 +2491,7 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 	// No TCP — Dispatch only.
 	QuackapiHttpServer server(db, "127.0.0.1", 0, opts, /*bind_and_listen=*/false);
 
-	duckdb_httplib::Request req;
+	quackapi_httplib::Request req;
 	req.method = StringUtil::Upper(method);
 	string path = path_in;
 	string query;
@@ -2447,7 +2524,7 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 		req.set_header("Content-Length", std::to_string(body.size()));
 	}
 
-	duckdb_httplib::Response res;
+	quackapi_httplib::Response res;
 	server.Dispatch(req, res);
 
 	status_out = res.status;
@@ -2559,7 +2636,7 @@ static string ErrorTypeForStatus(int status) {
 	}
 }
 
-static int64_t ResponseBytes(const duckdb_httplib::Response &res) {
+static int64_t ResponseBytes(const quackapi_httplib::Response &res) {
 	size_t bytes = res.body.size();
 	// Prefer Content-Length when set; body may be empty for HEAD.
 	auto cl = res.headers.find("Content-Length");
@@ -2578,7 +2655,7 @@ static bool IsDeniedHeaderName(const string &name) {
 	       StringUtil::Contains(name, "password");
 }
 
-static unordered_map<string, string> RedactedHeaders(const duckdb_httplib::Request &req, const string &allowlist) {
+static unordered_map<string, string> RedactedHeaders(const quackapi_httplib::Request &req, const string &allowlist) {
 	vector<string> allowed;
 	for (auto name : StringUtil::Split(allowlist, ',')) {
 		StringUtil::Trim(name);
@@ -2605,7 +2682,7 @@ static unordered_map<string, string> RedactedHeaders(const duckdb_httplib::Reque
 }
 
 static bool IsDeniedQueryKey(const string &raw_key) {
-	auto key = StringUtil::Lower(duckdb_httplib::decode_query_component(raw_key, true));
+	auto key = StringUtil::Lower(quackapi_httplib::decode_query_component(raw_key, true));
 	static constexpr const char *DENIED_QUERY_KEY_PARTS[] = {"token", "key",  "secret", "password",
 	                                                         "sig",   "code", "auth"};
 	for (auto part : DENIED_QUERY_KEY_PARTS) {
@@ -2650,11 +2727,11 @@ static string RedactRawQuery(const string &target) {
 	return redacted;
 }
 
-static QuackapiRequestRecord MakeRequestRecord(const duckdb_httplib::Request &req, const duckdb_httplib::Response &res,
-                                               const string &request_id, const string &route_name,
-                                               const string &route_path, double latency_ms, int64_t received_at_micros,
-                                               double sql_prepare_ms, double sql_execute_ms, int64_t rows_out,
-                                               const string &trace_id, const string &span_id,
+static QuackapiRequestRecord MakeRequestRecord(const quackapi_httplib::Request &req,
+                                               const quackapi_httplib::Response &res, const string &request_id,
+                                               const string &route_name, const string &route_path, double latency_ms,
+                                               int64_t received_at_micros, double sql_prepare_ms, double sql_execute_ms,
+                                               int64_t rows_out, const string &trace_id, const string &span_id,
                                                const string &parent_span_id, bool sampled,
                                                const QuackapiServeOptions &options) {
 	QuackapiRequestRecord entry;
@@ -2769,7 +2846,7 @@ static string TelemetryHealthJson(const std::vector<QuackapiTelemetryStatus> &st
 	return result;
 }
 
-void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+void QuackapiHttpServer::ApplyCorsHeaders(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 	if (cors_origins.empty()) {
 		return;
 	}
@@ -2823,7 +2900,7 @@ void QuackapiHttpServer::ApplyCorsHeaders(const duckdb_httplib::Request &req, du
 	}
 }
 
-void QuackapiHttpServer::MaybeCompressResponse(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+void QuackapiHttpServer::MaybeCompressResponse(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 	if (compression == QuackapiCompressionMode::OFF) {
 		return;
 	}
@@ -2931,7 +3008,7 @@ void QuackapiState::ClearRouteRateLimit(const string &route) {
 	}
 }
 
-static string RateLimitClientKey(DatabaseInstance &db, const duckdb_httplib::Request &req, const string &by,
+static string RateLimitClientKey(DatabaseInstance &db, const quackapi_httplib::Request &req, const string &by,
                                  const QuackapiRoute &route, const QuackapiAuthResult &verified) {
 	if (by == "token" || by == "key") {
 		// Only verified identities can select their own bucket. An unauthenticated
@@ -2950,7 +3027,7 @@ static string RateLimitClientKey(DatabaseInstance &db, const duckdb_httplib::Req
 	return "ip:" + ip;
 }
 
-void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 	// Always attach CORS headers when configured (including error responses).
 	// Stamp X-Request-ID + emit structured access log on every exit path.
 	// Applied once at the end via a small RAII-ish pattern: call ApplyCors on
@@ -3504,9 +3581,9 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			}
 
 			auto expected_types = prepared->GetExpectedParameterTypes();
-			case_insensitive_map_t<BoundParameterData> named_values;
-			for (auto &entry : prepared->named_param_map) {
-				auto &param_name = entry.first;
+			identifier_map_t<BoundParameterData> named_values;
+			for (auto &entry : prepared->GetNamedParameterMap()) {
+				auto &param_name = entry.first.GetIdentifierName();
 				auto type_it = expected_types.find(param_name);
 				LogicalType expected = LogicalType::UNKNOWN;
 				if (type_it != expected_types.end()) {
@@ -3516,7 +3593,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				if (it == provided.end()) {
 					// Optional last_id: missing → SQL NULL so WHERE id > $last_id works with COALESCE.
 					if (param_name == "last_id") {
-						named_values[param_name] = BoundParameterData(Value());
+						named_values[Identifier(param_name)] = BoundParameterData(Value());
 						continue;
 					}
 					string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
@@ -3532,11 +3609,11 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					finish();
 					return;
 				}
-				named_values[param_name] = bound;
+				named_values[Identifier(param_name)] = bound;
 			}
 
 			// Prove the first execute works before committing to chunked transfer.
-			auto first_result = prepared->Execute(named_values, true);
+			auto first_result = prepared->Execute(named_values);
 			if (first_result->HasError()) {
 				SetInternalError(res, first_result->GetError());
 				finish();
@@ -3546,7 +3623,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			struct SseProviderState {
 				shared_ptr<Connection> con;
 				string handler_sql;
-				case_insensitive_map_t<BoundParameterData> named_values;
+				identifier_map_t<BoundParameterData> named_values;
 				int64_t interval_ms = 0;
 				unique_ptr<PreparedStatement> prepared;
 				unique_ptr<QueryResult> result;
@@ -3575,7 +3652,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 
 			res.set_chunked_content_provider(
 			    "text/event-stream",
-			    [state](size_t /*offset*/, duckdb_httplib::DataSink &sink) -> bool {
+			    [state](size_t /*offset*/, quackapi_httplib::DataSink &sink) -> bool {
 				    if (state->closed) {
 					    sink.done();
 					    return true;
@@ -3583,7 +3660,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				    try {
 					    QuackapiQueryDeadline deadline(*state->con, state->query_timeout_ms);
 					    if (state->need_execute) {
-						    state->result = state->prepared->Execute(state->named_values, true);
+						    state->result = state->prepared->Execute(state->named_values);
 						    if (state->result->HasError()) {
 							    fprintf(stderr, "quackapi stream execute error: %s\n",
 							            state->result->GetError().c_str());
@@ -3617,7 +3694,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						    return true;
 					    }
 
-					    auto &names = state->result->names;
+					    auto names = QuackapiNames(state->result->GetNames());
 					    string buf;
 					    for (idx_t row = 0; row < chunk->size(); row++) {
 						    vector<Value> cols(chunk->ColumnCount());
@@ -4056,23 +4133,23 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 		// (never 422 for a missing claim).
 		// PARAM … DEFAULT makes a query/path param optional (bind default/NULL).
 		auto expected_types = prepared->GetExpectedParameterTypes();
-		case_insensitive_map_t<BoundParameterData> named_values;
+		identifier_map_t<BoundParameterData> named_values;
 		vector<QuackapiValidationIssue> validation_issues;
 		// Track raw strings for execute-time conversion error → param name recovery.
 		case_insensitive_map_t<std::pair<string, string>> bound_raw; // name -> (loc, raw)
 
-		for (auto &entry : prepared->named_param_map) {
-			auto &param_name = entry.first;
+		for (auto &entry : prepared->GetNamedParameterMap()) {
+			auto &param_name = entry.first.GetIdentifierName();
 
 			string claim_key;
 			if (IsClaimsParam(param_name, claim_key)) {
 				auto cit = auth_result.claims.find(claim_key);
 				if (cit == auth_result.claims.end()) {
 					// Absent claim → SQL NULL (do NOT 422).
-					named_values[param_name] = BoundParameterData(Value());
+					named_values[Identifier(param_name)] = BoundParameterData(Value());
 				} else {
 					// Claims bind as VARCHAR; non-string/nested already JSON-encoded.
-					named_values[param_name] = BoundParameterData(Value(cit->second));
+					named_values[Identifier(param_name)] = BoundParameterData(Value(cit->second));
 				}
 				continue;
 			}
@@ -4137,7 +4214,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				if (spec && spec->has_default) {
 					from_default = true;
 					if (spec->default_is_null) {
-						named_values[param_name] = BoundParameterData(Value());
+						named_values[Identifier(param_name)] = BoundParameterData(Value());
 						// Constraints on absent optional NULL: skip (FastAPI).
 						continue;
 					}
@@ -4160,7 +4237,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 						                             "Input should be a valid " + expected.ToString(), "type_error"});
 						continue;
 					}
-					named_values[param_name] = BoundParameterData(Value());
+					named_values[Identifier(param_name)] = BoundParameterData(Value());
 					continue;
 				}
 				raw = it->second.second;
@@ -4203,7 +4280,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					Value probe(raw);
 					Value as_int;
 					string cerr;
-					if (probe.DefaultTryCastAs(LogicalType::INTEGER, as_int, &cerr)) {
+					if (QuackapiTryCast(probe, LogicalType::INTEGER, as_int, &cerr)) {
 						// Would cast — only reject number-like non-integers
 						// (contain digit and non-digit). Pure text like "abc"
 						// fails TryCast and is left for later.
@@ -4243,7 +4320,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				if (typed_body.type() != expected) {
 					Value casted;
 					string cast_error;
-					if (!typed_body.DefaultTryCastAs(expected, casted, &cast_error)) {
+					if (!QuackapiTryCast(typed_body, expected, casted, &cast_error)) {
 						SetJson(res, 422,
 						        ValidationErrorJson("body", "body", "BODY TYPE does not match handler parameter type",
 						                            "type_error"));
@@ -4252,7 +4329,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 					}
 					typed_body = casted;
 				}
-				named_values[param_name] = BoundParameterData(typed_body);
+				named_values[Identifier(param_name)] = BoundParameterData(typed_body);
 				continue;
 			}
 
@@ -4278,7 +4355,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				Value constraint_val;
 				if (expected.id() != LogicalTypeId::UNKNOWN && expected.id() != LogicalTypeId::VARCHAR) {
 					string cerr;
-					Value(raw).DefaultTryCastAs(expected, constraint_val, &cerr);
+					QuackapiTryCast(Value(raw), expected, constraint_val, &cerr);
 				} else {
 					constraint_val = Value(raw);
 				}
@@ -4288,7 +4365,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				}
 			}
 
-			named_values[param_name] = bound;
+			named_values[Identifier(param_name)] = bound;
 			bound_raw[param_name] = {loc_kind, raw};
 			(void)from_default;
 		}
@@ -4340,7 +4417,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 				return;
 			}
 		} else {
-			result = prepared->Execute(named_values, false);
+			result = prepared->Execute(named_values);
 			sql_execute_ms =
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
 		}
@@ -4418,7 +4495,7 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			return;
 		}
 
-		auto &names = result->names;
+		auto names = QuackapiNames(result->GetNames());
 		// Identify special response columns (FastAPI RedirectResponse / response cookies).
 		// `location` → Location header; `set_cookie` / `set-cookie` → Set-Cookie.
 		// These are stripped from the JSON/HTML/TEXT body.
@@ -4547,10 +4624,10 @@ void QuackapiHttpServer::HandleRequest(const duckdb_httplib::Request &req, duckd
 			body = SerializeRowsCsv(names, data_cols, rows);
 			content_type = "text/csv; charset=utf-8";
 		} else if (body_format == BodyFormat::PARQUET) {
-			body = SerializeRowsParquet(con, names, result->types, data_cols, rows);
+			body = SerializeRowsParquet(con, names, result->GetTypes(), data_cols, rows);
 			content_type = "application/vnd.apache.parquet";
 		} else if (body_format == BodyFormat::ARROW) {
-			body = SerializeRowsArrow(con, names, result->types, data_cols, rows);
+			body = SerializeRowsArrow(con, names, result->GetTypes(), data_cols, rows);
 			// nanoarrow FORMAT ARROWS produces IPC *stream* (0xFFFFFFFF magic).
 			content_type = "application/vnd.apache.arrow.stream";
 		} else if (object_envelope) {
@@ -4634,7 +4711,7 @@ bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_m
 	const time_t sec = static_cast<time_t>(connect_timeout_ms / 1000);
 	const time_t usec = static_cast<time_t>((connect_timeout_ms % 1000) * 1000);
 	try {
-		duckdb_httplib::Client cli(host, port);
+		quackapi_httplib::Client cli(host, port);
 		cli.set_connection_timeout(sec, usec);
 		cli.set_read_timeout(1, 0);
 		cli.set_write_timeout(1, 0);
@@ -4642,8 +4719,8 @@ bool QuackapiPortIsAccepting(const string &host, int port, int connect_timeout_m
 		// Any completed HTTP exchange (including 404) means the listener accepts.
 		auto res = cli.Get("/");
 		auto err = res.error();
-		return err == duckdb_httplib::Error::Success || err == duckdb_httplib::Error::Read ||
-		       err == duckdb_httplib::Error::Write;
+		return err == quackapi_httplib::Error::Success || err == quackapi_httplib::Error::Read ||
+		       err == quackapi_httplib::Error::Write;
 	} catch (...) {
 		return false;
 	}

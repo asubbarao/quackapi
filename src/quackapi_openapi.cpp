@@ -127,7 +127,7 @@ string DuckTypeToOas(const LogicalType &type) {
 			if (i > 0) {
 				properties += ",";
 			}
-			properties += JsonString(children[i].first) + ":" + DuckTypeToOas(children[i].second);
+			properties += JsonString(children[i].first.GetIdentifierName()) + ":" + DuckTypeToOas(children[i].second);
 		}
 		return "{\"type\":\"object\",\"properties\":" + properties + "}}";
 	}
@@ -214,12 +214,12 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		auto prepared = con.Prepare(exec_route ? "SELECT $" + exec_param + "::VARCHAR" : route.handler_sql);
 		if (!prepared->HasError()) {
 			if (!exec_route) {
-				col_names = prepared->GetNames();
+				col_names = QuackapiNames(prepared->GetNames());
 				col_types = prepared->GetTypes();
 			}
 			expected_types = prepared->GetExpectedParameterTypes();
-			for (auto &entry : prepared->named_param_map) {
-				named_params.push_back(entry.first);
+			for (auto &entry : prepared->GetNamedParameterMap()) {
+				named_params.push_back(entry.first.GetIdentifierName());
 			}
 		}
 

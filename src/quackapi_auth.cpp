@@ -658,17 +658,17 @@ void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader) {
 	ScalarFunction verify("quackapi_verify_auth", {LogicalType::VARCHAR, LogicalType::VARCHAR}, VerifyAuthReturnType(),
 	                      QuackapiVerifyAuthFunction);
 	verify.SetVolatile();
-	loader.RegisterFunction(verify);
+	RegisterFallible(loader, verify);
 
 	ScalarFunction authn("quackapi_authentication", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     LogicalType::BOOLEAN, QuackapiAuthenticationFunction);
 	authn.SetVolatile();
-	loader.RegisterFunction(authn);
+	RegisterFallible(loader, authn);
 
 	ScalarFunction authz("quackapi_authorization", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
 	                     QuackapiAuthorizationFunction);
 	authz.SetVolatile();
-	loader.RegisterFunction(authz);
+	RegisterFallible(loader, authz);
 }
 
 //===--------------------------------------------------------------------===//
@@ -865,7 +865,7 @@ struct ApplyAuthBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyAuthBind(ClientContext &, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyAuthBindData>();
 	bind_data->action = input.inputs[0].GetValue<string>();
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
@@ -951,7 +951,7 @@ struct AuthsBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> AuthsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("name");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -979,7 +979,7 @@ void AuthsExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &ou
 		}
 		row++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 	bind_data.finished = true;
 }
 
@@ -995,7 +995,7 @@ struct AddApiKeyBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> AddApiKeyBind(ClientContext &, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<AddApiKeyBindData>();
 	bind_data->auth_name = input.inputs[0].GetValue<string>();
 	bind_data->raw_key = input.inputs[1].GetValue<string>();
@@ -1012,14 +1012,14 @@ void AddApiKeyExec(ClientContext &context, TableFunctionInput &data_p, DataChunk
 	}
 	auto subject = QuackapiState::Get(*context.db).AddApiKey(bind_data.auth_name, bind_data.raw_key, bind_data.subject);
 	output.SetValue(0, 0, Value(subject));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	bind_data.finished = true;
 }
 
 } // namespace
 
 AuthDdlParserExtension::AuthDdlParserExtension() {
-	parse_function = AuthDdlParse;
+	parse_function = QuackapiTokenParse<AuthDdlParse>;
 	plan_function = AuthDdlPlan;
 }
 

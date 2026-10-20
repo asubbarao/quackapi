@@ -176,7 +176,7 @@ struct ApplyApiBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> ApplyApiBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
 	auto bind_data = make_uniq<ApplyApiBindData>();
 	bind_data->or_replace = input.inputs[0].GetValue<bool>();
 	bind_data->table = input.inputs[1].GetValue<string>();
@@ -278,7 +278,7 @@ ParserExtensionPlanResult TableApiPlan(ParserExtensionInfo *, ClientContext &,
 } // namespace
 
 TableApiDdlParserExtension::TableApiDdlParserExtension() {
-	parse_function = TableApiParse;
+	parse_function = QuackapiTokenParse<TableApiParse>;
 	plan_function = TableApiPlan;
 }
 

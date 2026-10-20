@@ -143,12 +143,11 @@ SELECT
 ----
 Route multiline: GET /multi
 
-# Handler is stored with internal newlines collapsed only by whitespace trim at
-# the edges — body still contains SELECT … AS msg (single cell; replace \n for assert)
+# The handler is rebuilt from the statement's tokens, one space between them.
 query I
-SELECT replace(handler, chr(10), ' ') FROM quackapi_routes() WHERE name = 'multiline';
+SELECT handler FROM quackapi_routes() WHERE name = 'multiline';
 ----
-SELECT   'ok' AS msg
+SELECT 'ok' AS msg
 
 query I
 DROP ROUTE multiline;

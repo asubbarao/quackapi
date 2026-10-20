@@ -6,6 +6,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/logging/log_manager.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_result.hpp"
 

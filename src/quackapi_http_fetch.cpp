@@ -1,6 +1,7 @@
 #include "quackapi_http_fetch.hpp"
 #include "quackapi_thread_join.hpp"
 #include "quackapi_limits.hpp"
+#include "quackapi_util.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -62,7 +63,7 @@ QuackapiHttpFetchResult FromResponse(unique_ptr<HTTPResponse> response) {
 // and parallelism — the same shape as httpx's pool on the FastAPI side.
 
 struct PooledPlain {
-	unique_ptr<duckdb_httplib::Client> client;
+	unique_ptr<quackapi_httplib::Client> client;
 };
 
 struct PooledUtil {
@@ -201,13 +202,13 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 		return out;
 	}
 
-	duckdb_httplib::Error conn_error = duckdb_httplib::Error::Success;
-	auto sock = duckdb_httplib::detail::create_client_socket(
-	    host, "", port, AF_UNSPEC, /*tcp_nodelay=*/true, /*ipv6_v6only=*/false, duckdb_httplib::default_socket_options,
-	    OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0, /*intf=*/"",
-	    conn_error);
+	quackapi_httplib::Error conn_error = quackapi_httplib::Error::Success;
+	auto sock = quackapi_httplib::detail::create_client_socket(
+	    host, "", port, AF_UNSPEC, /*tcp_nodelay=*/true, /*ipv6_v6only=*/false,
+	    quackapi_httplib::default_socket_options, OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0,
+	    OUTBOUND_TIMEOUT_SECONDS, 0, /*intf=*/"", conn_error);
 	if (sock == INVALID_SOCKET) {
-		out.request_error = "stall_ms connect: " + duckdb_httplib::to_string(conn_error);
+		out.request_error = "stall_ms connect: " + quackapi_httplib::to_string(conn_error);
 		return out;
 	}
 
@@ -224,9 +225,9 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	const char *send_ptr = req.data();
 	size_t send_left = req.size();
 	while (send_left > 0) {
-		auto n = duckdb_httplib::detail::send_socket(sock, send_ptr, send_left, CPPHTTPLIB_SEND_FLAGS);
+		auto n = quackapi_httplib::detail::send_socket(sock, send_ptr, send_left, CPPHTTPLIB_SEND_FLAGS);
 		if (n <= 0) {
-			duckdb_httplib::detail::close_socket(sock);
+			quackapi_httplib::detail::close_socket(sock);
 			out.request_error = "stall_ms: send failed";
 			return out;
 		}
@@ -241,13 +242,13 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	string raw;
 	char buf[16384];
 	while (true) {
-		auto n = duckdb_httplib::detail::read_socket(sock, buf, sizeof(buf), CPPHTTPLIB_RECV_FLAGS);
+		auto n = quackapi_httplib::detail::read_socket(sock, buf, sizeof(buf), CPPHTTPLIB_RECV_FLAGS);
 		if (n <= 0) {
 			break;
 		}
 		raw.append(buf, static_cast<size_t>(n));
 	}
-	duckdb_httplib::detail::close_socket(sock);
+	quackapi_httplib::detail::close_socket(sock);
 
 	if (raw.empty()) {
 		out.request_error = "stall_ms: empty response (peer closed during stall)";
@@ -257,8 +258,8 @@ QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map
 	return out;
 }
 
-unique_ptr<duckdb_httplib::Client> DialPlain(const string &origin) {
-	auto client = make_uniq<duckdb_httplib::Client>(origin);
+unique_ptr<quackapi_httplib::Client> DialPlain(const string &origin) {
+	auto client = make_uniq<quackapi_httplib::Client>(origin);
 	client->set_keep_alive(true);
 	// Same Nagle/delayed-ACK deadlock the server side hit (quackapi_server.cpp:917),
 	// just on the other end of the socket: without this a small POST body waits on
@@ -272,18 +273,18 @@ unique_ptr<duckdb_httplib::Client> DialPlain(const string &origin) {
 	return client;
 }
 
-duckdb_httplib::Headers ToHttplibHeaders(const unordered_map<string, string> &extra) {
-	duckdb_httplib::Headers headers;
+quackapi_httplib::Headers ToHttplibHeaders(const unordered_map<string, string> &extra) {
+	quackapi_httplib::Headers headers;
 	for (auto &kv : extra) {
 		headers.emplace(kv.first, kv.second);
 	}
 	return headers;
 }
 
-QuackapiHttpFetchResult FromHttplibResult(const duckdb_httplib::Result &res) {
+QuackapiHttpFetchResult FromHttplibResult(const quackapi_httplib::Result &res) {
 	QuackapiHttpFetchResult out;
-	if (res.error() != duckdb_httplib::Error::Success) {
-		out.request_error = duckdb_httplib::to_string(res.error());
+	if (res.error() != quackapi_httplib::Error::Success) {
+		out.request_error = quackapi_httplib::to_string(res.error());
 		return out;
 	}
 	auto &response = res.value();
@@ -302,7 +303,7 @@ QuackapiHttpFetchResult FromHttplibResult(const duckdb_httplib::Result &res) {
 //! healthy — a broken socket must not be handed to the next request.
 template <class CALL>
 QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
-	unique_ptr<duckdb_httplib::Client> client;
+	unique_ptr<quackapi_httplib::Client> client;
 	bool reused = false;
 	{
 		auto &pool = ConnectionPool::Get();
@@ -333,7 +334,7 @@ QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
 	bool healthy = false;
 	try {
 		auto res = call(*client);
-		healthy = res.error() == duckdb_httplib::Error::Success;
+		healthy = res.error() == quackapi_httplib::Error::Success;
 		result = FromHttplibResult(res);
 	} catch (...) {
 		// Drop the client on the floor; a half-written socket is not reusable.
@@ -446,7 +447,7 @@ static QuackapiHttpFetchResult GetOnce(DatabaseInstance &db, const string &url,
 		string origin, path;
 		SplitURL(url, origin, path);
 		auto headers = ToHttplibHeaders(extra_headers);
-		return finish(WithPlainClient(origin, [&](duckdb_httplib::Client &client) {
+		return finish(WithPlainClient(origin, [&](quackapi_httplib::Client &client) {
 			client.set_follow_location(false);
 			auto response = client.Get(path, headers, receive);
 			client.set_follow_location(true);
@@ -622,7 +623,7 @@ QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const stri
 		auto headers = ToHttplibHeaders(extra_headers);
 		const auto &ct = content_type.empty() ? string("application/octet-stream") : content_type;
 		return WithPlainClient(origin,
-		                       [&](duckdb_httplib::Client &client) { return client.Post(path, headers, body, ct); });
+		                       [&](quackapi_httplib::Client &client) { return client.Post(path, headers, body, ct); });
 	}
 
 	// Built-In HTTPLibClient does not implement POST (http_util.cpp). Surface a
@@ -771,8 +772,36 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
 //!
 //! The single-request case — what a route handler doing one upstream call per
 //! request looks like — stays fully inline. No thread is created for it.
+//! The caller's deadline, tightened by the session's quackapi_http_timeout_ms. Outside a served
+//! request there is no other deadline, so this is what stops a call to a peer that went silent.
+std::chrono::steady_clock::time_point OutboundDeadline(ClientContext &context) {
+	auto deadline = QuackapiCurrentDeadline();
+	Value setting;
+	if (context.TryGetCurrentSetting("quackapi_http_timeout_ms", setting) && !setting.IsNull()) {
+		const auto timeout_ms = setting.GetValue<int64_t>();
+		if (timeout_ms <= 0) {
+			throw InvalidInputException("quackapi_http_timeout_ms must be > 0");
+		}
+		deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+	}
+	return deadline;
+}
+
+//! Restores the calling thread's deadline when an inline request returns or throws.
+struct ScopedOutboundDeadline {
+	explicit ScopedOutboundDeadline(ClientContext &context) : previous(QuackapiCurrentDeadline()) {
+		QuackapiSetCurrentDeadline(OutboundDeadline(context));
+	}
+	~ScopedOutboundDeadline() {
+		QuackapiSetCurrentDeadline(previous);
+	}
+	std::chrono::steady_clock::time_point previous;
+};
+
 template <class PERFORM>
-void FanOutRequests(idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out, PERFORM &&perform) {
+void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out,
+                    PERFORM &&perform) {
+	ScopedOutboundDeadline scoped(context);
 	const auto deadline = QuackapiCurrentDeadline();
 	auto run_one = [&](idx_t i) {
 		QuackapiSetCurrentDeadline(deadline);
@@ -864,7 +893,7 @@ void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 
 	vector<QuackapiHttpFetchResult> out(count);
-	FanOutRequests(count, skip, out,
+	FanOutRequests(state.GetContext(), count, skip, out,
 	               [&](idx_t i) { return QuackapiHttpFetch::Get(db, urls[i], headers[i], stalls[i]); });
 
 	for (idx_t i = 0; i < count; i++) {
@@ -904,7 +933,7 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 
 	vector<QuackapiHttpFetchResult> out(count);
-	FanOutRequests(count, skip, out, [&](idx_t i) {
+	FanOutRequests(state.GetContext(), count, skip, out, [&](idx_t i) {
 		return QuackapiHttpFetch::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
 	});
 
@@ -928,7 +957,7 @@ struct FetchTableBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> PoolBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
 	names = {"host", "idle", "dialed", "reused"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
 	return nullptr;
@@ -952,7 +981,7 @@ void PoolExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 //! Concurrent GETs — the seam SQLLogic needs for claim-race / fan-out tests.
@@ -976,7 +1005,7 @@ struct ParallelFetchGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ParallelFetchBind(ClientContext &, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<ParallelFetchBindData>();
 	bind->url = input.inputs[0].GetValue<string>();
 	bind->n = input.inputs[1].GetValue<int32_t>();
@@ -995,7 +1024,7 @@ unique_ptr<GlobalTableFunctionState> ParallelFetchInit(ClientContext &context, T
 	auto &bind = input.bind_data->Cast<ParallelFetchBindData>();
 	auto state = make_uniq<ParallelFetchGlobalState>();
 	state->rows.resize(NumericCast<idx_t>(bind.n));
-	const auto deadline = QuackapiCurrentDeadline();
+	const auto deadline = OutboundDeadline(context);
 	auto &db = *context.db;
 	vector<std::thread> threads;
 	threads.reserve(NumericCast<idx_t>(bind.n));
@@ -1035,7 +1064,7 @@ void ParallelFetchExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		row++;
 		state.offset++;
 	}
-	output.SetCardinality(row);
+	output.SetChildCardinality(row);
 }
 
 } // namespace
@@ -1051,21 +1080,21 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	// any benchmark built on it.
 	ScalarFunctionSet fetch_set("quackapi_fetch");
 	ScalarFunction fetch1("quackapi_fetch", {LogicalType::VARCHAR}, result_type, FetchScalar);
-	fetch1.stability = FunctionStability::VOLATILE;
+	fetch1.SetVolatile();
 	ScalarFunction fetch2("quackapi_fetch", {LogicalType::VARCHAR, header_type}, result_type, FetchScalar);
-	fetch2.stability = FunctionStability::VOLATILE;
+	fetch2.SetVolatile();
 	// stall_ms: after send, wait N ms before reading (socket write-timeout test seam).
 	ScalarFunction fetch_stall("quackapi_fetch", {LogicalType::VARCHAR, LogicalType::INTEGER}, result_type,
 	                           FetchScalar);
-	fetch_stall.stability = FunctionStability::VOLATILE;
+	fetch_stall.SetVolatile();
 	ScalarFunction fetch_hdr_stall("quackapi_fetch", {LogicalType::VARCHAR, header_type, LogicalType::INTEGER},
 	                               result_type, FetchScalar);
-	fetch_hdr_stall.stability = FunctionStability::VOLATILE;
+	fetch_hdr_stall.SetVolatile();
 	fetch_set.AddFunction(fetch1);
 	fetch_set.AddFunction(fetch2);
 	fetch_set.AddFunction(fetch_stall);
 	fetch_set.AddFunction(fetch_hdr_stall);
-	loader.RegisterFunction(fetch_set);
+	RegisterFallible(loader, fetch_set);
 
 	// Table form exposes named stall_ms := N (scalars have no named_parameters).
 	TableFunction fetch_tf(
@@ -1075,6 +1104,7 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    if (bind.finished) {
 			    return;
 		    }
+		    ScopedOutboundDeadline scoped(context);
 		    QuackapiHttpFetchResult result;
 		    try {
 			    result = QuackapiHttpFetch::Get(*context.db, bind.url, bind.headers, bind.stall_ms, bind.timeout_ms,
@@ -1090,11 +1120,11 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    for (idx_t c = 0; c < children.size(); c++) {
 			    output.SetValue(c, 0, children[c]);
 		    }
-		    output.SetCardinality(1);
+		    output.SetChildCardinality(1);
 		    bind.finished = true;
 	    },
 	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-	       vector<string> &names) -> unique_ptr<FunctionData> {
+	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
 		    auto bind = make_uniq<FetchTableBindData>();
 		    if (input.inputs.empty() || input.inputs[0].IsNull()) {
 			    throw InvalidInputException("quackapi_fetch(url, stall_ms := N): url must be non-NULL");
@@ -1133,29 +1163,29 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    }
 		    return std::move(bind);
 	    });
-	fetch_tf.named_parameters["headers"] = header_type;
-	fetch_tf.named_parameters["stall_ms"] = LogicalType::INTEGER;
-	fetch_tf.named_parameters["timeout_ms"] = LogicalType::BIGINT;
-	fetch_tf.named_parameters["max_response_bytes"] = LogicalType::BIGINT;
+	AddNamedParameter(fetch_tf, "headers", header_type);
+	AddNamedParameter(fetch_tf, "stall_ms", LogicalType::INTEGER);
+	AddNamedParameter(fetch_tf, "timeout_ms", LogicalType::BIGINT);
+	AddNamedParameter(fetch_tf, "max_response_bytes", LogicalType::BIGINT);
 	loader.RegisterFunction(fetch_tf);
 
 	ScalarFunctionSet post_set("quackapi_post");
 	ScalarFunction post2("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR}, result_type, PostScalar);
-	post2.stability = FunctionStability::VOLATILE;
+	post2.SetVolatile();
 	ScalarFunction post2j("quackapi_post", {LogicalType::VARCHAR, LogicalType::JSON()}, result_type, PostScalar);
-	post2j.stability = FunctionStability::VOLATILE;
+	post2j.SetVolatile();
 	ScalarFunction post3("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     result_type, PostScalar);
-	post3.stability = FunctionStability::VOLATILE;
+	post3.SetVolatile();
 	ScalarFunction post4("quackapi_post",
 	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, header_type}, result_type,
 	                     PostScalar);
-	post4.stability = FunctionStability::VOLATILE;
+	post4.SetVolatile();
 	post_set.AddFunction(post2);
 	post_set.AddFunction(post2j);
 	post_set.AddFunction(post3);
 	post_set.AddFunction(post4);
-	loader.RegisterFunction(post_set);
+	RegisterFallible(loader, post_set);
 
 	loader.RegisterFunction(TableFunction("quackapi_http_pool", {}, PoolExec, PoolBind, PoolInit));
 
