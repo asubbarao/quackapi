@@ -1,4 +1,6 @@
 #include "quackapi_limits.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
 #include <atomic>
 #include <condition_variable>
@@ -8,14 +10,35 @@
 #include <algorithm>
 
 namespace duckdb {
-static thread_local std::chrono::steady_clock::time_point current_deadline =
-    std::chrono::steady_clock::time_point::max();
+using QuackapiClock = std::chrono::steady_clock;
+
+static thread_local QuackapiClock::time_point current_deadline = QuackapiClock::time_point::max();
+
+//! Per-connection deadline and serving budgets. Read from any thread a query runs on.
+struct QuackapiContextBudget : public ClientContextState {
+	std::atomic<QuackapiClock::rep> deadline {QuackapiClock::time_point::max().time_since_epoch().count()};
+	std::atomic<int64_t> query_timeout_ms {0};
+	std::atomic<int64_t> max_response_bytes {0};
+};
+
+static const char *const QUACKAPI_BUDGET_KEY = "quackapi_request_budget";
+
+static shared_ptr<QuackapiContextBudget> BudgetOf(ClientContext &context) {
+	return context.registered_state->Get<QuackapiContextBudget>(QUACKAPI_BUDGET_KEY);
+}
+
+static shared_ptr<QuackapiContextBudget> BudgetFor(Connection &connection) {
+	return connection.context->registered_state->GetOrCreate<QuackapiContextBudget>(QUACKAPI_BUDGET_KEY);
+}
 
 struct QuackapiDeadlineState {
 	std::mutex mutex;
 	Connection *connection;
-	std::chrono::steady_clock::time_point deadline;
+	ClientContext *parent = nullptr;
+	QuackapiClock::time_point deadline;
 	std::atomic<bool> expired {false};
+	shared_ptr<QuackapiContextBudget> budget;
+	QuackapiClock::rep budget_previous = 0;
 };
 
 class DeadlineWatchdog {
@@ -44,17 +67,19 @@ private:
 		std::unique_lock<std::mutex> guard(mutex);
 		while (!stopping) {
 			wake.wait_for(guard, std::chrono::milliseconds(5));
-			const auto now = std::chrono::steady_clock::now();
+			const auto now = QuackapiClock::now();
 			for (auto it = states.begin(); it != states.end();) {
 				auto state = it->lock();
 				if (!state) {
 					it = states.erase(it);
 					continue;
 				}
-				if (now >= state->deadline) {
-					std::lock_guard<std::mutex> state_guard(state->mutex);
-					if (state->connection) {
+				std::lock_guard<std::mutex> state_guard(state->mutex);
+				if (state->connection) {
+					if (now >= state->deadline) {
 						state->expired = true;
+						state->connection->Interrupt();
+					} else if (state->parent && state->parent->interrupted) {
 						state->connection->Interrupt();
 					}
 				}
@@ -75,9 +100,20 @@ static DeadlineWatchdog &Watchdog() {
 }
 
 QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, int64_t timeout_ms) : previous(current_deadline) {
+	Start(connection, std::min(previous, QuackapiClock::now() + std::chrono::milliseconds(timeout_ms)), nullptr);
+}
+QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, QuackapiClock::time_point deadline,
+                                             ClientContext *parent)
+    : previous(current_deadline) {
+	Start(connection, deadline, parent);
+}
+void QuackapiQueryDeadline::Start(Connection &connection, QuackapiClock::time_point deadline, ClientContext *parent) {
 	state = std::make_shared<QuackapiDeadlineState>();
 	state->connection = &connection;
-	state->deadline = std::min(previous, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+	state->parent = parent;
+	state->deadline = deadline;
+	state->budget = BudgetFor(connection);
+	state->budget_previous = state->budget->deadline.exchange(deadline.time_since_epoch().count());
 	current_deadline = state->deadline;
 	Watchdog().Add(state);
 }
@@ -85,24 +121,50 @@ QuackapiQueryDeadline::~QuackapiQueryDeadline() {
 	{
 		std::lock_guard<std::mutex> guard(state->mutex);
 		state->connection = nullptr;
+		state->parent = nullptr;
 	}
+	// Restore only if no later guard on this connection replaced the deadline.
+	auto ours = state->deadline.time_since_epoch().count();
+	state->budget->deadline.compare_exchange_strong(ours, state->budget_previous);
 	current_deadline = previous;
 }
 bool QuackapiQueryDeadline::Expired() const {
-	return state->expired || std::chrono::steady_clock::now() >= state->deadline;
+	return state->expired || QuackapiClock::now() >= state->deadline;
 }
-std::chrono::steady_clock::time_point QuackapiCurrentDeadline() {
+QuackapiClock::time_point QuackapiCurrentDeadline() {
 	return current_deadline;
 }
-void QuackapiSetCurrentDeadline(std::chrono::steady_clock::time_point deadline) {
+void QuackapiSetCurrentDeadline(QuackapiClock::time_point deadline) {
 	current_deadline = deadline;
 }
 int64_t QuackapiRemainingTimeoutMillis(int64_t fallback_ms) {
-	if (current_deadline == std::chrono::steady_clock::time_point::max()) {
+	if (current_deadline == QuackapiClock::time_point::max()) {
 		return fallback_ms;
 	}
 	return std::max<int64_t>(1, std::min(fallback_ms, std::chrono::duration_cast<std::chrono::milliseconds>(
-	                                                      current_deadline - std::chrono::steady_clock::now())
+	                                                      current_deadline - QuackapiClock::now())
 	                                                      .count()));
+}
+QuackapiClock::time_point QuackapiContextDeadline(ClientContext &context) {
+	auto deadline = current_deadline;
+	auto budget = BudgetOf(context);
+	if (budget) {
+		deadline = std::min(deadline, QuackapiClock::time_point(QuackapiClock::duration(budget->deadline.load())));
+	}
+	return deadline;
+}
+void QuackapiSetServingBudget(Connection &connection, int64_t query_timeout_ms, int64_t max_response_bytes) {
+	auto budget = BudgetFor(connection);
+	budget->query_timeout_ms = query_timeout_ms;
+	budget->max_response_bytes = max_response_bytes;
+}
+bool QuackapiGetServingBudget(ClientContext &context, int64_t &query_timeout_ms, int64_t &max_response_bytes) {
+	auto budget = BudgetOf(context);
+	if (!budget || budget->query_timeout_ms <= 0) {
+		return false;
+	}
+	query_timeout_ms = budget->query_timeout_ms;
+	max_response_bytes = budget->max_response_bytes;
+	return true;
 }
 } // namespace duckdb

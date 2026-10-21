@@ -350,12 +350,18 @@ struct QuackapiExecResponse {
 	int status = 200;
 	string body;
 	vector<std::pair<string, string>> headers;
+	idx_t rows = 0;
 };
 
-//! Run every statement of `sql` on `con` in order; the last one answers (quackapi_exec()).
-//! A failed statement is 422 on body.sql, or 504 when `deadline` expired first.
+//! Run every statement of `sql` on `con` in order; the last one answers. Used by an
+//! exec route with default STATUS/FORMAT/ENVELOPE and by quackapi_exec(). A failed
+//! statement is 422 on `loc`.`param`, or 504 when `deadline` expired first.
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
-                                     const QuackapiQueryDeadline &deadline);
+                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param);
+//! The 504 an exec route answers past its deadline.
+QuackapiExecResponse QuackapiExecTimeoutResponse();
+//! The 403 an exec route answers while any row access or masking policy is bound.
+QuackapiExecResponse QuackapiExecPolicyDeniedResponse();
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.
