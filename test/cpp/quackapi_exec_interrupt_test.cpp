@@ -6,6 +6,10 @@
 //    inner connection releases the database long before its budget.
 // 2. The caller returns at once even while a row is blocked where no interrupt
 //    reaches (an outbound call to a peer that answers after 3 s).
+// 3. A row whose caller was interrupted runs none of its later statements, though
+//    DuckDB clears an interrupt as each statement starts.
+// 4. Closing the database while an abandoned row is still blocked waits for that
+//    row: when the close returns, the database is gone.
 #include "duckdb.hpp"
 
 #include <chrono>
@@ -27,6 +31,14 @@ void Run(duckdb::Connection &connection, const std::string &sql) {
 	if (result->HasError()) {
 		throw std::runtime_error(sql + ": " + result->GetError());
 	}
+}
+
+std::string Scalar(duckdb::Connection &connection, const std::string &sql) {
+	auto result = connection.Query(sql);
+	if (result->HasError()) {
+		throw std::runtime_error(sql + ": " + result->GetError());
+	}
+	return result->Fetch()->GetValue(0, 0).ToString();
 }
 
 //! Runs `sql` on `connection`, interrupts it after 300 ms, and returns how long the caller then took.
@@ -111,5 +123,77 @@ int main() {
 			return 1;
 		}
 	}
-	return 0;
+	// Cases 3 and 4 both report before the test fails, so one run shows each.
+	int failures = 0;
+	{
+		// 32 rows of 20000 short INSERTs, each stamped with its statement's start. A
+		// statement that has passed its last interrupt check (its commit, its result)
+		// finishes, and the next one clears the interrupt as it starts; without a check
+		// between statements such a row runs on to its end.
+		duckdb::DuckDB database(nullptr);
+		duckdb::Connection connection(database);
+		Run(connection, "LOAD quackapi");
+		Run(connection, "SET quackapi_query_timeout_ms = 20000");
+		Run(connection, "CREATE TABLE ticks (r INTEGER, started TIMESTAMPTZ)");
+		duckdb::unique_ptr<duckdb::QueryResult> result;
+		std::thread caller([&]() {
+			result = connection.Query("SELECT quackapi_exec(repeat('INSERT INTO ticks VALUES (' || range || ', "
+			                          "get_current_timestamp());', 20000)) FROM range(32)");
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		const auto interrupted_us =
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
+		        .count();
+		connection.Interrupt();
+		caller.join();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+		// Allow 100 ms for a statement already under way when the interrupt landed.
+		const auto late = Scalar(connection, "SELECT coalesce(list(DISTINCT r ORDER BY r)::VARCHAR, 'none') FROM ticks "
+		                                     "WHERE epoch_us(started) > " +
+		                                         std::to_string(interrupted_us + 100000));
+		if (late != "none") {
+			fprintf(stderr, "3. FAILED: rows %s went on starting statements after the interrupt\n", late.c_str());
+			failures++;
+		} else {
+			printf("3. every row stopped within one statement of the interrupt\n");
+		}
+	}
+	// A peer on a database of its own, answering after 1.5 s, outlives the caller below.
+	duckdb::DuckDB peer_database(nullptr);
+	duckdb::Connection peer(peer_database);
+	Run(peer, "LOAD quackapi");
+	Run(peer, "CREATE ROUTE slow GET '/slow' AS SELECT sleep_ms(1500) AS slept");
+	Run(peer, "SELECT * FROM quackapi_serve(29341, host := '127.0.0.1', access_log := false, worker_threads := 8)");
+	const std::string blocked_row = "SELECT quackapi_fetch(''http://127.0.0.1:29341/slow'') AS f";
+	{
+		const std::string path = "quackapi_exec_close_test.duckdb";
+		std::remove(path.c_str());
+		std::remove((path + ".wal").c_str());
+		duckdb::weak_ptr<duckdb::DatabaseInstance> weak_database;
+		const auto opened_at = clock_type::now();
+		{
+			duckdb::DuckDB database(path);
+			weak_database = database.instance;
+			duckdb::Connection connection(database);
+			Run(connection, "LOAD quackapi");
+			Run(connection, "SET quackapi_query_timeout_ms = 20000");
+			InterruptAfter300Ms(connection, "SELECT quackapi_exec('" + blocked_row + "')");
+		}
+		const auto closed_ms = MillisSince(opened_at);
+		if (!weak_database.expired()) {
+			fprintf(stderr, "4. FAILED: the database was still open when its close returned, %lld ms after opening\n",
+			        closed_ms);
+			// Let the blocked row finish before the process exits.
+			if (WaitForRelease(weak_database, 10000) < 0) {
+				fprintf(stderr, "4. and the blocked row never ended\n");
+			}
+			failures++;
+		} else {
+			printf("4. the database was gone when its close returned, %lld ms after opening\n", closed_ms);
+		}
+		std::remove(path.c_str());
+		std::remove((path + ".wal").c_str());
+	}
+	Run(peer, "SELECT * FROM quackapi_stop(29341)");
+	return failures == 0 ? 0 : 1;
 }
