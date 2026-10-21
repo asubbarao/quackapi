@@ -143,15 +143,20 @@ fan-outs (`array_agg(quackapi_post(...))` inside posted SQL) exhaust a fixed
 `worker_threads` pool and wait on each other until their timeouts.
 `quackapi_exec` cannot: each row runs on a thread of its own with a fresh
 `Connection`, so waits form a tree, never a cycle, at any depth and width.
+An exec route with no `STATUS`, `EMPTY STATUS`, `ENVELOPE object` or non-JSON
+`FORMAT`/`Accept` runs the same code, so the two answer alike.
 
 | Behavior | Detail |
 |----------|--------|
 | **Execution** | As an exec route: every statement in order on a fresh connection; the last one answers. Rows of one call run concurrently, up to 32 at a time |
+| **Threads** | At most `quackapi_exec_max_threads` (default 256) exec threads run in the process, across all calls and nesting levels. Past it, a call's rows run one at a time on the calling thread — slower, never waiting, so a full process cannot deadlock. `0` runs every row on the calling thread |
 | **Response** | JSON array, `html`/`text` column modes, `location`/`set_cookie` columns as `headers`; `[]` for a final `SET`/`PRAGMA`. No `Accept` negotiation |
 | **Errors** | 422 `{"detail":[{"loc":["body","sql"],…}]}` for a failing statement, 504 past the deadline, 507 past `quackapi_max_response_bytes`, 500 for an internal error. `error` is set only when no response could be produced; `NULL` in, `NULL` out |
-| **Deadline** | `quackapi_query_timeout_ms` (default 30 s) per call, never longer than the calling request's remaining deadline. Interrupting the calling query (Ctrl-C, a route deadline) interrupts every inner query |
+| **Budget** | Inside a served request (a route, `quackapi_request`), the server's `query_timeout_ms` and `max_response_bytes`, as the exec route uses; elsewhere the session's `quackapi_query_timeout_ms` (default 30 s) and `quackapi_max_response_bytes`. A nested call inherits its caller's budget |
+| **Deadline** | One deadline per call: its budget, never later than the caller's remaining deadline. When the caller is interrupted (Ctrl-C, a route deadline) the call raises and interrupts every running row; past its deadline every unfinished row is a 504. Either way the call returns at once: a row blocked where no interrupt reaches (a shell pipe, `sleep_ms`) finishes on its own thread and its result is dropped. Outbound `quackapi_fetch`/`quackapi_post` inside a row end at the row's deadline, also on DuckDB worker threads |
 | **Headers** | `Content-Type`, `Location`, `Set-Cookie` only — no transport headers (`Content-Length`, `X-Request-ID`); `reused_connection` is `false` |
-| **Not applied** | Route `REQUIRE`, middleware, policies, access log and rate limits: it is a SQL function with the caller's privileges, not a request |
+| **Policies** | While any row access or masking policy is bound, every row answers the exec route's 403 `{"detail":"Policy denies unauthenticated access"}`: neither can rewrite arbitrary SQL to apply a policy, so both fail closed |
+| **Not applied** | Route `REQUIRE`, middleware, access log and rate limits: it is a SQL function with the caller's privileges, not a request |
 | **Visibility** | The inner connection runs its own transactions: it does not see the caller's uncommitted writes, and what it commits is visible to the caller's next transaction |
 
 ### Scheduled routes
