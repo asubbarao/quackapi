@@ -1,8 +1,17 @@
 # name: test/sql/quackapi_stream.test
-# description: CREATE STREAM SSE emission over real serve + quackapi_fetch
+# description: CREATE STREAM SSE emission over real serve, read with http_client
 # group: [sql]
 
 require quackapi
+
+require json
+
+# Community http_client is the TCP client for these tests (http_get / http_head).
+statement ok
+INSTALL http_client FROM community;
+
+statement ok
+LOAD http_client;
 
 # Finite one-shot stream (interval=0 closes after rows)
 query I
@@ -34,14 +43,15 @@ SELECT * FROM quackapi_serve(29260, host := '127.0.0.1', access_log := false);
 ----
 http://127.0.0.1:29260
 
+# http_get returns status + body; http_head returns the response headers.
 query III
-SELECT r.status,
-       r.headers['Content-Type'],
-       starts_with(r.body, 'id: 0')
-         AND contains(r.body, 'data: {"id":0,"msg":"tick"}')
-         AND contains(r.body, 'data: {"id":1,"msg":"tick"}')
-         AND contains(r.body, 'data: {"id":2,"msg":"tick"}')
-FROM (SELECT quackapi_fetch('http://127.0.0.1:29260/ticks') AS r);
+SELECT (g->>'status')::INTEGER,
+       (h->>'headers')::JSON->>'content-type',
+       starts_with(g->>'body', 'id: 0')
+         AND contains(g->>'body', 'data: {"id":0,"msg":"tick"}')
+         AND contains(g->>'body', 'data: {"id":1,"msg":"tick"}')
+         AND contains(g->>'body', 'data: {"id":2,"msg":"tick"}')
+FROM (SELECT http_get('http://127.0.0.1:29260/ticks') AS g, http_head('http://127.0.0.1:29260/ticks') AS h);
 ----
 200	text/event-stream	true
 

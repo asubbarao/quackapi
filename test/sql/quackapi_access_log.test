@@ -4,6 +4,15 @@
 
 require quackapi
 
+require json
+
+# Community http_client is the TCP client for the served requests below.
+statement ok
+INSTALL http_client FROM community;
+
+statement ok
+LOAD http_client;
+
 statement ok
 CREATE TABLE access_log (
   request_id VARCHAR,
@@ -80,7 +89,7 @@ SELECT * FROM quackapi_serve(29461, host := '127.0.0.1', access_log := 'access_l
 http://127.0.0.1:29461
 
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+SELECT (http_get('http://127.0.0.1:29461/access-log')->>'status')::INTEGER;
 ----
 200
 
@@ -98,7 +107,7 @@ DROP TABLE access_log_retry;
 # The request still succeeds while the writer is backing off and the missing
 # table means its access row cannot be appended.
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+SELECT (http_get('http://127.0.0.1:29461/access-log')->>'status')::INTEGER;
 ----
 200
 
@@ -123,7 +132,7 @@ statement ok
 SELECT sleep_ms(1200);
 
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+SELECT (http_get('http://127.0.0.1:29461/access-log')->>'status')::INTEGER;
 ----
 200
 
@@ -147,8 +156,7 @@ SELECT * FROM quackapi_serve(29231, host := '127.0.0.1', access_log := 'access_l
 http://127.0.0.1:29231
 
 query I
-SELECT contains(body, '"access_log_overflow_count":0')
-FROM quackapi_fetch('http://127.0.0.1:29231/healthz');
+SELECT contains(http_get('http://127.0.0.1:29231/healthz')->>'body', '"access_log_overflow_count":0');
 ----
 true
 

@@ -247,7 +247,7 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …, max_request_bytes := …)` | `listen_url` |
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_telemetry_flush` | `([port])` — drain pending sink rows without stopping | `status` |
@@ -263,7 +263,20 @@ the “PDF service” is a function call in the same address space — not an RP
 | Setting | `SET quackapi_query_timeout_ms = N` | default `30000` |
 | Setting | `SET quackapi_max_response_bytes = N` | default `16777216` uncompressed bytes |
 | Setting | `SET quackapi_max_pending_requests = N` | default `256` |
+| Setting | `SET quackapi_max_request_bytes = N` | default `8388608` (8 MiB); larger bodies get `413` |
+| Setting | `SET quackapi_worker_threads = N` | default `32` |
+| Setting | `SET quackapi_keep_alive_max_count = N` | default `128` |
+| Setting | `SET quackapi_keep_alive_timeout_sec = N` | default `10` |
+| Setting | `SET quackapi_read_timeout_sec = N` / `SET quackapi_write_timeout_sec = N` | default `30` each |
 | Setting | `SET quackapi_graphql_allow_all = true\|false` | default `false`; legacy GraphQL open mode |
+
+Each transport setting is read when `quackapi_serve` starts, and the named
+parameter of the same name (`worker_threads := …`, `max_request_bytes := …`)
+overrides it. The SQL middleware limits are settings too:
+`quackapi_middleware_max_sql_bytes` (16384), `quackapi_middleware_max_definitions`
+(64), `quackapi_middleware_max_result_rows` (64),
+`quackapi_middleware_max_header_bytes` (8192) and
+`quackapi_middleware_max_body_bytes` (1048576).
 
 `access_log` defaults to structured stderr JSON; `false` disables it and a table
 name enables asynchronous table-backed logging. Table writes batch up to 100
@@ -299,7 +312,8 @@ SET memory_limit = '4GB';
 SELECT * FROM quackapi_serve(8000);
 ```
 
-Request body limit: **8 MiB** (`413` when exceeded).
+Request body limit: **8 MiB** by default (`413` when exceeded); change it with
+`SET quackapi_max_request_bytes = N` or `max_request_bytes := N`.
 
 ### Auth
 
@@ -389,29 +403,38 @@ CREATE ROUTE ask POST '/ask' AS
 
 | Function | Role |
 |----------|------|
-| `quackapi_fetch(url[, headers])` | GET → `STRUCT(status, reason, body, headers, error, reused_connection)` |
-| `quackapi_post(url, body[, content_type[, headers]])` | POST, same result shape (`content_type` defaults to `application/json`) |
-| `quackapi_http_pool()` | per-origin `host, idle, dialed, reused` |
+| `quackapi_post(url, body[, content_type[, headers]])` | POST → `STRUCT(status, reason, body, headers, error, reused_connection)` (`content_type` defaults to `application/json`) |
 
-Why this exists: `HTTPUtil::Request(request)` — and the community `http_client`
-extension — build a fresh client per call and drop it, so connections are only
-reused *within* one query execution. A route handler is exactly one execution,
-so every request paid a full dial. Against an ollama endpoint whose floor is
-12.7ms/call that cost **39.1ms p50**; through the pool the same route measures
-**13.2ms p50 / 13.8ms p90**.
+For GET and HEAD use the community `http_client` extension (`http_get`,
+`http_head`, which return the status), or `read_text('https://…')` through
+`curl_httpfs`. quackapi no longer ships `quackapi_fetch`,
+`quackapi_parallel_fetch`, `quackapi_http_pool` or `quackapi_http_util_name`;
+`SELECT current_setting('quackapi_http_client')` and `quackapi_servers()` report
+the outbound client choice.
+
+Why `quackapi_post` is pooled: `HTTPUtil::Request(request)` — and the community
+`http_client` extension — build a fresh client per call and drop it, so
+connections are only reused *within* one query execution. A route handler is
+exactly one execution, so every request paid a full dial. Against an ollama
+endpoint whose floor is 12.7ms/call that cost **39.1ms p50**; through the pool
+the same route measures **13.2ms p50 / 13.8ms p90**.
 
 `http://` uses the vendored httplib client, which implements POST — no companion
 extension needed. `https://` goes through `HTTPUtil`, pooled the same way, so
 `LOAD curl_httpfs` (or `httpfs`) supplies TLS.
 
-Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
-`FROM range(1000)` would issue one request while reporting 1000 rows.
+It is `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
+`FROM range(1000)` would issue one request while reporting 1000 rows. The rows
+of one chunk are sent concurrently.
 
-### Diagnostics
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `quackapi_http_fanout` | `0` | Sends in flight at once for one chunk of rows; `0` = no cap, every row at once |
+| `quackapi_http_max_idle_per_host` | `0` | Idle keep-alive connections kept per host; `0` = keep as many as were in flight |
+| `quackapi_http_connect_timeout_ms` | `5000` | TCP connect timeout |
+| `quackapi_http_timeout_ms` | `600000` | Read/write timeout; a tighter route request deadline wins |
 
-| Function | Role |
-|----------|------|
-| `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
+They are read each time `quackapi_post` runs.
 
 Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
 `quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async).

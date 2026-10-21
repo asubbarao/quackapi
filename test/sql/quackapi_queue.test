@@ -168,8 +168,9 @@ CREATE QUEUE race WITH (max_attempts=3, visibility_timeout='300s', backoff_base_
 ----
 Queue race: max_attempts=3 visibility_timeout=300s
 
+# POST so quackapi_post can fire the claims: one chunk of rows is sent concurrently.
 statement ok
-CREATE ROUTE q_rclaim GET '/q/rclaim' AS
+CREATE ROUTE q_rclaim POST '/q/rclaim' AS
   SELECT id, payload, status, attempts, delivery_generation FROM quackapi_dequeue('race', 1)
   WHERE $t::INT >= 0;
 
@@ -188,12 +189,14 @@ SELECT * FROM quackapi_serve(29270, host := '127.0.0.1', access_log := false, wo
 http://127.0.0.1:29270
 
 # Exactly one winner with job 3; losers empty []; every attempt 200 with no error.
+# Eight rows in one chunk: quackapi_post sends all eight claims at once.
 query III
 SELECT list(json_extract(body::JSON, '$[0].id')::BIGINT)
          FILTER (WHERE status = 200 AND body != '[]') AS winner_ids,
        bool_and(status = 200 AND error IS NULL) AS all_ok,
        len(list(idx) FILTER (WHERE body = '[]')) AS empty_n
-FROM quackapi_parallel_fetch('http://127.0.0.1:29270/q/rclaim?t=9', 8);
+FROM (SELECT idx, r.status, r.body, r.error
+      FROM (SELECT i AS idx, quackapi_post('http://127.0.0.1:29270/q/rclaim', '{"t":9}') AS r FROM range(8) t(i)));
 ----
 [3]	true	7
 

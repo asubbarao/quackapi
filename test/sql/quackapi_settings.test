@@ -1,0 +1,161 @@
+# name: test/sql/quackapi_settings.test
+# description: Every former hardcoded limit is a SET quackapi_* setting, read at serve or call time
+# group: [sql]
+
+require quackapi
+
+require json
+
+# Each setting is registered with its documented default.
+query II
+SELECT name, value FROM duckdb_settings()
+WHERE name IN (
+  'quackapi_http_fanout', 'quackapi_http_max_idle_per_host', 'quackapi_http_connect_timeout_ms',
+  'quackapi_http_timeout_ms', 'quackapi_worker_threads', 'quackapi_keep_alive_max_count',
+  'quackapi_keep_alive_timeout_sec', 'quackapi_read_timeout_sec', 'quackapi_write_timeout_sec',
+  'quackapi_max_request_bytes', 'quackapi_middleware_max_sql_bytes', 'quackapi_middleware_max_definitions',
+  'quackapi_middleware_max_result_rows', 'quackapi_middleware_max_header_bytes',
+  'quackapi_middleware_max_body_bytes')
+ORDER BY name;
+----
+quackapi_http_connect_timeout_ms	5000
+quackapi_http_fanout	0
+quackapi_http_max_idle_per_host	0
+quackapi_http_timeout_ms	600000
+quackapi_keep_alive_max_count	128
+quackapi_keep_alive_timeout_sec	10
+quackapi_max_request_bytes	8388608
+quackapi_middleware_max_body_bytes	1048576
+quackapi_middleware_max_definitions	64
+quackapi_middleware_max_header_bytes	8192
+quackapi_middleware_max_result_rows	64
+quackapi_middleware_max_sql_bytes	16384
+quackapi_read_timeout_sec	30
+quackapi_worker_threads	32
+quackapi_write_timeout_sec	30
+
+# --- quackapi_max_request_bytes: read at serve time; the named parameter wins ---
+statement ok
+CREATE ROUTE settings_echo POST '/settings-echo' AS SELECT length($body::VARCHAR) AS n;
+
+statement ok
+SET quackapi_max_request_bytes = 64;
+
+query I
+SELECT * FROM quackapi_serve(29591, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29591
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29591/settings-echo', repeat('x', 1000))).status;
+----
+413
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29591/settings-echo', 'small')).status;
+----
+200
+
+query I
+SELECT * FROM quackapi_stop(29591);
+----
+Stopped quackapi server on port 29591
+
+query I
+SELECT * FROM quackapi_serve(29592, host := '127.0.0.1', access_log := false, max_request_bytes := 4096);
+----
+http://127.0.0.1:29592
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29592/settings-echo', repeat('x', 1000))).status;
+----
+200
+
+query I
+SELECT * FROM quackapi_stop(29592);
+----
+Stopped quackapi server on port 29592
+
+statement ok
+RESET quackapi_max_request_bytes;
+
+# --- transport settings are validated when the server starts --------------------
+statement ok
+SET quackapi_worker_threads = 0;
+
+statement error
+SELECT * FROM quackapi_serve(29593, host := '127.0.0.1', access_log := false);
+----
+worker_threads must be between 1 and 4096
+
+# The named parameter still wins over the setting.
+query I
+SELECT * FROM quackapi_serve(29593, host := '127.0.0.1', access_log := false, worker_threads := 4);
+----
+http://127.0.0.1:29593
+
+query I
+SELECT * FROM quackapi_stop(29593);
+----
+Stopped quackapi server on port 29593
+
+statement ok
+RESET quackapi_worker_threads;
+
+# --- middleware limits ------------------------------------------------------------
+statement ok
+SET quackapi_middleware_max_sql_bytes = 16;
+
+statement error
+CREATE MIDDLEWARE too_long BEFORE AS SELECT true AS allow, NULL::INTEGER AS status;
+----
+Middleware SQL must be between 1 byte and 16 bytes
+
+statement ok
+RESET quackapi_middleware_max_sql_bytes;
+
+statement ok
+SET quackapi_middleware_max_definitions = 1;
+
+statement ok
+CREATE MIDDLEWARE first_hook BEFORE GROUP settings_group AS SELECT true AS allow;
+
+statement error
+CREATE MIDDLEWARE second_hook BEFORE GROUP settings_group AS SELECT true AS allow;
+----
+Middleware registry limit is 1 definitions
+
+# Replacing an existing definition is not a new one.
+statement ok
+CREATE OR REPLACE MIDDLEWARE first_hook BEFORE GROUP settings_group AS
+  SELECT true AS allow FROM range(2);
+
+statement ok
+RESET quackapi_middleware_max_definitions;
+
+statement ok
+CREATE GROUP settings_group WITH (prefix='/settings');
+
+statement ok
+CREATE ROUTE settings_route GET '/route' GROUP settings_group AS SELECT 'ok' AS v;
+
+# Two control rows are within the default of 64.
+query I
+SELECT status FROM quackapi_request('GET', '/settings/route');
+----
+200
+
+# quackapi_request reads the per-request limit when it binds: two rows now fail closed.
+statement ok
+SET quackapi_middleware_max_result_rows = 1;
+
+query I
+SELECT status FROM quackapi_request('GET', '/settings/route');
+----
+500
+
+statement ok
+RESET quackapi_middleware_max_result_rows;
+
+statement ok
+DROP MIDDLEWARE first_hook;

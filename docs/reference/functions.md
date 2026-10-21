@@ -6,7 +6,7 @@ Authoritative list from [FEATURE_STATUS §1.4](../FEATURE_STATUS.md) (live regis
 
 ## Server lifecycle
 
-### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, slow_request_ms := …, log_headers := …, log_query := …, request_ring := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)`
+### `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, slow_request_ms := …, log_headers := …, log_query := …, request_ring := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …, max_request_bytes := …)`
 
 | | |
 |--|--|
@@ -389,22 +389,29 @@ SELECT id, payload, status FROM quackapi_jobs WHERE status = 'done';
 
 ---
 
-## Diagnostics
+## Outbound HTTP
 
-### `quackapi_http_util_name()`
+### `quackapi_post(url, body [, content_type [, headers]])`
 
 | | |
 |--|--|
-| **Kind** | Scalar |
-| **Returns** | `VARCHAR` name of the active outbound HTTP util |
+| **Kind** | Scalar, `VOLATILE` |
+| **Args** | `url VARCHAR`, `body VARCHAR` or `JSON`, optional `content_type VARCHAR` (default `application/json`), optional `headers MAP(VARCHAR, VARCHAR)` |
+| **Returns** | `STRUCT(status INTEGER, reason VARCHAR, body VARCHAR, headers MAP(VARCHAR, VARCHAR), error VARCHAR, reused_connection BOOLEAN)` |
+
+Connections are pooled per origin for the life of the process. The rows of one
+chunk are sent concurrently; `SET quackapi_http_fanout` caps how many are in
+flight (default `0`, no cap). Transport failures are returned in `error`, not
+raised. A NULL `url` returns NULL without a request.
 
 ```sql
-SELECT quackapi_http_util_name();
--- Built-In
--- (becomes MultiCurl after LOAD curl_httpfs, if installed)
+SELECT (quackapi_post('http://127.0.0.1:8000/echo', '{"a":1}')).status;
 ```
 
-Outbound HTTPS for handlers that call `read_text` / httpfs uses DuckDB’s shared HTTP stack — quackapi does not link its own curl.
+GET and HEAD are not served by quackapi: use the community `http_client`
+extension (`http_get`, `http_head`) or `read_text` through `curl_httpfs`.
+Outbound HTTPS for handlers that call `read_text` / httpfs uses DuckDB’s shared
+HTTP stack — quackapi does not link its own curl.
 
 ---
 
@@ -420,7 +427,6 @@ server, registry, auth, queue, and outbound HTTP surfaces above.
 | `quackapi_middlewares()` | → `name, phase, group_name, handler_sql, registration_order` |
 | `quackapi_graphql_tables()` | → `mode, table_name` |
 | `quackapi_graphql_routes()` | → `name, method, path, tables, require_auth, limit` |
-| `quackapi_parallel_fetch(url VARCHAR, n INTEGER)` | → `idx, status, body, error`; `n` is limited to 256 |
 | `quack_from_{fastapi,rails,express,gin}(path)` | route extractor → `method, path, handler_name, file, start_line, evidence` |
 | `quack_from_{fastapi,rails,express,gin}_models(path)` | model extractor → `model_name, field_name, field_type, is_required, is_optional, has_default, default_expr, file, field_line` |
 | `quack_from_x_sql(source VARCHAR, relpath VARCHAR)` / `_relpath` | → embedded SQL text for the bridge extractors |
@@ -447,7 +453,26 @@ not application-facing functions.
 | `SET quackapi_query_timeout_ms = N` | Query execution budget; default `30000` |
 | `SET quackapi_max_response_bytes = N` | Uncompressed response cap; default `16777216` |
 | `SET quackapi_max_pending_requests = N` | Pending request cap; default `256` |
+| `SET quackapi_max_request_bytes = N` | Request body cap, `413` above it; default `8388608`; serve `max_request_bytes :=` wins |
+| `SET quackapi_worker_threads = N` | HTTP worker threads; default `32`; serve `worker_threads :=` wins |
+| `SET quackapi_keep_alive_max_count = N` | Requests per keep-alive connection; default `128`; serve `keep_alive_max_count :=` wins |
+| `SET quackapi_keep_alive_timeout_sec = N` | Keep-alive idle timeout; default `10`; serve `keep_alive_timeout_sec :=` wins |
+| `SET quackapi_read_timeout_sec = N` | Socket read timeout; default `30`; serve `read_timeout_sec :=` wins |
+| `SET quackapi_write_timeout_sec = N` | Socket write timeout; default `30`; serve `write_timeout_sec :=` or a route `TIMEOUT` wins |
+| `SET quackapi_middleware_max_sql_bytes = N` | Largest middleware handler SQL; default `16384` |
+| `SET quackapi_middleware_max_definitions = N` | Most middleware definitions; default `64` |
+| `SET quackapi_middleware_max_result_rows = N` | Most rows one middleware may return; default `64` |
+| `SET quackapi_middleware_max_header_bytes = N` | Largest middleware response header (name + value); default `8192` |
+| `SET quackapi_middleware_max_body_bytes = N` | Largest blocking-middleware response body; default `1048576` |
+| `SET quackapi_http_fanout = N` | `quackapi_post` sends in flight per chunk; default `0` = no cap |
+| `SET quackapi_http_max_idle_per_host = N` | `quackapi_post` idle connections kept per host; default `0` = as many as were in flight |
+| `SET quackapi_http_connect_timeout_ms = N` | `quackapi_post` connect timeout; default `5000` |
+| `SET quackapi_http_timeout_ms = N` | `quackapi_post` read/write timeout; default `600000` |
 | `SET quackapi_graphql_allow_all = true\|false` | Legacy global GraphQL open mode; default `false` |
+
+Serve settings are read when `quackapi_serve` starts; the middleware request
+limits when the server starts (or when `quackapi_request` binds); the
+`quackapi_http_*` settings each time `quackapi_post` runs.
 
 ```sql
 SET quackapi_cors_origins = '*';

@@ -1,0 +1,212 @@
+# name: test/sql/quackapi_post.test
+# description: quackapi_post — pooled outbound POST, per-chunk fan-out and the SET quackapi_http_* settings
+# group: [sql]
+
+require quackapi
+
+require json
+
+# Serve a tiny echo API and then call it from the SAME process. No external
+# network: the pool is exercised against quackapi's own server.
+statement ok
+CREATE ROUTE echo POST '/echo' AS SELECT $body::VARCHAR AS got;
+
+statement ok
+CREATE ROUTE fan POST '/fan/:i' AS SELECT $i::INTEGER AS i;
+
+query I
+SELECT * FROM quackapi_serve(29301, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29301
+
+# --- POST --------------------------------------------------------------------
+# Plain http:// needs NO companion extension — the vendored httplib implements
+# POST, unlike DuckDB's built-in HTTPUtil client.
+query I
+SELECT (quackapi_post('http://127.0.0.1:29301/echo', to_json({a: 1})::VARCHAR)).status;
+----
+200
+
+# The body arrives intact — $body binds the raw payload we sent.
+query I
+SELECT (quackapi_post('http://127.0.0.1:29301/echo', to_json({a: 1})::VARCHAR)).body;
+----
+[{"got":"{\"a\":1}"}]
+
+# Extra headers travel as a MAP argument.
+query I
+SELECT (quackapi_post('http://127.0.0.1:29301/echo', '{}', 'application/json', MAP {'X-Test': 'yes'})).status;
+----
+200
+
+# --- pooling -----------------------------------------------------------------
+# The point of the pool: a later call must NOT dial again.
+query I
+SELECT (quackapi_post('http://127.0.0.1:29301/echo', '{}')).reused_connection;
+----
+true
+
+# --- VOLATILE ----------------------------------------------------------------
+# Without FunctionStability::VOLATILE, DuckDB constant-folds a literal-argument
+# call and range(N) would issue ONE request while reporting N rows. The server's
+# request ring shows every one of them arrived.
+statement ok
+CREATE ROUTE volatile POST '/volatile' AS SELECT 1 AS n;
+
+statement ok
+SELECT (quackapi_post('http://127.0.0.1:29301/volatile', '{}')).status AS s FROM range(10) t(i);
+
+query I
+SELECT list(status) FROM quackapi_requests(29301) WHERE path = '/volatile';
+----
+[200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+
+# --- fan-out: one chunk, many concurrent calls --------------------------------
+# Concurrency loses nothing — every row gets its own correct answer, none are
+# dropped, none error.
+query I
+SELECT bool_and((r).status = 200 AND (r).error IS NULL AND (r).body = printf('[{"got":"%d"}]', i))
+FROM (SELECT i, quackapi_post('http://127.0.0.1:29301/echo', i::VARCHAR) AS r FROM range(64) t(i));
+----
+true
+
+# Every one of the 64 rows became its own request.
+statement ok
+SELECT quackapi_post('http://127.0.0.1:29301/fan/' || i, '{}') AS r FROM range(64) t(i);
+
+query I
+SELECT list_sort(list(split_part(path, '/', 3)::BIGINT)) = range(64)
+FROM quackapi_requests(29301) WHERE starts_with(path, '/fan/');
+----
+true
+
+# --- transport errors are values, not exceptions ------------------------------
+query I
+SELECT (quackapi_post('http://127.0.0.1:29399/nope', '{}')).error IS NOT NULL;
+----
+true
+
+# NULL url → NULL struct, no request.
+query I
+SELECT (quackapi_post(NULL::VARCHAR, '{}')).status IS NULL;
+----
+true
+
+# --- SET quackapi_http_fanout: sends in flight at once --------------------------
+# Each request sleeps one second on the server. If every request reached the
+# server before any of them finished, all of them were in flight at once.
+# worker_threads is wide enough that the server never queues one.
+statement ok
+CREATE ROUTE slow POST '/slow/:batch/:i' AS SELECT sleep_ms(1000) IS NULL AS slept, $i::INTEGER AS i;
+
+query I
+SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', access_log := false, worker_threads := 128);
+----
+http://127.0.0.1:29302
+
+# 64 is above the old hardcoded cap of 32.
+statement ok
+SET quackapi_http_fanout = 64;
+
+query I
+SELECT bool_and((r).status = 200 AND (r).error IS NULL)
+FROM (SELECT quackapi_post('http://127.0.0.1:29302/slow/wide/' || i, '{}') AS r FROM range(64) t(i));
+----
+true
+
+query I
+SELECT list_sort(list(split_part(path, '/', 4)::BIGINT)) = range(64)
+FROM quackapi_requests(29302) WHERE starts_with(path, '/slow/wide/');
+----
+true
+
+# false: no request arrived after another one had finished.
+query I
+WITH wide AS (
+  SELECT received_at, received_at + to_microseconds(CAST(duration_ms * 1000 AS BIGINT)) AS finished_at
+  FROM quackapi_requests(29302) WHERE starts_with(path, '/slow/wide/')
+)
+SELECT bool_or(a.received_at >= b.finished_at) FROM wide a CROSS JOIN wide b;
+----
+false
+
+# Control: a cap of 32 sends the second 32 only as the first 32 finish.
+statement ok
+SET quackapi_http_fanout = 32;
+
+query I
+SELECT bool_and((r).status = 200 AND (r).error IS NULL)
+FROM (SELECT quackapi_post('http://127.0.0.1:29302/slow/capped/' || i, '{}') AS r FROM range(64) t(i));
+----
+true
+
+query I
+WITH capped AS (
+  SELECT received_at, received_at + to_microseconds(CAST(duration_ms * 1000 AS BIGINT)) AS finished_at
+  FROM quackapi_requests(29302) WHERE starts_with(path, '/slow/capped/')
+)
+SELECT bool_or(a.received_at >= b.finished_at) FROM capped a CROSS JOIN capped b;
+----
+true
+
+# The default, 0, is no cap: every row of the chunk is in flight at once.
+statement ok
+RESET quackapi_http_fanout;
+
+query I
+SELECT bool_and((r).status = 200 AND (r).error IS NULL)
+FROM (SELECT quackapi_post('http://127.0.0.1:29302/slow/uncapped/' || i, '{}') AS r FROM range(64) t(i));
+----
+true
+
+query I
+WITH uncapped AS (
+  SELECT received_at, received_at + to_microseconds(CAST(duration_ms * 1000 AS BIGINT)) AS finished_at
+  FROM quackapi_requests(29302) WHERE starts_with(path, '/slow/uncapped/')
+)
+SELECT bool_or(a.received_at >= b.finished_at) FROM uncapped a CROSS JOIN uncapped b;
+----
+false
+
+# --- SET quackapi_http_timeout_ms: read at call time ----------------------------
+statement ok
+SET quackapi_http_timeout_ms = 200;
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29302/slow/timeout/0', '{}')).error IS NOT NULL;
+----
+true
+
+statement ok
+RESET quackapi_http_timeout_ms;
+
+# --- invalid settings raise to the caller ---------------------------------------
+statement ok
+SET quackapi_http_fanout = -1;
+
+statement error
+SELECT quackapi_post('http://127.0.0.1:29301/echo', '{}');
+----
+quackapi_http_fanout must be >= 0
+
+statement ok
+RESET quackapi_http_fanout;
+
+statement ok
+SET quackapi_http_connect_timeout_ms = 0;
+
+statement error
+SELECT quackapi_post('http://127.0.0.1:29301/echo', '{}');
+----
+quackapi_http_connect_timeout_ms must be >= 1
+
+statement ok
+RESET quackapi_http_connect_timeout_ms;
+
+# stop closes the listener and (via StopServer) drains the free-list so idle
+# keep-alive clients cannot pin httplib workers across process teardown.
+statement ok
+SELECT * FROM quackapi_stop(29302);
+
+statement ok
+SELECT * FROM quackapi_stop(29301);

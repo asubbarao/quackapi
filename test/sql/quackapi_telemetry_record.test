@@ -4,6 +4,15 @@
 
 require quackapi
 
+require json
+
+# Community http_client is the TCP client for the served request below.
+statement ok
+INSTALL http_client FROM community;
+
+statement ok
+LOAD http_client;
+
 statement ok
 CREATE TABLE telemetry_log (
   request_id VARCHAR,
@@ -151,7 +160,7 @@ SELECT * FROM quackapi_serve(29520, host := '127.0.0.1', access_log := 'warn_log
 http://127.0.0.1:29520
 
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29520/telemetry/ok')).status;
+SELECT (http_get('http://127.0.0.1:29520/telemetry/ok')->>'status')::INTEGER;
 ----
 200
 
