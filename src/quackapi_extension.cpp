@@ -1217,6 +1217,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          Value::BIGINT(16 * 1024 * 1024));
 	config.AddExtensionOption("quackapi_max_pending_requests", "Maximum queued HTTP connections", LogicalType::BIGINT,
 	                          Value::BIGINT(256));
+	config.AddExtensionOption("quackapi_exec_max_threads",
+	                          "quackapi_exec threads allowed to run in this process at once; past it, rows run "
+	                          "one at a time on the calling thread (0: always)",
+	                          LogicalType::BIGINT, Value::BIGINT(256));
 	config.AddExtensionOption("quackapi_graphql_allow_all", "Explicit legacy opt-in to public GraphQL catalog exposure",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// quackapi_serve() / quackapi_serve(port) with batteries-included options.

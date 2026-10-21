@@ -220,6 +220,76 @@ RESET SESSION quackapi_http_timeout_ms;
 statement ok
 RESET GLOBAL quackapi_http_timeout_ms;
 
+
+# ---------------------------------------------------------------------------
+# quackapi_exec_max_threads bounds exec threads process-wide. Past it a row runs
+# on the calling thread instead of waiting, so a full process cannot deadlock.
+# ---------------------------------------------------------------------------
+statement ok
+SET GLOBAL quackapi_exec_max_threads = 2;
+
+statement ok
+DELETE FROM exec_clock;
+
+statement ok
+INSERT INTO exec_clock VALUES (get_current_timestamp());
+
+# Eight 300 ms rows on two threads: four waves.
+query I
+SELECT list(DISTINCT (quackapi_exec('SELECT sleep_ms(300) AS s')).status) FROM range(8);
+----
+[200]
+
+query I
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) >= 1100 FROM exec_clock;
+----
+true
+
+# The outer rows hold both threads; every inner call runs on its caller's thread.
+query II
+WITH outer_statements AS (
+    SELECT o, $q$SELECT list((exec_sd('SELECT ' || i || ' AS v')).status) AS inner_status FROM range(2) t(i)$q$ AS outer_sql
+    FROM range(4) t(o)
+)
+SELECT list(DISTINCT (r).status), list(DISTINCT (r).body)
+FROM (SELECT exec_sd(outer_sql) AS r FROM outer_statements);
+----
+[200]	['[{"inner_status":[200,200]}]']
+
+# 0: every row on the calling thread, one at a time.
+statement ok
+SET GLOBAL quackapi_exec_max_threads = 0;
+
+statement ok
+DELETE FROM exec_clock;
+
+statement ok
+INSERT INTO exec_clock VALUES (get_current_timestamp());
+
+query I
+SELECT list(DISTINCT (quackapi_exec('SELECT sleep_ms(300) AS s')).status) FROM range(4);
+----
+[200]
+
+query I
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) >= 1100 FROM exec_clock;
+----
+true
+
+statement ok
+RESET GLOBAL quackapi_exec_max_threads;
+
+statement ok
+SET quackapi_exec_max_threads = -1;
+
+statement error
+SELECT quackapi_exec('SELECT 1');
+----
+quackapi_exec_max_threads must be >= 0
+
+statement ok
+RESET quackapi_exec_max_threads;
+
 # ---------------------------------------------------------------------------
 # Budgets: quackapi_query_timeout_ms (504), quackapi_max_response_bytes (507)
 # ---------------------------------------------------------------------------
@@ -234,7 +304,44 @@ SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT 1; SELECT sum(ran
 statement ok
 RESET quackapi_query_timeout_ms;
 
-# A request's deadline bounds the execs its SQL makes.
+# Inside a served request the server's budget applies, as on the exec route,
+# not the session's quackapi_query_timeout_ms. GLOBAL reaches the request's own
+# connection; SESSION shadows the value an earlier RESET left on this one.
+statement ok
+SET GLOBAL quackapi_query_timeout_ms = 200;
+
+statement ok
+SET SESSION quackapi_query_timeout_ms = 200;
+
+query I
+SELECT (quackapi_exec('SELECT sleep_ms(400) AS a; SELECT 42 AS v')).status;
+----
+504
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/sql',
+  '{"sql":"SELECT (quackapi_exec(''SELECT sleep_ms(400) AS a; SELECT 42 AS v'')).body AS b"}', query_timeout_ms := 5000);
+----
+200	[{"b":"[{\"v\":42}]"}]
+
+statement ok
+RESET SESSION quackapi_query_timeout_ms;
+
+statement ok
+RESET GLOBAL quackapi_query_timeout_ms;
+
+# A peer that answers after 2.5 s, on its own workers so abandoned calls to it
+# never hold a worker the other servers need.
+statement ok
+CREATE ROUTE exec_slow GET '/slow' AS SELECT sleep_ms(2500) AS slept;
+
+query I
+SELECT * FROM quackapi_serve(29322, host := '127.0.0.1', access_log := false, worker_threads := 32);
+----
+http://127.0.0.1:29322
+
+# A request's deadline ends an exec inside it even while its rows are blocked in
+# calls no interrupt can stop: the caller stops waiting and drops their results.
 statement ok
 DELETE FROM exec_clock;
 
@@ -243,14 +350,62 @@ INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
 SELECT status FROM quackapi_request('POST', '/sql',
-  '{"sql":"SELECT quackapi_exec(''SELECT sum(range) FROM range(100000000000)'') AS r"}', query_timeout_ms := 300);
+  '{"sql":"SELECT list((quackapi_exec(''SELECT sleep_ms(1500) AS s'')).status) AS r FROM range(4)"}', query_timeout_ms := 300);
 ----
 504
 
 query I
-SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 5000 FROM exec_clock;
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 1000 FROM exec_clock;
 ----
 true
+
+# Outbound calls a request's query makes on DuckDB worker threads (one per row
+# group of a parallel scan) end at the request's deadline, not at the peer's answer.
+statement ok
+CREATE TABLE exec_wide AS SELECT range AS i FROM range(16 * 122880);
+
+statement ok
+DELETE FROM exec_clock;
+
+statement ok
+INSERT INTO exec_clock VALUES (get_current_timestamp());
+
+query I
+SELECT status FROM quackapi_request('POST', '/sql',
+  '{"sql":"SELECT count((quackapi_fetch(''http://127.0.0.1:29322/slow'')).status) AS n FROM exec_wide WHERE i % 122880 = 0"}', query_timeout_ms := 300);
+----
+504
+
+query I
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 1500 FROM exec_clock;
+----
+true
+
+# A row never outlives its caller's remaining deadline. The row runs on the
+# request's own thread (max_threads 0) and blocks in a call that only its
+# deadline ends: at 600 ms the request has 400 ms left, not its full 1000 ms.
+statement ok
+SET GLOBAL quackapi_exec_max_threads = 0;
+
+statement ok
+DELETE FROM exec_clock;
+
+statement ok
+INSERT INTO exec_clock VALUES (get_current_timestamp());
+
+query I
+SELECT status FROM quackapi_request('POST', '/sql',
+  '{"sql":"SELECT sleep_ms(600) AS a; SELECT (quackapi_exec(''SELECT quackapi_fetch(''''http://127.0.0.1:29322/slow'''') AS f'')).status AS r"}', query_timeout_ms := 1000);
+----
+504
+
+query I
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 1350 FROM exec_clock;
+----
+true
+
+statement ok
+RESET GLOBAL quackapi_exec_max_threads;
 
 statement ok
 SET quackapi_max_response_bytes = 10;
@@ -273,6 +428,42 @@ quackapi_query_timeout_ms must be > 0
 
 statement ok
 RESET quackapi_query_timeout_ms;
+
+# ---------------------------------------------------------------------------
+# While a row access or masking policy is bound, quackapi_exec fails closed with
+# the exec route's 403: neither can rewrite arbitrary SQL to apply it.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE exec_secret (e VARCHAR);
+
+statement ok
+CREATE MASKING POLICY exec_mask ON VARCHAR USING ('***');
+
+statement ok
+ALTER TABLE exec_secret MODIFY COLUMN e SET MASKING POLICY exec_mask;
+
+query III
+WITH receipts AS (
+    SELECT quackapi_exec('SELECT * FROM exec_secret') AS exec,
+           quackapi_post('http://127.0.0.1:29320/sql', '{"sql":"SELECT * FROM exec_secret"}') AS http
+)
+SELECT exec.status, exec.status = http.status AND exec.body = http.body, exec.body FROM receipts;
+----
+403	true	{"detail":"Policy denies unauthenticated access"}
+
+statement ok
+ALTER TABLE exec_secret MODIFY COLUMN e UNSET MASKING POLICY;
+
+statement ok
+DROP MASKING POLICY exec_mask;
+
+query I
+SELECT (quackapi_exec('SELECT * FROM exec_secret')).status;
+----
+200
+
+statement ok
+SELECT * FROM quackapi_stop(29322);
 
 statement ok
 SELECT * FROM quackapi_stop(29321);

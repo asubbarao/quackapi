@@ -3,6 +3,7 @@
 #include "quackapi_limits.hpp"
 #include "quackapi_util.hpp"
 #include "quackapi_server.hpp"
+#include "quackapi_state.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -596,8 +597,10 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
 //! request looks like — stays fully inline. No thread is created for it.
 //! The caller's deadline, tightened by the session's quackapi_http_timeout_ms. Outside a served
 //! request there is no other deadline, so this is what stops a call to a peer that went silent.
+//! The deadline is read from the connection too: a call evaluated on a DuckDB worker thread
+//! (a parallel scan) never sees the request thread's deadline.
 std::chrono::steady_clock::time_point OutboundDeadline(ClientContext &context) {
-	auto deadline = QuackapiCurrentDeadline();
+	auto deadline = QuackapiContextDeadline(context);
 	Value setting;
 	if (context.TryGetCurrentSetting("quackapi_http_timeout_ms", setting) && !setting.IsNull()) {
 		const auto timeout_ms = setting.GetValue<int64_t>();
@@ -776,124 +779,248 @@ int64_t PositiveSetting(ClientContext &context, const string &name, int64_t fall
 	return value;
 }
 
-//! quackapi_exec(sql): the receipt quackapi_post gives for POST {"sql": sql} to an exec
-//! route (`AS $sql`), produced on this process's own database with no HTTP worker.
-//!
-//! A self-post holds an HTTP worker while the SQL it posted posts again, so nested
-//! fan-outs exhaust a fixed pool and wait on each other. Here every row runs on a
-//! thread of its own with a fresh Connection: waits form a tree, never a cycle, and a
-//! nested call starts on a fresh stack. This thread watches the caller: when the
-//! calling query is interrupted (Ctrl-C, a route deadline), every inner query is too.
-void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	auto db = context.db;
-	const auto count = args.size();
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-
-	vector<bool> skip(count, false);
-	vector<string> sqls(count);
-	for (idx_t i = 0; i < count; i++) {
-		auto sql = args.data[0].GetValue(i);
-		if (sql.IsNull()) {
-			skip[i] = true;
-			continue;
-		}
-		sqls[i] = sql.GetValue<string>();
+int64_t NonNegativeSetting(ClientContext &context, const string &name, int64_t fallback) {
+	Value setting;
+	if (!context.TryGetCurrentSetting(Identifier(name), setting) || setting.IsNull()) {
+		return fallback;
 	}
-	// The same budget quackapi_request and an exec route give one request.
-	const auto timeout_ms =
-	    QuackapiRemainingTimeoutMillis(PositiveSetting(context, "quackapi_query_timeout_ms", 30000));
-	const auto max_response_bytes =
-	    NumericCast<idx_t>(PositiveSetting(context, "quackapi_max_response_bytes", 16 * 1024 * 1024));
+	const auto value = setting.GetValue<int64_t>();
+	if (value < 0) {
+		throw InvalidInputException("%s must be >= 0", name);
+	}
+	return value;
+}
 
-	vector<QuackapiHttpFetchResult> out(count);
+//! quackapi_exec threads running in this process, across every call and nesting level.
+std::atomic<int64_t> exec_threads_running {0};
+
+//! Reserve up to `wanted` exec threads without passing `cap`. Never waits, so a full
+//! process cannot leave an outer call waiting on inner calls that wait for a thread.
+idx_t ReserveExecThreads(idx_t wanted, int64_t cap) {
+	auto running = exec_threads_running.load();
+	for (;;) {
+		const auto room = cap - running;
+		if (room <= 0) {
+			return 0;
+		}
+		const auto take = std::min<int64_t>(room, NumericCast<int64_t>(wanted));
+		if (exec_threads_running.compare_exchange_weak(running, running + take)) {
+			return NumericCast<idx_t>(take);
+		}
+	}
+}
+
+//! One quackapi_exec call, shared with the threads running its rows, so a caller that
+//! gives up (interrupt, deadline) returns while a row is still blocked in a host call.
+struct ExecCall {
+	shared_ptr<DatabaseInstance> db;
+	vector<string> sqls;
+	vector<bool> skip;
+	vector<QuackapiHttpFetchResult> out;
+	vector<bool> done;
+	std::chrono::steady_clock::time_point deadline;
+	idx_t max_response_bytes = 0;
+	//! A served request's budgets, passed on so nested calls apply them too (0: none).
+	int64_t serving_timeout_ms = 0;
+	int64_t serving_max_response_bytes = 0;
 	std::mutex mutex;
 	std::condition_variable finished;
 	unordered_set<Connection *> running;
 	bool cancelled = false;
 	idx_t threads_done = 0;
 	std::atomic<idx_t> cursor {0};
+};
 
-	auto run_one = [&](idx_t i) {
-		try {
-			Connection con(*db);
-			struct Registration {
-				std::mutex &mutex;
-				unordered_set<Connection *> &running;
-				Connection *con;
-				~Registration() {
-					std::lock_guard<std::mutex> guard(mutex);
-					running.erase(con);
-				}
-			};
-			{
-				std::lock_guard<std::mutex> guard(mutex);
-				if (cancelled) {
-					return;
-				}
-				running.insert(&con);
+QuackapiHttpFetchResult ExecReceipt(QuackapiExecResponse response) {
+	QuackapiHttpFetchResult receipt;
+	receipt.status = static_cast<HTTPStatusCode>(response.status);
+	receipt.reason = quackapi_httplib::status_message(response.status);
+	receipt.body = std::move(response.body);
+	for (auto &header : response.headers) {
+		receipt.headers.Insert(header.first, header.second);
+	}
+	receipt.success = true;
+	return receipt;
+}
+
+//! `parent` is set only for a row run on the calling thread, which the caller outlives.
+void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
+	QuackapiHttpFetchResult receipt;
+	try {
+		{
+			std::lock_guard<std::mutex> guard(call.mutex);
+			if (call.cancelled) {
+				return;
 			}
-			Registration registration {mutex, running, &con};
-			QuackapiQueryDeadline deadline(con, timeout_ms);
-			auto response = QuackapiExecSql(con, sqls[i], max_response_bytes, deadline);
-			out[i].status = static_cast<HTTPStatusCode>(response.status);
-			out[i].reason = quackapi_httplib::status_message(response.status);
-			out[i].body = std::move(response.body);
-			for (auto &header : response.headers) {
-				out[i].headers.Insert(header.first, header.second);
-			}
-			out[i].success = true;
-		} catch (std::exception &e) {
-			out[i].request_error = e.what();
-		} catch (...) {
-			out[i].request_error = "unknown error during quackapi_exec";
 		}
-	};
+		Connection con(*call.db);
+		if (call.serving_timeout_ms > 0) {
+			QuackapiSetServingBudget(con, call.serving_timeout_ms, call.serving_max_response_bytes);
+		}
+		struct Registration {
+			ExecCall &call;
+			Connection *con;
+			~Registration() {
+				std::lock_guard<std::mutex> guard(call.mutex);
+				call.running.erase(con);
+			}
+		};
+		{
+			std::lock_guard<std::mutex> guard(call.mutex);
+			if (call.cancelled) {
+				return;
+			}
+			call.running.insert(&con);
+		}
+		Registration registration {call, &con};
+		QuackapiQueryDeadline deadline(con, call.deadline, parent);
+		receipt = ExecReceipt(QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql"));
+	} catch (std::exception &e) {
+		receipt.request_error = e.what();
+	} catch (...) {
+		receipt.request_error = "unknown error during quackapi_exec";
+	}
+	std::lock_guard<std::mutex> guard(call.mutex);
+	call.out[i] = std::move(receipt);
+	call.done[i] = true;
+}
 
+//! Stop waiting on `call`: no row starts after this, and every running row is interrupted.
+void AbandonExecCall(ExecCall &call) {
+	call.cancelled = true;
+	for (auto con : call.running) {
+		con->Interrupt();
+	}
+}
+
+//! quackapi_exec(sql): the receipt quackapi_post gives for POST {"sql": sql} to an exec
+//! route (`AS $sql`), produced on this process's own database with no HTTP worker.
+//!
+//! A self-post holds an HTTP worker while the SQL it posted posts again, so nested
+//! fan-outs exhaust a fixed pool and wait on each other. Here every row runs on a
+//! thread of its own with a fresh Connection: waits form a tree, never a cycle, and a
+//! nested call starts on a fresh stack. Past quackapi_exec_max_threads in the process,
+//! rows run one at a time on the calling thread instead of waiting for a thread.
+//!
+//! The calling thread watches the caller and the call's deadline. When either ends, it
+//! interrupts every running row and returns without waiting for them: a row blocked in
+//! a host call (a pipe, a sleep) finishes on its own thread, and its result is dropped.
+void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	const auto count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+
+	auto call = std::make_shared<ExecCall>();
+	call->db = context.db;
+	call->sqls.resize(count);
+	call->skip.assign(count, false);
+	call->out.resize(count);
+	call->done.assign(count, false);
 	idx_t active = 0;
 	for (idx_t i = 0; i < count; i++) {
-		if (!skip[i]) {
-			active++;
+		auto sql = args.data[0].GetValue(i);
+		if (sql.IsNull()) {
+			call->skip[i] = true;
+			continue;
 		}
-	}
-	const idx_t n_threads = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
-	{
-		vector<std::thread> threads;
-		threads.reserve(n_threads);
-		JoinOutboundThreads<vector<std::thread>> join_threads {threads};
-		for (idx_t t = 0; t < n_threads; t++) {
-			threads.emplace_back([&]() {
-				for (;;) {
-					const idx_t i = cursor.fetch_add(1);
-					if (i >= count) {
-						break;
-					}
-					if (!skip[i]) {
-						run_one(i);
-					}
-				}
-				std::lock_guard<std::mutex> guard(mutex);
-				threads_done++;
-				finished.notify_one();
-			});
-		}
-		std::unique_lock<std::mutex> guard(mutex);
-		while (threads_done < n_threads) {
-			finished.wait_for(guard, std::chrono::milliseconds(10));
-			if (context.IsInterrupted()) {
-				cancelled = true;
-				for (auto con : running) {
-					con->Interrupt();
-				}
-			}
-		}
-	}
-	if (cancelled) {
-		throw InterruptException();
+		call->sqls[i] = sql.GetValue<string>();
+		active++;
 	}
 
+	// Inside a served request, the server's own budgets; otherwise the session's.
+	int64_t timeout_ms = 0;
+	int64_t max_response_bytes = 0;
+	if (QuackapiGetServingBudget(context, timeout_ms, max_response_bytes)) {
+		call->serving_timeout_ms = timeout_ms;
+		call->serving_max_response_bytes = max_response_bytes;
+	} else {
+		timeout_ms = PositiveSetting(context, "quackapi_query_timeout_ms", 30000);
+		max_response_bytes = PositiveSetting(context, "quackapi_max_response_bytes", 16 * 1024 * 1024);
+	}
+	call->max_response_bytes = NumericCast<idx_t>(max_response_bytes);
+	// Never longer than what the caller has left.
+	call->deadline = std::min(QuackapiContextDeadline(context),
+	                          std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+	const auto max_threads = NonNegativeSetting(context, "quackapi_exec_max_threads", 256);
+
+	// An exec route answers 403 while any policy is bound: its SQL cannot be rewritten.
+	auto &quackapi_state = QuackapiState::Get(*context.db);
+	if (!quackapi_state.SnapshotRowAccessBindings().empty() || !quackapi_state.SnapshotMaskingBindings().empty()) {
+		for (idx_t i = 0; i < count; i++) {
+			result.SetValue(i, call->skip[i] ? Value(FetchResultType())
+			                                 : ToValue(ExecReceipt(QuackapiExecPolicyDeniedResponse())));
+		}
+		return;
+	}
+
+	const idx_t wanted = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
+	const idx_t reserved = wanted == 0 ? 0 : ReserveExecThreads(wanted, max_threads);
+	idx_t started = 0;
+	for (; started < reserved; started++) {
+		try {
+			std::thread([call]() {
+				struct Slot {
+					~Slot() {
+						exec_threads_running--;
+					}
+				} slot;
+				for (;;) {
+					const idx_t i = call->cursor.fetch_add(1);
+					if (i >= call->sqls.size()) {
+						break;
+					}
+					if (!call->skip[i]) {
+						RunExecRow(*call, i, nullptr);
+					}
+				}
+				std::lock_guard<std::mutex> guard(call->mutex);
+				call->threads_done++;
+				call->finished.notify_one();
+			}).detach();
+		} catch (std::exception &) {
+			// The OS refused a thread: the ones running take every row.
+			exec_threads_running -= NumericCast<int64_t>(reserved - started);
+			break;
+		}
+	}
+
+	if (started == 0) {
+		for (idx_t i = 0; i < count; i++) {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+			if (!call->skip[i]) {
+				RunExecRow(*call, i, &context);
+			}
+		}
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	} else {
+		std::unique_lock<std::mutex> guard(call->mutex);
+		while (call->threads_done < started) {
+			if (context.IsInterrupted()) {
+				AbandonExecCall(*call);
+				throw InterruptException();
+			}
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= call->deadline) {
+				AbandonExecCall(*call);
+				break;
+			}
+			call->finished.wait_until(guard, std::min(call->deadline, now + std::chrono::milliseconds(10)));
+		}
+	}
+
+	std::lock_guard<std::mutex> guard(call->mutex);
 	for (idx_t i = 0; i < count; i++) {
-		result.SetValue(i, skip[i] ? Value(FetchResultType()) : ToValue(out[i]));
+		if (call->skip[i]) {
+			result.SetValue(i, Value(FetchResultType()));
+		} else if (call->done[i]) {
+			result.SetValue(i, ToValue(call->out[i]));
+		} else {
+			result.SetValue(i, ToValue(ExecReceipt(QuackapiExecTimeoutResponse())));
+		}
 	}
 }
 

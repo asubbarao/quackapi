@@ -1846,25 +1846,36 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 } // namespace
 
+static QuackapiExecResponse ExecJsonResponse(int status, string body) {
+	QuackapiExecResponse out;
+	out.status = status;
+	out.body = std::move(body);
+	out.headers.emplace_back("Content-Type", "application/json");
+	return out;
+}
+
+QuackapiExecResponse QuackapiExecTimeoutResponse() {
+	return ExecJsonResponse(504, "{\"detail\":\"Query execution deadline exceeded\"}");
+}
+
+QuackapiExecResponse QuackapiExecPolicyDeniedResponse() {
+	return ExecJsonResponse(403, "{\"detail\":\"Policy denies unauthenticated access\"}");
+}
+
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
-                                     const QuackapiQueryDeadline &deadline) {
-	// Mirrors the exec-route branch of HandleRequest for a route with no STATUS,
-	// FORMAT or ENVELOPE, so a receipt reads the same in-process as over HTTP.
+                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param) {
 	QuackapiExecResponse out;
 	auto set_json = [&out](int status, string body) {
-		out.status = status;
-		out.body = std::move(body);
-		out.headers.clear();
-		out.headers.emplace_back("Content-Type", "application/json");
+		out = ExecJsonResponse(status, std::move(body));
 	};
 	try {
 		unique_ptr<QueryResult> result;
 		string error;
 		if (!ExecuteRequestSql(con, sql, result, error)) {
 			if (deadline.Expired()) {
-				set_json(504, "{\"detail\":\"Query execution deadline exceeded\"}");
+				out = QuackapiExecTimeoutResponse();
 			} else {
-				set_json(422, ValidationErrorJson("body", "sql", error, "value_error"));
+				set_json(422, ValidationErrorJson(loc, param, error, "value_error"));
 			}
 			return out;
 		}
@@ -1902,6 +1913,7 @@ QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t m
 				rows.push_back(std::move(cols));
 			}
 		}
+		out.rows = rows.size();
 		if (data_cols.empty() && location_col == names.size() && set_cookie_col == names.size()) {
 			// A final SET / PRAGMA / BEGIN has no columns: the exec route answers [].
 			set_json(200, "[]");
@@ -1939,10 +1951,41 @@ QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t m
 			out.headers.emplace_back("Location", location_value);
 		}
 	} catch (std::exception &ex) {
+		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
 		set_json(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
 	}
 	return out;
 }
+
+namespace {
+
+//! An exec route whose answer is exactly QuackapiExecSql's: no STATUS, EMPTY STATUS,
+//! ENVELOPE object, or FORMAT / Accept other than JSON.
+bool IsPlainExecRoute(const QuackapiRoute &route, BodyFormat body_format) {
+	auto envelope = StringUtil::Lower(route.response_envelope);
+	return route.status == 200 && route.empty_status == 0 && (envelope.empty() || envelope == "array") &&
+	       body_format == BodyFormat::JSON;
+}
+
+void ApplyExecResponse(quackapi_httplib::Response &res, const QuackapiExecResponse &response) {
+	res.status = response.status;
+	string content_type;
+	for (auto &header : response.headers) {
+		if (StringUtil::CIEquals(header.first, "Content-Type")) {
+			content_type = header.second;
+		} else {
+			// httplib Headers is a multimap: set_header appends each Set-Cookie.
+			res.set_header(header.first, header.second);
+		}
+	}
+	if (content_type.empty()) {
+		res.body.clear();
+	} else {
+		res.set_content(response.body, content_type);
+	}
+}
+
+} // namespace
 
 enum class QuackapiAccessLogColumn : uint8_t {
 	REQUEST_ID,
@@ -3653,6 +3696,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			// Bind path + query (+ Last-Event-ID → $last_id) before installing provider.
 			auto con = make_shared_ptr<Connection>(*db);
 			QuackapiQueryDeadline initial_deadline(*con, options.query_timeout_ms);
+			QuackapiSetServingBudget(*con, options.query_timeout_ms, options.max_response_bytes);
 			auto prepared = con->Prepare(stream_sql);
 			if (prepared->HasError()) {
 				SetInternalError(res, prepared->GetError());
@@ -3916,6 +3960,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		const auto elapsed_ms =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 		QuackapiQueryDeadline deadline(con, std::max<int64_t>(1, options.query_timeout_ms - elapsed_ms));
+		QuackapiSetServingBudget(con, options.query_timeout_ms, options.max_response_bytes);
 		auto &middleware_registry = QuackapiMiddlewareRegistry::Get(*db);
 		if (!middleware_registry.Snapshot(QuackapiMiddlewarePhase::BEFORE, match.route.group_name).empty() ||
 		    !middleware_registry.Snapshot(QuackapiMiddlewarePhase::AFTER, match.route.group_name).empty()) {
@@ -4498,6 +4543,17 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				SetJson(res, 422,
 				        ValidationErrorJson(IsBodyMethod(req.method) ? "body" : "query", exec_param, "Field required",
 				                            "missing"));
+				finish();
+				return;
+			}
+			if (IsPlainExecRoute(match.route, body_format)) {
+				// The same code quackapi_exec() runs, so a receipt reads the same either way.
+				auto response = QuackapiExecSql(con, sql_it->second.second, NumericCast<idx_t>(options.max_response_bytes),
+				                                deadline, sql_it->second.first, exec_param);
+				sql_execute_ms =
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
+				rows_out = NumericCast<int64_t>(response.rows);
+				ApplyExecResponse(res, response);
 				finish();
 				return;
 			}
