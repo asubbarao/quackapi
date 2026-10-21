@@ -89,7 +89,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 
 ```
 quackapi_ack, quackapi_add_api_key, quackapi_authentication, quackapi_authorization,
-quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_fetch, quackapi_graphql_routes,
+quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_exec, quackapi_fetch, quackapi_graphql_routes,
 quackapi_graphql_tables, quackapi_groups, quackapi_http_pool, quackapi_http_util_name,
 quackapi_last_write_timeout_sec, quackapi_middlewares, quackapi_nack, quackapi_policies,
 quackapi_parallel_fetch, quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,

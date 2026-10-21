@@ -1846,6 +1846,104 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 } // namespace
 
+QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
+                                     const QuackapiQueryDeadline &deadline) {
+	// Mirrors the exec-route branch of HandleRequest for a route with no STATUS,
+	// FORMAT or ENVELOPE, so a receipt reads the same in-process as over HTTP.
+	QuackapiExecResponse out;
+	auto set_json = [&out](int status, string body) {
+		out.status = status;
+		out.body = std::move(body);
+		out.headers.clear();
+		out.headers.emplace_back("Content-Type", "application/json");
+	};
+	try {
+		unique_ptr<QueryResult> result;
+		string error;
+		if (!ExecuteRequestSql(con, sql, result, error)) {
+			if (deadline.Expired()) {
+				set_json(504, "{\"detail\":\"Query execution deadline exceeded\"}");
+			} else {
+				set_json(422, ValidationErrorJson("body", "sql", error, "value_error"));
+			}
+			return out;
+		}
+		auto names = QuackapiNames(result->GetNames());
+		vector<idx_t> data_cols;
+		idx_t location_col = names.size();
+		idx_t set_cookie_col = names.size();
+		for (idx_t c = 0; c < names.size(); c++) {
+			auto lower = StringUtil::Lower(names[c]);
+			if (lower == "location") {
+				location_col = c;
+			} else if (lower == "set_cookie" || lower == "set-cookie") {
+				set_cookie_col = c;
+			} else {
+				data_cols.push_back(c);
+			}
+		}
+		vector<vector<Value>> rows;
+		idx_t response_value_bytes = 0;
+		while (true) {
+			auto chunk = result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> cols(chunk->ColumnCount());
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					cols[col] = chunk->GetValue(col, row);
+					response_value_bytes += cols[col].ToString().size();
+					if (response_value_bytes > max_response_bytes) {
+						set_json(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+						return out;
+					}
+				}
+				rows.push_back(std::move(cols));
+			}
+		}
+		if (data_cols.empty() && location_col == names.size() && set_cookie_col == names.size()) {
+			// A final SET / PRAGMA / BEGIN has no columns: the exec route answers [].
+			set_json(200, "[]");
+			return out;
+		}
+		vector<string> data_names;
+		for (auto c : data_cols) {
+			data_names.push_back(names[c]);
+		}
+		auto mode = ResponseModeFor(data_names);
+		out.status = 200;
+		if (data_cols.empty()) {
+			// Redirect / cookie-only response: no body, no Content-Type.
+		} else if (mode == ResponseMode::JSON) {
+			set_json(200, SerializeRowsJsonArray(names, data_cols, rows));
+		} else {
+			for (auto &cols : rows) {
+				if (!cols[data_cols[0]].IsNull()) {
+					out.body += cols[data_cols[0]].ToString();
+				}
+			}
+			out.headers.emplace_back("Content-Type", mode == ResponseMode::HTML ? "text/html; charset=utf-8"
+			                                                                    : "text/plain; charset=utf-8");
+		}
+		string location_value;
+		for (auto &cols : rows) {
+			if (location_col < cols.size() && !cols[location_col].IsNull() && location_value.empty()) {
+				location_value = cols[location_col].ToString();
+			}
+			if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
+				out.headers.emplace_back("Set-Cookie", cols[set_cookie_col].ToString());
+			}
+		}
+		if (!location_value.empty()) {
+			out.headers.emplace_back("Location", location_value);
+		}
+	} catch (std::exception &ex) {
+		set_json(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
+	}
+	return out;
+}
+
 enum class QuackapiAccessLogColumn : uint8_t {
 	REQUEST_ID,
 	RECEIVED_AT,

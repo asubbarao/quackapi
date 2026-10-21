@@ -1,0 +1,281 @@
+# name: test/sql/quackapi_exec.test
+# description: quackapi_exec(sql) answers what quackapi_post to an exec route answers, with no HTTP worker, so nested self-dispatch cannot exhaust the pool
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE ROUTE sql POST '/sql' AS $sql;
+
+query I
+SELECT * FROM quackapi_serve(29320, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29320
+
+# ---------------------------------------------------------------------------
+# The receipt is quackapi_post's struct
+# ---------------------------------------------------------------------------
+query I
+SELECT typeof(quackapi_exec('SELECT 1')) = typeof(quackapi_post('http://127.0.0.1:29320/sql', '{}'));
+----
+true
+
+query I
+SELECT quackapi_exec(NULL) IS NULL;
+----
+true
+
+# ---------------------------------------------------------------------------
+# Same status, reason, body and Content-Type as POST /sql over real HTTP
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE exec_cases AS SELECT * FROM (VALUES
+    ('select', 'SELECT 42 AS answer'),
+    ('zero_rows', 'SELECT 1 AS x WHERE false'),
+    ('last_answers', 'SELECT 1 AS first; SELECT 2 AS second; SELECT 3 AS third'),
+    ('ddl_dml_select', 'CREATE OR REPLACE TEMP TABLE c (id INTEGER); INSERT INTO c VALUES (1), (2); SELECT list(id ORDER BY id) AS ids FROM c'),
+    ('trailing_set', 'SELECT 1 AS x; SET search_path = ''main'''),
+    ('pragma', 'PRAGMA disable_checkpoint_on_shutdown'),
+    ('pivot', 'CREATE OR REPLACE TEMP TABLE p AS SELECT * FROM (VALUES (''a'', 1), (''b'', 2)) t(k, v); PIVOT p ON k USING sum(v)'),
+    ('types', 'SELECT 1.5::DOUBLE AS d, NULL AS n, [1, 2] AS l, {''a'': ''x''} AS s, DATE ''2026-10-20'' AS dt'),
+    ('html', 'SELECT 1; SELECT ''<b>hi</b>'' AS html'),
+    ('text', 'SELECT ''plain'' AS text'),
+    ('failing', 'SELECT 1; SELECT nope FROM nowhere; SELECT 2'),
+    ('parse_error', 'SELEC 1'),
+    ('conversion', 'SELECT CAST(''nope'' AS INTEGER)'),
+    ('empty', '  ;  ')
+) t(case_name, sql_text);
+
+query IIIIII
+WITH receipts AS (
+    SELECT case_name,
+           quackapi_post('http://127.0.0.1:29320/sql', json_object('sql', sql_text)::VARCHAR) AS http,
+           quackapi_exec(sql_text) AS exec
+    FROM exec_cases
+)
+SELECT case_name,
+       exec.status,
+       exec.status = http.status,
+       exec.reason = http.reason,
+       exec.body = http.body,
+       exec.headers['Content-Type'] = http.headers['Content-Type'] AND exec.error IS NULL AND http.error IS NULL
+FROM receipts
+ORDER BY case_name;
+----
+conversion	422	true	true	true	true
+ddl_dml_select	200	true	true	true	true
+empty	422	true	true	true	true
+failing	422	true	true	true	true
+html	200	true	true	true	true
+last_answers	200	true	true	true	true
+parse_error	422	true	true	true	true
+pivot	200	true	true	true	true
+pragma	200	true	true	true	true
+select	200	true	true	true	true
+text	200	true	true	true	true
+trailing_set	200	true	true	true	true
+types	200	true	true	true	true
+zero_rows	200	true	true	true	true
+
+query II
+SELECT (r).body, (r).headers['Content-Type'] FROM (SELECT quackapi_exec('SELECT 42 AS answer') AS r);
+----
+[{"answer":42}]	application/json
+
+query III
+SELECT (r).status,
+       json_extract_string((r).body, '$.detail[0].loc'),
+       contains(json_extract_string((r).body, '$.detail[0].msg'), 'Statement 2 of 3 failed')
+FROM (SELECT quackapi_exec('SELECT 1; SELECT nope FROM nowhere; SELECT 2') AS r);
+----
+422	["body","sql"]	true
+
+# Location / Set-Cookie columns become headers, as on the route.
+query III
+SELECT (r).body, (r).headers['Location'], (r).headers['Set-Cookie']
+FROM (SELECT quackapi_exec('SELECT ''/next'' AS location, ''k=v'' AS set_cookie, 1 AS v') AS r);
+----
+[{"v":1}]	/next	k=v
+
+# ---------------------------------------------------------------------------
+# DDL is real and later statements in a failing batch never run
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE exec_hits (n INTEGER);
+
+query I
+SELECT (quackapi_exec('INSERT INTO exec_hits VALUES (1); SELECT nope FROM nowhere; INSERT INTO exec_hits VALUES (2)')).status;
+----
+422
+
+query I
+SELECT (quackapi_exec('CREATE TABLE exec_made AS SELECT 7 AS v')).status;
+----
+200
+
+query II
+SELECT (SELECT list(n) FROM exec_hits), (SELECT list(v) FROM exec_made);
+----
+[1]	[7]
+
+# Forty concurrent execs each create a table and append to one shared table.
+query I
+SELECT list(DISTINCT (quackapi_exec('CREATE TABLE exec_t' || range || ' AS SELECT ' || range || ' AS v; INSERT INTO exec_hits VALUES (' || range || ' + 100)')).status)
+FROM range(40);
+----
+[200]
+
+query I
+SELECT len(list(DISTINCT n)) FROM exec_hits WHERE n >= 100;
+----
+40
+
+# ---------------------------------------------------------------------------
+# Rows run concurrently: 16 sleeps of 300 ms finish well under the 4.8 s serial time
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE exec_clock AS SELECT get_current_timestamp() AS started;
+
+query I
+SELECT list(DISTINCT (quackapi_exec('SELECT sleep_ms(300) AS s')).status) FROM range(16);
+----
+[200]
+
+query I
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 2000 FROM exec_clock;
+----
+true
+
+# ---------------------------------------------------------------------------
+# Nested self-dispatch: 40 x 5, and three levels deep
+# ---------------------------------------------------------------------------
+statement ok
+CREATE MACRO exec_sd(q) AS quackapi_exec(q);
+
+query II
+WITH outer_statements AS (
+    SELECT o, $q$SELECT list((exec_sd('SELECT ' || i || ' AS v')).body ORDER BY i) AS inner_bodies FROM range(5) t(i)$q$ AS outer_sql
+    FROM range(40) t(o)
+)
+SELECT list(DISTINCT (r).status), list(DISTINCT (r).body)
+FROM (SELECT exec_sd(outer_sql) AS r FROM outer_statements);
+----
+[200]	['[{"inner_bodies":["[{\\"v\\":0}]","[{\\"v\\":1}]","[{\\"v\\":2}]","[{\\"v\\":3}]","[{\\"v\\":4}]"]}]']
+
+query II
+WITH outer_statements AS (
+    SELECT o, $q$SELECT sum(((exec_sd($i$SELECT sum(((exec_sd('SELECT ' || k || ' AS v')).body::JSON->>'$[0].v')::INTEGER) AS s FROM range(3) t(k)$i$)).body::JSON->>'$[0].s')::INTEGER) AS mid FROM range(4) t(j)$q$ AS outer_sql
+    FROM range(10) t(o)
+)
+SELECT list(DISTINCT (r).status), list(DISTINCT (r).body)
+FROM (SELECT exec_sd(outer_sql) AS r FROM outer_statements);
+----
+[200]	['[{"mid":12}]']
+
+# ---------------------------------------------------------------------------
+# The same nesting over HTTP exhausts a small worker pool: every outer post
+# waits on inner posts that need a worker the outer posts hold.
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM quackapi_serve(29321, host := '127.0.0.1', access_log := false, worker_threads := 2);
+----
+http://127.0.0.1:29321
+
+# The caller gives up at 1.5 s; the server's own inner posts wait 3 s, so no
+# worker frees up before every outer post has failed.
+statement ok
+SET GLOBAL quackapi_http_timeout_ms = 3000;
+
+statement ok
+SET SESSION quackapi_http_timeout_ms = 1500;
+
+statement ok
+CREATE MACRO http_sd(q) AS quackapi_post('http://127.0.0.1:29321/sql', json_object('sql', q)::VARCHAR);
+
+query II
+WITH outer_statements AS (
+    SELECT o, $q$SELECT list((http_sd('SELECT ' || i || ' AS v')).status) AS inner_status FROM range(2) t(i)$q$ AS outer_sql
+    FROM range(4) t(o)
+)
+SELECT list(DISTINCT (r).status), bool_and((r).error IS NOT NULL)
+FROM (SELECT http_sd(outer_sql) AS r FROM outer_statements);
+----
+[0]	true
+
+query II
+WITH outer_statements AS (
+    SELECT o, $q$SELECT list((exec_sd('SELECT ' || i || ' AS v')).status) AS inner_status FROM range(2) t(i)$q$ AS outer_sql
+    FROM range(4) t(o)
+)
+SELECT list(DISTINCT (r).status), list(DISTINCT (r).body)
+FROM (SELECT exec_sd(outer_sql) AS r FROM outer_statements);
+----
+[200]	['[{"inner_status":[200,200]}]']
+
+statement ok
+RESET SESSION quackapi_http_timeout_ms;
+
+statement ok
+RESET GLOBAL quackapi_http_timeout_ms;
+
+# ---------------------------------------------------------------------------
+# Budgets: quackapi_query_timeout_ms (504), quackapi_max_response_bytes (507)
+# ---------------------------------------------------------------------------
+statement ok
+SET quackapi_query_timeout_ms = 200;
+
+query II
+SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT 1; SELECT sum(range) FROM range(100000000000)') AS r);
+----
+504	{"detail":"Query execution deadline exceeded"}
+
+statement ok
+RESET quackapi_query_timeout_ms;
+
+# A request's deadline bounds the execs its SQL makes.
+statement ok
+DELETE FROM exec_clock;
+
+statement ok
+INSERT INTO exec_clock VALUES (get_current_timestamp());
+
+query I
+SELECT status FROM quackapi_request('POST', '/sql',
+  '{"sql":"SELECT quackapi_exec(''SELECT sum(range) FROM range(100000000000)'') AS r"}', query_timeout_ms := 300);
+----
+504
+
+query I
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 5000 FROM exec_clock;
+----
+true
+
+statement ok
+SET quackapi_max_response_bytes = 10;
+
+query II
+SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT repeat(''x'', 100) AS big') AS r);
+----
+507	{"detail":"Response exceeds configured byte limit"}
+
+statement ok
+RESET quackapi_max_response_bytes;
+
+statement ok
+SET quackapi_query_timeout_ms = 0;
+
+statement error
+SELECT quackapi_exec('SELECT 1');
+----
+quackapi_query_timeout_ms must be > 0
+
+statement ok
+RESET quackapi_query_timeout_ms;
+
+statement ok
+SELECT * FROM quackapi_stop(29321);
+
+statement ok
+SELECT * FROM quackapi_stop(29320);
