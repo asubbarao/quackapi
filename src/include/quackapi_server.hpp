@@ -105,12 +105,13 @@ struct QuackapiServeOptions {
 	int32_t max_pending_requests = 256;
 
 	// --- Batteries: DuckDB SETs applied at serve (overridable) ---
-	//! Empty = apply non-clobber memory guard (256MB when still at system default).
+	//! Empty = leave DuckDB memory_limit alone. Else SET memory_limit to it.
 	string memory_limit;
 	//! Empty = leave DuckDB threads at system default (all cores). Else e.g. "8".
 	string threads;
-	//! When true (default), SET preserve_insertion_order=false for throughput.
+	//! Applied only when preserve_insertion_order_explicit (named param given).
 	bool preserve_insertion_order = false;
+	bool preserve_insertion_order_explicit = false;
 	//! When true (default), SET enable_http_metadata_cache=true for outbound HTTP.
 	bool enable_http_metadata_cache = true;
 

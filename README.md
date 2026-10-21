@@ -288,7 +288,7 @@ the “PDF service” is a function call in the same address space — not an RP
 | `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
-| Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = non-clobber default logic |
+| Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = leave DuckDB `memory_limit` alone |
 | Setting | `SET quackapi_log_level = 'silent' \| 'error' \| 'warn' \| 'info' \| 'debug'` | default `info` |
 | Setting | `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | default `auto`; legacy booleans map to `auto`/`off` |
 | Setting | `SET quackapi_compression_min_bytes = N` | default `1024` |
@@ -313,12 +313,14 @@ Built-in OpenAPI (not listed in `quackapi_routes()`):
 - `GET /docs` — Swagger UI  
 - `GET /redoc` — ReDoc  
 
-**Serve memory limit** (never silently clobbers an operator setting):
+**Database-wide settings.** `memory_limit` and `preserve_insertion_order` apply
+to every connection in the database, not only to HTTP handlers, so
+`quackapi_serve` changes them only when asked:
 
 1. `memory_limit := '…'` named parameter on `quackapi_serve` wins  
 2. else `SET quackapi_memory_limit = '…'`  
-3. else if DuckDB already has a **non-default** `memory_limit` → leave it alone  
-4. else apply the safe default of **256MB**
+3. else DuckDB's `memory_limit` is left as it is
+4. `preserve_insertion_order := true|false` sets it; omitted, it is left as it is
 
 ```sql
 -- App that needs headroom (PDF/HTML workloads, large joins, etc.)
@@ -550,11 +552,9 @@ C++11 by the repository CMake configuration.
   a connection-pooled app tier under heavy concurrent writes.
 - **Platform coverage:** **DuckDB v1.5.6** on linux/macOS/windows_amd64 only.
   Older DuckDB versions are unsupported — upgrade the host.
-- **Serve memory default:** `quackapi_serve` applies a 256MB `memory_limit`
-  only when nothing was configured (no `memory_limit` / `quackapi_memory_limit`
-  and DuckDB is still at its system default). Prefer
-  `memory_limit := '4GB'` (or `SET quackapi_memory_limit`) for large PDF/HTML
-  workloads — it will never clobber an explicit operator `SET memory_limit`.
+- **Serve memory limit:** `quackapi_serve` sets no `memory_limit` of its own;
+  the database keeps DuckDB's default (80% of RAM) unless you pass
+  `memory_limit := '…'`, `SET quackapi_memory_limit`, or `SET memory_limit`.
 - **No WebSocket routes** on the HTTP transport (SSE via `CREATE STREAM` only).
 - **`CREATE API FOR TABLE`** scaffolds **GET list + GET by key** only.
 - **JWT:** HS256 only (`ALGORITHM HS256`); no RS256 / OIDC discovery yet.
