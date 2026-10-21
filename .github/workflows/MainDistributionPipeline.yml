@@ -126,6 +126,11 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_lifetime_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-lifetime-test
           /tmp/quackapi-lifetime-test
 
+      - name: Verify quackapi_exec interrupt
+        run: |
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_exec_interrupt_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-exec-interrupt-test
+          /tmp/quackapi-exec-interrupt-test
+
       - name: Verify benchmark correctness gates
         run: |
           python3 bench/test_bench_config.py

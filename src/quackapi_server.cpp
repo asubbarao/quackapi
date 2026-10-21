@@ -1003,8 +1003,10 @@ bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
 //! order on the request connection, stopping at the first failure. The last
 //! statement's result is the response. Unlike Connection::Query(string), which
 //! answers with the first statement that produces rows, a batch such as
-//! `CREATE …; INSERT …; SELECT …` answers with its final SELECT.
-bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error) {
+//! `CREATE …; INSERT …; SELECT …` answers with its final SELECT. When `stop` answers
+//! true before a statement, that statement and the rest never run.
+bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
+                       const std::function<bool()> &stop) {
 	// DuckDB's statement extraction truncates at the first null byte, which
 	// would silently drop the tail of the batch while executing the prefix.
 	// Null bytes are never legitimate in request SQL text.
@@ -1025,6 +1027,13 @@ bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResul
 	}
 	const auto statement_count = statements.size();
 	for (idx_t i = 0; i < statement_count; i++) {
+		// DuckDB clears an interrupt as each statement starts, so one that lands after the
+		// previous statement's last check is seen only here.
+		if (stop()) {
+			error =
+			    StringUtil::Format("Statement %llu of %llu not run: the call was cancelled", i + 1, statement_count);
+			return false;
+		}
 		unique_ptr<QueryResult> statement_result = con.Query(std::move(statements[i]));
 		if (statement_result->HasError()) {
 			error = statement_result->GetError();
@@ -1842,6 +1851,166 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 		}
 	}
 	return false;
+}
+
+} // namespace
+
+static QuackapiExecResponse ExecJsonResponse(int status, string body) {
+	QuackapiExecResponse out;
+	out.status = status;
+	out.body = std::move(body);
+	out.headers.emplace_back("Content-Type", "application/json");
+	return out;
+}
+
+QuackapiExecResponse QuackapiExecTimeoutResponse() {
+	return ExecJsonResponse(504, "{\"detail\":\"Query execution deadline exceeded\"}");
+}
+
+QuackapiExecResponse QuackapiExecPolicyDeniedResponse() {
+	return ExecJsonResponse(403, "{\"detail\":\"Policy denies unauthenticated access\"}");
+}
+
+static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, idx_t max_response_bytes,
+                                            const QuackapiQueryDeadline &deadline, const string &loc,
+                                            const string &param, const std::function<bool()> &cancelled) {
+	QuackapiExecResponse out;
+	auto set_json = [&out](int status, string body) {
+		out = ExecJsonResponse(status, std::move(body));
+	};
+	try {
+		unique_ptr<QueryResult> result;
+		string error;
+		auto stop = [&]() {
+			return deadline.Expired() || (cancelled && cancelled());
+		};
+		if (!ExecuteRequestSql(con, sql, result, error, stop)) {
+			if (deadline.Expired()) {
+				out = QuackapiExecTimeoutResponse();
+			} else {
+				set_json(422, ValidationErrorJson(loc, param, error, "value_error"));
+			}
+			return out;
+		}
+		auto names = QuackapiNames(result->GetNames());
+		vector<idx_t> data_cols;
+		idx_t location_col = names.size();
+		idx_t set_cookie_col = names.size();
+		for (idx_t c = 0; c < names.size(); c++) {
+			auto lower = StringUtil::Lower(names[c]);
+			if (lower == "location") {
+				location_col = c;
+			} else if (lower == "set_cookie" || lower == "set-cookie") {
+				set_cookie_col = c;
+			} else {
+				data_cols.push_back(c);
+			}
+		}
+		vector<vector<Value>> rows;
+		idx_t response_value_bytes = 0;
+		while (true) {
+			auto chunk = result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> cols(chunk->ColumnCount());
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					cols[col] = chunk->GetValue(col, row);
+					response_value_bytes += cols[col].ToString().size();
+					if (response_value_bytes > max_response_bytes) {
+						set_json(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+						return out;
+					}
+				}
+				rows.push_back(std::move(cols));
+			}
+		}
+		out.rows = rows.size();
+		if (data_cols.empty() && location_col == names.size() && set_cookie_col == names.size()) {
+			// A final SET / PRAGMA / BEGIN has no columns: the exec route answers [].
+			set_json(200, "[]");
+			return out;
+		}
+		vector<string> data_names;
+		for (auto c : data_cols) {
+			data_names.push_back(names[c]);
+		}
+		auto mode = ResponseModeFor(data_names);
+		out.status = 200;
+		if (data_cols.empty()) {
+			// Redirect / cookie-only response: no body, no Content-Type.
+		} else if (mode == ResponseMode::JSON) {
+			set_json(200, SerializeRowsJsonArray(names, data_cols, rows));
+		} else {
+			for (auto &cols : rows) {
+				if (!cols[data_cols[0]].IsNull()) {
+					out.body += cols[data_cols[0]].ToString();
+				}
+			}
+			out.headers.emplace_back("Content-Type", mode == ResponseMode::HTML ? "text/html; charset=utf-8"
+			                                                                    : "text/plain; charset=utf-8");
+		}
+		string location_value;
+		for (auto &cols : rows) {
+			if (location_col < cols.size() && !cols[location_col].IsNull() && location_value.empty()) {
+				location_value = cols[location_col].ToString();
+			}
+			if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
+				out.headers.emplace_back("Set-Cookie", cols[set_cookie_col].ToString());
+			}
+		}
+		if (!location_value.empty()) {
+			out.headers.emplace_back("Location", location_value);
+		}
+	} catch (std::exception &ex) {
+		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
+		set_json(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
+	}
+	return out;
+}
+
+QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
+                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
+                                     const std::function<bool()> &cancelled) {
+	auto out = ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled);
+	// What a served route checks last, after serialization: values under the cap can
+	// serialize past it, and the deadline can pass while they do.
+	if (deadline.Expired()) {
+		return QuackapiExecTimeoutResponse();
+	}
+	if (out.body.size() > max_response_bytes) {
+		return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+	}
+	return out;
+}
+
+namespace {
+
+//! An exec route whose answer is exactly QuackapiExecSql's: no STATUS, EMPTY STATUS,
+//! ENVELOPE object, or FORMAT / Accept other than JSON.
+bool IsPlainExecRoute(const QuackapiRoute &route, BodyFormat body_format) {
+	auto envelope = StringUtil::Lower(route.response_envelope);
+	return route.status == 200 && route.empty_status == 0 && (envelope.empty() || envelope == "array") &&
+	       body_format == BodyFormat::JSON;
+}
+
+void ApplyExecResponse(quackapi_httplib::Response &res, const QuackapiExecResponse &response) {
+	res.status = response.status;
+	string content_type;
+	for (auto &header : response.headers) {
+		if (StringUtil::CIEquals(header.first, "Content-Type")) {
+			content_type = header.second;
+		} else {
+			// httplib Headers is a multimap: set_header appends each Set-Cookie.
+			res.set_header(header.first, header.second);
+		}
+	}
+	if (content_type.empty()) {
+		res.body.clear();
+	} else {
+		res.set_content(response.body, content_type);
+	}
 }
 
 } // namespace
@@ -3555,6 +3724,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			// Bind path + query (+ Last-Event-ID → $last_id) before installing provider.
 			auto con = make_shared_ptr<Connection>(*db);
 			QuackapiQueryDeadline initial_deadline(*con, options.query_timeout_ms);
+			QuackapiSetServingBudget(*con, options.query_timeout_ms, options.max_response_bytes);
 			auto prepared = con->Prepare(stream_sql);
 			if (prepared->HasError()) {
 				SetInternalError(res, prepared->GetError());
@@ -3818,6 +3988,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		const auto elapsed_ms =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 		QuackapiQueryDeadline deadline(con, std::max<int64_t>(1, options.query_timeout_ms - elapsed_ms));
+		QuackapiSetServingBudget(con, options.query_timeout_ms, options.max_response_bytes);
 		auto &middleware_registry = QuackapiMiddlewareRegistry::Get(*db);
 		if (!middleware_registry.Snapshot(QuackapiMiddlewarePhase::BEFORE, match.route.group_name).empty() ||
 		    !middleware_registry.Snapshot(QuackapiMiddlewarePhase::AFTER, match.route.group_name).empty()) {
@@ -4403,8 +4574,22 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				finish();
 				return;
 			}
+			if (IsPlainExecRoute(match.route, body_format)) {
+				// The same code quackapi_exec() runs, so a receipt reads the same either way.
+				auto response =
+				    QuackapiExecSql(con, sql_it->second.second, NumericCast<idx_t>(options.max_response_bytes),
+				                    deadline, sql_it->second.first, exec_param);
+				sql_execute_ms =
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started)
+				        .count();
+				rows_out = NumericCast<int64_t>(response.rows);
+				ApplyExecResponse(res, response);
+				finish();
+				return;
+			}
 			string exec_error;
-			const bool exec_ok = ExecuteRequestSql(con, sql_it->second.second, result, exec_error);
+			const bool exec_ok = ExecuteRequestSql(con, sql_it->second.second, result, exec_error,
+			                                       [&deadline]() { return deadline.Expired(); });
 			sql_execute_ms =
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
 			if (!exec_ok) {
