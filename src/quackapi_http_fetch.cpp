@@ -19,6 +19,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
 
 #include "httplib.hpp"
@@ -826,9 +827,65 @@ struct ExecCall {
 	std::mutex mutex;
 	std::condition_variable finished;
 	unordered_set<Connection *> running;
-	bool cancelled = false;
+	std::atomic<bool> cancelled {false};
 	idx_t threads_done = 0;
 	std::atomic<idx_t> cursor {0};
+};
+
+//! How long a connection's close waits for the rows it gave up on.
+constexpr int64_t EXEC_ABANDONED_JOIN_MS = 5000;
+
+//! Threads still running rows of the quackapi_exec calls one connection gave up on.
+//! A thread holds the database through its row's connection, so the caller's close
+//! waits for them: otherwise the database outlives its close (a file stays locked) and
+//! its last reference can drop on a row's thread after the process began to exit.
+struct ExecAbandonedRows : public ClientContextState {
+	struct Abandoned {
+		std::shared_ptr<ExecCall> call;
+		vector<std::thread> threads;
+	};
+
+	static bool Ended(ExecCall &call, idx_t threads, std::chrono::steady_clock::time_point until) {
+		std::unique_lock<std::mutex> guard(call.mutex);
+		return call.finished.wait_until(guard, until, [&]() { return call.threads_done >= threads; });
+	}
+
+	//! Join a call's threads once they have ended; past `until`, leave them running.
+	static void Release(Abandoned &abandoned, std::chrono::steady_clock::time_point until) {
+		const bool ended = Ended(*abandoned.call, abandoned.threads.size(), until);
+		for (auto &thread : abandoned.threads) {
+			if (ended) {
+				thread.join();
+			} else {
+				thread.detach();
+			}
+		}
+		abandoned.threads.clear();
+	}
+
+	void Add(std::shared_ptr<ExecCall> call, vector<std::thread> threads) {
+		std::lock_guard<std::mutex> guard(mutex);
+		const auto now = std::chrono::steady_clock::now();
+		for (auto it = calls.begin(); it != calls.end();) {
+			if (Ended(*it->call, it->threads.size(), now)) {
+				Release(*it, now);
+				it = calls.erase(it);
+			} else {
+				++it;
+			}
+		}
+		calls.push_back(Abandoned {std::move(call), std::move(threads)});
+	}
+
+	~ExecAbandonedRows() override {
+		const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(EXEC_ABANDONED_JOIN_MS);
+		for (auto &abandoned : calls) {
+			Release(abandoned, until);
+		}
+	}
+
+	std::mutex mutex;
+	vector<Abandoned> calls;
 };
 
 QuackapiHttpFetchResult ExecReceipt(QuackapiExecResponse response) {
@@ -874,7 +931,11 @@ void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
 		}
 		Registration registration {call, &con};
 		QuackapiQueryDeadline deadline(con, call.deadline, parent);
-		receipt = ExecReceipt(QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql"));
+		auto cancelled = [&call, parent]() {
+			return call.cancelled || (parent && parent->IsInterrupted());
+		};
+		receipt = ExecReceipt(
+		    QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql", cancelled));
 	} catch (std::exception &e) {
 		receipt.request_error = e.what();
 	} catch (...) {
@@ -885,8 +946,10 @@ void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
 	call.done[i] = true;
 }
 
-//! Stop waiting on `call`: no row starts after this, and every running row is interrupted.
+//! Stop waiting on `call`: no row or statement starts after this, and every running row
+//! is interrupted.
 void AbandonExecCall(ExecCall &call) {
+	std::lock_guard<std::mutex> guard(call.mutex);
 	call.cancelled = true;
 	for (auto con : call.running) {
 		con->Interrupt();
@@ -905,6 +968,8 @@ void AbandonExecCall(ExecCall &call) {
 //! The calling thread watches the caller and the call's deadline. When either ends, it
 //! interrupts every running row and returns without waiting for them: a row blocked in
 //! a host call (a pipe, a sleep) finishes on its own thread, and its result is dropped.
+//! Such a row starts no further statement, and the caller's connection waits for it
+//! (up to EXEC_ABANDONED_JOIN_MS) when it closes.
 void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	const auto count = args.size();
@@ -955,10 +1020,19 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 
 	const idx_t wanted = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
 	const idx_t reserved = wanted == 0 ? 0 : ReserveExecThreads(wanted, max_threads);
+	vector<std::thread> threads;
+	// Rows that ran to the end: their threads have finished, so this join is brief.
+	JoinOutboundThreads<vector<std::thread>> join_threads {threads};
+	auto abandon = [&]() {
+		AbandonExecCall(*call);
+		context.registered_state->GetOrCreate<ExecAbandonedRows>("quackapi_exec_abandoned_rows")
+		    ->Add(call, std::move(threads));
+		threads.clear();
+	};
 	idx_t started = 0;
 	for (; started < reserved; started++) {
 		try {
-			std::thread([call]() {
+			threads.emplace_back([call]() {
 				struct Slot {
 					~Slot() {
 						exec_threads_running--;
@@ -976,7 +1050,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 				std::lock_guard<std::mutex> guard(call->mutex);
 				call->threads_done++;
 				call->finished.notify_one();
-			}).detach();
+			});
 		} catch (std::exception &) {
 			// The OS refused a thread: the ones running take every row.
 			exec_threads_running -= NumericCast<int64_t>(reserved - started);
@@ -1000,12 +1074,14 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		std::unique_lock<std::mutex> guard(call->mutex);
 		while (call->threads_done < started) {
 			if (context.IsInterrupted()) {
-				AbandonExecCall(*call);
+				guard.unlock();
+				abandon();
 				throw InterruptException();
 			}
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= call->deadline) {
-				AbandonExecCall(*call);
+				guard.unlock();
+				abandon();
 				break;
 			}
 			call->finished.wait_until(guard, std::min(call->deadline, now + std::chrono::milliseconds(10)));
