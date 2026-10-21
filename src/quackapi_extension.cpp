@@ -110,6 +110,7 @@ struct ServeBindData : public TableFunctionData {
 	bool health_routes = true;
 	string threads;
 	bool preserve_insertion_order = false;
+	bool preserve_insertion_order_explicit = false;
 	bool enable_http_metadata_cache = true;
 	int32_t worker_threads = static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	int32_t keep_alive_max_count = static_cast<int32_t>(QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
@@ -240,7 +241,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		}
 	}
 	// memory_limit named param wins; else fall back to SET quackapi_memory_limit.
-	// Empty means "not provided" — ApplyQuackapiServerDefaults uses non-clobber logic.
+	// Empty means "not provided" — ApplyQuackapiServerDefaults leaves memory_limit alone.
 	auto mem_entry = input.named_parameters.find("memory_limit");
 	if (mem_entry != input.named_parameters.end()) {
 		bind_data->memory_limit = mem_entry->second.GetValue<string>();
@@ -305,6 +306,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	auto pio_entry = input.named_parameters.find("preserve_insertion_order");
 	if (pio_entry != input.named_parameters.end()) {
 		bind_data->preserve_insertion_order = pio_entry->second.GetValue<bool>();
+		bind_data->preserve_insertion_order_explicit = true;
 	}
 	auto http_meta_entry = input.named_parameters.find("enable_http_metadata_cache");
 	if (http_meta_entry != input.named_parameters.end()) {
@@ -449,6 +451,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 	opts.health_routes = bind_data.health_routes;
 	opts.threads = bind_data.threads;
 	opts.preserve_insertion_order = bind_data.preserve_insertion_order;
+	opts.preserve_insertion_order_explicit = bind_data.preserve_insertion_order_explicit;
 	opts.enable_http_metadata_cache = bind_data.enable_http_metadata_cache;
 	opts.worker_threads = bind_data.worker_threads;
 	opts.keep_alive_max_count = bind_data.keep_alive_max_count;
@@ -1145,12 +1148,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Empty (default) disables CORS. Overridden by cors_origins named parameter.",
 	                          LogicalType::VARCHAR, Value(""));
 	// SET quackapi_memory_limit = '4GB' | '512MB' | …
-	// Empty (default) = leave DuckDB memory_limit alone if already non-default;
-	// otherwise apply the 256MB serve guard. Serve-time memory_limit := '…' wins.
+	// Empty (default) = leave DuckDB memory_limit alone. Serve-time memory_limit := '…' wins.
 	config.AddExtensionOption("quackapi_memory_limit",
 	                          "Memory limit applied by quackapi_serve (e.g. '4GB', '512MB'). "
-	                          "Empty (default): do not clobber a non-default DuckDB memory_limit; "
-	                          "only apply the 256MB serve default when nothing was configured. "
+	                          "Empty (default): leave DuckDB memory_limit alone. "
 	                          "Overridden by memory_limit named parameter.",
 	                          LogicalType::VARCHAR, Value(""));
 	// SET quackapi_log_level = 'info' | 'debug' | 'warn' | 'error' | 'silent'

@@ -48,25 +48,6 @@ static const char *LogLevelDuckDBName(QuackapiLogLevel level) {
 	}
 }
 
-//! Safe serve default when nothing was configured (valsafe HARDENING P1-2).
-static constexpr const char *SERVE_DEFAULT_MEMORY_LIMIT = "256MB";
-
-static bool IsAtSystemDefaultMemoryLimit(DatabaseInstance &db) {
-	auto &config = DBConfig::GetConfig(db);
-	if (!config.file_system) {
-		return false;
-	}
-	auto available = DBConfig::GetSystemAvailableMemory(*config.file_system);
-	idx_t system_default;
-	if (available == DBConfigOptions().maximum_memory) {
-		system_default = available;
-	} else {
-		// Match DBConfig::SetDefaultMaxMemory().
-		system_default = available * 8 / 10;
-	}
-	return config.options.maximum_memory == system_default;
-}
-
 static bool RunSet(Connection &con, const string &sql, string &err_out) {
 	auto res = con.Query(sql);
 	if (res->HasError()) {
@@ -89,49 +70,41 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	string err;
 
 	// --- memory_limit ---
-	// WHY: unbounded RAM is the #1 footgun for multi-tenant HTTP handlers; a
-	// conservative ceiling prevents a single query from OOMing the host.
-	// Non-clobber: never overwrite an operator-set DuckDB memory_limit.
-	{
-		string limit_to_apply;
-		if (!opts.memory_limit.empty()) {
-			limit_to_apply = opts.memory_limit;
-		} else if (IsAtSystemDefaultMemoryLimit(*context.db)) {
-			limit_to_apply = SERVE_DEFAULT_MEMORY_LIMIT;
+	// WHY: memory_limit is database-wide; serve runs inside a database that other
+	// sessions also query, so it applies a limit only when the operator passed
+	// memory_limit := … or SET quackapi_memory_limit.
+	if (!opts.memory_limit.empty()) {
+		try {
+			DBConfig::ParseMemoryLimit(opts.memory_limit);
+		} catch (std::exception &ex) {
+			throw InvalidInputException("quackapi_serve: invalid memory_limit '%s': %s", opts.memory_limit, ex.what());
 		}
-		if (!limit_to_apply.empty()) {
-			try {
-				DBConfig::ParseMemoryLimit(limit_to_apply);
-			} catch (std::exception &ex) {
-				throw InvalidInputException("quackapi_serve: invalid memory_limit '%s': %s", limit_to_apply, ex.what());
-			}
-			auto escaped = StringUtil::Replace(limit_to_apply, "'", "''");
-			if (RunSet(con, StringUtil::Format("SET memory_limit TO '%s'", escaped), err)) {
-				applied.push_back(
-				    StringUtil::Format("memory_limit=%s (WHY: RAM guardrail for multi-query HTTP workers; "
-				                       "prevents one handler from OOMing the process)",
-				                       limit_to_apply));
-			} else {
-				fprintf(stderr, "quackapi: could not SET memory_limit: %s\n", err.c_str());
-			}
+		auto escaped = StringUtil::Replace(opts.memory_limit, "'", "''");
+		if (RunSet(con, StringUtil::Format("SET memory_limit TO '%s'", escaped), err)) {
+			applied.push_back(StringUtil::Format("memory_limit=%s (WHY: operator-set RAM guardrail for HTTP workers)",
+			                                     opts.memory_limit));
 		} else {
-			applied.push_back("memory_limit=<operator/prior> (WHY: non-clobber; left alone)");
+			fprintf(stderr, "quackapi: could not SET memory_limit: %s\n", err.c_str());
 		}
+	} else {
+		applied.push_back("memory_limit=<DuckDB setting> (WHY: database-wide; left alone unless memory_limit := … "
+		                  "or SET quackapi_memory_limit)");
 	}
 
 	// --- preserve_insertion_order ---
-	// WHY: insertion-order preservation serializes some pipelines; servers almost
-	// never need row order unless ORDER BY is present — false raises throughput.
-	{
+	// WHY: also database-wide; turning it off reorders every unordered query in
+	// the process, not only HTTP handlers. Applied only when the operator passed
+	// preserve_insertion_order := ….
+	if (opts.preserve_insertion_order_explicit) {
 		const char *pio = opts.preserve_insertion_order ? "true" : "false";
 		if (RunSet(con, StringUtil::Format("SET preserve_insertion_order = %s", pio), err)) {
-			applied.push_back(StringUtil::Format("preserve_insertion_order=%s (WHY: %s)", pio,
-			                                     opts.preserve_insertion_order
-			                                         ? "operator requested stable scan order"
-			                                         : "server throughput — allow reordering when no ORDER BY"));
+			applied.push_back(StringUtil::Format("preserve_insertion_order=%s (WHY: operator request)", pio));
 		} else {
 			fprintf(stderr, "quackapi: could not SET preserve_insertion_order: %s\n", err.c_str());
 		}
+	} else {
+		applied.push_back("preserve_insertion_order=<DuckDB setting> (WHY: database-wide; left alone unless "
+		                  "preserve_insertion_order := …)");
 	}
 
 	// --- postgres attach OLTP: disable ctid parallel page scan ---

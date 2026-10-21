@@ -17,12 +17,13 @@ SELECT current_setting('quackapi_http_client');
 auto
 
 # ---------------------------------------------------------------------------
-# Overridable: preserve_insertion_order := true keeps insertion order
+# preserve_insertion_order is database-wide: serve leaves it alone unless the
+# named parameter is given, and then applies exactly that value.
 # ---------------------------------------------------------------------------
 query I
-SELECT * FROM quackapi_serve(29202, host := '127.0.0.1', preserve_insertion_order := true);
+SELECT * FROM quackapi_serve(29201, host := '127.0.0.1');
 ----
-http://127.0.0.1:29202
+http://127.0.0.1:29201
 
 query I
 SELECT current_setting('preserve_insertion_order');
@@ -30,9 +31,39 @@ SELECT current_setting('preserve_insertion_order');
 true
 
 query I
+SELECT * FROM quackapi_stop(29201);
+----
+Stopped quackapi server on port 29201
+
+query I
+SELECT * FROM quackapi_serve(29202, host := '127.0.0.1', preserve_insertion_order := false);
+----
+http://127.0.0.1:29202
+
+query I
+SELECT current_setting('preserve_insertion_order');
+----
+false
+
+query I
 SELECT * FROM quackapi_stop(29202);
 ----
 Stopped quackapi server on port 29202
+
+query I
+SELECT * FROM quackapi_serve(29205, host := '127.0.0.1', preserve_insertion_order := true);
+----
+http://127.0.0.1:29205
+
+query I
+SELECT current_setting('preserve_insertion_order');
+----
+true
+
+query I
+SELECT * FROM quackapi_stop(29205);
+----
+Stopped quackapi server on port 29205
 
 # ---------------------------------------------------------------------------
 # health_routes := false → not re-registered after explicit drop
