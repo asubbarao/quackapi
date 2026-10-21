@@ -4548,10 +4548,12 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 			if (IsPlainExecRoute(match.route, body_format)) {
 				// The same code quackapi_exec() runs, so a receipt reads the same either way.
-				auto response = QuackapiExecSql(con, sql_it->second.second, NumericCast<idx_t>(options.max_response_bytes),
-				                                deadline, sql_it->second.first, exec_param);
+				auto response =
+				    QuackapiExecSql(con, sql_it->second.second, NumericCast<idx_t>(options.max_response_bytes),
+				                    deadline, sql_it->second.first, exec_param);
 				sql_execute_ms =
-				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
+				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started)
+				        .count();
 				rows_out = NumericCast<int64_t>(response.rows);
 				ApplyExecResponse(res, response);
 				finish();

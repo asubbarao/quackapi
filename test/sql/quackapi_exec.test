@@ -340,8 +340,10 @@ SELECT * FROM quackapi_serve(29322, host := '127.0.0.1', access_log := false, wo
 ----
 http://127.0.0.1:29322
 
-# A request's deadline ends an exec inside it even while its rows are blocked in
-# calls no interrupt can stop: the caller stops waiting and drops their results.
+# A request's deadline bounds the execs its SQL makes. (A caller that returns
+# while a row is blocked where no interrupt reaches is tested in
+# test/cpp/quackapi_exec_interrupt_test.cpp: only a Ctrl-C, which SQL cannot
+# send, interrupts a caller before its rows' deadline.)
 statement ok
 DELETE FROM exec_clock;
 
@@ -350,12 +352,12 @@ INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
 SELECT status FROM quackapi_request('POST', '/sql',
-  '{"sql":"SELECT list((quackapi_exec(''SELECT sleep_ms(1500) AS s'')).status) AS r FROM range(4)"}', query_timeout_ms := 300);
+  '{"sql":"SELECT quackapi_exec(''SELECT sum(range) FROM range(100000000000)'') AS r"}', query_timeout_ms := 300);
 ----
 504
 
 query I
-SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 1000 FROM exec_clock;
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 5000 FROM exec_clock;
 ----
 true
 

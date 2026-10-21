@@ -141,9 +141,10 @@ int64_t QuackapiRemainingTimeoutMillis(int64_t fallback_ms) {
 	if (current_deadline == QuackapiClock::time_point::max()) {
 		return fallback_ms;
 	}
-	return std::max<int64_t>(1, std::min(fallback_ms, std::chrono::duration_cast<std::chrono::milliseconds>(
-	                                                      current_deadline - QuackapiClock::now())
-	                                                      .count()));
+	return std::max<int64_t>(
+	    1, std::min(
+	           fallback_ms,
+	           std::chrono::duration_cast<std::chrono::milliseconds>(current_deadline - QuackapiClock::now()).count()));
 }
 QuackapiClock::time_point QuackapiContextDeadline(ClientContext &context) {
 	auto deadline = current_deadline;
