@@ -31,7 +31,7 @@ void Run(duckdb::Connection &connection, const std::string &sql) {
 
 //! Runs `sql` on `connection`, interrupts it after 300 ms, and returns how long the caller then took.
 long long InterruptAfter300Ms(duckdb::Connection &connection, const std::string &sql) {
-	duckdb::unique_ptr<duckdb::MaterializedQueryResult> result;
+	duckdb::unique_ptr<duckdb::QueryResult> result;
 	std::thread caller([&]() { result = connection.Query(sql); });
 	std::this_thread::sleep_for(std::chrono::milliseconds(300));
 	const auto interrupted_at = clock_type::now();
