@@ -1,0 +1,13 @@
+diff --git a/src/quackapi_http_fetch.cpp b/src/quackapi_http_fetch.cpp
+index b8e0abc..6a46b5e 100644
+--- a/src/quackapi_http_fetch.cpp
++++ b/src/quackapi_http_fetch.cpp
+@@ -599,7 +599,7 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
+ //! The deadline is read from the connection too: a call evaluated on a DuckDB worker thread
+ //! (a parallel scan) never sees the request thread's deadline.
+ std::chrono::steady_clock::time_point OutboundDeadline(ClientContext &context) {
+-	auto deadline = QuackapiContextDeadline(context);
++	auto deadline = QuackapiCurrentDeadline();
+ 	Value setting;
+ 	if (context.TryGetCurrentSetting("quackapi_http_timeout_ms", setting) && !setting.IsNull()) {
+ 		const auto timeout_ms = setting.GetValue<int64_t>();

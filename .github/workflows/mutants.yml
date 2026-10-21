@@ -1,0 +1,77 @@
+#
+# False-first evidence for the quackapi_exec review round (PR #53). Not for merge.
+# Each job applies one mutant patch from mutants/, builds, and runs the tests it
+# must break. A red job is the expected result.
+#
+name: quackapi_exec mutants
+on:
+  push:
+    branches: ['mutant/quackapi-exec-round2']
+
+jobs:
+  mutant:
+    name: ${{ matrix.mutant }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant:
+          - M1_no_abandon
+          - M2_thread_deadline_only
+          - M3_no_remaining_cap
+          - M4_no_interrupt_poll
+          - M5_no_forwarding
+          - M6_all_inline
+          - M7_no_thread_cap
+          - M8_session_budget_only
+          - M9_no_policy_check
+    env:
+      GEN: ninja
+      DUCKDB_GIT_VERSION: v1.5.6
+      ENABLE_EXTENSION_AUTOLOADING: "1"
+      ENABLE_EXTENSION_AUTOINSTALL: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Checkout extension-ci-tools
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/extension-ci-tools
+          ref: v1.5.6
+          path: extension-ci-tools
+
+      - name: Checkout DuckDB v1.5.6
+        run: make set_duckdb_version
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache libpq-dev
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@main
+        continue-on-error: true
+        with:
+          key: ccache-quackapi-mutant-${{ matrix.mutant }}
+          restore-keys: ccache-quackapi-pg-sqllogic-linux-amd64-
+
+      - name: Apply mutant
+        run: |
+          git apply mutants/${{ matrix.mutant }}.patch
+          git diff
+
+      - name: Build extension
+        run: make release -j"$(nproc)"
+
+      - name: Run quackapi_exec.test
+        run: ./build/release/test/unittest test/sql/quackapi_exec.test
+
+      - name: Run quackapi_exec interrupt test
+        if: always()
+        run: |
+          c++ -std=c++17 -pthread -isystem duckdb/src/include test/cpp/quackapi_exec_interrupt_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-exec-interrupt-test
+          /tmp/quackapi-exec-interrupt-test

@@ -1,0 +1,14 @@
+diff --git a/src/quackapi_http_fetch.cpp b/src/quackapi_http_fetch.cpp
+index b8e0abc..dad960f 100644
+--- a/src/quackapi_http_fetch.cpp
++++ b/src/quackapi_http_fetch.cpp
+@@ -887,9 +887,6 @@ void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
+ //! Stop waiting on `call`: no row starts after this, and every running row is interrupted.
+ void AbandonExecCall(ExecCall &call) {
+ 	call.cancelled = true;
+-	for (auto con : call.running) {
+-		con->Interrupt();
+-	}
+ }
+ 
+ //! quackapi_exec(sql): the receipt quackapi_post gives for POST {"sql": sql} to an exec

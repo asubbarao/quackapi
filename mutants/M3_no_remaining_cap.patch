@@ -1,0 +1,14 @@
+diff --git a/src/quackapi_http_fetch.cpp b/src/quackapi_http_fetch.cpp
+index b8e0abc..ada42c3 100644
+--- a/src/quackapi_http_fetch.cpp
++++ b/src/quackapi_http_fetch.cpp
+@@ -938,8 +938,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+ 	}
+ 	call->max_response_bytes = NumericCast<idx_t>(max_response_bytes);
+ 	// Never longer than what the caller has left.
+-	call->deadline = std::min(QuackapiContextDeadline(context),
+-	                          std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
++	call->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+ 	const auto max_threads = NonNegativeSetting(context, "quackapi_exec_max_threads", 256);
+ 
+ 	// An exec route answers 403 while any policy is bound: its SQL cannot be rewritten.

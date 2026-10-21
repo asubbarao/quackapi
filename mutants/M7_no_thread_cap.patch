@@ -1,0 +1,13 @@
+diff --git a/src/quackapi_http_fetch.cpp b/src/quackapi_http_fetch.cpp
+index b8e0abc..73916d3 100644
+--- a/src/quackapi_http_fetch.cpp
++++ b/src/quackapi_http_fetch.cpp
+@@ -953,7 +953,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+ 	}
+ 
+ 	const idx_t wanted = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
+-	const idx_t reserved = wanted == 0 ? 0 : ReserveExecThreads(wanted, max_threads);
++	const idx_t reserved = wanted == 0 ? 0 : ReserveExecThreads(wanted, NumericLimits<int64_t>::Maximum());
+ 	idx_t started = 0;
+ 	for (; started < reserved; started++) {
+ 		try {

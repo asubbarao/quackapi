@@ -1,0 +1,20 @@
+diff --git a/src/quackapi_http_fetch.cpp b/src/quackapi_http_fetch.cpp
+index b8e0abc..b3f4504 100644
+--- a/src/quackapi_http_fetch.cpp
++++ b/src/quackapi_http_fetch.cpp
+@@ -1000,14 +1000,8 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+ 		while (call->threads_done < started) {
+ 			if (context.interrupted) {
+ 				AbandonExecCall(*call);
+-				throw InterruptException();
+-			}
+-			const auto now = std::chrono::steady_clock::now();
+-			if (now >= call->deadline) {
+-				AbandonExecCall(*call);
+-				break;
+ 			}
+-			call->finished.wait_until(guard, std::min(call->deadline, now + std::chrono::milliseconds(10)));
++			call->finished.wait_for(guard, std::chrono::milliseconds(10));
+ 		}
+ 	}
+ 

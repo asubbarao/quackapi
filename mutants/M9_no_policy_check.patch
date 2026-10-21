@@ -1,0 +1,13 @@
+diff --git a/src/quackapi_http_fetch.cpp b/src/quackapi_http_fetch.cpp
+index b8e0abc..aeec2c2 100644
+--- a/src/quackapi_http_fetch.cpp
++++ b/src/quackapi_http_fetch.cpp
+@@ -944,7 +944,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+ 
+ 	// An exec route answers 403 while any policy is bound: its SQL cannot be rewritten.
+ 	auto &quackapi_state = QuackapiState::Get(*context.db);
+-	if (!quackapi_state.SnapshotRowAccessBindings().empty() || !quackapi_state.SnapshotMaskingBindings().empty()) {
++	if (false) {
+ 		for (idx_t i = 0; i < count; i++) {
+ 			result.SetValue(i, call->skip[i] ? Value(FetchResultType())
+ 			                                 : ToValue(ExecReceipt(QuackapiExecPolicyDeniedResponse())));
