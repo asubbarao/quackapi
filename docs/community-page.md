@@ -325,9 +325,8 @@ clean release tag with **no merge-conflict markers** in `src/`, green
 2. **Instance-scoped registry** — routes/auth/groups/streams/queue *options*
    die with the process; re-run DDL on boot. Job **rows** in `quackapi_jobs`
    persist.
-3. **Serve memory guard** — `quackapi_serve` applies a 256MB default only when
-   no operator or serve memory limit is configured; use `memory_limit := '4GB'`
-   or `SET quackapi_memory_limit` for large PDF/HTML work.
+3. **Serve memory limit** — `quackapi_serve` leaves DuckDB's `memory_limit`
+   alone; cap it with `memory_limit := '512MB'` or `SET quackapi_memory_limit`.
 4. **Body size** — 8 MiB max payload.
 5. **JWT** — HS256 only.
 6. **Table API** — read-only GET scaffold.
