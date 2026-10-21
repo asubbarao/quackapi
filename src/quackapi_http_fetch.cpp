@@ -1,19 +1,23 @@
 #include "quackapi_http_fetch.hpp"
 #include "quackapi_thread_join.hpp"
 #include "quackapi_limits.hpp"
+#include "quackapi_server.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
 
 #include "httplib.hpp"
 
@@ -759,6 +763,139 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
+int64_t PositiveSetting(ClientContext &context, const string &name, int64_t fallback) {
+	Value setting;
+	if (!context.TryGetCurrentSetting(name, setting) || setting.IsNull()) {
+		return fallback;
+	}
+	const auto value = setting.GetValue<int64_t>();
+	if (value <= 0) {
+		throw InvalidInputException("%s must be > 0", name);
+	}
+	return value;
+}
+
+//! quackapi_exec(sql): the receipt quackapi_post gives for POST {"sql": sql} to an exec
+//! route (`AS $sql`), produced on this process's own database with no HTTP worker.
+//!
+//! A self-post holds an HTTP worker while the SQL it posted posts again, so nested
+//! fan-outs exhaust a fixed pool and wait on each other. Here every row runs on a
+//! thread of its own with a fresh Connection: waits form a tree, never a cycle, and a
+//! nested call starts on a fresh stack. This thread watches the caller: when the
+//! calling query is interrupted (Ctrl-C, a route deadline), every inner query is too.
+void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	auto db = context.db;
+	const auto count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+
+	vector<bool> skip(count, false);
+	vector<string> sqls(count);
+	for (idx_t i = 0; i < count; i++) {
+		auto sql = args.data[0].GetValue(i);
+		if (sql.IsNull()) {
+			skip[i] = true;
+			continue;
+		}
+		sqls[i] = sql.GetValue<string>();
+	}
+	// The same budget quackapi_request and an exec route give one request.
+	const auto timeout_ms =
+	    QuackapiRemainingTimeoutMillis(PositiveSetting(context, "quackapi_query_timeout_ms", 30000));
+	const auto max_response_bytes =
+	    NumericCast<idx_t>(PositiveSetting(context, "quackapi_max_response_bytes", 16 * 1024 * 1024));
+
+	vector<QuackapiHttpFetchResult> out(count);
+	std::mutex mutex;
+	std::condition_variable finished;
+	unordered_set<Connection *> running;
+	bool cancelled = false;
+	idx_t threads_done = 0;
+	std::atomic<idx_t> cursor {0};
+
+	auto run_one = [&](idx_t i) {
+		try {
+			Connection con(*db);
+			struct Registration {
+				std::mutex &mutex;
+				unordered_set<Connection *> &running;
+				Connection *con;
+				~Registration() {
+					std::lock_guard<std::mutex> guard(mutex);
+					running.erase(con);
+				}
+			};
+			{
+				std::lock_guard<std::mutex> guard(mutex);
+				if (cancelled) {
+					return;
+				}
+				running.insert(&con);
+			}
+			Registration registration {mutex, running, &con};
+			QuackapiQueryDeadline deadline(con, timeout_ms);
+			auto response = QuackapiExecSql(con, sqls[i], max_response_bytes, deadline);
+			out[i].status = static_cast<HTTPStatusCode>(response.status);
+			out[i].reason = duckdb_httplib::status_message(response.status);
+			out[i].body = std::move(response.body);
+			for (auto &header : response.headers) {
+				out[i].headers.Insert(header.first, header.second);
+			}
+			out[i].success = true;
+		} catch (std::exception &e) {
+			out[i].request_error = e.what();
+		} catch (...) {
+			out[i].request_error = "unknown error during quackapi_exec";
+		}
+	};
+
+	idx_t active = 0;
+	for (idx_t i = 0; i < count; i++) {
+		if (!skip[i]) {
+			active++;
+		}
+	}
+	const idx_t n_threads = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
+	{
+		vector<std::thread> threads;
+		threads.reserve(n_threads);
+		JoinOutboundThreads<vector<std::thread>> join_threads {threads};
+		for (idx_t t = 0; t < n_threads; t++) {
+			threads.emplace_back([&]() {
+				for (;;) {
+					const idx_t i = cursor.fetch_add(1);
+					if (i >= count) {
+						break;
+					}
+					if (!skip[i]) {
+						run_one(i);
+					}
+				}
+				std::lock_guard<std::mutex> guard(mutex);
+				threads_done++;
+				finished.notify_one();
+			});
+		}
+		std::unique_lock<std::mutex> guard(mutex);
+		while (threads_done < n_threads) {
+			finished.wait_for(guard, std::chrono::milliseconds(10));
+			if (context.interrupted) {
+				cancelled = true;
+				for (auto con : running) {
+					con->Interrupt();
+				}
+			}
+		}
+	}
+	if (cancelled) {
+		throw InterruptException();
+	}
+
+	for (idx_t i = 0; i < count; i++) {
+		result.SetValue(i, skip[i] ? Value(FetchResultType()) : ToValue(out[i]));
+	}
+}
+
 struct PoolGlobalState : public GlobalTableFunctionState {
 	vector<QuackapiHttpPoolStats> rows;
 	idx_t offset = 0;
@@ -972,6 +1109,11 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	post_set.AddFunction(post3);
 	post_set.AddFunction(post4);
 	loader.RegisterFunction(post_set);
+
+	// Same receipt as quackapi_post to an exec route; VOLATILE for the same reason.
+	ScalarFunction exec("quackapi_exec", {LogicalType::VARCHAR}, result_type, ExecScalar);
+	exec.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(exec);
 
 	loader.RegisterFunction(TableFunction("quackapi_http_pool", {}, PoolExec, PoolBind, PoolInit));
 
