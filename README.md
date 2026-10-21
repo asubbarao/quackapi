@@ -460,7 +460,7 @@ CREATE ROUTE ask POST '/ask' AS
 
 | Function | Role |
 |----------|------|
-| `quackapi_fetch(url[, headers])` | GET → `STRUCT(status, reason, body, headers, error, reused_connection)` |
+| `quackapi_fetch(url[, headers])` | GET → `STRUCT(status, reason, body, headers, error, reused_connection, url_effective)` |
 | `quackapi_post(url, body[, content_type[, headers]])` | POST, same result shape (`content_type` defaults to `application/json`) |
 | `quackapi_http_pool()` | per-origin `host, idle, dialed, reused` |
 | `quackapi_exec(sql)` | the receipt `quackapi_post` gives from an exec route, computed in-process — see [`quackapi_exec`](#quackapi_execsql-the-exec-route-without-http) |
@@ -475,6 +475,29 @@ so every request paid a full dial. Against an ollama endpoint whose floor is
 `http://` uses the vendored httplib client, which implements POST — no companion
 extension needed. `https://` goes through `HTTPUtil`, pooled the same way, so
 `LOAD curl_httpfs` (or `httpfs`) supplies TLS.
+
+GET follows at most 20 redirects and returns the final absolute URL in
+`url_effective`, including relative `Location` targets. No redirect returns the
+requested URL (without its fragment). Transport failures return a non-null
+`error` and null `url_effective`; HTTP error responses retain their final URL.
+The shared POST result appends the same field, currently always NULL.
+Cross-origin GET redirects discard explicit Authorization, Cookie,
+Proxy-Authorization and Host request headers.
+
+The table form accepts optional positive `timeout_ms` and `max_response_bytes`:
+
+```sql
+SELECT * FROM quackapi_fetch('https://example.com/',
+  timeout_ms := 30000, max_response_bytes := 16777216);
+```
+
+The timeout is one total budget across redirects; an enclosing request's shorter
+deadline still applies. The byte limit aborts streaming before accumulating more
+than that many response body bytes per hop, and returns an error instead of a
+partial body. Failure remains a response row with `error` populated. Omitting
+these options retains the existing timeout defaults and unlimited body size.
+These options cannot be combined with `stall_ms`, which is a plain TCP test seam
+that deliberately pauses before reading, rather than a timeout setting.
 
 Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
 `FROM range(1000)` would issue one request while reporting 1000 rows.
