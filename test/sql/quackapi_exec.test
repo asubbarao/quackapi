@@ -420,6 +420,22 @@ SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT repeat(''x'', 100
 ----
 507	{"detail":"Response exceeds configured byte limit"}
 
+# The cap is on the serialized body, as on the route: these values are 100 bytes
+# and their JSON is 2.7 KB.
+statement ok
+SET quackapi_max_response_bytes = 1000;
+
+query II
+SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT 1 AS some_long_column_name FROM range(100)') AS r);
+----
+507	{"detail":"Response exceeds configured byte limit"}
+
+query I
+SELECT status FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1 AS some_long_column_name FROM range(100)"}',
+  max_response_bytes := 1000);
+----
+507
+
 statement ok
 RESET quackapi_max_response_bytes;
 
