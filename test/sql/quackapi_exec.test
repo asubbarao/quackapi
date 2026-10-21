@@ -363,6 +363,8 @@ true
 
 # Outbound calls a request's query makes on DuckDB worker threads (one per row
 # group of a parallel scan) end at the request's deadline, not at the peer's answer.
+# The calls and the watchdog both act at the deadline, so a query that finishes in
+# between answers 200; the elapsed time is what shows where the calls ended.
 statement ok
 CREATE TABLE exec_wide AS SELECT range AS i FROM range(16 * 122880);
 
@@ -373,10 +375,10 @@ statement ok
 INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
-SELECT status FROM quackapi_request('POST', '/sql',
+SELECT status IN (200, 504) FROM quackapi_request('POST', '/sql',
   '{"sql":"SELECT count((quackapi_fetch(''http://127.0.0.1:29322/slow'')).status) AS n FROM exec_wide WHERE i % 122880 = 0"}', query_timeout_ms := 300);
 ----
-504
+true
 
 query I
 SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 1500 FROM exec_clock;
@@ -386,6 +388,7 @@ true
 # A row never outlives its caller's remaining deadline. The row runs on the
 # request's own thread (max_threads 0) and blocks in a call that only its
 # deadline ends: at 600 ms the request has 400 ms left, not its full 1000 ms.
+# As above, 200 or 504 depending on which acts first at the deadline.
 statement ok
 SET GLOBAL quackapi_exec_max_threads = 0;
 
@@ -396,10 +399,10 @@ statement ok
 INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
-SELECT status FROM quackapi_request('POST', '/sql',
+SELECT status IN (200, 504) FROM quackapi_request('POST', '/sql',
   '{"sql":"SELECT sleep_ms(600) AS a; SELECT (quackapi_exec(''SELECT quackapi_fetch(''''http://127.0.0.1:29322/slow'''') AS f'')).status AS r"}', query_timeout_ms := 1000);
 ----
-504
+true
 
 query I
 SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 1350 FROM exec_clock;
