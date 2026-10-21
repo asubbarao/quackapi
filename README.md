@@ -149,7 +149,7 @@ An exec route with no `STATUS`, `EMPTY STATUS`, `ENVELOPE object` or non-JSON
 | Behavior | Detail |
 |----------|--------|
 | **Execution** | As an exec route: every statement in order on a fresh connection; the last one answers. Rows of one call run concurrently, up to 32 at a time |
-| **Threads** | At most `quackapi_exec_max_threads` (default 256) exec threads run in the process, across all calls and nesting levels. Past it, a call's rows run one at a time on the calling thread — slower, never waiting, so a full process cannot deadlock. `0` runs every row on the calling thread |
+| **Threads** | At most `quackapi_exec_max_threads` (default 256) exec threads run in the process, across all calls and nesting levels. Past it, a call's rows run one at a time on the calling thread — slower, never waiting, so a full process cannot deadlock. `0` runs every row on the calling thread. A row on the calling thread cannot be abandoned: an interrupt or deadline ends it only where it reaches |
 | **Response** | JSON array, `html`/`text` column modes, `location`/`set_cookie` columns as `headers`; `[]` for a final `SET`/`PRAGMA`. No `Accept` negotiation |
 | **Errors** | 422 `{"detail":[{"loc":["body","sql"],…}]}` for a failing statement, 504 past the deadline, 507 past `quackapi_max_response_bytes`, 500 for an internal error. `error` is set only when no response could be produced; `NULL` in, `NULL` out |
 | **Budget** | Inside a served request (a route, `quackapi_request`), the server's `query_timeout_ms` and `max_response_bytes`, as the exec route uses; elsewhere the session's `quackapi_query_timeout_ms` (default 30 s) and `quackapi_max_response_bytes`. A nested call inherits its caller's budget |
@@ -331,6 +331,7 @@ the “PDF service” is a function call in the same address space — not an RP
 | Setting | `SET quackapi_query_timeout_ms = N` | default `30000` |
 | Setting | `SET quackapi_max_response_bytes = N` | default `16777216` uncompressed bytes |
 | Setting | `SET quackapi_max_pending_requests = N` | default `256` |
+| Setting | `SET quackapi_exec_max_threads = N` | default `256`; past it `quackapi_exec` rows run on the calling thread; `0` = always |
 | Setting | `SET quackapi_graphql_allow_all = true\|false` | default `false`; legacy GraphQL open mode |
 
 `access_log` defaults to structured stderr JSON; `false` disables it and a table

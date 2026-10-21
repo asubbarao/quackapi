@@ -447,6 +447,7 @@ not application-facing functions.
 | `SET quackapi_query_timeout_ms = N` | Query execution budget; default `30000` |
 | `SET quackapi_max_response_bytes = N` | Uncompressed response cap; default `16777216` |
 | `SET quackapi_max_pending_requests = N` | Pending request cap; default `256` |
+| `SET quackapi_exec_max_threads = N` | Process-wide `quackapi_exec` thread cap; past it rows run on the calling thread; default `256`, `0` always |
 | `SET quackapi_graphql_allow_all = true\|false` | Legacy global GraphQL open mode; default `false` |
 
 ```sql
