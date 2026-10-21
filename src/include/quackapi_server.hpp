@@ -2,14 +2,17 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/vector.hpp"
 
 namespace duckdb_httplib {
 class Server;
@@ -20,7 +23,9 @@ struct Response;
 namespace duckdb {
 
 class ClientContext;
+class Connection;
 class DatabaseInstance;
+class QuackapiQueryDeadline;
 class Value;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
@@ -340,6 +345,27 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
                               const unordered_map<string, string> *req_headers = nullptr,
                               unordered_map<string, string> *headers_out = nullptr, const string &pg_dsn = string(),
                               const QuackapiServeOptions *request_options = nullptr);
+
+//! What an exec route (`AS $sql`) with default STATUS/FORMAT/ENVELOPE answers for one SQL text.
+struct QuackapiExecResponse {
+	int status = 200;
+	string body;
+	vector<std::pair<string, string>> headers;
+	idx_t rows = 0;
+};
+
+//! Run every statement of `sql` on `con` in order; the last one answers. Used by an
+//! exec route with default STATUS/FORMAT/ENVELOPE and by quackapi_exec(). A failed
+//! statement is 422 on `loc`.`param`, or 504 when `deadline` expired first. Past the
+//! deadline the answer is 504, and a body over `max_response_bytes` is 507. When
+//! `cancelled` answers true before a statement, that statement and the rest never run.
+QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
+                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
+                                     const std::function<bool()> &cancelled = nullptr);
+//! The 504 an exec route answers past its deadline.
+QuackapiExecResponse QuackapiExecTimeoutResponse();
+//! The 403 an exec route answers while any row access or masking policy is bound.
+QuackapiExecResponse QuackapiExecPolicyDeniedResponse();
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.
