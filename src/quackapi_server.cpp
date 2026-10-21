@@ -1003,8 +1003,10 @@ bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
 //! order on the request connection, stopping at the first failure. The last
 //! statement's result is the response. Unlike Connection::Query(string), which
 //! answers with the first statement that produces rows, a batch such as
-//! `CREATE …; INSERT …; SELECT …` answers with its final SELECT.
-bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error) {
+//! `CREATE …; INSERT …; SELECT …` answers with its final SELECT. When `stop` answers
+//! true before a statement, that statement and the rest never run.
+bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
+                       const std::function<bool()> &stop) {
 	// DuckDB's statement extraction truncates at the first null byte, which
 	// would silently drop the tail of the batch while executing the prefix.
 	// Null bytes are never legitimate in request SQL text.
@@ -1025,6 +1027,13 @@ bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResul
 	}
 	const auto statement_count = statements.size();
 	for (idx_t i = 0; i < statement_count; i++) {
+		// DuckDB clears an interrupt as each statement starts, so one that lands after the
+		// previous statement's last check is seen only here.
+		if (stop()) {
+			error =
+			    StringUtil::Format("Statement %llu of %llu not run: the call was cancelled", i + 1, statement_count);
+			return false;
+		}
 		unique_ptr<QueryResult> statement_result = con.Query(std::move(statements[i]));
 		if (statement_result->HasError()) {
 			error = statement_result->GetError();
@@ -1862,8 +1871,9 @@ QuackapiExecResponse QuackapiExecPolicyDeniedResponse() {
 	return ExecJsonResponse(403, "{\"detail\":\"Policy denies unauthenticated access\"}");
 }
 
-QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
-                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param) {
+static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, idx_t max_response_bytes,
+                                            const QuackapiQueryDeadline &deadline, const string &loc,
+                                            const string &param, const std::function<bool()> &cancelled) {
 	QuackapiExecResponse out;
 	auto set_json = [&out](int status, string body) {
 		out = ExecJsonResponse(status, std::move(body));
@@ -1871,7 +1881,10 @@ QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t m
 	try {
 		unique_ptr<QueryResult> result;
 		string error;
-		if (!ExecuteRequestSql(con, sql, result, error)) {
+		auto stop = [&]() {
+			return deadline.Expired() || (cancelled && cancelled());
+		};
+		if (!ExecuteRequestSql(con, sql, result, error, stop)) {
 			if (deadline.Expired()) {
 				out = QuackapiExecTimeoutResponse();
 			} else {
@@ -1953,6 +1966,21 @@ QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t m
 	} catch (std::exception &ex) {
 		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
 		set_json(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
+	}
+	return out;
+}
+
+QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
+                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
+                                     const std::function<bool()> &cancelled) {
+	auto out = ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled);
+	// What a served route checks last, after serialization: values under the cap can
+	// serialize past it, and the deadline can pass while they do.
+	if (deadline.Expired()) {
+		return QuackapiExecTimeoutResponse();
+	}
+	if (out.body.size() > max_response_bytes) {
+		return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
 	}
 	return out;
 }
@@ -4560,7 +4588,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				return;
 			}
 			string exec_error;
-			const bool exec_ok = ExecuteRequestSql(con, sql_it->second.second, result, exec_error);
+			const bool exec_ok = ExecuteRequestSql(con, sql_it->second.second, result, exec_error,
+			                                       [&deadline]() { return deadline.Expired(); });
 			sql_execute_ms =
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
 			if (!exec_ok) {

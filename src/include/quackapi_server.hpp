@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -355,9 +356,12 @@ struct QuackapiExecResponse {
 
 //! Run every statement of `sql` on `con` in order; the last one answers. Used by an
 //! exec route with default STATUS/FORMAT/ENVELOPE and by quackapi_exec(). A failed
-//! statement is 422 on `loc`.`param`, or 504 when `deadline` expired first.
+//! statement is 422 on `loc`.`param`, or 504 when `deadline` expired first. Past the
+//! deadline the answer is 504, and a body over `max_response_bytes` is 507. When
+//! `cancelled` answers true before a statement, that statement and the rest never run.
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
-                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param);
+                                     const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
+                                     const std::function<bool()> &cancelled = nullptr);
 //! The 504 an exec route answers past its deadline.
 QuackapiExecResponse QuackapiExecTimeoutResponse();
 //! The 403 an exec route answers while any row access or masking policy is bound.
