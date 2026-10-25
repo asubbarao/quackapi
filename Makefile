@@ -6,6 +6,12 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 DUCKDB_GIT_VERSION ?= v2.0.0
 OVERRIDE_GIT_DESCRIBE ?= v2.0.0
 
+# The CI tool's staged archives for this release commit identify as an alpha.
+# Build the pinned stable host rather than linking those archives into tests.
+DUCKDB_PREBUILT_LIBRARY :=
+DUCKDB_PREBUILT_EXTENSIONS :=
+EXT_FLAGS += -DPREBUILT_BINARY= -DPREBUILT_EXTENSIONS=
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
