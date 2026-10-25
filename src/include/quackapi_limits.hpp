@@ -18,8 +18,8 @@ public:
 	QuackapiQueryDeadline(Connection &connection, int64_t timeout_ms);
 	//! An absolute deadline. When `parent` is interrupted, so is `connection`;
 	//! `parent` must outlive this guard.
-	QuackapiQueryDeadline(Connection &connection, std::chrono::steady_clock::time_point deadline,
-	                      ClientContext *parent);
+	QuackapiQueryDeadline(Connection &connection, std::chrono::steady_clock::time_point deadline, ClientContext *parent,
+	                      bool thread_affine = true);
 	~QuackapiQueryDeadline();
 	bool Expired() const;
 	QuackapiQueryDeadline(const QuackapiQueryDeadline &) = delete;
@@ -29,6 +29,7 @@ private:
 	void Start(Connection &connection, std::chrono::steady_clock::time_point deadline, ClientContext *parent);
 	std::shared_ptr<QuackapiDeadlineState> state;
 	std::chrono::steady_clock::time_point previous;
+	bool thread_affine = true;
 };
 
 //! Outbound clients inherit the request's remaining execution budget.

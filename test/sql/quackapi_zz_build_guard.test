@@ -1,0 +1,13 @@
+# name: test/sql/quackapi_zz_build_guard.test
+# description: The loaded extension is this checkout's candidate artifact
+# group: [sql]
+
+require quackapi
+
+require-env EXPECTED_QUACKAPI_VERSION
+
+query I
+SELECT extension_version = '${EXPECTED_QUACKAPI_VERSION}'
+FROM duckdb_extensions() WHERE extension_name = 'quackapi';
+----
+true

@@ -4,7 +4,18 @@
 
 require quackapi
 
-require cronjob
+require httpfs
+
+require-env QUACKAPI_NETWORK_TESTS
+
+statement ok
+CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm';
+
+statement ok
+INSTALL cronjob FROM query_farm;
+
+statement ok
+LOAD cronjob FROM query_farm;
 
 statement ok
 CREATE ROUTE cron_target GET '/cron-target' SCHEDULE '*/1 * * * * *' AS SELECT 'cron-ok' AS msg;

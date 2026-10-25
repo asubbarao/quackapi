@@ -19,6 +19,21 @@ struct QuackapiContextBudget : public ClientContextState {
 	std::atomic<QuackapiClock::rep> deadline {QuackapiClock::time_point::max().time_since_epoch().count()};
 	std::atomic<int64_t> query_timeout_ms {0};
 	std::atomic<int64_t> max_response_bytes {0};
+	void QueryBegin(ClientContext &context) override {
+		auto absolute = deadline.load();
+		if (absolute == QuackapiClock::time_point::max().time_since_epoch().count()) {
+			return;
+		}
+		// BeginQueryInternal has already installed max_execution_time. Tighten it
+		// to the whole request's absolute deadline, including preceding statements.
+		// Round up so native checks cannot expire before the receipt's deadline.
+		auto millis =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(QuackapiClock::duration(absolute)).count() + 1;
+		auto native_deadline = NumericCast<idx_t>(MaxValue<int64_t>(0, millis));
+		if (!context.query_deadline.IsValid() || native_deadline < context.query_deadline.GetIndex()) {
+			context.query_deadline = native_deadline;
+		}
+	}
 };
 
 static const char *const QUACKAPI_BUDGET_KEY = "quackapi_request_budget";
@@ -103,8 +118,8 @@ QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, int64_t tim
 	Start(connection, std::min(previous, QuackapiClock::now() + std::chrono::milliseconds(timeout_ms)), nullptr);
 }
 QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, QuackapiClock::time_point deadline,
-                                             ClientContext *parent)
-    : previous(current_deadline) {
+                                             ClientContext *parent, bool thread_affine_p)
+    : previous(current_deadline), thread_affine(thread_affine_p) {
 	Start(connection, deadline, parent);
 }
 void QuackapiQueryDeadline::Start(Connection &connection, QuackapiClock::time_point deadline, ClientContext *parent) {
@@ -114,7 +129,9 @@ void QuackapiQueryDeadline::Start(Connection &connection, QuackapiClock::time_po
 	state->deadline = deadline;
 	state->budget = BudgetFor(connection);
 	state->budget_previous = state->budget->deadline.exchange(deadline.time_since_epoch().count());
-	current_deadline = state->deadline;
+	if (thread_affine) {
+		current_deadline = state->deadline;
+	}
 	Watchdog().Add(state);
 }
 QuackapiQueryDeadline::~QuackapiQueryDeadline() {
@@ -126,7 +143,9 @@ QuackapiQueryDeadline::~QuackapiQueryDeadline() {
 	// Restore only if no later guard on this connection replaced the deadline.
 	auto ours = state->deadline.time_since_epoch().count();
 	state->budget->deadline.compare_exchange_strong(ours, state->budget_previous);
-	current_deadline = previous;
+	if (thread_affine) {
+		current_deadline = previous;
+	}
 }
 bool QuackapiQueryDeadline::Expired() const {
 	return state->expired || QuackapiClock::now() >= state->deadline;

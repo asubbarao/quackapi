@@ -21,6 +21,7 @@ struct Response;
 } // namespace quackapi_httplib
 
 namespace duckdb {
+class QueryResult;
 
 class ClientContext;
 class Connection;
@@ -367,6 +368,9 @@ QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t m
 QuackapiExecResponse QuackapiExecTimeoutResponse();
 //! The 403 an exec route answers while any row access or masking policy is bound.
 QuackapiExecResponse QuackapiExecPolicyDeniedResponse();
+//! Serialize a completed native query handle without executing the SQL again.
+QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_bytes);
+QuackapiExecResponse QuackapiExecErrorResponse(const string &error);
 
 //! Apply batteries-included DuckDB SETs / logging at quackapi_serve() time.
 //! Overridable via QuackapiServeOptions; never disables safety features.

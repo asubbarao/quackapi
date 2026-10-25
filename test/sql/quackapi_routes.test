@@ -6,6 +6,11 @@ require quackapi
 
 require json
 
+require httpfs
+
+statement ok
+CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm';
+
 # Registry starts empty
 query I
 SELECT count(*) FROM quackapi_routes();
@@ -259,7 +264,7 @@ Invalid BODY SCHEMA JSON
 statement error
 CREATE ROUTE bad_schema POST '/x' BODY SCHEMA '{"type":"object" AS SELECT 1;
 ----
-Unterminated BODY SCHEMA
+unterminated string literal
 
 # Multi-chunk emission: > STANDARD_VECTOR_SIZE (2048) routes must not corrupt
 loop i 0 2100

@@ -6,6 +6,11 @@ require quackapi
 
 require json
 
+require httpfs
+
+statement ok
+CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm';
+
 # BODY TYPE uses DuckDB json_transform structure syntax. It needs no optional
 # json_schema extension; the declared type is injected for $body at prepare time.
 query I

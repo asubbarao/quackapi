@@ -1223,17 +1223,18 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 		{
 			Connection con(*context.db);
 			if (!bind_data.route.body_schema.empty()) {
-				// BODY SCHEMA depends on the community json_schema extension. Resolve it
+				// BODY SCHEMA depends on Query.Farm's json_schema extension on DuckDB 2.0. Resolve it
 				// while creating the route, outside any request deadline, so the first
 				// request cannot unexpectedly pay the installation/network cost.
 				auto load = con.Query("LOAD json_schema");
 				if (load->HasError()) {
-					auto install = con.Query("INSTALL json_schema FROM community");
+					auto install = con.Query("INSTALL json_schema FROM query_farm");
 					if (install->HasError()) {
-						throw InvalidInputException("BODY SCHEMA requires the json_schema extension: %s",
+						throw InvalidInputException("BODY SCHEMA requires json_schema from a registered query_farm "
+						                            "repository (https://duckdb-extensions.query.farm): %s",
 						                            install->GetError());
 					}
-					load = con.Query("LOAD json_schema");
+					load = con.Query("LOAD json_schema FROM query_farm");
 				}
 				if (load->HasError()) {
 					throw InvalidInputException("BODY SCHEMA requires the json_schema extension: %s", load->GetError());

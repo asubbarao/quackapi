@@ -24,7 +24,24 @@ The query already types the response.
 
 ## Five-line quickstart
 
-Requires **DuckDB v1.5.6** (linux, macOS, windows_amd64).
+Requires **DuckDB v2.0.0** (linux, macOS, windows_amd64). Builds target the stable
+release and use DuckDB's PEG parser token interface for custom DDL. JSON responses
+preserve native `VARIANT` objects, lists, scalars and nulls.
+
+`BODY SCHEMA` uses `json_schema`, distributed from Query.Farm on DuckDB 2.0.
+Register its native extension repository before creating schema-validated routes
+(or install and load the dependency explicitly during startup):
+
+```sql
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm
+  WITH PREFIX 'https://duckdb-extensions.query.farm';
+INSTALL json_schema FROM query_farm;
+LOAD json_schema FROM query_farm;
+```
+
+Optional `cronjob` scheduling uses the same repository. The network scheduling
+test runs with `QUACKAPI_NETWORK_TESTS=1`; the Postgres CI job enables it.
 
 ```sql
 INSTALL quackapi FROM community;
@@ -141,23 +158,40 @@ SELECT list((quackapi_exec('SELECT ' || range || ' AS v')).body) FROM range(3);
 A self-post holds a server worker while the SQL it posted posts again, so nested
 fan-outs (`array_agg(quackapi_post(...))` inside posted SQL) exhaust a fixed
 `worker_threads` pool and wait on each other until their timeouts.
-`quackapi_exec` cannot: each row runs on a thread of its own with a fresh
-`Connection`, so waits form a tree, never a cycle, at any depth and width.
+`quackapi_exec` uses a fresh `Connection` per row and DuckDB 2.0's task scheduler.
+Nested scalar calls execute inline rather than waiting for capacity in their
+own pool. Table calls submit a resumable query and yield the SQL pipeline.
 An exec route with no `STATUS`, `EMPTY STATUS`, `ENVELOPE object` or non-JSON
 `FORMAT`/`Accept` runs the same code, so the two answer alike.
 
 | Behavior | Detail |
 |----------|--------|
-| **Execution** | As an exec route: every statement in order on a fresh connection; the last one answers. Rows of one call run concurrently, up to 32 at a time |
-| **Threads** | At most `quackapi_exec_max_threads` (default 256) exec threads run in the process, across all calls and nesting levels. Past it, a call's rows run one at a time on the calling thread — slower, never waiting, so a full process cannot deadlock. `0` runs every row on the calling thread. A row on the calling thread cannot be abandoned: an interrupt or deadline ends it only where it reaches |
+| **Execution** | Every statement completes in order on a fresh connection; the last one answers. Scalar batches admit up to 32 native tasks; execution concurrency follows DuckDB's `threads` setting |
+| **Threads** | `quackapi_exec_max_threads` (default 256) caps admitted scalar exec tasks across calls, preserving the setting name. It creates no private worker threads. Nested calls, a single engine thread, or exhausted admission run inline. `0` always runs scalar rows inline |
 | **Response** | JSON array, `html`/`text` column modes, `location`/`set_cookie` columns as `headers`; `[]` for a final `SET`/`PRAGMA`. No `Accept` negotiation |
 | **Errors** | 422 `{"detail":[{"loc":["body","sql"],…}]}` for a failing statement, 504 past the deadline, 507 past `quackapi_max_response_bytes`, 500 for an internal error. `error` is set only when no response could be produced; `NULL` in, `NULL` out |
 | **Budget** | Inside a served request (a route, `quackapi_request`), the server's `query_timeout_ms` and `max_response_bytes`, as the exec route uses; elsewhere the session's `quackapi_query_timeout_ms` (default 30 s) and `quackapi_max_response_bytes`. A nested call inherits its caller's budget |
-| **Deadline** | One deadline per call: its budget, never later than the caller's remaining deadline. When the caller is interrupted (Ctrl-C, a route deadline) the call raises and interrupts every running row; past its deadline every unfinished row is a 504. Either way the call returns at once: a row blocked where no interrupt reaches (a shell pipe, `sleep_ms`) finishes on its own thread and its result is dropped. Outbound `quackapi_fetch`/`quackapi_post` inside a row end at the row's deadline, also on DuckDB worker threads |
+| **Deadline** | One absolute deadline per call, inherited by nested SQL and outbound I/O. Native query execution checks it alongside `max_execution_time`. Caller interruption cancels admitted rows. Blocked native tasks remain owned and are drained before the database closes; inline work returns at its next interrupt point |
 | **Headers** | `Content-Type`, `Location`, `Set-Cookie` only — no transport headers (`Content-Length`, `X-Request-ID`); `reused_connection` is `false` |
 | **Policies** | While any row access or masking policy is bound, every row answers the exec route's 403 `{"detail":"Policy denies unauthenticated access"}`: neither can rewrite arbitrary SQL to apply a policy, so both fail closed |
 | **Not applied** | Route `REQUIRE`, middleware, access log and rate limits: it is a SQL function with the caller's privileges, not a request |
 | **Visibility** | The inner connection runs its own transactions: it does not see the caller's uncommitted writes, and what it commits is visible to the caller's next transaction |
+
+The table forms release the pipeline while work is pending:
+
+```sql
+FROM quackapi_fetch('https://example.com');
+FROM quackapi_post('https://example.com/api', '{"n":42}', content_type := 'application/json');
+FROM quackapi_exec('SELECT 42 AS answer');
+```
+
+They emit the receipt fields as columns. HTTP tasks run on DuckDB's `async_threads`
+pool; submitted SQL advances through native query tasks and completion. The scalar
+forms retain row-wise NULL handling and the existing STRUCT result. Native VARIANT
+objects and arrays serialize as JSON values rather than display strings. Native
+triggers execute in the mutation's own transaction through HTTP and local exec.
+DuckDB 2.0 currently rejects `RETURNING` on a table with `FOR EACH ROW` triggers;
+route creation surfaces that native error before serving requests.
 
 ### Scheduled routes
 
@@ -196,8 +230,8 @@ WHERE schedule IS NOT NULL;
 ```
 
 The optional `test/sql/quackapi_schedule_cronjob.test` SQLLogic case asserts
-a single-route registration when `cronjob` is available; otherwise run the
-statements above manually in the same DuckDB v1.5.6 environment.
+a single-route registration with Query.Farm's native `cronjob` build when
+`QUACKAPI_NETWORK_TESTS=1`.
 
 ### Response modes (column names)
 
@@ -506,9 +540,9 @@ LOAD quackapi;
 
 | Requirement | Detail |
 |-------------|--------|
-| **DuckDB** | **v1.5.6 only** |
+| **DuckDB** | **v2.0.0** |
 | **CI / platforms** | linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64 |
-| **Community CDN** | `…/v1.5.6/{platform}/quackapi.duckdb_extension.gz` |
+| **Community CDN** | `…/v2.0.0/{platform}/quackapi.duckdb_extension.gz` |
 | **Wasm** | excluded (no server sockets) |
 
 See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
@@ -518,15 +552,15 @@ See [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
 Release assets: https://github.com/asubbarao/quackapi/releases  
 
 ```text
-quackapi-duckdb-v1.5.6-linux_amd64.duckdb_extension
-quackapi-duckdb-v1.5.6-windows_amd64.duckdb_extension
-quackapi-duckdb-v1.5.6-osx_arm64.duckdb_extension
+quackapi-duckdb-v2.0.0-linux_amd64.duckdb_extension
+quackapi-duckdb-v2.0.0-windows_amd64.duckdb_extension
+quackapi-duckdb-v2.0.0-osx_arm64.duckdb_extension
 …
 ```
 
 ```sh
 curl -fsSL -o quackapi.duckdb_extension \
-  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v1.5.6-osx_arm64.duckdb_extension"
+  "https://github.com/asubbarao/quackapi/releases/download/<tag>/quackapi-duckdb-v2.0.0-osx_arm64.duckdb_extension"
 duckdb -unsigned -c "LOAD '$(pwd)/quackapi.duckdb_extension';"
 ```
 
@@ -543,7 +577,7 @@ GEN=ninja make release
 LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 ```
 
-**Target DuckDB:** **v1.5.6 only.** Dependencies: DuckDB’s bundled
+**Target DuckDB:** **v2.0.0.** Dependencies: DuckDB’s bundled
 **httplib** + **mbedtls** only — no vcpkg, no libcurl. The extension is built as
 C++11 by the repository CMake configuration.
 
@@ -586,7 +620,7 @@ C++11 by the repository CMake configuration.
 
 - **Write concurrency / OLTP:** single-writer semantics; not a replacement for
   a connection-pooled app tier under heavy concurrent writes.
-- **Platform coverage:** **DuckDB v1.5.6** on linux/macOS/windows_amd64 only.
+- **Platform coverage:** **DuckDB v2.0.0** on linux/macOS/windows_amd64 only.
   Older DuckDB versions are unsupported — upgrade the host.
 - **Serve memory limit:** `quackapi_serve` sets no `memory_limit` of its own;
   the database keeps DuckDB's default (80% of RAM) unless you pass

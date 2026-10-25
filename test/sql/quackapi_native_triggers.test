@@ -1,0 +1,54 @@
+# name: test/sql/quackapi_native_triggers.test
+# description: Native triggers, VARIANT and PEG DDL through asynchronous exec and HTTP
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE TABLE native_events (id INTEGER, payload VARIANT);
+
+statement ok
+CREATE TABLE native_audit (id INTEGER, payload VARIANT);
+
+# The PEG parser must distinguish extension DDL from native trigger syntax,
+# including a semicolon inside a literal, in the same submitted SQL program.
+query II
+SELECT status, body FROM quackapi_exec($sql$
+CREATE TRIGGER native_event_added AFTER INSERT ON native_events FOR EACH ROW
+INSERT INTO native_audit VALUES (NEW.id, NEW.payload);
+CREATE ROUTE native_insert POST '/native-event' AS
+INSERT INTO native_events VALUES ($id::INTEGER, $body::JSON::VARIANT);
+SELECT 'created; once' AS result;
+$sql$);
+----
+200	[{"result":"created; once"}]
+
+query I
+SELECT * FROM quackapi_serve(29326, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29326
+
+query II
+SELECT status, body FROM quackapi_post('http://127.0.0.1:29326/native-event?id=7', '{"nested":[1,true,null]}');
+----
+200	[{"count_star()":1}]
+
+query III
+SELECT id, payload.nested[1]::INTEGER, payload.nested[2]::BOOLEAN FROM native_audit;
+----
+7	1	true
+
+# Preserve the native engine's restriction instead of accepting a handler that
+# can only fail at request time.
+statement error
+CREATE ROUTE unsupported_returning POST '/returning' AS
+INSERT INTO native_events VALUES (8, NULL) RETURNING id;
+----
+RETURNING is not yet supported on tables with FOR EACH ROW triggers
+
+query I
+SELECT * FROM quackapi_stop(29326);
+----
+Stopped quackapi server on port 29326

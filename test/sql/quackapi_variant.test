@@ -1,0 +1,50 @@
+# name: test/sql/quackapi_variant.test
+# description: DuckDB 2.0 VARIANT values retain JSON types in exec and HTTP results
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE ROUTE variant_sql POST '/sql' AS $sql;
+
+query I
+SELECT * FROM quackapi_serve(29324, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29324
+
+# Compare with the engine's own JSON conversion, not VARIANT's display text.
+query TTTT
+WITH cases AS (
+    SELECT unnest(['{"nested":[1,true,null,"quoted \"text\"",{"x":2}]}',
+                   '[1,"two",false,null]', '42', '1.25', 'true', '"hello"', 'null']) AS document
+), receipts AS (
+    SELECT document, document::JSON::VARIANT AS value,
+           concat($q$SELECT '$q$, document, $q$'::JSON::VARIANT AS value$q$) AS sql,
+           quackapi_exec(sql) AS local,
+           quackapi_post('http://127.0.0.1:29324/sql', json_object('sql', sql)::VARCHAR) AS http
+    FROM cases
+)
+SELECT local.status, http.status,
+       local.body::JSON = json_array(json_object('value', value)),
+       http.body = local.body
+FROM receipts ORDER BY document;
+----
+200	200	true	true
+200	200	true	true
+200	200	true	true
+200	200	true	true
+200	200	true	true
+200	200	true	true
+200	200	true	true
+
+query I
+SELECT (quackapi_exec('SELECT NULL::VARIANT AS value')).body;
+----
+[{"value":null}]
+
+query I
+SELECT * FROM quackapi_stop(29324);
+----
+Stopped quackapi server on port 29324

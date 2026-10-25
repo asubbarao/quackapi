@@ -12,15 +12,10 @@
 //                  HTTPUtil::Request(request, client) which reuses the client
 //                  we hand it instead of building a fresh one.
 //
-// Why the pool exists: HTTPUtil::Request(request) — the single-argument form —
-// declares a local `unique_ptr<HTTPClient> client;` and lets it die at the end
-// of the call (duckdb/src/main/http/http_util.cpp:128). Every request therefore
-// pays a fresh DNS + TCP + (TLS) handshake. The community `http_client`
-// extension has the same shape, which is why a route calling http_post() once
-// per request measured ~40ms against an upstream whose own floor was 13ms,
-// flat across worker_threads — while ten calls inside ONE query amortised to
-// 9.2ms. Connections were only ever reused WITHIN a query execution. A route
-// handler makes exactly one call per request: the worst case.
+// DuckDB 2.0 also provides a managed transport pool. This explicit-client bridge
+// preserves QuackAPI's existing per-call reused_connection and per-host pool
+// counters. Query scheduling and I/O task ownership use the native scheduler;
+// no outbound worker threads are created here.
 //
 // Never shell out to the curl binary. Never link libcurl into quackapi.
 //===----------------------------------------------------------------------===//

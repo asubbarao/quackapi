@@ -133,8 +133,12 @@ SELECT len(list(DISTINCT n)) FROM exec_hits WHERE n >= 100;
 40
 
 # ---------------------------------------------------------------------------
-# Rows run concurrently: 16 sleeps of 300 ms finish well under the 4.8 s serial time
+# Native tasks share the engine's bounded CPU pool. With four engine threads,
+# 16 sleeps of 300 ms finish below the 4.8 s serial time without 16 private threads.
 # ---------------------------------------------------------------------------
+statement ok
+SET threads = 4;
+
 statement ok
 CREATE TABLE exec_clock AS SELECT get_current_timestamp() AS started;
 
@@ -144,7 +148,7 @@ SELECT list(DISTINCT (quackapi_exec('SELECT sleep_ms(300) AS s')).status) FROM r
 [200]
 
 query I
-SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 2000 FROM exec_clock;
+SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 3500 FROM exec_clock;
 ----
 true
 
