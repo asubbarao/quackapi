@@ -653,6 +653,7 @@ private:
 template <class PERFORM>
 void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out,
                     PERFORM &&perform) {
+	context.BlockingInterruptCheck();
 	ScopedOutboundDeadline scoped(context);
 	const auto deadline = QuackapiCurrentDeadline();
 	auto run_one = [&](idx_t i) {
@@ -681,6 +682,7 @@ void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &ski
 				run_one(i);
 			}
 		}
+		context.BlockingInterruptCheck();
 		return;
 	}
 
@@ -690,9 +692,7 @@ void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &ski
 	for (idx_t t = 0; t < n_tasks; t++) {
 		executor.ScheduleTask(make_uniq<OutboundExecutorTask>(executor, [&]() {
 			for (;;) {
-				if (context.IsInterrupted()) {
-					return;
-				}
+				context.BlockingInterruptCheck();
 				const idx_t i = cursor.fetch_add(1);
 				if (i >= count) {
 					return;
@@ -704,7 +704,7 @@ void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &ski
 		}));
 	}
 	executor.WorkOnTasks();
-	context.InterruptCheck();
+	context.BlockingInterruptCheck();
 }
 
 void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1271,6 +1271,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		}
 	}
 
+	context.BlockingInterruptCheck();
 	std::lock_guard<std::mutex> guard(call->mutex);
 	for (idx_t i = 0; i < count; i++) {
 		if (call->skip[i]) {
@@ -1307,7 +1308,8 @@ struct FetchTableGlobalState : public GlobalTableFunctionState {
 	bool finished = false;
 };
 
-void AsyncReceiptExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+void AsyncReceiptExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	context.BlockingInterruptCheck();
 	auto &state = data_p.global_state->Cast<FetchTableGlobalState>();
 	if (state.finished) {
 		data_p.async_result = AsyncResultType::FINISHED;
@@ -1329,6 +1331,7 @@ void AsyncReceiptExec(ClientContext &, TableFunctionInput &data_p, DataChunk &ou
 			return;
 		}
 	}
+	context.BlockingInterruptCheck();
 	auto value = ToValue(state.receipt);
 	auto &children = StructValue::GetChildren(value);
 	for (idx_t col = 0; col < children.size(); col++) {
@@ -1430,6 +1433,7 @@ unique_ptr<GlobalTableFunctionState> ParallelFetchInit(ClientContext &context, T
 }
 
 void ParallelFetchExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	context.BlockingInterruptCheck();
 	auto &bind = data_p.bind_data->Cast<ParallelFetchBindData>();
 	auto &state = data_p.global_state->Cast<ParallelFetchGlobalState>();
 	if (!state.scheduled) {
@@ -1459,6 +1463,7 @@ void ParallelFetchExec(ClientContext &context, TableFunctionInput &data_p, DataC
 			return;
 		}
 	}
+	context.BlockingInterruptCheck();
 	idx_t row = 0;
 	while (state.offset < state.rows.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &r = state.rows[state.offset];

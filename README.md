@@ -190,6 +190,8 @@ pool; submitted SQL advances through native query tasks and completion. The scal
 forms retain row-wise NULL handling and the existing STRUCT result. Native VARIANT
 objects and arrays serialize as JSON values rather than display strings. Native
 triggers execute in the mutation's own transaction through HTTP and local exec.
+The caller's native `max_execution_time` deadline also bounds nested execution
+and outbound I/O; an expired native limit raises DuckDB's timeout error.
 DuckDB 2.0 currently rejects `RETURNING` on a table with `FOR EACH ROW` triggers;
 route creation surfaces that native error before serving requests.
 

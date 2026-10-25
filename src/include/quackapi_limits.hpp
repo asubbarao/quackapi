@@ -36,7 +36,7 @@ private:
 std::chrono::steady_clock::time_point QuackapiCurrentDeadline();
 void QuackapiSetCurrentDeadline(std::chrono::steady_clock::time_point deadline);
 int64_t QuackapiRemainingTimeoutMillis(int64_t fallback_ms);
-//! The earlier of this thread's deadline and the deadline recorded on `context`'s connection.
+//! The earliest thread, connection-budget, or native active-query deadline.
 std::chrono::steady_clock::time_point QuackapiContextDeadline(ClientContext &context);
 
 //! A served request's own query_timeout_ms / max_response_bytes, recorded on its

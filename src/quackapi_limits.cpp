@@ -171,6 +171,17 @@ QuackapiClock::time_point QuackapiContextDeadline(ClientContext &context) {
 	if (budget) {
 		deadline = std::min(deadline, QuackapiClock::time_point(QuackapiClock::duration(budget->deadline.load())));
 	}
+	if (context.query_deadline.IsValid()) {
+		// Native max_execution_time is a deadline, not an interrupt flag. Carry
+		// it into nested connections and outbound I/O before a scalar can block
+		// the caller's next native interrupt check. Compare in milliseconds first
+		// so an extremely distant native deadline cannot overflow clock duration.
+		auto deadline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline.time_since_epoch()).count();
+		if (deadline_ms >= 0 && context.query_deadline.GetIndex() <= NumericCast<idx_t>(deadline_ms)) {
+			deadline = QuackapiClock::time_point(std::chrono::duration_cast<QuackapiClock::duration>(
+			    std::chrono::milliseconds(NumericCast<int64_t>(context.query_deadline.GetIndex()))));
+		}
+	}
 	return deadline;
 }
 void QuackapiSetServingBudget(Connection &connection, int64_t query_timeout_ms, int64_t max_response_bytes) {
