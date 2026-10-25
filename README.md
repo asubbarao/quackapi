@@ -579,7 +579,7 @@ LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 
 **Target DuckDB:** **v2.0.0.** Dependencies: DuckDB’s bundled
 **httplib** + **mbedtls** only — no vcpkg, no libcurl. The extension is built as
-C++11 by the repository CMake configuration.
+C++17 by the repository CMake configuration.
 
 ---
 

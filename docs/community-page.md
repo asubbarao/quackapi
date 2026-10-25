@@ -295,7 +295,7 @@ for the planner and are not part of the public app API.
 | Item | Value |
 |------|--------|
 | Target DuckDB | **v2.0.0** (CI + submodule pin) |
-| Language / build | C++11 / **cmake** |
+| Language / build | C++17 / **cmake** |
 | Extra toolchains | **None** (no vcpkg, no Rust, no Python at build) |
 | Linked deps | DuckDB **bundled httplib** + **mbedtls** only |
 | Outbound HTTPS | Core `HTTPUtil`; optional `LOAD curl_httpfs` upgrades process-wide client |

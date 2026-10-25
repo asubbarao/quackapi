@@ -21,10 +21,9 @@ set(NANOARROW_SOURCES
 
 project(${TARGET_NAME})
 
-# Match DuckDB (C++11). C++17 on these TUs emits inline FileFlags/LogicalType
-# symbols that already live in libduckdb_static — Linux link then fails.
+# Match DuckDB 2.0's C++17 baseline for its native query and async APIs.
 set(CMAKE_CXX_STANDARD
-    "11"
+    "17"
     CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
