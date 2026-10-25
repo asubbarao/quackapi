@@ -1,0 +1,30 @@
+# name: test/sql/quackapi_native_protocol.test
+# description: Native Quack carries VARIANT and can invoke the rebuilt async exec operator
+# group: [sql]
+
+require quackapi
+
+require httpfs
+
+require quack
+
+statement ok
+CALL quack_serve('quack:127.0.0.1:29327', token := 'quackapi-native-test');
+
+query III
+SELECT value.answer::INTEGER, value.nested[1]::BOOLEAN, typeof(value)
+FROM quack_query('quack:127.0.0.1:29327',
+    $sql$SELECT {'answer': 42, 'nested': [true, false]}::VARIANT AS value$sql$,
+    token := 'quackapi-native-test');
+----
+42	true	VARIANT
+
+query II
+SELECT status, body FROM quack_query('quack:127.0.0.1:29327',
+    $sql$SELECT status, body FROM quackapi_exec('SELECT 42 AS answer')$sql$,
+    token := 'quackapi-native-test');
+----
+200	[{"answer":42}]
+
+statement ok
+CALL quack_stop('quack:127.0.0.1:29327');

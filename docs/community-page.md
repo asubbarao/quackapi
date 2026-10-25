@@ -36,7 +36,7 @@ Zero external app servers.
 
 ## Install
 
-**DuckDB v1.5.6** required (community CDN path is versioned).
+**DuckDB v2.0.0** required (community CDN path is versioned).
 
 ```sql
 INSTALL quackapi FROM community;
@@ -294,8 +294,8 @@ for the planner and are not part of the public app API.
 
 | Item | Value |
 |------|--------|
-| Target DuckDB | **v1.5.6** (CI + submodule pin) |
-| Language / build | C++11 / **cmake** |
+| Target DuckDB | **v2.0.0** (CI + submodule pin) |
+| Language / build | C++17 / **cmake** |
 | Extra toolchains | **None** (no vcpkg, no Rust, no Python at build) |
 | Linked deps | DuckDB **bundled httplib** + **mbedtls** only |
 | Outbound HTTPS | Core `HTTPUtil`; optional `LOAD curl_httpfs` upgrades process-wide client |
@@ -308,8 +308,9 @@ for the planner and are not part of the public app API.
 | `windows_amd64` | Build & sign |
 | `windows_amd64_mingw`, `windows_amd64_rtools`, `windows_arm64` | **Excluded** — not enabled by the repository descriptor |
 
-Repo workflow: `duckdb/extension-ci-tools` `@v1.5.6`,
-`duckdb_version: v1.5.6`, same `exclude_archs` as `description.yml`.
+Repo workflow: `duckdb/extension-ci-tools` pinned to
+`fe955ed3a046b0324cac2c691e73d8d776a7d5cc`, `duckdb_version: v2.0.0`,
+same `exclude_archs` as `description.yml`.
 
 **Feasibility:** high for the non-excluded platforms — pure CMake extension
 template shape, no exotic system libraries. Blocker before first signed publish:

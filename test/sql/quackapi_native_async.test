@@ -1,0 +1,124 @@
+# name: test/sql/quackapi_native_async.test
+# description: Native async table operators yield, resume once, and preserve receipt contracts
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+SET threads = 1;
+
+statement ok
+SET async_threads = 2;
+
+statement ok
+CREATE SEQUENCE async_hits;
+
+statement ok
+CREATE ROUTE async_get GET '/async' AS SELECT nextval('async_hits') AS hit;
+
+statement ok
+CREATE ROUTE async_post POST '/async' AS SELECT $n::INTEGER AS n;
+
+query I
+SELECT * FROM quackapi_serve(29325, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29325
+
+statement ok
+CALL enable_logging(['AsyncTaskSchedule'], level := 'debug', storage := 'memory');
+
+query II
+SELECT status, body FROM quackapi_fetch('http://127.0.0.1:29325/async');
+----
+200	[{"hit":1}]
+
+# Multiple native I/O tasks share two engine workers; requests fire once each.
+query II
+SELECT list(idx ORDER BY idx), list_sort(list(json_extract(body::JSON, '$[0].hit')::INTEGER))
+FROM quackapi_parallel_fetch('http://127.0.0.1:29325/async', 5);
+----
+[0, 1, 2, 3, 4]	[2, 3, 4, 5, 6]
+
+query II
+SELECT status, body FROM quackapi_post('http://127.0.0.1:29325/async', '{"n":42}');
+----
+200	[{"n":42}]
+
+# With no background CPU worker, a submitted query advances a task at a time
+# on the async scheduler and resumes the source only when its receipt is ready.
+query II
+SELECT status, body FROM quackapi_exec('SELECT 1 AS first; SELECT sum(range) AS total FROM range(1000000)');
+----
+200	[{"total":499999500000}]
+
+query II
+SELECT status, body FROM quackapi_exec('SELECT nextval(''async_hits'') AS hit');
+----
+200	[{"hit":7}]
+
+query I
+SELECT currval('async_hits');
+----
+7
+
+# Prepared plans retain immutable arguments; execution state belongs to each
+# pipeline, so the second execution cannot reuse an exhausted receipt.
+statement ok
+PREPARE async_prepared AS SELECT status, body FROM quackapi_exec('SELECT 42 AS answer');
+
+query II
+EXECUTE async_prepared;
+----
+200	[{"answer":42}]
+
+query II
+EXECUTE async_prepared;
+----
+200	[{"answer":42}]
+
+# Observe the engine's own scheduler receipt, not a QuackAPI counter claiming
+# to be async. Removing HandleBlocked/AsyncResult makes this assertion fail.
+query I
+SELECT len(list(message)) > 0 FROM duckdb_logs()
+WHERE type = 'AsyncTaskSchedule' AND contains(message, 'ASYNC');
+----
+true
+
+# The engine's explicit synchronous fallback uses the same operator and receipt.
+statement ok
+SET async_threads = 0;
+
+query II
+SELECT status, body FROM quackapi_exec('SELECT 42 AS answer');
+----
+200	[{"answer":42}]
+
+# A no-column final statement still consumes its two-byte JSON response budget.
+statement ok
+SET quackapi_max_response_bytes = 1;
+
+query I
+SELECT status FROM quackapi_exec('SET search_path = ''main''');
+----
+507
+
+statement ok
+SET quackapi_max_response_bytes = 16777216;
+
+statement ok
+SET async_threads = 2;
+
+statement ok
+SET quackapi_query_timeout_ms = 50;
+
+query I
+SELECT status FROM quackapi_exec('SELECT sum(range) FROM range(100000000000)');
+----
+504
+
+query I
+SELECT * FROM quackapi_stop(29325);
+----
+Stopped quackapi server on port 29325

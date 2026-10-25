@@ -1,7 +1,7 @@
 #
 # Build, test, and (on tags) publish extension binaries.
 #
-# Single supported DuckDB host: the 2.0 alpha, duckdb f8f3f4dcd954cea2613572e8cc40a8612698d232 (v2.0.0-alpha48730)
+# Single supported DuckDB host: DuckDB v2.0.0 (d54cbbe3df17e8e5ce68312f483b4155836112aa)
 # Platforms (extension-ci-tools): linux_amd64, linux_arm64, osx_amd64,
 #   osx_arm64, windows_amd64
 # Excludes: wasm / MinGW / rtools / windows_arm64
@@ -29,20 +29,22 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    # Build against the DuckDB 2.0 alpha commit this branch targets.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    # Build against the DuckDB v2.0.0 release this branch targets.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@fe955ed3a046b0324cac2c691e73d8d776a7d5cc
     with:
-      duckdb_version: f8f3f4dcd954cea2613572e8cc40a8612698d232
-      ci_tools_version: main
+      duckdb_version: v2.0.0
+      ci_tools_version: fe955ed3a046b0324cac2c691e73d8d776a7d5cc
       extension_name: quackapi
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools;windows_arm64
+      opt_in_archs: osx_amd64
+      reduced_ci_mode: disabled
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@fe955ed3a046b0324cac2c691e73d8d776a7d5cc
     with:
-      duckdb_version: f8f3f4dcd954cea2613572e8cc40a8612698d232
-      ci_tools_version: main
+      duckdb_version: v2.0.0
+      ci_tools_version: fe955ed3a046b0324cac2c691e73d8d776a7d5cc
       extension_name: quackapi
       format_checks: "format"
 
@@ -54,10 +56,11 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GEN: ninja
-      DUCKDB_GIT_VERSION: f8f3f4dcd954cea2613572e8cc40a8612698d232
+      DUCKDB_GIT_VERSION: v2.0.0
       ENABLE_EXTENSION_AUTOLOADING: "1"
       ENABLE_EXTENSION_AUTOINSTALL: "1"
       QUACKAPI_TEST_PG_DSN: postgresql://quackapi_pg_cache:qa_pg_cache_test@127.0.0.1:5432/quackapi_pg_cache_test
+      QUACKAPI_NETWORK_TESTS: "1"
     services:
       postgres:
         image: postgres:16
@@ -83,10 +86,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: duckdb/extension-ci-tools
-          ref: main
+          ref: fe955ed3a046b0324cac2c691e73d8d776a7d5cc
           path: extension-ci-tools
 
-      - name: Checkout DuckDB (2.0 alpha commit)
+      - name: Checkout DuckDB (v2.0.0)
         run: make set_duckdb_version
 
       - name: Install build deps
@@ -98,7 +101,7 @@ jobs:
         uses: hendrikmuhs/ccache-action@main
         continue-on-error: true
         with:
-          key: ccache-quackapi-pg-sqllogic-linux-amd64-v2.0-alpha
+          key: ccache-quackapi-pg-sqllogic-linux-amd64-v2.0.0
           restore-keys: ccache-quackapi-pg-sqllogic-linux-amd64-
 
       - name: Wait for Postgres
@@ -111,12 +114,7 @@ jobs:
         run: make release -j"$(nproc)"
 
       - name: Run quackapi SQLLogic
-        run: ./build/release/test/unittest "test/sql/quackapi*"
-
-      - name: Verify outbound worker cleanup
-        run: |
-          c++ -std=c++17 -pthread -Wall -Wextra -Werror -Isrc/include test/cpp/quackapi_thread_join_test.cpp -o /tmp/quackapi-thread-join-test
-          /tmp/quackapi-thread-join-test
+        run: make test_release T='"test/sql/quackapi*"'
 
       - name: Verify build without libpq
         run: c++ -std=c++17 -fsyntax-only -isystem duckdb/src/include -Isrc/include src/quackapi_pg.cpp

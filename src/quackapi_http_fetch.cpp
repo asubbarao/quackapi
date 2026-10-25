@@ -1,5 +1,4 @@
 #include "quackapi_http_fetch.hpp"
-#include "quackapi_thread_join.hpp"
 #include "quackapi_limits.hpp"
 #include "quackapi_util.hpp"
 #include "quackapi_server.hpp"
@@ -21,6 +20,12 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/sql_statement.hpp"
+#include "duckdb/parallel/async_result.hpp"
+#include "duckdb/parallel/callback_async_task.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parallel/task.hpp"
 
 #include "httplib.hpp"
 
@@ -590,8 +595,8 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
 //!
 //! `perform(i)` must be safe to call from any thread. Exceptions are captured per
 //! row rather than allowed to escape: WithPlainClient deliberately rethrows on a
-//! half-written socket, and an exception crossing a std::thread boundary would
-//! call std::terminate and take the server down with it. Argument validation that
+//! half-written socket. Native tasks return failures as receipts rather than
+//! cancelling unrelated rows. Argument validation that
 //! must still raise to the caller therefore happens BEFORE the fan-out.
 //!
 //! The single-request case — what a route handler doing one upstream call per
@@ -615,8 +620,11 @@ std::chrono::steady_clock::time_point OutboundDeadline(ClientContext &context) {
 
 //! Restores the calling thread's deadline when an inline request returns or throws.
 struct ScopedOutboundDeadline {
-	explicit ScopedOutboundDeadline(ClientContext &context) : previous(QuackapiCurrentDeadline()) {
-		QuackapiSetCurrentDeadline(OutboundDeadline(context));
+	explicit ScopedOutboundDeadline(std::chrono::steady_clock::time_point deadline)
+	    : previous(QuackapiCurrentDeadline()) {
+		QuackapiSetCurrentDeadline(deadline);
+	}
+	explicit ScopedOutboundDeadline(ClientContext &context) : ScopedOutboundDeadline(OutboundDeadline(context)) {
 	}
 	~ScopedOutboundDeadline() {
 		QuackapiSetCurrentDeadline(previous);
@@ -624,13 +632,32 @@ struct ScopedOutboundDeadline {
 	std::chrono::steady_clock::time_point previous;
 };
 
+//! Scalar callbacks cannot yield a pipeline. Their compatibility adapter uses
+//! the engine's async pool and participates in its drain instead of owning OS threads.
+class OutboundExecutorTask : public BaseExecutorTask {
+public:
+	OutboundExecutorTask(TaskExecutor &executor, std::function<void()> work)
+	    : BaseExecutorTask(executor), work(std::move(work)) {
+	}
+	void ExecuteTask() override {
+		work();
+	}
+	string TaskType() const override {
+		return "QuackapiOutbound";
+	}
+
+private:
+	std::function<void()> work;
+};
+
 template <class PERFORM>
 void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out,
                     PERFORM &&perform) {
+	context.BlockingInterruptCheck();
 	ScopedOutboundDeadline scoped(context);
 	const auto deadline = QuackapiCurrentDeadline();
 	auto run_one = [&](idx_t i) {
-		QuackapiSetCurrentDeadline(deadline);
+		ScopedOutboundDeadline scoped_row(deadline);
 		try {
 			out[i] = perform(i);
 		} catch (std::exception &e) {
@@ -655,17 +682,17 @@ void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &ski
 				run_one(i);
 			}
 		}
+		context.BlockingInterruptCheck();
 		return;
 	}
 
-	const idx_t n_threads = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
+	const idx_t n_tasks = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
 	std::atomic<idx_t> cursor {0};
-	vector<std::thread> threads;
-	threads.reserve(n_threads);
-	JoinOutboundThreads<vector<std::thread>> join_threads {threads};
-	for (idx_t t = 0; t < n_threads; t++) {
-		threads.emplace_back([&]() {
+	TaskExecutor executor(context, TaskSchedulerType::ASYNC);
+	for (idx_t t = 0; t < n_tasks; t++) {
+		executor.ScheduleTask(make_uniq<OutboundExecutorTask>(executor, [&]() {
 			for (;;) {
+				context.BlockingInterruptCheck();
 				const idx_t i = cursor.fetch_add(1);
 				if (i >= count) {
 					return;
@@ -674,8 +701,10 @@ void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &ski
 					run_one(i);
 				}
 			}
-		});
+		}));
 	}
+	executor.WorkOnTasks();
+	context.BlockingInterruptCheck();
 }
 
 void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -792,26 +821,26 @@ int64_t NonNegativeSetting(ClientContext &context, const string &name, int64_t f
 	return value;
 }
 
-//! quackapi_exec threads running in this process, across every call and nesting level.
-std::atomic<int64_t> exec_threads_running {0};
+//! Admitted exec tasks across calls; OS worker counts belong to DuckDB.
+std::atomic<int64_t> exec_tasks_running {0};
 
-//! Reserve up to `wanted` exec threads without passing `cap`. Never waits, so a full
+//! Reserve up to `wanted` exec tasks without passing `cap`. Never waits, so a full
 //! process cannot leave an outer call waiting on inner calls that wait for a thread.
-idx_t ReserveExecThreads(idx_t wanted, int64_t cap) {
-	auto running = exec_threads_running.load();
+idx_t ReserveExecTasks(idx_t wanted, int64_t cap) {
+	auto running = exec_tasks_running.load();
 	for (;;) {
 		const auto room = cap - running;
 		if (room <= 0) {
 			return 0;
 		}
 		const auto take = std::min<int64_t>(room, NumericCast<int64_t>(wanted));
-		if (exec_threads_running.compare_exchange_weak(running, running + take)) {
+		if (exec_tasks_running.compare_exchange_weak(running, running + take)) {
 			return NumericCast<idx_t>(take);
 		}
 	}
 }
 
-//! One quackapi_exec call, shared with the threads running its rows, so a caller that
+//! One quackapi_exec call, retained by its native tasks, so a caller that
 //! gives up (interrupt, deadline) returns while a row is still blocked in a host call.
 struct ExecCall {
 	shared_ptr<DatabaseInstance> db;
@@ -828,64 +857,60 @@ struct ExecCall {
 	std::condition_variable finished;
 	unordered_set<Connection *> running;
 	std::atomic<bool> cancelled {false};
-	idx_t threads_done = 0;
+	idx_t tasks_done = 0;
+	std::atomic<idx_t> tasks_started {0};
 	std::atomic<idx_t> cursor {0};
+	unique_ptr<TaskExecutor> executor;
 };
 
-//! How long a connection's close waits for the rows it gave up on.
-constexpr int64_t EXEC_ABANDONED_JOIN_MS = 5000;
+std::shared_ptr<ExecCall> NewExecCall(ClientContext &context, idx_t count) {
+	auto call = std::make_shared<ExecCall>();
+	call->db = context.db;
+	call->sqls.resize(count);
+	call->skip.assign(count, false);
+	call->out.resize(count);
+	call->done.assign(count, false);
+	int64_t timeout_ms = 0;
+	int64_t max_response_bytes = 0;
+	if (QuackapiGetServingBudget(context, timeout_ms, max_response_bytes)) {
+		call->serving_timeout_ms = timeout_ms;
+		call->serving_max_response_bytes = max_response_bytes;
+	} else {
+		timeout_ms = PositiveSetting(context, "quackapi_query_timeout_ms", 30000);
+		max_response_bytes = PositiveSetting(context, "quackapi_max_response_bytes", 16 * 1024 * 1024);
+	}
+	call->max_response_bytes = NumericCast<idx_t>(max_response_bytes);
+	call->deadline = std::min(QuackapiContextDeadline(context),
+	                          std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+	return call;
+}
 
-//! Threads still running rows of the quackapi_exec calls one connection gave up on.
-//! A thread holds the database through its row's connection, so the caller's close
-//! waits for them: otherwise the database outlives its close (a file stays locked) and
-//! its last reference can drop on a row's thread after the process began to exit.
+//! Keep interrupted operations alive until DuckDB's executor has retired their
+//! tasks. Connection teardown drains the native executor before releasing the DB.
+//! No worker is detached and no native task references a destroyed caller context.
 struct ExecAbandonedRows : public ClientContextState {
-	struct Abandoned {
-		std::shared_ptr<ExecCall> call;
-		vector<std::thread> threads;
-	};
-
-	static bool Ended(ExecCall &call, idx_t threads, std::chrono::steady_clock::time_point until) {
-		std::unique_lock<std::mutex> guard(call.mutex);
-		return call.finished.wait_until(guard, until, [&]() { return call.threads_done >= threads; });
-	}
-
-	//! Join a call's threads once they have ended; past `until`, leave them running.
-	static void Release(Abandoned &abandoned, std::chrono::steady_clock::time_point until) {
-		const bool ended = Ended(*abandoned.call, abandoned.threads.size(), until);
-		for (auto &thread : abandoned.threads) {
-			if (ended) {
-				thread.join();
-			} else {
-				thread.detach();
-			}
-		}
-		abandoned.threads.clear();
-	}
-
-	void Add(std::shared_ptr<ExecCall> call, vector<std::thread> threads) {
+	void Add(std::shared_ptr<ExecCall> call) {
 		std::lock_guard<std::mutex> guard(mutex);
-		const auto now = std::chrono::steady_clock::now();
 		for (auto it = calls.begin(); it != calls.end();) {
-			if (Ended(*it->call, it->threads.size(), now)) {
-				Release(*it, now);
+			if (it->use_count() == 1) {
 				it = calls.erase(it);
 			} else {
 				++it;
 			}
 		}
-		calls.push_back(Abandoned {std::move(call), std::move(threads)});
+		calls.push_back(std::move(call));
 	}
 
 	~ExecAbandonedRows() override {
-		const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(EXEC_ABANDONED_JOIN_MS);
-		for (auto &abandoned : calls) {
-			Release(abandoned, until);
+		for (auto &call : calls) {
+			if (call->executor) {
+				call->executor->CancelAndDrain();
+			}
 		}
 	}
 
 	std::mutex mutex;
-	vector<Abandoned> calls;
+	vector<std::shared_ptr<ExecCall>> calls;
 };
 
 QuackapiHttpFetchResult ExecReceipt(QuackapiExecResponse response) {
@@ -956,31 +981,191 @@ void AbandonExecCall(ExecCall &call) {
 	}
 }
 
-//! quackapi_exec(sql): the receipt quackapi_post gives for POST {"sql": sql} to an exec
-//! route (`AS $sql`), produced on this process's own database with no HTTP worker.
-//!
-//! A self-post holds an HTTP worker while the SQL it posted posts again, so nested
-//! fan-outs exhaust a fixed pool and wait on each other. Here every row runs on a
-//! thread of its own with a fresh Connection: waits form a tree, never a cycle, and a
-//! nested call starts on a fresh stack. Past quackapi_exec_max_threads in the process,
-//! rows run one at a time on the calling thread instead of waiting for a thread.
-//!
-//! The calling thread watches the caller and the call's deadline. When either ends, it
-//! interrupts every running row and returns without waiting for them: a row blocked in
-//! a host call (a pipe, a sleep) finishes on its own thread, and its result is dropped.
-//! Such a row starts no further statement, and the caller's connection waits for it
-//! (up to EXEC_ABANDONED_JOIN_MS) when it closes.
+thread_local bool in_native_exec_task = false;
+
+struct NativeExecScope {
+	bool previous = in_native_exec_task;
+	NativeExecScope() {
+		in_native_exec_task = true;
+	}
+	~NativeExecScope() {
+		in_native_exec_task = previous;
+	}
+};
+
+//! One resumable SQL row. Submit/Materialize do not run the query; each Step
+//! participates in at most one engine task before yielding back to its scheduler.
+class ExecOperation {
+public:
+	ExecOperation(ExecCall &call, idx_t row, ClientContext *parent = nullptr) : call(call), row(row), parent(parent) {
+	}
+	~ExecOperation() {
+		if (connection) {
+			std::lock_guard<std::mutex> guard(call.mutex);
+			call.running.erase(connection.get());
+		}
+	}
+	bool Step() {
+		if (finished) {
+			return true;
+		}
+		NativeExecScope scope;
+		ScopedOutboundDeadline thread_deadline(call.deadline);
+		try {
+			if (call.cancelled || (parent && parent->IsInterrupted()) ||
+			    std::chrono::steady_clock::now() >= call.deadline) {
+				if (connection) {
+					connection->Interrupt();
+				}
+				return Finish(QuackapiExecTimeoutResponse());
+			}
+			if (!connection) {
+				connection = make_uniq<Connection>(*call.db);
+				if (call.serving_timeout_ms > 0) {
+					QuackapiSetServingBudget(*connection, call.serving_timeout_ms, call.serving_max_response_bytes);
+				}
+				// Resumable operations can migrate between scheduler threads.
+				// Persist only the connection budget; scope TLS to each Step.
+				deadline = make_uniq<QuackapiQueryDeadline>(*connection, call.deadline, parent, false);
+				{
+					std::lock_guard<std::mutex> guard(call.mutex);
+					call.running.insert(connection.get());
+				}
+				if (call.sqls[row].find('\0') != string::npos) {
+					return Finish(QuackapiExecErrorResponse("SQL text must not contain null bytes"));
+				}
+				statements = connection->ExtractStatements(call.sqls[row]);
+				if (statements.empty()) {
+					return Finish(QuackapiExecErrorResponse("No statement to execute"));
+				}
+			}
+			if (!result) {
+				result = connection->Submit(std::move(statements[statement]));
+				if (!result->HasError()) {
+					result->Materialize();
+				}
+			}
+			auto state = result->Poll();
+			if (!IsTerminal(state)) {
+				state = result->ExecuteTask();
+			}
+			if (!IsTerminal(state)) {
+				return false;
+			}
+			// Poll observes readiness; Complete settles the retained handle and its
+			// transaction before the following statement can use a DDL/DML result.
+			if (!result->HasError()) {
+				result->Complete();
+			}
+			if (result->HasError()) {
+				auto error = result->GetError();
+				if (statements.size() > 1) {
+					error = StringUtil::Format("Statement %llu of %llu failed: %s", statement + 1, statements.size(),
+					                           error);
+				}
+				return Finish(deadline->Expired() ? QuackapiExecTimeoutResponse() : QuackapiExecErrorResponse(error));
+			}
+			if (++statement < statements.size()) {
+				result.reset();
+				return false;
+			}
+			auto response = QuackapiExecResult(*result, call.max_response_bytes);
+			return Finish(deadline->Expired() ? QuackapiExecTimeoutResponse() : std::move(response));
+		} catch (std::exception &ex) {
+			return Finish(std::chrono::steady_clock::now() >= call.deadline
+			                  ? QuackapiExecTimeoutResponse()
+			                  : QuackapiExecErrorResponse(ErrorData(ex).Message()));
+		}
+	}
+
+private:
+	bool Finish(QuackapiExecResponse response) {
+		std::lock_guard<std::mutex> guard(call.mutex);
+		call.out[row] = ExecReceipt(std::move(response));
+		call.done[row] = true;
+		finished = true;
+		return true;
+	}
+	ExecCall &call;
+	idx_t row;
+	ClientContext *parent;
+	unique_ptr<Connection> connection;
+	unique_ptr<QuackapiQueryDeadline> deadline;
+	vector<unique_ptr<SQLStatement>> statements;
+	unique_ptr<QueryResult> result;
+	idx_t statement = 0;
+	bool finished = false;
+};
+
+class ExecExecutorTask : public BaseExecutorTask {
+public:
+	ExecExecutorTask(TaskExecutor &executor, std::shared_ptr<ExecCall> call)
+	    : BaseExecutorTask(executor), call(std::move(call)) {
+	}
+	~ExecExecutorTask() override {
+		Settle();
+	}
+	TaskExecutionResult ExecuteTaskStep() override {
+		if (!began) {
+			began = true;
+			call->tasks_started++;
+		}
+		if (call->cancelled) {
+			operation.reset();
+			Settle();
+			return TaskExecutionResult::TASK_FINISHED;
+		}
+		if (!operation) {
+			idx_t i;
+			do {
+				i = call->cursor.fetch_add(1);
+				if (i >= call->sqls.size()) {
+					Settle();
+					return TaskExecutionResult::TASK_FINISHED;
+				}
+			} while (call->skip[i]);
+			operation = make_uniq<ExecOperation>(*call, i);
+		}
+		if (operation->Step()) {
+			operation.reset();
+		}
+		return TaskExecutionResult::TASK_NOT_FINISHED;
+	}
+	void Cancel() override {
+		Settle();
+	}
+	string TaskType() const override {
+		return "QuackapiExec";
+	}
+
+private:
+	void Settle() {
+		if (settled) {
+			return;
+		}
+		settled = true;
+		exec_tasks_running--;
+		std::lock_guard<std::mutex> guard(call->mutex);
+		call->tasks_done++;
+		call->finished.notify_one();
+	}
+	std::shared_ptr<ExecCall> call;
+	unique_ptr<ExecOperation> operation;
+	bool settled = false;
+	bool began = false;
+};
+
+//! Scalar compatibility adapter over resumable native query tasks. DuckDB owns
+//! their workers. Nested scalar bridges participate inline rather than waiting
+//! for capacity in their own pool; table forms yield the pipeline instead.
+//! Interrupts stop admission and every running connection. The caller returns
+//! promptly while its connection retains and drains any unfinished native tasks.
 void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	const auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 
-	auto call = std::make_shared<ExecCall>();
-	call->db = context.db;
-	call->sqls.resize(count);
-	call->skip.assign(count, false);
-	call->out.resize(count);
-	call->done.assign(count, false);
+	auto call = NewExecCall(context, count);
 	idx_t active = 0;
 	for (idx_t i = 0; i < count; i++) {
 		auto sql = args.data[0].GetValue(i);
@@ -992,20 +1177,6 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		active++;
 	}
 
-	// Inside a served request, the server's own budgets; otherwise the session's.
-	int64_t timeout_ms = 0;
-	int64_t max_response_bytes = 0;
-	if (QuackapiGetServingBudget(context, timeout_ms, max_response_bytes)) {
-		call->serving_timeout_ms = timeout_ms;
-		call->serving_max_response_bytes = max_response_bytes;
-	} else {
-		timeout_ms = PositiveSetting(context, "quackapi_query_timeout_ms", 30000);
-		max_response_bytes = PositiveSetting(context, "quackapi_max_response_bytes", 16 * 1024 * 1024);
-	}
-	call->max_response_bytes = NumericCast<idx_t>(max_response_bytes);
-	// Never longer than what the caller has left.
-	call->deadline = std::min(QuackapiContextDeadline(context),
-	                          std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
 	const auto max_threads = NonNegativeSetting(context, "quackapi_exec_max_threads", 256);
 
 	// An exec route answers 403 while any policy is bound: its SQL cannot be rewritten.
@@ -1019,41 +1190,35 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 
 	const idx_t wanted = active < MAX_OUTBOUND_FANOUT ? active : MAX_OUTBOUND_FANOUT;
-	const idx_t reserved = wanted == 0 ? 0 : ReserveExecThreads(wanted, max_threads);
-	vector<std::thread> threads;
-	// Rows that ran to the end: their threads have finished, so this join is brief.
-	JoinOutboundThreads<vector<std::thread>> join_threads {threads};
+	// A nested scalar bridge participates inline rather than waiting for another
+	// task in the same bounded async pool. Native table operators yield instead.
+	auto &scheduler = TaskScheduler::GetScheduler(context);
+	const idx_t reserved = wanted == 0 || in_native_exec_task || scheduler.NumberOfThreads() <= 1
+	                           ? 0
+	                           : ReserveExecTasks(wanted, max_threads);
+	if (reserved) {
+		try {
+			call->executor = make_uniq<TaskExecutor>(scheduler, TaskSchedulerType::REGULAR);
+			context.registered_state->GetOrCreate<ExecAbandonedRows>("quackapi_exec_abandoned_rows")->Add(call);
+		} catch (...) {
+			exec_tasks_running -= NumericCast<int64_t>(reserved);
+			throw;
+		}
+	}
 	auto abandon = [&]() {
 		AbandonExecCall(*call);
-		context.registered_state->GetOrCreate<ExecAbandonedRows>("quackapi_exec_abandoned_rows")
-		    ->Add(call, std::move(threads));
-		threads.clear();
 	};
 	idx_t started = 0;
-	for (; started < reserved; started++) {
+	for (; started < reserved;) {
+		unique_ptr<ExecExecutorTask> task;
 		try {
-			threads.emplace_back([call]() {
-				struct Slot {
-					~Slot() {
-						exec_threads_running--;
-					}
-				} slot;
-				for (;;) {
-					const idx_t i = call->cursor.fetch_add(1);
-					if (i >= call->sqls.size()) {
-						break;
-					}
-					if (!call->skip[i]) {
-						RunExecRow(*call, i, nullptr);
-					}
-				}
-				std::lock_guard<std::mutex> guard(call->mutex);
-				call->threads_done++;
-				call->finished.notify_one();
-			});
+			task = make_uniq<ExecExecutorTask>(*call->executor, call);
+			started++;
+			call->executor->ScheduleTask(std::move(task));
 		} catch (std::exception &) {
-			// The OS refused a thread: the ones running take every row.
-			exec_threads_running -= NumericCast<int64_t>(reserved - started);
+			// Native submission retires a constructed task. Any admitted task can
+			// drain the remaining rows; if none ran, the bridge finishes them below.
+			exec_tasks_running -= NumericCast<int64_t>(reserved - started);
 			break;
 		}
 	}
@@ -1072,7 +1237,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		}
 	} else {
 		std::unique_lock<std::mutex> guard(call->mutex);
-		while (call->threads_done < started) {
+		while (call->tasks_done < started) {
 			if (context.IsInterrupted()) {
 				guard.unlock();
 				abandon();
@@ -1085,9 +1250,28 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 				break;
 			}
 			call->finished.wait_until(guard, std::min(call->deadline, now + std::chrono::milliseconds(10)));
+			if (call->tasks_started == 0) {
+				// Every CPU worker can be inside a scalar compatibility callback.
+				// Participate in our producer rather than waiting for unavailable workers.
+				guard.unlock();
+				call->executor->WorkOnTasks();
+				guard.lock();
+			}
+		}
+		if (guard.owns_lock()) {
+			guard.unlock();
+		}
+		if (!call->cancelled) {
+			call->executor->WorkOnTasks();
+			for (idx_t i = 0; i < count; i++) {
+				if (!call->skip[i] && !call->done[i]) {
+					RunExecRow(*call, i, &context);
+				}
+			}
 		}
 	}
 
+	context.BlockingInterruptCheck();
 	std::lock_guard<std::mutex> guard(call->mutex);
 	for (idx_t i = 0; i < count; i++) {
 		if (call->skip[i]) {
@@ -1107,9 +1291,70 @@ struct PoolGlobalState : public GlobalTableFunctionState {
 
 struct FetchTableBindData : public TableFunctionData {
 	string url;
+	string body;
+	string content_type = "application/json";
 	unordered_map<string, string> headers;
 	int32_t stall_ms = 0;
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<FetchTableBindData>(*this);
+	}
+};
+
+struct FetchTableGlobalState : public GlobalTableFunctionState {
+	QuackapiHttpFetchResult receipt;
+	std::function<QuackapiHttpFetchResult()> perform;
+	std::function<bool(QuackapiHttpFetchResult &)> step;
+	bool ready = false;
 	bool finished = false;
+};
+
+void AsyncReceiptExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	context.BlockingInterruptCheck();
+	auto &state = data_p.global_state->Cast<FetchTableGlobalState>();
+	if (state.finished) {
+		data_p.async_result = AsyncResultType::FINISHED;
+		return;
+	}
+	// A resumed scan arrives only after the previously scheduled step finished.
+	while (!state.ready) {
+		vector<unique_ptr<AsyncTask>> tasks;
+		tasks.push_back(make_uniq<CallbackAsyncTask>([&state]() {
+			if (state.step) {
+				state.ready = state.step(state.receipt);
+			} else {
+				state.receipt = state.perform();
+				state.ready = true;
+			}
+		}));
+		auto pending = AsyncResult::FromTasks(std::move(tasks), TaskSchedulerType::ASYNC);
+		if (data_p.HandleBlocked(pending)) {
+			return;
+		}
+	}
+	context.BlockingInterruptCheck();
+	auto value = ToValue(state.receipt);
+	auto &children = StructValue::GetChildren(value);
+	for (idx_t col = 0; col < children.size(); col++) {
+		output.data[col].SetValue(0, children[col]);
+	}
+	output.SetChildCardinality(1);
+	state.finished = true;
+	data_p.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+}
+
+void ReceiptColumns(vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto result_type = FetchResultType();
+	for (auto &child : StructType::GetChildTypes(result_type)) {
+		names.push_back(child.first);
+		return_types.push_back(child.second);
+	}
+}
+
+struct ExecTableBindData : public TableFunctionData {
+	string sql;
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<ExecTableBindData>(*this);
+	}
 };
 
 unique_ptr<FunctionData> PoolBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
@@ -1142,10 +1387,13 @@ void PoolExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 
 //! Concurrent GETs — the seam SQLLogic needs for claim-race / fan-out tests.
 //! `FROM range(n)` around scalar quackapi_fetch constant-folds to one request;
-//! this table function fires n real threads and returns one row per attempt.
+//! this table function schedules n native async I/O tasks, one receipt per attempt.
 struct ParallelFetchBindData : public TableFunctionData {
 	string url;
 	int32_t n = 1;
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<ParallelFetchBindData>(*this);
+	}
 };
 
 struct ParallelFetchRow {
@@ -1158,6 +1406,7 @@ struct ParallelFetchRow {
 struct ParallelFetchGlobalState : public GlobalTableFunctionState {
 	vector<ParallelFetchRow> rows;
 	idx_t offset = 0;
+	bool scheduled = false;
 };
 
 unique_ptr<FunctionData> ParallelFetchBind(ClientContext &, TableFunctionBindInput &input,
@@ -1180,36 +1429,41 @@ unique_ptr<GlobalTableFunctionState> ParallelFetchInit(ClientContext &context, T
 	auto &bind = input.bind_data->Cast<ParallelFetchBindData>();
 	auto state = make_uniq<ParallelFetchGlobalState>();
 	state->rows.resize(NumericCast<idx_t>(bind.n));
-	const auto deadline = OutboundDeadline(context);
-	auto &db = *context.db;
-	vector<std::thread> threads;
-	threads.reserve(NumericCast<idx_t>(bind.n));
-	JoinOutboundThreads<vector<std::thread>> join_threads {threads};
-	for (int32_t i = 0; i < bind.n; i++) {
-		threads.emplace_back([&db, &bind, &state, i, deadline]() {
-			QuackapiSetCurrentDeadline(deadline);
-			auto &row = state->rows[NumericCast<idx_t>(i)];
-			row.idx = i;
-			try {
-				auto res = QuackapiHttpFetch::Get(db, bind.url);
-				row.status = static_cast<int32_t>(res.status);
-				row.body = std::move(res.body);
-				row.error = std::move(res.request_error);
-			} catch (std::exception &ex) {
-				row.error = ex.what();
-			} catch (...) {
-				row.error = "unknown error during outbound HTTP request";
-			}
-		});
-	}
-	for (auto &t : threads) {
-		t.join();
-	}
 	return std::move(state);
 }
 
-void ParallelFetchExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+void ParallelFetchExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	context.BlockingInterruptCheck();
+	auto &bind = data_p.bind_data->Cast<ParallelFetchBindData>();
 	auto &state = data_p.global_state->Cast<ParallelFetchGlobalState>();
+	if (!state.scheduled) {
+		state.scheduled = true;
+		const auto deadline = OutboundDeadline(context);
+		vector<unique_ptr<AsyncTask>> tasks;
+		for (int32_t i = 0; i < bind.n; i++) {
+			auto db = context.db;
+			tasks.push_back(make_uniq<CallbackAsyncTask>([&state, &bind, db, i, deadline]() {
+				ScopedOutboundDeadline scoped(deadline);
+				auto &row = state.rows[NumericCast<idx_t>(i)];
+				row.idx = i;
+				try {
+					auto res = QuackapiHttpFetch::Get(*db, bind.url);
+					row.status = static_cast<int32_t>(res.status);
+					row.body = std::move(res.body);
+					row.error = std::move(res.request_error);
+				} catch (std::exception &ex) {
+					row.error = ex.what();
+				} catch (...) {
+					row.error = "unknown error during outbound HTTP request";
+				}
+			}));
+		}
+		auto pending = AsyncResult::FromTasks(std::move(tasks), TaskSchedulerType::ASYNC);
+		if (data_p.HandleBlocked(pending)) {
+			return;
+		}
+	}
+	context.BlockingInterruptCheck();
 	idx_t row = 0;
 	while (state.offset < state.rows.size() && row < STANDARD_VECTOR_SIZE) {
 		auto &r = state.rows[state.offset];
@@ -1221,6 +1475,7 @@ void ParallelFetchExec(ClientContext &, TableFunctionInput &data_p, DataChunk &o
 		state.offset++;
 	}
 	output.SetChildCardinality(row);
+	data_p.async_result = AsyncResult::FromChunk(output);
 }
 
 } // namespace
@@ -1254,22 +1509,7 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 
 	// Table form exposes named stall_ms := N (scalars have no named_parameters).
 	TableFunction fetch_tf(
-	    "quackapi_fetch", {LogicalType::VARCHAR},
-	    [](ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-		    auto &bind = data_p.bind_data->CastNoConst<FetchTableBindData>();
-		    if (bind.finished) {
-			    return;
-		    }
-		    ScopedOutboundDeadline scoped(context);
-		    auto result = QuackapiHttpFetch::Get(*context.db, bind.url, bind.headers, bind.stall_ms);
-		    auto value = ToValue(result);
-		    auto &children = StructValue::GetChildren(value);
-		    for (idx_t c = 0; c < children.size(); c++) {
-			    output.SetValue(c, 0, children[c]);
-		    }
-		    output.SetChildCardinality(1);
-		    bind.finished = true;
-	    },
+	    "quackapi_fetch", {LogicalType::VARCHAR}, AsyncReceiptExec,
 	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
 	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
 		    auto bind = make_uniq<FetchTableBindData>();
@@ -1285,12 +1525,19 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    if (stall_it != input.named_parameters.end() && !stall_it->second.IsNull()) {
 			    bind->stall_ms = stall_it->second.GetValue<int32_t>();
 		    }
-		    auto result_type = FetchResultType();
-		    for (auto &child : StructType::GetChildTypes(result_type)) {
-			    names.push_back(child.first);
-			    return_types.push_back(child.second);
-		    }
+		    ReceiptColumns(return_types, names);
 		    return std::move(bind);
+	    },
+	    [](ClientContext &context, TableFunctionInitInput &input) -> unique_ptr<GlobalTableFunctionState> {
+		    auto &bind = input.bind_data->Cast<FetchTableBindData>();
+		    auto state = make_uniq<FetchTableGlobalState>();
+		    const auto deadline = OutboundDeadline(context);
+		    auto db = context.db;
+		    state->perform = [&bind, db, deadline]() {
+			    ScopedOutboundDeadline scoped(deadline);
+			    return QuackapiHttpFetch::Get(*db, bind.url, bind.headers, bind.stall_ms);
+		    };
+		    return std::move(state);
 	    });
 	AddNamedParameter(fetch_tf, "headers", header_type);
 	AddNamedParameter(fetch_tf, "stall_ms", LogicalType::INTEGER);
@@ -1314,10 +1561,84 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	post_set.AddFunction(post4);
 	RegisterFallible(loader, post_set);
 
+	// Table forms yield the SQL pipeline while DuckDB's async pool performs the
+	// request. Scalar overloads keep their existing receipt and row-alignment contract.
+	TableFunction post_tf(
+	    "quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR}, AsyncReceiptExec,
+	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
+		    if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+			    throw InvalidInputException("quackapi_post table arguments must be non-NULL");
+		    }
+		    auto bind = make_uniq<FetchTableBindData>();
+		    bind->url = input.inputs[0].GetValue<string>();
+		    bind->body = input.inputs[1].GetValue<string>();
+		    auto content_type = input.named_parameters.find("content_type");
+		    if (content_type != input.named_parameters.end() && !content_type->second.IsNull()) {
+			    bind->content_type = content_type->second.GetValue<string>();
+		    }
+		    auto headers = input.named_parameters.find("headers");
+		    if (headers != input.named_parameters.end() && !headers->second.IsNull()) {
+			    bind->headers = HeadersFromValue(headers->second);
+		    }
+		    ReceiptColumns(types, names);
+		    return std::move(bind);
+	    },
+	    [](ClientContext &context, TableFunctionInitInput &input) -> unique_ptr<GlobalTableFunctionState> {
+		    auto &bind = input.bind_data->Cast<FetchTableBindData>();
+		    auto state = make_uniq<FetchTableGlobalState>();
+		    const auto deadline = OutboundDeadline(context);
+		    auto db = context.db;
+		    state->perform = [&bind, db, deadline]() {
+			    ScopedOutboundDeadline scoped(deadline);
+			    return QuackapiHttpFetch::Post(*db, bind.url, bind.body, bind.content_type, bind.headers);
+		    };
+		    return std::move(state);
+	    });
+	AddNamedParameter(post_tf, "headers", header_type);
+	AddNamedParameter(post_tf, "content_type", LogicalType::VARCHAR);
+	loader.RegisterFunction(post_tf);
+
 	// Same receipt as quackapi_post to an exec route; volatile for the same reason.
 	ScalarFunction exec("quackapi_exec", {LogicalType::VARCHAR}, result_type, ExecScalar);
 	exec.SetVolatile();
 	RegisterFallible(loader, exec);
+
+	TableFunction exec_tf(
+	    "quackapi_exec", {LogicalType::VARCHAR}, AsyncReceiptExec,
+	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
+		    if (input.inputs[0].IsNull()) {
+			    throw InvalidInputException("quackapi_exec table argument must be non-NULL");
+		    }
+		    auto bind = make_uniq<ExecTableBindData>();
+		    bind->sql = input.inputs[0].GetValue<string>();
+		    ReceiptColumns(types, names);
+		    return std::move(bind);
+	    },
+	    [](ClientContext &context, TableFunctionInitInput &input) -> unique_ptr<GlobalTableFunctionState> {
+		    auto &bind = input.bind_data->Cast<ExecTableBindData>();
+		    auto state = make_uniq<FetchTableGlobalState>();
+		    auto call = NewExecCall(context, 1);
+		    call->sqls[0] = bind.sql;
+		    auto &registry = QuackapiState::Get(*context.db);
+		    const bool denied =
+		        !registry.SnapshotRowAccessBindings().empty() || !registry.SnapshotMaskingBindings().empty();
+		    auto operation = std::make_shared<ExecOperation>(*call, 0, &context);
+		    state->step = [call, operation, denied](QuackapiHttpFetchResult &receipt) {
+			    if (denied) {
+				    receipt = ExecReceipt(QuackapiExecPolicyDeniedResponse());
+				    return true;
+			    }
+			    if (!operation->Step()) {
+				    return false;
+			    }
+			    receipt = std::move(call->out[0]);
+			    return true;
+		    };
+		    return std::move(state);
+	    });
+	loader.RegisterFunction(exec_tf);
 
 	loader.RegisterFunction(TableFunction("quackapi_http_pool", {}, PoolExec, PoolBind, PoolInit));
 

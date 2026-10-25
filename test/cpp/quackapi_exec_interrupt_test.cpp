@@ -123,6 +123,47 @@ int main() {
 			return 1;
 		}
 	}
+	{
+		duckdb::weak_ptr<duckdb::DatabaseInstance> weak_database;
+		long long caller_ms = 0;
+		{
+			duckdb::DuckDB database(nullptr);
+			weak_database = database.instance;
+			duckdb::Connection connection(database);
+			Run(connection, "LOAD quackapi");
+			Run(connection, "SET threads = 1");
+			Run(connection, "SET async_threads = 2");
+			Run(connection, "SET quackapi_query_timeout_ms = 20000");
+			caller_ms = InterruptAfter300Ms(
+			    connection, "SELECT * FROM quackapi_exec('SELECT sum(range) FROM range(100000000000)')");
+		}
+		printf("5. native table caller returned %lld ms after the interrupt\n", caller_ms);
+		if (caller_ms > 2000 || WaitForRelease(weak_database, 5000) < 0) {
+			fprintf(stderr, "5. FAILED: native table cancellation did not drain its submitted query\n");
+			return 1;
+		}
+	}
+	{
+		duckdb::DuckDB database(nullptr);
+		duckdb::Connection connection(database);
+		Run(connection, "LOAD quackapi");
+		Run(connection, "SET threads = 4");
+		Run(connection, "SET quackapi_query_timeout_ms = 2000");
+		Run(connection, "SET max_execution_time = 100");
+		for (const auto &sql : {"SELECT quackapi_exec('SELECT sum(range) FROM range(100000000000)')",
+		                        "SELECT * FROM quackapi_exec('SELECT sum(range) FROM range(100000000000)')"}) {
+			const auto start = clock_type::now();
+			auto result = connection.Query(sql);
+			const auto elapsed_ms = MillisSince(start);
+			printf("6. native engine deadline returned in %lld ms\n", elapsed_ms);
+			if (!result->HasError() || result->GetError().find("maximum execution time") == std::string::npos ||
+			    elapsed_ms > 1000) {
+				fprintf(stderr, "6. FAILED: nested execution did not inherit max_execution_time: %s\n",
+				        result->HasError() ? result->GetError().c_str() : "successful result");
+				return 1;
+			}
+		}
+	}
 	// Cases 3 and 4 both report before the test fails, so one run shows each.
 	int failures = 0;
 	{

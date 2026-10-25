@@ -296,6 +296,10 @@ string ValueToJson(const Value &value) {
 	}
 	auto &type = value.type();
 	switch (type.id()) {
+	case LogicalTypeId::VARIANT:
+		// DuckDB owns the VARIANT representation. Unwrap it to native Values so
+		// nested objects, lists, scalars and variant null retain their JSON types.
+		return ValueToJson(VariantValue::GetValue(value));
 	case LogicalTypeId::BOOLEAN:
 		return value.GetValue<bool>() ? "true" : "false";
 	case LogicalTypeId::TINYINT:
@@ -1739,7 +1743,7 @@ string SerializeRowsArrow(Connection &con, const vector<string> &names, const ve
 					    row, source_col < rows[offset + row].size() ? rows[offset + row][source_col] : Value());
 				}
 			}
-			input.SetCardinality(batch_size);
+			input.SetChildCardinality(batch_size);
 
 			ArrowArray array;
 			array.Init();
@@ -1871,28 +1875,17 @@ QuackapiExecResponse QuackapiExecPolicyDeniedResponse() {
 	return ExecJsonResponse(403, "{\"detail\":\"Policy denies unauthenticated access\"}");
 }
 
-static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, idx_t max_response_bytes,
-                                            const QuackapiQueryDeadline &deadline, const string &loc,
-                                            const string &param, const std::function<bool()> &cancelled) {
+QuackapiExecResponse QuackapiExecErrorResponse(const string &error) {
+	return ExecJsonResponse(422, ValidationErrorJson("body", "sql", error, "value_error"));
+}
+
+QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_bytes) {
 	QuackapiExecResponse out;
 	auto set_json = [&out](int status, string body) {
 		out = ExecJsonResponse(status, std::move(body));
 	};
 	try {
-		unique_ptr<QueryResult> result;
-		string error;
-		auto stop = [&]() {
-			return deadline.Expired() || (cancelled && cancelled());
-		};
-		if (!ExecuteRequestSql(con, sql, result, error, stop)) {
-			if (deadline.Expired()) {
-				out = QuackapiExecTimeoutResponse();
-			} else {
-				set_json(422, ValidationErrorJson(loc, param, error, "value_error"));
-			}
-			return out;
-		}
-		auto names = QuackapiNames(result->GetNames());
+		auto names = QuackapiNames(result.GetNames());
 		vector<idx_t> data_cols;
 		idx_t location_col = names.size();
 		idx_t set_cookie_col = names.size();
@@ -1909,7 +1902,7 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 		vector<vector<Value>> rows;
 		idx_t response_value_bytes = 0;
 		while (true) {
-			auto chunk = result->Fetch();
+			auto chunk = result.Fetch();
 			if (!chunk || chunk->size() == 0) {
 				break;
 			}
@@ -1930,6 +1923,9 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 		if (data_cols.empty() && location_col == names.size() && set_cookie_col == names.size()) {
 			// A final SET / PRAGMA / BEGIN has no columns: the exec route answers [].
 			set_json(200, "[]");
+			if (out.body.size() > max_response_bytes) {
+				return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+			}
 			return out;
 		}
 		vector<string> data_names;
@@ -1967,7 +1963,30 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
 		set_json(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
 	}
+	if (out.body.size() > max_response_bytes) {
+		return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+	}
 	return out;
+}
+
+static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, idx_t max_response_bytes,
+                                            const QuackapiQueryDeadline &deadline, const string &loc,
+                                            const string &param, const std::function<bool()> &cancelled) {
+	unique_ptr<QueryResult> result;
+	string error;
+	auto stop = [&]() {
+		return deadline.Expired() || (cancelled && cancelled());
+	};
+	try {
+		if (!ExecuteRequestSql(con, sql, result, error, stop)) {
+			return deadline.Expired() ? QuackapiExecTimeoutResponse()
+			                          : ExecJsonResponse(422, ValidationErrorJson(loc, param, error, "value_error"));
+		}
+		return QuackapiExecResult(*result, max_response_bytes);
+	} catch (std::exception &ex) {
+		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
+		return ExecJsonResponse(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
+	}
 }
 
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
