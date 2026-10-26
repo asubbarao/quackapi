@@ -18,6 +18,9 @@ namespace quackapi_httplib {
 class Server;
 struct Request;
 struct Response;
+namespace ws {
+class WebSocket;
+} // namespace ws
 } // namespace quackapi_httplib
 
 namespace duckdb {
@@ -315,6 +318,12 @@ public:
 private:
 	static void ListenThread(QuackapiHttpServer *server);
 	void HandleRequest(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
+	//! Before a WebSocket upgrade: match a WS stream, check policy/Origin and bind
+	//! its parameters. Returns true after answering 4xx over HTTP instead.
+	bool RejectWebSocket(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
+	//! After the upgrade: run the stream's SELECT and send each row as a text frame.
+	void HandleWebSocket(const quackapi_httplib::Request &req, quackapi_httplib::ws::WebSocket &ws);
+	bool OriginAllowed(const quackapi_httplib::Request &req) const;
 	void ApplyCorsHeaders(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
 	string NextRequestId(DatabaseInstance &db);
 	void EmitAccessLog(const QuackapiRequestRecord &entry);

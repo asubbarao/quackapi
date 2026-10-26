@@ -462,13 +462,15 @@ FROM quackapi_dequeue('emails', 10);
 
 Worker = compose community `cronjob` (or a drain route). See [`docs/QUEUE.md`](docs/QUEUE.md).
 
-### SSE streams
+### SSE and WebSocket streams
 
 ```sql
 CREATE STREAM ticks GET '/events' AS SELECT …;   -- text/event-stream
--- WebSocket methods are rejected (bundled httplib has no Upgrade API)
+CREATE STREAM chat WS '/chat' AS SELECT upper($message) AS said;   -- one JSON frame per row
 SELECT * FROM quackapi_streams();
 ```
+
+See [`docs/guide/stream.md`](docs/guide/stream.md).
 
 ### Row-access & masking policies
 
@@ -627,7 +629,8 @@ C++17 by the repository CMake configuration.
 - **Serve memory limit:** `quackapi_serve` sets no `memory_limit` of its own;
   the database keeps DuckDB's default (80% of RAM) unless you pass
   `memory_limit := '…'`, `SET quackapi_memory_limit`, or `SET memory_limit`.
-- **No WebSocket routes** on the HTTP transport (SSE via `CREATE STREAM` only).
+- **WebSockets are streams, not routes:** `CREATE STREAM … WS` pushes rows or
+  answers each client message; there is no `REQUIRE` auth or middleware on them yet.
 - **`CREATE API FOR TABLE`** scaffolds **GET list + GET by key** only.
 - **JWT:** HS256 only (`ALGORITHM HS256`); no RS256 / OIDC discovery yet.
 - **Not a general multi-tenant SaaS framework:** policies are claims-keyed

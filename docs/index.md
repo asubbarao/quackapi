@@ -215,7 +215,7 @@ amd64. wasm, Windows MinGW/rtools, and Windows arm64 are excluded.
 - **Single-writer DuckDB** — fine for many concurrent readers and light writes; not a pooled OLTP app tier.
 - **JWT** — HS256 only today (no RS256 / OIDC browser flow yet).
 - **`CREATE API FOR TABLE`** — read routes only (list + get by key).
-- **WebSocket** — not supported on the HTTP transport; use [SSE streams](guide/stream.md).
+- **WebSocket** — a stream, not a route: [`CREATE STREAM … WS`](guide/stream.md#websocket).
 - **Response gzip / zstd** — [compression guide](guide/compression.md).
 - Registry (routes, auth, groups, queues, streams) lives on the **database instance**. Re-run DDL after reopen. Queue **jobs** (`quackapi_jobs`) are normal tables and survive restart.
 

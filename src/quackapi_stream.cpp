@@ -17,6 +17,14 @@ namespace duckdb {
 
 namespace {
 
+QuackapiStreamTransport StreamTransportForMethod(const string &method) {
+	return method == "WS" ? QuackapiStreamTransport::WS : QuackapiStreamTransport::SSE;
+}
+
+const char *StreamTransportName(QuackapiStreamTransport transport) {
+	return transport == QuackapiStreamTransport::WS ? "WS" : "SSE";
+}
+
 //! Parse duration to milliseconds: 30 | '30' | '30s' | '500ms' | '1m' | '1h'
 bool ParseIntervalMs(const string &raw, int64_t &out_ms, string &err) {
 	auto s = QuackapiTrim(raw);
@@ -96,7 +104,7 @@ struct StreamDdlParseData : public ParserExtensionParseData {
 };
 
 //! Grammar:
-//!   CREATE [OR REPLACE] STREAM <name> GET '<path>'
+//!   CREATE [OR REPLACE] STREAM <name> GET | WS '<path>'
 //!     [WITH (interval='1s'|1000)]
 //!     AS <select>
 //!   DROP STREAM <name>
@@ -128,7 +136,7 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 	// <name> <METHOD>
 	auto first_space = rest.find(' ');
 	if (first_space == string::npos) {
-		return ParserExtensionParseResult("CREATE STREAM <name> GET '<path>' AS <select>");
+		return ParserExtensionParseResult("CREATE STREAM <name> GET | WS '<path>' AS <select>");
 	}
 	auto name = rest.substr(0, first_space);
 	for (char c : name) {
@@ -139,24 +147,25 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 	rest = QuackapiTrim(rest.substr(first_space));
 	auto second_space = rest.find(' ');
 	if (second_space == string::npos) {
-		return ParserExtensionParseResult("Expected GET '<path>' after stream name");
+		return ParserExtensionParseResult("Expected GET or WS '<path>' after stream name");
 	}
 	auto method = StringUtil::Upper(rest.substr(0, second_space));
-	if (method == "WS" || method == "WEBSOCKET" || method == "WSS") {
-		return ParserExtensionParseResult(
-		    "CREATE STREAM WebSocket is not supported: bundled cpp-httplib has no WebSocket/Upgrade API. "
-		    "Use CREATE STREAM <name> GET '<path>' for Server-Sent Events (text/event-stream). "
-		    "Bidirectional duplex belongs on the quack protocol, not HTTP Upgrade.");
+	if (method == "WEBSOCKET") {
+		method = "WS";
 	}
-	if (method != "GET") {
-		return ParserExtensionParseResult("CREATE STREAM only supports GET (SSE). Unknown method \"" + method +
-		                                  "\" — WebSocket is deferred (no WS on httplib transport)");
+	if (method == "WSS") {
+		return ParserExtensionParseResult("Use WS: wss:// is TLS in front of the same WebSocket stream");
+	}
+	if (method != "GET" && method != "WS") {
+		return ParserExtensionParseResult("CREATE STREAM supports GET (Server-Sent Events) or WS (WebSocket). "
+		                                  "Unknown method \"" +
+		                                  method + "\"");
 	}
 	rest = QuackapiTrim(rest.substr(second_space));
 
 	// '<path>'
 	if (rest.empty() || rest[0] != '\'') {
-		return ParserExtensionParseResult("Expected quoted '<path>' after GET");
+		return ParserExtensionParseResult("Expected quoted '<path>' after " + method);
 	}
 	auto path_end = rest.find('\'', 1);
 	if (path_end == string::npos) {
@@ -171,10 +180,10 @@ ParserExtensionParseResult StreamDdlParse(ParserExtensionInfo *, const string &q
 
 	QuackapiStream stream;
 	stream.name = name;
-	stream.method = "GET";
+	stream.method = method;
 	stream.pattern = pattern;
 	stream.interval_ms = 0;
-	stream.transport = QuackapiStreamTransport::SSE;
+	stream.transport = StreamTransportForMethod(method);
 
 	// optional WITH ( interval=... )
 	if (StringUtil::StartsWith(rest_upper, "WITH") &&
@@ -295,7 +304,7 @@ unique_ptr<FunctionData> ApplyStreamBind(ClientContext &, TableFunctionBindInput
 	bind_data->stream.pattern = input.inputs[4].GetValue<string>();
 	bind_data->stream.handler_sql = input.inputs[5].GetValue<string>();
 	bind_data->stream.interval_ms = input.inputs[6].GetValue<int64_t>();
-	bind_data->stream.transport = QuackapiStreamTransport::SSE;
+	bind_data->stream.transport = StreamTransportForMethod(bind_data->stream.method);
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
 }
@@ -317,11 +326,13 @@ void ApplyStreamExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 			}
 		}
 		state.AddStream(bind_data.stream, bind_data.or_replace);
-		if (bind_data.stream.interval_ms > 0) {
-			message = StringUtil::Format("Stream %s: GET %s SSE interval=%lldms", bind_data.stream.name,
-			                             bind_data.stream.pattern, (long long)bind_data.stream.interval_ms);
+		auto &s = bind_data.stream;
+		if (s.interval_ms > 0) {
+			message = StringUtil::Format("Stream %s: %s %s %s interval=%lldms", s.name, s.method, s.pattern,
+			                             StreamTransportName(s.transport), (long long)s.interval_ms);
 		} else {
-			message = StringUtil::Format("Stream %s: GET %s SSE", bind_data.stream.name, bind_data.stream.pattern);
+			message = StringUtil::Format("Stream %s: %s %s %s", s.name, s.method, s.pattern,
+			                             StreamTransportName(s.transport));
 		}
 	} else {
 		if (state.DropStream(bind_data.stream.name)) {
@@ -398,7 +409,7 @@ void StreamsExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output)
 		output.SetValue(0, row, Value(s.name));
 		output.SetValue(1, row, Value(s.method));
 		output.SetValue(2, row, Value(s.pattern));
-		output.SetValue(3, row, Value("sse"));
+		output.SetValue(3, row, Value(StringUtil::Lower(StreamTransportName(s.transport))));
 		output.SetValue(4, row, Value::BIGINT(s.interval_ms));
 		output.SetValue(5, row, Value(s.handler_sql));
 		row++;

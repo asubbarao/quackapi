@@ -207,18 +207,18 @@ struct QuackapiMaskingBinding {
 	string policy_name;
 };
 
-//! Transport for CREATE STREAM. SSE is first-class on cpp-httplib; WebSocket is
-//! not available on the bundled httplib (no Upgrade/WS API) — WS is rejected at DDL.
+//! Transport for CREATE STREAM: SSE (GET, text/event-stream) or WebSocket (WS).
 enum class QuackapiStreamTransport : uint8_t {
 	SSE = 0,
+	WS = 1,
 };
 
-//! One SSE push stream registered via CREATE STREAM.
-//! Emits text/event-stream (one event per row). Optional interval re-runs the
-//! SELECT for polling/tailing — no separate thread pool (blocks the httplib worker).
+//! One push stream registered via CREATE STREAM. Each result row is one SSE
+//! event or one WebSocket text frame. Optional interval re-runs the SELECT for
+//! polling/tailing — no separate thread pool (blocks the httplib worker).
 struct QuackapiStream {
 	string name;
-	string method = "GET"; // SSE is GET; WS deferred
+	string method = "GET"; // GET for SSE, WS for WebSocket
 	string pattern;        // e.g. /events
 	string handler_sql;    // AS <select>; named params bind like routes
 	//! 0 = run SELECT once and close the stream. >0 = re-run after each empty/full cycle.

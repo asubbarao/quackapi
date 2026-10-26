@@ -54,12 +54,12 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# The HTTP *server* uses the VENDORED copy in third_party/httplib (patched — see
-# the header of that file for the RFC 7230 §3.3.3 empty-body fix). BEFORE:
-# duckdb's global include_directories already list duckdb/third_party/httplib;
-# prepend ours so #include "httplib.hpp" resolves the patched vendored header.
-# Outbound HTTP uses DuckDB's HTTPUtil (core) and is upgraded at runtime by LOAD
-# curl_httpfs / LOAD httpfs — quackapi does NOT link libcurl.
+# The HTTP *server* uses the VENDORED copy in third_party/httplib (patched — the
+# header of that file lists quackapi's changes). BEFORE: duckdb's global
+# include_directories already list duckdb/third_party/httplib; prepend ours so
+# #include "httplib.hpp" resolves the patched vendored header. Outbound HTTP
+# uses DuckDB's HTTPUtil (core) and is upgraded at runtime by LOAD curl_httpfs /
+# LOAD httpfs — quackapi does NOT link libcurl.
 target_include_directories(
   ${EXTENSION_NAME} BEFORE
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib)

@@ -80,7 +80,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 | **ReDoc** | `GET /redoc` | `test/http/redoc.test.sh`, case `redoc_get` | `/redoc` |
 | **Queue** enqueue/dequeue/ack/nack | `quackapi_enqueue` / `_dequeue` / `_ack` / `_nack`, `quackapi_jobs` | queue SQL + HTTP tests | BackgroundTasks + broker |
 | **SSE stream** | `CREATE STREAM … GET '/path' AS <select>` | stream SQL + HTTP | `StreamingResponse` / SSE |
-| **WebSocket** | **not built** — DDL errors with explicit httplib message | stream tests document reject | `WebSocket` |
+| **WebSocket** | **built** — `CREATE STREAM … WS` (push rows, or reply per `$message`) | `quackapi_stream.test`, `test/cpp/quackapi_websocket_test.cpp` | `WebSocket` |
 | **Row access + masking policies** | CREATE … POLICY + ALTER TABLE bind | policy SQL + HTTP | — (DB-native leapfrog) |
 | Quack RPC auth bridge | `quackapi_authentication` / `quackapi_authorization` | `quackapi_quack_bridge.test` | N/A (DuckDB quack sibling) |
 | Security / key hashing | auth + security tests | `quackapi_security.test` | secret storage patterns |
@@ -179,7 +179,6 @@ These are **not** counted against the 100% harness score; they are product/roadm
 
 | Gap | Notes | Cite |
 |-----|-------|------|
-| **WebSocket Upgrade** | Bundled cpp-httplib has no WS; use SSE + compose `radio` bus | stream reject string; catalog `radio` |
 | **OIDC / OAuth2 SSO** browser code flow | JWT/API_KEY only; compose `quack_oauth` / `jwt` for resource-server patterns | `/tmp/quackapi_spec_oidc/SPEC.md` |
 | **Signed cookie sessions + CSRF** | not built | `/tmp/quackapi_spec_sessions/SPEC.md` |
 | **Middleware BEFORE/AFTER SQL** | **shipped** — `CREATE MIDDLEWARE` around ordinary routes and `quackapi_request` | `docs/MIDDLEWARE.md`, middleware tests |
@@ -284,7 +283,7 @@ now shipped, while the remaining rows are partial or not built.
 | 17 | `spec_static_files` | `static_prefix` + file/blob download + disposition | **S** | THIN-GLUE; httplib mount/ranges exist | **Partial** — `static_dir` only |
 | 18 | `spec_streaming` | Chunked NDJSON/SSE + cancel on disconnect | **M** | THIN-GLUE ContentProvider + Interrupt | **Partial** — **`CREATE STREAM` SSE**; full NDJSON STREAM clause / cancel polish open |
 | 19 | `spec_test_client` | `quackapi_request(…)` in-process TF | **S** | THIN-GLUE extract HandleRequest | **Yes** |
-| 20 | `spec_websocket_sse` | Browser WS vs SSE+radio push | **M** (S if SSE-only docs) | SSE THIN-GLUE; **WS SKIP-BLOAT** on httplib; **HAVE-EXT(`radio`)** for bus | **Partial** — SSE built; **WS blocked on transport** |
+| 20 | `spec_websocket_sse` | Browser WS vs SSE+radio push | **M** (S if SSE-only docs) | SSE THIN-GLUE; **WS SKIP-BLOAT** on httplib; **HAVE-EXT(`radio`)** for bus | **Built** — SSE and WS streams |
 
 ### Ext adoption notes (composition, not new nouns)
 
@@ -350,7 +349,6 @@ The current built set declared by the repository's community descriptor includes
 
 | Item | Blocker | Escape hatch |
 |------|---------|--------------|
-| **WebSocket Upgrade** (browser RFC6455 server) | cpp-httplib **no** WebSocket/Upgrade API | **SSE** (`CREATE STREAM`) + **`radio`** for push bus; duplex RPC → **quack** protocol, not DIY WS |
 | Full Arrow Flight **server** inside quackapi | airport/adbc are **clients** | External Flight server; quackapi stays HTTP+JSON/IPC-blob |
 
 ---

@@ -261,7 +261,7 @@ CREATE QUEUE emails WITH (max_attempts=5, visibility_timeout='30s');
 ## 7. CREATE STREAM
 
 ```sql
-CREATE [OR REPLACE] STREAM <name> GET '<path>'
+CREATE [OR REPLACE] STREAM <name> GET | WS '<path>'
   [WITH (interval='1s'|2|'250ms')]
   AS <select>;
 
@@ -270,10 +270,10 @@ DROP STREAM <name>;
 
 | Rule | Detail |
 |------|--------|
-| Method | **GET only** (SSE) |
+| Method | **GET** (Server-Sent Events) or **WS** (WebSocket; `WEBSOCKET` is an alias). `WSS` is rejected: TLS is the client's scheme, not a different stream |
 | Path | Must start with `/` |
 | interval | Polling period for long-lived streams |
-| WS / WEBSOCKET / WSS | **Rejected** with an explicit error |
+| `$message` (WS) | A WS SELECT that uses it runs once per client message; without it the rows are pushed |
 
 **Example:**
 
