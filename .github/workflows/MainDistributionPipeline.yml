@@ -129,6 +129,11 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_exec_interrupt_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-exec-interrupt-test
           /tmp/quackapi-exec-interrupt-test
 
+      - name: Verify WebSocket streams
+        run: |
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include -isystem duckdb/third_party/re2 -Ithird_party/httplib test/cpp/quackapi_websocket_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-websocket-test
+          /tmp/quackapi-websocket-test
+
       - name: Verify benchmark correctness gates
         run: |
           python3 bench/test_bench_config.py

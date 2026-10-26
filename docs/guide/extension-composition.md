@@ -126,8 +126,8 @@ curl -N http://127.0.0.1:8000/ticks
 | Want | Reality |
 |------|---------|
 | Browser `EventSource` / SSE | **Yes** — `CREATE STREAM … GET` |
-| WebSocket Upgrade | **No** — bundled httplib has no Upgrade API; `CREATE STREAM … WS` errors |
-| Streams in `quackapi_routes()` | **No** — use `quackapi_streams()` (`transport` is always `'sse'` today) |
+| WebSocket Upgrade | **Yes** — `CREATE STREAM … WS` |
+| Streams in `quackapi_routes()` | **No** — use `quackapi_streams()` (`transport` is `'sse'` or `'ws'`) |
 | `REQUIRE` auth on streams | Not in the current version |
 
 A bus extension (e.g. community pub/sub) can feed the `SELECT` behind the stream
@@ -257,7 +257,6 @@ These are **out of scope** for quackapi composition stories and this guide:
 |----------|-----|
 | GraphQL | Not a quackapi transport; stay REST + SQL |
 | Asio / custom async server rewrite | Inbound remains httplib |
-| Browser WebSocket Upgrade | Use SSE (`CREATE STREAM … GET`) |
 | `WITH HISTORY` / time-travel as a product feature | Ordinary DuckDB time-travel if *you* enable it; not a quackapi API |
 
 Also not invented here: public `quackapi_fetch` / `quackapi_post` SQL TVFs.

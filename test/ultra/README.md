@@ -47,7 +47,7 @@ function signatures so a future run can compare the actual extension surface.
 | Operations | deterministic logs and machine-readable scorecard | equal worker/connection budgets and write accounting |
 
 WebSockets are intentionally a separate capability result. FastAPI documents
-WebSockets as a first-class Starlette transport, while QuackAPI's bundled
-transport exposes SSE and rejects WebSocket registration. That is a transport
-boundary to measure honestly, not a missing JSON-route test.
+WebSockets as a first-class Starlette transport; QuackAPI serves them as
+`CREATE STREAM … WS`, tested in `test/cpp/quackapi_websocket_test.cpp`, not as
+JSON routes in this matrix.
 

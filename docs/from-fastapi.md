@@ -113,7 +113,7 @@ curl http://127.0.0.1:8000/docs
 - **Routing + validation** → automated  
 - **Handler body** → SQL rewrite or keep a thin external worker and use [CREATE QUEUE](guide/queue.md) / HTTP clients from SQL  
 
-WebSocket handlers will not translate to HTTP Upgrade routes (use [SSE](guide/stream.md)).
+WebSocket handlers are not translated; write them as [`CREATE STREAM … WS`](guide/stream.md#websocket).
 
 ---
 

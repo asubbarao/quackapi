@@ -10,11 +10,40 @@ CREATE STREAM ticks GET '/ticks' AS SELECT i AS id, 'tick' AS msg FROM range(3) 
 ----
 Stream ticks: GET /ticks SSE
 
-# WebSocket method is rejected (httplib has no WS server)
-statement error
-CREATE STREAM chat WS '/ws' AS SELECT 1;
+# WebSocket streams register like SSE ones (frames are tested in test/cpp/quackapi_websocket_test.cpp)
+query I
+CREATE STREAM chat WS '/ws' AS SELECT upper($message) AS reply;
 ----
-WebSocket is not supported
+Stream chat: WS /ws WS
+
+query I
+CREATE STREAM feed WEBSOCKET '/feed' WITH (interval='250ms') AS SELECT 1 AS n;
+----
+Stream feed: WS /feed WS interval=250ms
+
+query IIII
+SELECT name, method, transport, interval_ms FROM quackapi_streams() ORDER BY name;
+----
+chat	WS	ws	0
+feed	WS	ws	250
+ticks	GET	sse	0
+
+# wss:// is the client's TLS, not a different stream
+statement error
+CREATE STREAM secure WSS '/secure' AS SELECT 1;
+----
+Use WS
+
+statement error
+CREATE STREAM bad POST '/bad' AS SELECT 1;
+----
+GET (Server-Sent Events) or WS (WebSocket)
+
+# A plain HTTP request to a WS path asks for the upgrade
+query II
+SELECT status, headers['Upgrade'] FROM quackapi_request('GET', '/ws');
+----
+426	websocket
 
 # Path must start with /
 statement error
@@ -54,3 +83,13 @@ query I
 DROP STREAM ticks;
 ----
 Dropped stream ticks
+
+query I
+DROP STREAM chat;
+----
+Dropped stream chat
+
+query I
+DROP STREAM feed;
+----
+Dropped stream feed

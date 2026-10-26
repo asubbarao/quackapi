@@ -57,7 +57,7 @@ classes: MATCH 88, STRONGER 1, BUG 0
 | 422 `RequestValidationError` | same `{detail:[{loc,msg,type}]}` shape |
 | 405 + `Allow` | built-in |
 | trailing slash redirect | 307 (Starlette-style) |
-| WebSocket | **not built** — use SSE |
+| WebSocket | `CREATE STREAM … WS` — push rows or reply per `$message` |
 | OIDC / signed sessions + CSRF | not built — see [coming soon](guide/coming-soon.md) |
 
 ---

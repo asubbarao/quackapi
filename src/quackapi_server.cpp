@@ -61,6 +61,35 @@ namespace {
 thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
 thread_local quackapi_httplib::Stream *quackapi_tls_stream = nullptr;
 
+//! A WS stream bound before its upgrade. httplib runs the pre-routing handler
+//! and the WebSocket handler for one request on the same worker thread, so the
+//! prepared statement is handed between them here.
+struct QuackapiPendingWebSocket {
+	QuackapiStream stream;
+	shared_ptr<Connection> con;
+	unique_ptr<PreparedStatement> prepared;
+	identifier_map_t<BoundParameterData> named_values;
+	LogicalType message_type = LogicalType::UNKNOWN;
+	bool takes_message = false;
+	string request_id;
+	string trace_id, span_id, parent_span_id;
+	bool sampled = true;
+	std::chrono::steady_clock::time_point started;
+	int64_t received_at_micros = 0;
+	//! The server's open-session count, held from admission until the session ends.
+	std::atomic<idx_t> *session_count = nullptr;
+
+	QuackapiPendingWebSocket() = default;
+	QuackapiPendingWebSocket(const QuackapiPendingWebSocket &) = delete;
+	QuackapiPendingWebSocket &operator=(const QuackapiPendingWebSocket &) = delete;
+	~QuackapiPendingWebSocket() {
+		if (session_count) {
+			session_count->fetch_sub(1);
+		}
+	}
+};
+thread_local unique_ptr<QuackapiPendingWebSocket> quackapi_pending_ws;
+
 //! httplib Server subclass: stash the live Stream/socket for per-route IO timeouts.
 struct QuackapiHttplibServer : quackapi_httplib::Server {
 	bool process_and_close_socket(socket_t sock) override {
@@ -88,6 +117,8 @@ struct QuackapiHttplibServer : quackapi_httplib::Server {
 			                                                  write_timeout_usec_);
 			    quackapi_tls_stream = nullptr;
 			    quackapi_tls_sock = INVALID_SOCKET;
+			    // A handshake that failed after preparation leaves its connection here.
+			    quackapi_pending_ws.reset();
 			    return ok;
 		    });
 
@@ -1126,6 +1157,21 @@ struct StreamMatch {
 	vector<std::pair<string, string>> path_params;
 };
 
+//! One result row as a JSON object: an SSE event's data, or one WebSocket frame.
+string RowJsonObject(const vector<string> &names, const vector<Value> &cols) {
+	string json = "{";
+	bool first = true;
+	for (idx_t c = 0; c < names.size() && c < cols.size(); c++) {
+		if (!first) {
+			json += ",";
+		}
+		first = false;
+		json += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
+	}
+	json += "}";
+	return json;
+}
+
 //! Format one SSE event from a result row. Includes `id:` when a column named
 //! `id` (case-insensitive) is present and non-null.
 string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
@@ -1142,16 +1188,7 @@ string FormatSseEvent(const vector<string> &names, const vector<Value> &cols) {
 		event += cols[id_col].ToString();
 		event += "\n";
 	}
-	event += "data: {";
-	bool first = true;
-	for (idx_t c = 0; c < names.size() && c < cols.size(); c++) {
-		if (!first) {
-			event += ",";
-		}
-		first = false;
-		event += "\"" + QuackapiJsonEscape(names[c]) + "\":" + ValueToJson(cols[c]);
-	}
-	event += "}\n\n";
+	event += "data: " + RowJsonObject(names, cols) + "\n\n";
 	return event;
 }
 
@@ -1846,6 +1883,56 @@ bool IsPathParam(const string &pattern, const string &param_name) {
 		}
 	}
 	return false;
+}
+
+//! Bind a stream handler's named parameters from the request values. A parameter
+//! named in `optional` binds NULL when absent. On failure fills a 422 body.
+bool BindStreamParams(PreparedStatement &prepared, const string &pattern,
+                      const case_insensitive_map_t<string> &provided, const vector<string> &optional,
+                      identifier_map_t<BoundParameterData> &named_values, string &err_json) {
+	auto expected_types = prepared.GetExpectedParameterTypes();
+	for (auto &entry : prepared.GetNamedParameterMap()) {
+		auto &param_name = entry.first.GetIdentifierName();
+		auto type_it = expected_types.find(param_name);
+		LogicalType expected = LogicalType::UNKNOWN;
+		if (type_it != expected_types.end()) {
+			expected = type_it->second;
+		}
+		string loc = IsPathParam(pattern, param_name) ? "path" : "query";
+		auto it = provided.find(param_name);
+		if (it == provided.end()) {
+			if (std::find(optional.begin(), optional.end(), param_name) != optional.end()) {
+				named_values[Identifier(param_name)] = BoundParameterData(Value());
+				continue;
+			}
+			err_json = ValidationErrorJson(loc, param_name, "Field required", "missing");
+			return false;
+		}
+		BoundParameterData bound;
+		if (!BindParamValue(it->second, expected, loc, param_name, bound, err_json)) {
+			return false;
+		}
+		named_values[Identifier(param_name)] = bound;
+	}
+	return true;
+}
+
+//! Values a stream handler can bind: query, path captures and request identity.
+case_insensitive_map_t<string> StreamProvidedParams(const quackapi_httplib::Request &req,
+                                                    const vector<std::pair<string, string>> &path_params,
+                                                    const string &request_id, const string &trace_id,
+                                                    const string &span_id) {
+	case_insensitive_map_t<string> provided;
+	for (auto &kv : req.params) {
+		provided[kv.first] = kv.second;
+	}
+	for (auto &kv : path_params) {
+		provided[kv.first] = kv.second;
+	}
+	provided["request_id"] = request_id;
+	provided["trace_id"] = trace_id;
+	provided["span_id"] = span_id;
+	return provided;
 }
 
 bool MethodListContains(const vector<string> &list, const string &method) {
@@ -2588,8 +2675,10 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	int32_t workers =
 	    opts.worker_threads > 0 ? opts.worker_threads : static_cast<int32_t>(QUACKAPI_DEFAULT_WORKER_THREADS);
 	const auto max_pending = opts.max_pending_requests;
+	// A fixed pool: httplib would otherwise grow past worker_threads under load.
 	server->new_task_queue = [workers, max_pending] {
-		return new quackapi_httplib::ThreadPool(static_cast<size_t>(workers), static_cast<size_t>(max_pending));
+		return new quackapi_httplib::ThreadPool(static_cast<size_t>(workers), static_cast<size_t>(workers),
+		                                        static_cast<size_t>(max_pending));
 	};
 	server->set_keep_alive_max_count(opts.keep_alive_max_count > 0 ? static_cast<size_t>(opts.keep_alive_max_count)
 	                                                               : QUACKAPI_DEFAULT_KEEP_ALIVE_MAX);
@@ -2617,6 +2706,18 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	// Automatic HEAD-for-GET is handled inside HandleRequest.
 	// OPTIONS: CORS preflight + Allow listing for registered paths.
 	server->Options(".*", handler);
+	// WebSocket upgrades: httplib runs the pre-routing handler before switching
+	// protocols, so an upgrade with no WS stream, a denied policy or a bad
+	// parameter is answered over HTTP instead.
+	server->set_pre_routing_handler([this](const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
+		return RejectWebSocket(req, res) ? quackapi_httplib::Server::HandlerResponse::Handled
+		                                 : quackapi_httplib::Server::HandlerResponse::Unhandled;
+	});
+	server->WebSocket(".*", [this](const quackapi_httplib::Request &req, quackapi_httplib::ws::WebSocket &ws) {
+		HandleWebSocket(req, ws);
+	});
+	// Each session holds a worker for its lifetime; keep half of them for HTTP.
+	websocket_session_limit = MaxValue<idx_t>(1, static_cast<idx_t>(workers) / 2);
 
 	if (!server->is_valid()) {
 		throw IOException("quackapi: failed to instantiate HTTP server for %s:%d", host, port);
@@ -3215,6 +3316,254 @@ static string RateLimitClientKey(DatabaseInstance &db, const quackapi_httplib::R
 	return "ip:" + ip;
 }
 
+//! A browser's Origin must be allowed by cors_origins or be this server itself:
+//! browsers apply no CORS to WebSockets, so any page could otherwise read a stream.
+bool QuackapiHttpServer::OriginAllowed(const quackapi_httplib::Request &req) const {
+	auto origin = req.get_header_value("Origin");
+	if (origin.empty() || cors_origins == "*") {
+		return true;
+	}
+	for (auto &part : StringUtil::Split(cors_origins, ',')) {
+		if (QuackapiTrim(part) == origin) {
+			return true;
+		}
+	}
+	auto host_header = req.get_header_value("Host");
+	return !host_header.empty() && (origin == "http://" + host_header || origin == "https://" + host_header);
+}
+
+bool QuackapiHttpServer::RejectWebSocket(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
+	quackapi_pending_ws.reset();
+	if (!quackapi_httplib::detail::is_websocket_upgrade(req)) {
+		return false;
+	}
+	auto pending = make_uniq<QuackapiPendingWebSocket>();
+	pending->started = std::chrono::steady_clock::now();
+	pending->received_at_micros = Timestamp::GetCurrentTimestamp().value;
+	MakeTraceContext(req.get_header_value("traceparent"), pending->trace_id, pending->span_id, pending->parent_span_id,
+	                 pending->sampled);
+	auto reject = [&](int status, const string &body) {
+		if (status > 0) {
+			SetJson(res, status, body);
+		}
+		if (!pending->request_id.empty()) {
+			res.set_header("X-Request-ID", pending->request_id);
+		}
+		auto latency_ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pending->started).count();
+		EmitAccessLog(MakeRequestRecord(req, res, pending->request_id.empty() ? string("-") : pending->request_id,
+		                                pending->stream.name, pending->stream.pattern, latency_ms,
+		                                pending->received_at_micros, -1, -1, -1, pending->trace_id, pending->span_id,
+		                                pending->parent_span_id, pending->sampled, options));
+		return true;
+	};
+
+	auto db = db_ptr.lock();
+	if (!db) {
+		return reject(503, "{\"detail\":\"database shutting down\"}");
+	}
+	pending->request_id = SanitizeClientRequestId(req.get_header_value("X-Request-ID"));
+	if (pending->request_id.empty()) {
+		pending->request_id = NextRequestId(*db);
+	}
+
+	vector<std::pair<string, string>> path_params;
+	bool matched = false;
+	for (auto &stream : *QuackapiState::Get(*db).LiveStreams()) {
+		if (stream.transport == QuackapiStreamTransport::WS && MatchPattern(stream.pattern, req.path, path_params)) {
+			pending->stream = stream;
+			matched = true;
+			break;
+		}
+		path_params.clear();
+	}
+	if (!matched) {
+		return reject(404, "{\"detail\":\"Not Found\"}");
+	}
+	if (!OriginAllowed(req)) {
+		return reject(403, "{\"detail\":\"Origin not allowed\"}");
+	}
+	if (websocket_sessions.fetch_add(1) >= websocket_session_limit) {
+		websocket_sessions.fetch_sub(1);
+		return reject(503, "{\"detail\":\"Too many open WebSocket sessions\"}");
+	}
+	pending->session_count = &websocket_sessions;
+
+	try {
+		bool policy_denied = false;
+		string policy_error;
+		auto sql = RewriteHandlerWithPolicies(*db, pending->stream.handler_sql, false, policy_denied, policy_error);
+		if (policy_denied || !policy_error.empty()) {
+			return reject(403, "{\"detail\":\"Policy denies unauthenticated access\"}");
+		}
+		pending->con = make_shared_ptr<Connection>(*db);
+		QuackapiQueryDeadline deadline(*pending->con, options.query_timeout_ms);
+		QuackapiSetServingBudget(*pending->con, options.query_timeout_ms, options.max_response_bytes);
+		pending->prepared = pending->con->Prepare(sql);
+		if (pending->prepared->HasError()) {
+			SetInternalError(res, pending->prepared->GetError());
+			return reject(0, string());
+		}
+		for (auto &entry : pending->prepared->GetNamedParameterMap()) {
+			pending->takes_message = pending->takes_message || entry.first.GetIdentifierName() == "message";
+		}
+		auto expected_types = pending->prepared->GetExpectedParameterTypes();
+		auto message_type = expected_types.find("message");
+		if (message_type != expected_types.end()) {
+			pending->message_type = message_type->second;
+		}
+		// $message is the client's text, bound per message once connected.
+		auto provided =
+		    StreamProvidedParams(req, path_params, pending->request_id, pending->trace_id, pending->span_id);
+		string err_json;
+		if (!BindStreamParams(*pending->prepared, pending->stream.pattern, provided, {"message"}, pending->named_values,
+		                      err_json)) {
+			return reject(422, err_json);
+		}
+	} catch (std::exception &ex) {
+		SetInternalError(res, ex.what());
+		return reject(0, string());
+	}
+	quackapi_pending_ws = std::move(pending);
+	return false;
+}
+
+//! A close reason is at most 123 bytes; cut on a UTF-8 boundary.
+static string WebSocketCloseReason(const string &message) {
+	idx_t end = MinValue<idx_t>(message.size(), 123);
+	while (end > 0 && end < message.size() && (static_cast<uint8_t>(message[end]) & 0xC0) == 0x80) {
+		end--;
+	}
+	return message.substr(0, end);
+}
+
+//! Push mode (no $message): run the SELECT, send each row, then close, or
+//! re-run every interval until the client leaves.
+//! Reply mode ($message in the SELECT): each client message runs it once.
+//! Reads poll every 100 ms, so the client's Close is answered while pushing and
+//! quackapi_stop ends the session.
+void QuackapiHttpServer::HandleWebSocket(const quackapi_httplib::Request &req, quackapi_httplib::ws::WebSocket &ws) {
+	using quackapi_httplib::ws::CloseStatus;
+	namespace qws = quackapi_httplib::ws;
+	auto pending = std::move(quackapi_pending_ws);
+	if (!pending) {
+		ws.close(CloseStatus::InternalError, "stream was not prepared");
+		return;
+	}
+	ws.set_read_timeout(0, 100000);
+	// httplib waits 300 s for the rest of a started frame; a client stalled mid-frame
+	// gets the serve read timeout instead, as an HTTP request would.
+	if (quackapi_tls_stream) {
+		quackapi_tls_stream->set_read_timeout(options.read_timeout_sec > 0
+		                                          ? static_cast<time_t>(options.read_timeout_sec)
+		                                          : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC,
+		                                      0);
+	}
+	int64_t rows_sent = 0;
+	idx_t bytes_sent = 0;
+	// False once the session is over (send failed, or the SELECT failed and closed it).
+	auto send_rows = [&]() -> bool {
+		try {
+			QuackapiQueryDeadline deadline(*pending->con, options.query_timeout_ms);
+			auto result = pending->prepared->Execute(pending->named_values);
+			if (result->HasError()) {
+				ws.close(CloseStatus::InternalError, WebSocketCloseReason(result->GetError()));
+				return false;
+			}
+			auto names = QuackapiNames(result->GetNames());
+			while (auto chunk = result->Fetch()) {
+				if (chunk->size() == 0) {
+					break;
+				}
+				for (idx_t row = 0; row < chunk->size(); row++) {
+					vector<Value> cols(chunk->ColumnCount());
+					for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+						cols[col] = chunk->GetValue(col, row);
+					}
+					auto frame = RowJsonObject(names, cols);
+					if (bytes_sent + frame.size() > static_cast<idx_t>(options.max_response_bytes)) {
+						ws.close(CloseStatus::MessageTooBig, "Response exceeds configured byte limit");
+						return false;
+					}
+					if (!ws.send(frame)) {
+						return false;
+					}
+					bytes_sent += frame.size();
+					rows_sent++;
+				}
+			}
+			return true;
+		} catch (std::exception &ex) {
+			ws.close(CloseStatus::InternalError, WebSocketCloseReason(ex.what()));
+			return false;
+		}
+	};
+
+	// The client's message as $message; false (after an error reply) when it does not bind.
+	auto bind_message = [&](const string &message) -> bool {
+		BoundParameterData bound;
+		string err_json;
+		try {
+			if (BindParamValue(message, pending->message_type, "body", "message", bound, err_json)) {
+				pending->named_values[Identifier("message")] = bound;
+				return true;
+			}
+		} catch (std::exception &ex) {
+			// e.g. a binary frame that is not UTF-8: httplib checks UTF-8 on text frames only.
+			err_json = ValidationErrorJson("body", "message", ErrorData(ex).RawMessage(), "value_error");
+		}
+		ws.send(err_json);
+		return false;
+	};
+
+	// An exception escaping a WebSocket handler terminates the process.
+	try {
+		string message;
+		if (pending->takes_message) {
+			while (is_running.load()) {
+				auto read = ws.read(message);
+				if (read == qws::Fail) {
+					break;
+				}
+				if (read == qws::Timeout || !is_running.load() || !bind_message(message)) {
+					continue;
+				}
+				if (!send_rows()) {
+					break;
+				}
+			}
+		} else if (send_rows()) {
+			// Messages a push client sends are read and dropped; Fail means it left.
+			bool client_open = true;
+			while (client_open && pending->stream.interval_ms > 0 && is_running.load()) {
+				auto next_run =
+				    std::chrono::steady_clock::now() + std::chrono::milliseconds(pending->stream.interval_ms);
+				while (client_open && is_running.load() && std::chrono::steady_clock::now() < next_run) {
+					client_open = ws.read(message) != qws::Fail;
+				}
+				client_open = client_open && is_running.load() && send_rows();
+			}
+		}
+	} catch (std::exception &ex) {
+		ws.close(CloseStatus::InternalError, WebSocketCloseReason(ex.what()));
+	} catch (...) {
+		ws.close(CloseStatus::InternalError, "unknown exception");
+	}
+	if (ws.is_open()) {
+		ws.close(is_running.load() ? CloseStatus::Normal : CloseStatus::GoingAway);
+	}
+
+	// One access-log row per session: status 101, duration = session length.
+	quackapi_httplib::Response res;
+	res.status = 101;
+	res.set_header("Content-Length", std::to_string(bytes_sent));
+	auto latency_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pending->started).count();
+	EmitAccessLog(MakeRequestRecord(req, res, pending->request_id, pending->stream.name, pending->stream.pattern,
+	                                latency_ms, pending->received_at_micros, -1, -1, rows_sent, pending->trace_id,
+	                                pending->span_id, pending->parent_span_id, pending->sampled, options));
+}
+
 void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 	// Always attach CORS headers when configured (including error responses).
 	// Stamp X-Request-ID + emit structured access log on every exit path.
@@ -3573,8 +3922,14 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 		}
 	}
+	// WS streams answer only upgrade requests (RejectWebSocket / HandleWebSocket).
+	bool websocket_path = false;
 	for (auto &stream : *streams) {
 		vector<std::pair<string, string>> captures;
+		if (stream.transport == QuackapiStreamTransport::WS) {
+			websocket_path = websocket_path || MatchPattern(stream.pattern, req.path, captures);
+			continue;
+		}
 		if (MatchPattern(stream.pattern, req.path, captures)) {
 			if (!MethodListContains(methods_for_path, stream.method)) {
 				methods_for_path.push_back(stream.method);
@@ -3649,6 +4004,13 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		}
 		// Unknown path: 404 (no route to preflight).
 		SetJson(res, 404, "{\"detail\":\"Not Found\"}");
+		finish();
+		return;
+	}
+
+	if (!match.matched && !stream_match.matched && websocket_path) {
+		res.set_header("Upgrade", "websocket");
+		SetJson(res, 426, "{\"detail\":\"Upgrade Required: this path is a WebSocket stream\"}");
 		finish();
 		return;
 	}
@@ -3751,16 +4113,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				return;
 			}
 
-			case_insensitive_map_t<string> provided;
-			for (auto &kv : req.params) {
-				provided[kv.first] = kv.second;
-			}
-			for (auto &kv : stream_match.path_params) {
-				provided[kv.first] = kv.second;
-			}
-			provided["request_id"] = request_id;
-			provided["trace_id"] = trace_id;
-			provided["span_id"] = span_id;
+			auto provided = StreamProvidedParams(req, stream_match.path_params, request_id, trace_id, span_id);
 			// Last-Event-ID header → last_id (query ?last_id= wins if both set).
 			if (provided.find("last_id") == provided.end()) {
 				string last_event_id;
@@ -3769,36 +4122,14 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				}
 			}
 
-			auto expected_types = prepared->GetExpectedParameterTypes();
+			// Optional last_id: missing → SQL NULL so WHERE id > $last_id works with COALESCE.
 			identifier_map_t<BoundParameterData> named_values;
-			for (auto &entry : prepared->GetNamedParameterMap()) {
-				auto &param_name = entry.first.GetIdentifierName();
-				auto type_it = expected_types.find(param_name);
-				LogicalType expected = LogicalType::UNKNOWN;
-				if (type_it != expected_types.end()) {
-					expected = type_it->second;
-				}
-				auto it = provided.find(param_name);
-				if (it == provided.end()) {
-					// Optional last_id: missing → SQL NULL so WHERE id > $last_id works with COALESCE.
-					if (param_name == "last_id") {
-						named_values[Identifier(param_name)] = BoundParameterData(Value());
-						continue;
-					}
-					string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
-					SetJson(res, 422, ValidationErrorJson(loc, param_name, "Field required", "missing"));
-					finish();
-					return;
-				}
-				string loc = IsPathParam(stream_match.stream.pattern, param_name) ? "path" : "query";
-				BoundParameterData bound;
-				string err_json;
-				if (!BindParamValue(it->second, expected, loc, param_name, bound, err_json)) {
-					SetJson(res, 422, err_json);
-					finish();
-					return;
-				}
-				named_values[Identifier(param_name)] = bound;
+			string err_json;
+			if (!BindStreamParams(*prepared, stream_match.stream.pattern, provided, {"last_id"}, named_values,
+			                      err_json)) {
+				SetJson(res, 422, err_json);
+				finish();
+				return;
 			}
 
 			// Prove the first execute works before committing to chunked transfer.
