@@ -1340,7 +1340,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quack_nop_authorization so they can be SET as quack_*_function.
 	RegisterQuackAuthBridgeFunctions(loader);
 
-	// CREATE STREAM + quackapi_streams() (SSE push; WS deferred on httplib).
+	// CREATE STREAM + quackapi_streams() (SSE and WebSocket push).
 	RegisterQuackapiStreamFunctions(loader);
 
 	// Outbound client diagnostic — works with Built-In, HTTPFS, MultiCurl, …

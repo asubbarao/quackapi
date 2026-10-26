@@ -1,8 +1,8 @@
 // VENDORED by quackapi from duckdb/third_party/httplib at the pinned duckdb
 // submodule commit (v2.0.0, cpp-httplib 0.53.1). quackapi's changes, each
 // marked "quackapi" below: its own namespace, SocketStream::set_write_timeout
-// for per-route IO deadlines, the file request handler running for HEAD, and
-// 0.56's server WebSocket read timeout (ws::Timeout).
+// for per-route IO deadlines, the file request handler running for HEAD and
+// 304s, and 0.56's server WebSocket read timeout (ws::Timeout).
 
 //
 //  httplib.h
@@ -12881,7 +12881,11 @@ inline bool Server::handle_file_request(Request &req, Response &res) {
             res.set_header("Last-Modified", last_modified);
           }
 
-          if (check_if_not_modified(req, res, etag, mtime)) { return true; }
+          if (check_if_not_modified(req, res, etag, mtime)) {
+            // quackapi: a 304 is a static request too; log it.
+            if (file_request_handler_) { file_request_handler_(req, res); }
+            return true;
+          }
 
           check_if_range(req, etag, mtime);
 

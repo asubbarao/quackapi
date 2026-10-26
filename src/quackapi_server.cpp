@@ -76,6 +76,17 @@ struct QuackapiPendingWebSocket {
 	bool sampled = true;
 	std::chrono::steady_clock::time_point started;
 	int64_t received_at_micros = 0;
+	//! The server's open-session count, held from admission until the session ends.
+	std::atomic<idx_t> *session_count = nullptr;
+
+	QuackapiPendingWebSocket() = default;
+	QuackapiPendingWebSocket(const QuackapiPendingWebSocket &) = delete;
+	QuackapiPendingWebSocket &operator=(const QuackapiPendingWebSocket &) = delete;
+	~QuackapiPendingWebSocket() {
+		if (session_count) {
+			session_count->fetch_sub(1);
+		}
+	}
 };
 thread_local unique_ptr<QuackapiPendingWebSocket> quackapi_pending_ws;
 
@@ -2705,9 +2716,8 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	server->WebSocket(".*", [this](const quackapi_httplib::Request &req, quackapi_httplib::ws::WebSocket &ws) {
 		HandleWebSocket(req, ws);
 	});
-	// A session whose client vanished without closing would poll forever and
-	// hold its worker: close after two unanswered 30 s pings.
-	server->set_websocket_max_missed_pongs(2);
+	// Each session holds a worker for its lifetime; keep half of them for HTTP.
+	websocket_session_limit = MaxValue<idx_t>(1, static_cast<idx_t>(workers) / 2);
 
 	if (!server->is_valid()) {
 		throw IOException("quackapi: failed to instantiate HTTP server for %s:%d", host, port);
@@ -3373,6 +3383,11 @@ bool QuackapiHttpServer::RejectWebSocket(const quackapi_httplib::Request &req, q
 	if (!OriginAllowed(req)) {
 		return reject(403, "{\"detail\":\"Origin not allowed\"}");
 	}
+	if (websocket_sessions.fetch_add(1) >= websocket_session_limit) {
+		websocket_sessions.fetch_sub(1);
+		return reject(503, "{\"detail\":\"Too many open WebSocket sessions\"}");
+	}
+	pending->session_count = &websocket_sessions;
 
 	try {
 		bool policy_denied = false;
@@ -3436,6 +3451,14 @@ void QuackapiHttpServer::HandleWebSocket(const quackapi_httplib::Request &req, q
 		return;
 	}
 	ws.set_read_timeout(0, 100000);
+	// httplib waits 300 s for the rest of a started frame; a client stalled mid-frame
+	// gets the serve read timeout instead, as an HTTP request would.
+	if (quackapi_tls_stream) {
+		quackapi_tls_stream->set_read_timeout(options.read_timeout_sec > 0
+		                                          ? static_cast<time_t>(options.read_timeout_sec)
+		                                          : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC,
+		                                      0);
+	}
 	int64_t rows_sent = 0;
 	idx_t bytes_sent = 0;
 	// False once the session is over (send failed, or the SELECT failed and closed it).
@@ -3476,39 +3499,55 @@ void QuackapiHttpServer::HandleWebSocket(const quackapi_httplib::Request &req, q
 		}
 	};
 
-	string message;
-	if (pending->takes_message) {
-		while (is_running.load()) {
-			auto read = ws.read(message);
-			if (read == qws::Fail) {
-				break;
+	// The client's message as $message; false (after an error reply) when it does not bind.
+	auto bind_message = [&](const string &message) -> bool {
+		BoundParameterData bound;
+		string err_json;
+		try {
+			if (BindParamValue(message, pending->message_type, "body", "message", bound, err_json)) {
+				pending->named_values[Identifier("message")] = bound;
+				return true;
 			}
-			if (read == qws::Timeout) {
-				continue;
-			}
-			BoundParameterData bound;
-			string err_json;
-			if (!BindParamValue(message, pending->message_type, "body", "message", bound, err_json)) {
-				if (!ws.send(err_json)) {
+		} catch (std::exception &ex) {
+			// e.g. a binary frame that is not UTF-8: httplib checks UTF-8 on text frames only.
+			err_json = ValidationErrorJson("body", "message", ErrorData(ex).RawMessage(), "value_error");
+		}
+		ws.send(err_json);
+		return false;
+	};
+
+	// An exception escaping a WebSocket handler terminates the process.
+	try {
+		string message;
+		if (pending->takes_message) {
+			while (is_running.load()) {
+				auto read = ws.read(message);
+				if (read == qws::Fail) {
 					break;
 				}
-				continue;
+				if (read == qws::Timeout || !is_running.load() || !bind_message(message)) {
+					continue;
+				}
+				if (!send_rows()) {
+					break;
+				}
 			}
-			pending->named_values[Identifier("message")] = bound;
-			if (!send_rows()) {
-				break;
+		} else if (send_rows()) {
+			// Messages a push client sends are read and dropped; Fail means it left.
+			bool client_open = true;
+			while (client_open && pending->stream.interval_ms > 0 && is_running.load()) {
+				auto next_run =
+				    std::chrono::steady_clock::now() + std::chrono::milliseconds(pending->stream.interval_ms);
+				while (client_open && is_running.load() && std::chrono::steady_clock::now() < next_run) {
+					client_open = ws.read(message) != qws::Fail;
+				}
+				client_open = client_open && is_running.load() && send_rows();
 			}
 		}
-	} else if (send_rows()) {
-		// Messages a push client sends are read and dropped; Fail means it left.
-		bool client_open = true;
-		while (client_open && pending->stream.interval_ms > 0 && is_running.load()) {
-			auto next_run = std::chrono::steady_clock::now() + std::chrono::milliseconds(pending->stream.interval_ms);
-			while (client_open && is_running.load() && std::chrono::steady_clock::now() < next_run) {
-				client_open = ws.read(message) != qws::Fail;
-			}
-			client_open = client_open && is_running.load() && send_rows();
-		}
+	} catch (std::exception &ex) {
+		ws.close(CloseStatus::InternalError, WebSocketCloseReason(ex.what()));
+	} catch (...) {
+		ws.close(CloseStatus::InternalError, "unknown exception");
 	}
 	if (ws.is_open()) {
 		ws.close(is_running.load() ? CloseStatus::Normal : CloseStatus::GoingAway);
@@ -3517,6 +3556,7 @@ void QuackapiHttpServer::HandleWebSocket(const quackapi_httplib::Request &req, q
 	// One access-log row per session: status 101, duration = session length.
 	quackapi_httplib::Response res;
 	res.status = 101;
+	res.set_header("Content-Length", std::to_string(bytes_sent));
 	auto latency_ms =
 	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pending->started).count();
 	EmitAccessLog(MakeRequestRecord(req, res, pending->request_id, pending->stream.name, pending->stream.pattern,

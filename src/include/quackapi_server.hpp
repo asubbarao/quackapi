@@ -340,6 +340,8 @@ private:
 	unique_ptr<quackapi_httplib::Server> server;
 	std::vector<std::thread> listen_threads;
 	std::atomic<bool> is_running {false};
+	std::atomic<idx_t> websocket_sessions {0};
+	idx_t websocket_session_limit = 1;
 	unique_ptr<QuackapiRequestRing> request_ring;
 	std::vector<unique_ptr<QuackapiTelemetrySink>> telemetry_sinks;
 };

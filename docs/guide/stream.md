@@ -94,13 +94,17 @@ ws.onopen = () => ws.send('hello');
   `$message` binds the client's text, cast to the type the SELECT expects; a message
   that does not cast is answered with the 422 JSON body and the session continues.
 - An upgrade that cannot proceed is answered over HTTP before switching protocols:
-  404 (no WS stream at the path), 403 (policy, or a browser `Origin` that is neither
-  this server nor in `cors_origins`), 422 (a missing or invalid parameter).
+  404 (no WS stream at the path, even where a GET route or static file exists),
+  403 (policy, or a browser `Origin` that is neither this server nor in `cors_origins`),
+  422 (a missing or invalid parameter), 503 (too many open sessions).
   A plain HTTP request to a WS path gets 426.
+- Each open session holds one HTTP worker thread, so at most half of `worker_threads`
+  (at least one) are admitted at a time; the rest stay free for HTTP.
 - A failed SELECT closes with 1011 and the error as the reason; going past
-  `max_response_bytes` for the session closes with 1009.
+  `max_response_bytes` for the whole session closes with 1009.
+- `quackapi_stop` closes open sessions within 100 ms. A client that stops partway
+  through a frame is dropped after the serve `read_timeout_sec`.
 - The access log gets one row per session, status 101, when it ends.
-- Each open session holds one HTTP worker thread (`worker_threads`), as an SSE stream does.
 
 ---
 
@@ -109,7 +113,7 @@ ws.onopen = () => ws.send('hello');
 - Streams are **not** listed in `quackapi_routes()` — use `quackapi_streams()`.
 - Path must start with `/`.
 - Streams do not take `REQUIRE` auth in the current version, and middleware does not run for them.
-- Ordinary routes win if both match the same path.
+- Ordinary routes win over an SSE stream on the same path; a WebSocket upgrade only ever reaches WS streams.
 
 ```sql
 DROP STREAM ticks;
