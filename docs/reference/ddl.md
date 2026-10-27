@@ -42,7 +42,7 @@ DROP ROUTE <name>;
 | **GROUP / IN GROUP** | Join group prefix + inherit auth/tags |
 | **BODY SCHEMA** | Quoted JSON Schema string; the `json_schema` extension is loaded when the route is created (and may be installed from community); may appear before or after PARAM |
 | **BODY TYPE** | Quoted DuckDB `json_transform` structure; native typed body validation; may appear before or after PARAM |
-| **PARAM** | Zero or more. Types: INTEGER/INT, BIGINT, VARCHAR/TEXT/STRING, BOOLEAN/BOOL, DOUBLE, FLOAT/REAL, HUGEINT, UBIGINT, UINTEGER |
+| **PARAM** | Zero or more. Types: INTEGER/INT, BIGINT, SMALLINT, TINYINT, HUGEINT, UBIGINT, UINTEGER, USMALLINT, UTINYINT, DECIMAL/NUMERIC, VARCHAR/TEXT/STRING, BOOLEAN/BOOL, DOUBLE, FLOAT/REAL, VARIANT. JSON body VARIANT values preserve their JSON value kinds; text-wire values remain strings. Native default literal types are retained. Numeric/length constraints require matching value kinds. |
 | **AS** | Any SQL returning a result; validated at CREATE time |
 
 **Example:**

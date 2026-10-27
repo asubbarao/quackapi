@@ -21,7 +21,7 @@ FROM quack_query('quack:127.0.0.1:29327',
 
 query II
 SELECT status, body FROM quack_query('quack:127.0.0.1:29327',
-    $sql$SELECT status, body FROM quackapi_exec('SELECT 42 AS answer')$sql$,
+    $sql$SELECT status, body FROM quackapi_selfdispatch('SELECT 42 AS answer')$sql$,
     token := 'quackapi-native-test');
 ----
 200	[{"answer":42}]

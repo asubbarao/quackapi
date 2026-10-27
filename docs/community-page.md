@@ -112,18 +112,28 @@ Query.Farm on DuckDB 2.0; see [request bodies](guide/request-bodies.md) for setu
 |---------------|-----------|
 | Multiple columns / ordinary names | `application/json` — **array of row objects** |
 | `FORMAT ARROW` / Arrow Accept | Arrow IPC stream; BLOB columns are Arrow byte arrays |
+| `FORMAT PARQUET` / Parquet Accept | Complete native Parquet file, `application/vnd.apache.parquet` |
 | `FORMAT binary` | Exact BLOB body from one row, with optional `content_type` |
 | Single column `html` | `text/html; charset=utf-8` |
 | Single column `text` | `text/plain; charset=utf-8` |
 | Column `location` | sets `Location` (pair with `STATUS 3xx`) |
 | Column `set_cookie` / `set-cookie` | sets `Set-Cookie` (stripped from JSON) |
 
-JSON types follow DuckDB column types, including native `VARIANT` objects,
-lists, scalars and nulls. JSON rows are encoded once as chunks are fetched;
-Arrow converts native chunk vectors without rebuilding each row. Both formats
+JSON preserves `VARIANT` objects, lists, scalars and nulls as JSON values, but
+does not retain DuckDB's full type information. Arrow and Parquet carry native
+schema information. JSON rows are encoded once as chunks are fetched; Arrow
+converts native chunk vectors without rebuilding each row. Parquet uses native
+chunk append and DuckDB 2.0 query submission/completion for `COPY`. These formats
 buffer the complete HTTP body and enforce the configured response cap. See
 [request budgets](RESOURCE_LIMITS.md) and the
 [large-response benchmark](../bench/large_response.sql).
+
+SQL callers use `quackapi_post(..., response_format := 'arrow'|'parquet')` to
+decode a binary response directly into `rows LIST<VARIANT>` and
+`columns LIST<STRUCT(name VARCHAR, type TYPE)>`. No curl pipe or JSON round trip
+is needed. `quackapi_selfdispatch(sql)` produces the same native fields directly
+from a fresh connection to the current database. Empty results retain their
+column types. The raw HTTP bytes remain available as `body_blob`.
 
 ### Error shapes (verified)
 
@@ -296,8 +306,8 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `quackapi_post(url, body[, ct[, headers]], timeout_ms := …)` | scalar/table | Pooled outbound POST; receipt includes exact `body_blob`; `body` is NULL for invalid UTF-8 |
-| `quackapi_exec(sql)` | scalar/table | Execute local SQL on a fresh connection; same receipt shape |
+| `quackapi_post(url, body[, ct[, headers]], response_format := 'raw', timeout_ms := …)` | scalar/table | Pooled outbound POST; exact `body_blob`; `body` is NULL for invalid UTF-8. `arrow`/`parquet` decode native `rows` and `columns`; raw/default leaves those fields NULL |
+| `quackapi_selfdispatch(sql)` | scalar/table | Execute local SQL on a fresh connection; native `rows` and `columns` are captured before JSON serialization |
 | `quackapi_http_pool()` | table | Outbound pool per origin: `host, idle, dialed, reused` |
 | `quackapi_request(method, path [, body], …)` | table | In-process request → status, BLOB body, content type, headers |
 | `quackapi_middlewares()` | table | Inspect SQL middleware definitions |
@@ -315,7 +325,7 @@ for the planner and are not part of the public app API.
 | Target DuckDB | **v2.0.0** (CI + submodule pin) |
 | Language / build | C++17 / **cmake** |
 | Extra toolchains | **None** (no vcpkg, no Rust, no Python at build) |
-| Linked deps | DuckDB **bundled httplib** + **mbedtls** only |
+| Linked deps | DuckDB **bundled httplib** + **mbedtls**, and vendored **nanoarrow IPC** (no separately installed Arrow extension required) |
 | Outbound HTTPS | Core `HTTPUtil`; optional `LOAD curl_httpfs` upgrades process-wide client |
 
 | DuckDB arch | Community CI intent |
@@ -330,9 +340,13 @@ Repo workflow: `duckdb/extension-ci-tools` pinned to
 `fe955ed3a046b0324cac2c691e73d8d776a7d5cc`, `duckdb_version: v2.0.0`,
 same `exclude_archs` as `description.yml`.
 
-The repository workflow builds and tests all five target architectures. Community
-publication separately requires an accepted descriptor update and successful
-signing; a repository CI result alone does not update the hosted package.
+The repository workflow builds all five target architectures. The pinned upstream
+workflow runs runtime tests on Linux AMD64, native macOS ARM64 and Windows AMD64;
+Linux ARM64 and macOS AMD64 distribution jobs build without runtime tests. The
+separate Linux AMD64 integration job exercises PostgreSQL, native byte budgets,
+cancellation, WebSockets and real HTTP contracts. Community publication separately
+requires an accepted descriptor update and successful signing; a repository CI
+result alone does not update the hosted package.
 
 ---
 

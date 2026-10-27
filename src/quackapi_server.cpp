@@ -19,12 +19,14 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -44,6 +46,7 @@
 #include "quackapi_limits.hpp"
 #include "quackapi_middleware.hpp"
 #include "quackapi_state.hpp"
+#include "quackapi_util.hpp"
 
 #include "httplib.hpp"
 #include "miniz_wrapper.hpp"
@@ -466,10 +469,12 @@ string ValidationErrorJsonSchema(const string &msg, const string &type, const st
 //! "null" remains a string and must not silently become SQL NULL.
 struct JsonBodyField {
 	string value;
+	string json_value;
 	bool explicit_null;
 	JsonBodyField() : explicit_null(false) {
 	}
-	JsonBodyField(string value_p, bool explicit_null_p) : value(std::move(value_p)), explicit_null(explicit_null_p) {
+	JsonBodyField(string value_p, bool explicit_null_p, string json_value_p = string())
+	    : value(std::move(value_p)), json_value(std::move(json_value_p)), explicit_null(explicit_null_p) {
 	}
 };
 
@@ -635,6 +640,7 @@ bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<Jso
 			return false;
 		}
 		string val;
+		const char *json_start = s;
 		bool explicit_null = false;
 		if (*s == '"') {
 			if (!parse_plain_string(val)) {
@@ -659,7 +665,7 @@ bool TryExtractFlatJsonObject(const string &raw_body, case_insensitive_map_t<Jso
 			// nested object/array — not flat; fall back
 			return false;
 		}
-		fields[key] = {val, explicit_null};
+		fields[key] = {val, explicit_null, string(json_start, s - json_start)};
 		skip_ws();
 		if (s < end && *s == ',') {
 			s++;
@@ -728,7 +734,7 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 	                            "    WHEN 'VARCHAR' THEN json_extract_string(value, '$') "
 	                            "    WHEN 'NULL' THEN NULL "
 	                            "    ELSE CAST(value AS VARCHAR) "
-	                            "  END AS val "
+	                            "  END AS val, CAST(value AS VARCHAR) AS json_value "
 	                            "FROM json_each(?::JSON)",
 	                            Value(raw_body));
 	if (fields_res->HasError()) {
@@ -748,10 +754,11 @@ bool ExtractJsonBodyFields(Connection &con, const string &raw_body, case_insensi
 			string key = key_v.GetValue<string>();
 			auto val_v = chunk->GetValue(1, row);
 			if (val_v.IsNull()) {
-				fields[key] = {string(), true};
+				fields[key] = {string(), true, "null"};
 				continue;
 			}
-			fields[key] = {val_v.GetValue<string>(), false};
+			auto json_v = chunk->GetValue(2, row);
+			fields[key] = {val_v.GetValue<string>(), false, json_v.IsNull() ? string() : json_v.GetValue<string>()};
 		}
 	}
 	return true;
@@ -840,6 +847,62 @@ bool TransformTypedBody(Connection &con, const string &body_type, const string &
 	return false;
 }
 
+//! Resolve a BODY TYPE containing VARIANT by transforming through JSON leaves.
+//! This preserves exact DECIMAL and other typed fields while allowing selected
+//! JSON leaves to become VARIANT in the final declared type.
+bool ResolveVariantTypedBodyTypes(Connection &con, const string &body_type, LogicalType &intermediate_type,
+                                  LogicalType &target_type, string &error) {
+	auto load = con.Query("LOAD json");
+	if (load->HasError()) {
+		error = "JSON extension unavailable";
+		return false;
+	}
+	string normalized_body_type;
+	if (!QuackapiDuckdbTransformVariantLeavesAsJson(body_type, normalized_body_type)) {
+		error = "BODY TYPE does not contain a valid VARIANT declaration";
+		return false;
+	}
+	auto first = body_type.find_first_not_of(" \t\n\r");
+	string sample = "null";
+	if (first != string::npos && body_type[first] == '{') {
+		sample = "{}";
+	} else if (first != string::npos && body_type[first] == '[') {
+		sample = "[]";
+	}
+	auto result = con.Query("SELECT json_transform(?::JSON, ?::JSON)", Value(sample), Value(normalized_body_type));
+	if (result->HasError()) {
+		error = result->GetError();
+		return false;
+	}
+	auto types = result->GetTypes();
+	if (types.empty() || !QuackapiDuckdbTransformRestoreVariantLeaves(types[0], body_type, target_type)) {
+		error = "BODY TYPE does not describe a DuckDB value type";
+		return false;
+	}
+	intermediate_type = types[0];
+	return true;
+}
+
+bool TransformVariantTypedBody(Connection &con, const string &body_type, const string &raw_body, Value &out,
+                               string &err_json) {
+	LogicalType intermediate_type;
+	LogicalType target_type;
+	string type_error;
+	if (!ResolveVariantTypedBodyTypes(con, body_type, intermediate_type, target_type, type_error)) {
+		err_json = ValidationErrorJsonBody(type_error, "type_error");
+		return false;
+	}
+	try {
+		auto json_value = Value(raw_body).CastAs(*con.context, LogicalType::JSON());
+		auto intermediate_value = json_value.CastAs(*con.context, intermediate_type, true);
+		out = intermediate_value.CastAs(*con.context, target_type, true);
+		return true;
+	} catch (std::exception &ex) {
+		err_json = ValidationErrorJsonBody(ex.what(), "type_error");
+		return false;
+	}
+}
+
 //! True if type is a signed/unsigned integral type (not float/decimal).
 bool IsIntegralType(const LogicalType &type) {
 	switch (type.id()) {
@@ -909,7 +972,7 @@ const QuackapiParamSpec *FindParamSpec(const vector<QuackapiParamSpec> &specs, c
 //! Apply FastAPI-style numeric/string constraints. Returns false and fills
 //! msg/type when violated.
 bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, const Value &bound, string &msg,
-                           string &err_type) {
+                           string &err_type, bool native_variant = false) {
 	// The binder validates UTF-8 before calling this function. Count code points,
 	// not bytes, to match character-based min_length/max_length constraints.
 	idx_t character_count = 0;
@@ -917,6 +980,12 @@ bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, con
 		if ((byte & 0xc0) != 0x80) {
 			character_count++;
 		}
+	}
+	if ((spec.has_min_length || spec.has_max_length) && native_variant && !bound.IsNull() &&
+	    bound.type().id() != LogicalTypeId::VARCHAR) {
+		msg = "Input should be a valid string";
+		err_type = "type_error";
+		return false;
 	}
 	if (spec.has_min_length && character_count < spec.min_length) {
 		msg = StringUtil::Format("String should have at least %llu characters", (unsigned long long)spec.min_length);
@@ -940,6 +1009,10 @@ bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, con
 	Value numeric = bound;
 	if (bound.type().id() == LogicalTypeId::BOOLEAN) {
 		numeric = bound.DefaultCastAs(LogicalType::TINYINT);
+	} else if (!IsNumericType(bound.type()) && native_variant) {
+		msg = "Input should be a valid number";
+		err_type = "type_error";
+		return false;
 	} else if (!IsNumericType(bound.type())) {
 		try {
 			auto parser = Parser::GetBuiltinParser();
@@ -1117,6 +1190,15 @@ bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResul
 //! This lets route SQL use $body.items directly: the server inserts the cast
 //! from the one declaration before DuckDB prepares the handler.
 bool ResolveTypedBodySqlType(Connection &con, const string &body_type, string &sql_type, string &error) {
+	if (QuackapiDuckdbTransformHasVariant(body_type)) {
+		LogicalType intermediate_type;
+		LogicalType target_type;
+		if (!ResolveVariantTypedBodyTypes(con, body_type, intermediate_type, target_type, error)) {
+			return false;
+		}
+		sql_type = target_type.ToString();
+		return true;
+	}
 	auto first = body_type.find_first_not_of(" \t\n\r");
 	string sample = "null";
 	if (first != string::npos && body_type[first] == '{') {
@@ -1629,10 +1711,9 @@ string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_c
 	return body;
 }
 
-//! Shared: TEMP table + Appender fill for binary serdes (parquet / arrow).
-void FillTempTableForSerdes(Connection &con, const string &table, const vector<string> &names,
-                            const vector<LogicalType> &types, const vector<idx_t> &data_cols,
-                            const vector<vector<Value>> &rows, const char *label) {
+//! Create the typed staging table used by the native Parquet writer.
+void CreateTempTableForSerdes(Connection &con, const string &table, const vector<string> &names,
+                              const vector<LogicalType> &types, const vector<idx_t> &data_cols, const char *label) {
 	string create_sql = "CREATE TEMP TABLE " + table + " (";
 	for (idx_t i = 0; i < data_cols.size(); i++) {
 		if (i > 0) {
@@ -1648,25 +1729,21 @@ void FillTempTableForSerdes(Connection &con, const string &table, const vector<s
 	if (create_res->HasError()) {
 		throw InvalidInputException("%s serialize CREATE: %s", label, create_res->GetError());
 	}
-
-	if (!rows.empty()) {
-		Appender appender(con, Identifier(table));
-		for (auto &cols : rows) {
-			appender.BeginRow();
-			for (auto c : data_cols) {
-				if (c < cols.size()) {
-					appender.Append(cols[c]);
-				} else {
-					appender.Append(Value());
-				}
-			}
-			appender.EndRow();
-		}
-		appender.Close();
-	}
 }
 
-//! OS temp dir + basename for parquet/arrow scratch files. Never hardcode /tmp
+//! Fill the typed staging table from native column vectors without reconstructing row Values.
+void FillTempTableForSerdes(Connection &con, const string &table, const vector<string> &names,
+                            const vector<LogicalType> &types, const vector<idx_t> &data_cols,
+                            ColumnDataCollection &chunks, const char *label) {
+	CreateTempTableForSerdes(con, table, names, types, data_cols, label);
+	auto table_info = con.TableInfo(Identifier(table));
+	if (!table_info) {
+		throw InvalidInputException("%s serialize: staging table metadata unavailable", label);
+	}
+	con.Append(*table_info, chunks);
+}
+
+//! OS temp dir + basename for Parquet scratch files. Never hardcode /tmp
 //! (Windows CI has no /tmp). Paths use forward slashes for SQL COPY literals.
 string SerdesTempFilePath(FileSystem &fs, const string &filename) {
 	string dir;
@@ -1688,59 +1765,152 @@ string SqlQuotePath(const string &path) {
 	return StringUtil::Replace(path, "'", "''");
 }
 
-//! Read path bytes then delete the file. On open failure, best-effort remove.
-string ReadAndRemoveFileBytes(Connection &con, const string &path) {
+struct ResponseTooLarge {};
+
+//! Read a bounded file body, then delete it on success and on every failure path.
+string ReadAndRemoveFileBytes(Connection &con, const string &path, idx_t max_response_bytes) {
 	auto &fs = FileSystem::GetFileSystem(*con.context);
 	unique_ptr<FileHandle> handle;
 	try {
 		handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+		idx_t file_size = handle->GetFileSize();
+		if (file_size > max_response_bytes) {
+			handle->Close();
+			handle.reset();
+			fs.TryRemoveFile(path);
+			throw ResponseTooLarge {};
+		}
+		string body;
+		if (file_size > 0) {
+			// mutable buffer — data_ptr_cast rejects const char* from string::data()
+			vector<data_t> buf(file_size);
+			handle->Read(buf.data(), file_size);
+			body.assign(reinterpret_cast<const char *>(buf.data()), file_size);
+		}
+		handle->Close();
+		handle.reset();
+		fs.TryRemoveFile(path);
+		return body;
 	} catch (...) {
+		if (handle) {
+			try {
+				handle->Close();
+			} catch (...) {
+			}
+		}
 		fs.TryRemoveFile(path);
 		throw;
 	}
-	idx_t file_size = handle->GetFileSize();
-	string body;
-	if (file_size > 0) {
-		// mutable buffer — data_ptr_cast rejects const char* from string::data()
-		vector<data_t> buf(file_size);
-		handle->Read(buf.data(), file_size);
-		body.assign(reinterpret_cast<const char *>(buf.data()), file_size);
-	}
-	handle->Close();
-	fs.TryRemoveFile(path);
-	return body;
 }
 
-//! Serialize result rows as a Parquet file body (magic "PAR1"). Uses a unique
-//! TEMP table + COPY TO (FORMAT PARQUET) + read bytes, then cleans up.
-string SerializeRowsParquet(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
-                            const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
+struct ParquetResponseData {
+	string body;
+	string location;
+	vector<string> cookies;
+	idx_t row_count = 0;
+};
+
+struct ParquetRequestStopped {};
+
+//! Serialize the already-executed result from native chunks. Only the final Parquet COPY is submitted
+//! asynchronously; the route SQL is never repeated, and no per-row Values are reconstructed.
+ParquetResponseData SerializeResultParquet(Connection &con, QueryResult &result, const vector<string> &names,
+                                           const vector<LogicalType> &types, const vector<idx_t> &data_cols,
+                                           idx_t max_response_bytes, const std::function<bool()> &stop) {
 	if (data_cols.empty()) {
 		throw InvalidInputException("parquet serialize: no data columns");
+	}
+	vector<LogicalType> parquet_types;
+	vector<column_t> parquet_columns;
+	idx_t location_col = names.size();
+	idx_t set_cookie_col = names.size();
+	for (idx_t i = 0; i < names.size(); i++) {
+		auto lower = StringUtil::Lower(names[i]);
+		if (lower == "location") {
+			location_col = i;
+		} else if (lower == "set_cookie" || lower == "set-cookie") {
+			set_cookie_col = i;
+		}
+	}
+	for (auto col : data_cols) {
+		parquet_types.push_back(types[col]);
+		parquet_columns.push_back(NumericCast<column_t>(col));
 	}
 	auto &fs = FileSystem::GetFileSystem(*con.context);
 	string uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
 	string table = "qa_parquet_" + uid;
 	string path = SerdesTempFilePath(fs, table + ".parquet");
+	ParquetResponseData output;
+	try {
+		ColumnDataCollection chunks(*con.context, parquet_types);
+		ColumnDataAppendState append_state;
+		chunks.InitializeAppend(append_state);
+		while (auto chunk = result.Fetch()) {
+			if (stop()) {
+				result.Close();
+				throw ParquetRequestStopped {};
+			}
+			if (chunk->size() == 0) {
+				continue;
+			}
+			output.row_count += chunk->size();
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				if (location_col < names.size() && output.location.empty()) {
+					auto value = chunk->GetValue(location_col, row);
+					if (!value.IsNull()) {
+						output.location = value.ToString();
+					}
+				}
+				if (set_cookie_col < names.size()) {
+					auto value = chunk->GetValue(set_cookie_col, row);
+					if (!value.IsNull()) {
+						output.cookies.push_back(value.ToString());
+					}
+				}
+			}
+			DataChunk projected;
+			projected.InitializeEmpty(parquet_types);
+			projected.ReferenceColumns(*chunk, parquet_columns);
+			chunks.Append(append_state, projected);
+		}
+		if (stop()) {
+			result.Close();
+			throw ParquetRequestStopped {};
+		}
 
-	FillTempTableForSerdes(con, table, names, types, data_cols, rows, "parquet");
-
-	auto copy_res = con.Query("COPY " + table + " TO '" + SqlQuotePath(path) + "' (FORMAT PARQUET)");
-	if (copy_res->HasError()) {
-		con.Query("DROP TABLE IF EXISTS " + table);
+		FillTempTableForSerdes(con, table, names, types, data_cols, chunks, "parquet");
+		auto copy_res = con.Submit("COPY " + table + " TO '" + SqlQuotePath(path) + "' (FORMAT PARQUET)");
+		if (copy_res->HasError()) {
+			throw InvalidInputException("parquet serialize COPY: %s", copy_res->GetError());
+		}
+		copy_res->Complete();
+		if (copy_res->HasError()) {
+			throw InvalidInputException("parquet serialize COPY: %s", copy_res->GetError());
+		}
+		if (stop()) {
+			copy_res->Close();
+			throw ParquetRequestStopped {};
+		}
+		output.body = ReadAndRemoveFileBytes(con, path, max_response_bytes);
+		auto drop_res = con.Query("DROP TABLE IF EXISTS " + table);
+		if (drop_res->HasError()) {
+			throw InvalidInputException("parquet serialize DROP: %s", drop_res->GetError());
+		}
+		return output;
+	} catch (...) {
+		try {
+			con.Query("DROP TABLE IF EXISTS " + table);
+		} catch (...) {
+		}
 		fs.TryRemoveFile(path);
-		throw InvalidInputException("parquet serialize COPY: %s", copy_res->GetError());
+		throw;
 	}
-	con.Query("DROP TABLE IF EXISTS " + table);
-	return ReadAndRemoveFileBytes(con, path);
 }
 
 //! Serialize result rows as Arrow IPC stream bytes using DuckDB's Arrow C data
 //! converter and the vendored nanoarrow IPC encoder. Magic is 0xFFFFFFFF
 //! stream continuation (not ARROW1 file). Content-Type:
 //! application/vnd.apache.arrow.stream.
-struct ResponseTooLarge {};
-
 string SerializeResultArrow(Connection &con, QueryResult &result, const vector<string> &names,
                             const vector<LogicalType> &types, const vector<idx_t> &data_cols, idx_t max_response_bytes,
                             idx_t &row_count, const std::function<void(DataChunk &)> &visit) {
@@ -1982,10 +2152,14 @@ QuackapiExecResponse QuackapiExecErrorResponse(const string &error) {
 	return ExecJsonResponse(422, ValidationErrorJson("body", "sql", error, "value_error"));
 }
 
-QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_bytes) {
+QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_bytes, bool collect_typed_rows) {
 	QuackapiExecResponse out;
 	try {
 		auto names = QuackapiNames(result.GetNames());
+		unique_ptr<QuackapiTypedRowCollector> typed_rows;
+		if (collect_typed_rows) {
+			typed_rows = make_uniq<QuackapiTypedRowCollector>(names, result.GetTypes(), max_response_bytes);
+		}
 		vector<idx_t> data_cols;
 		vector<string> data_names;
 		idx_t location_col = names.size(), set_cookie_col = names.size();
@@ -2013,9 +2187,13 @@ QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_
 		while (auto chunk = result.Fetch()) {
 			for (idx_t row = 0; row < chunk->size(); row++) {
 				vector<Value> cols;
+				child_list_t<Value> typed_columns;
 				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-					cols.push_back(chunk->GetValue(col, row));
+					auto value = chunk->GetValue(col, row);
+					cols.push_back(value);
 				}
+				if (typed_rows)
+					typed_rows->AppendRow(cols);
 				if (json) {
 					auto encoded = SerializeRowJsonObject(names, data_cols, cols);
 					if (out.body.size() + encoded.size() + (out.rows ? 1 : 0) + 1 > max_response_bytes) {
@@ -2045,9 +2223,14 @@ QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_
 		} else if (names.empty()) {
 			out = ExecJsonResponse(200, "[]");
 		}
+		if (typed_rows) {
+			out.typed_result = typed_rows->Finish();
+		}
 		if (!location.empty()) {
 			out.headers.emplace_back("Location", location);
 		}
+	} catch (const QuackapiTypedRowsTooLarge &) {
+		return ExecJsonResponse(507, "{\"detail\":\"Native typed rows exceed configured byte limit\"}");
 	} catch (std::exception &ex) {
 		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
 		out = ExecJsonResponse(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
@@ -2060,7 +2243,8 @@ QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_
 
 static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, idx_t max_response_bytes,
                                             const QuackapiQueryDeadline &deadline, const string &loc,
-                                            const string &param, const std::function<bool()> &cancelled) {
+                                            const string &param, const std::function<bool()> &cancelled,
+                                            bool collect_typed_rows) {
 	unique_ptr<QueryResult> result;
 	string error;
 	auto stop = [&]() {
@@ -2071,7 +2255,7 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 			return deadline.Expired() ? QuackapiExecTimeoutResponse()
 			                          : ExecJsonResponse(422, ValidationErrorJson(loc, param, error, "value_error"));
 		}
-		return QuackapiExecResult(*result, max_response_bytes);
+		return QuackapiExecResult(*result, max_response_bytes, collect_typed_rows);
 	} catch (std::exception &ex) {
 		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
 		return ExecJsonResponse(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
@@ -2080,8 +2264,8 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
                                      const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
-                                     const std::function<bool()> &cancelled) {
-	auto out = ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled);
+                                     const std::function<bool()> &cancelled, bool collect_typed_rows) {
+	auto out = ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled, collect_typed_rows);
 	// What a served route checks last, after serialization: values under the cap can
 	// serialize past it, and the deadline can pass while they do.
 	if (deadline.Expired()) {
@@ -4507,6 +4691,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		// Body fields (JSON / form / multipart) fill remaining names with loc=body.
 		case_insensitive_map_t<std::pair<string, string>> provided; // name -> (loc, raw)
 		case_insensitive_map_t<bool> explicit_json_nulls;           // body field -> true; missing is absent
+		case_insensitive_map_t<string> json_body_values;            // exact JSON tokens for VARIANT binding
+		bool json_variant_extension_loaded = false;
 		Value validated_typed_body;
 		bool has_validated_typed_body = false;
 		string media = ContentTypeMedia(headers);
@@ -4564,6 +4750,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		// ---- REQUEST BODY BINDING (POST/PUT/PATCH) ----
 		// Bind body values before preparing the DuckDB handler.
 		bool body_method = IsBodyMethod(req.method);
+		const bool body_type_has_variant =
+		    !match.route.body_type.empty() && QuackapiDuckdbTransformHasVariant(match.route.body_type);
 		bool has_body_named = false;
 		bool needs_json_field_extraction = false;
 		bool needs_body_fields = !match.route.body_schema.empty() || !match.route.body_type.empty();
@@ -4646,7 +4834,12 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 						}
 					}
 					if (!match.route.body_type.empty()) {
-						if (!TransformTypedBody(con, match.route.body_type, req.body, validated_typed_body, err_json)) {
+						bool transformed = body_type_has_variant
+						                       ? TransformVariantTypedBody(con, match.route.body_type, req.body,
+						                                                   validated_typed_body, err_json)
+						                       : TransformTypedBody(con, match.route.body_type, req.body,
+						                                            validated_typed_body, err_json);
+						if (!transformed) {
 							SetJson(res, 422, err_json);
 							finish();
 							return;
@@ -4657,6 +4850,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 					for (auto &kv : body_fields) {
 						if (provided.find(kv.first) == provided.end()) {
 							provided[kv.first] = {"body", kv.second.value};
+							json_body_values[kv.first] = kv.second.json_value;
 							if (kv.second.explicit_null) {
 								explicit_json_nulls[kv.first] = true;
 							}
@@ -4665,6 +4859,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 					// $body binds the raw JSON payload.
 					if (has_body_named && provided.find("body") == provided.end()) {
 						provided["body"] = {"body", req.body};
+						json_body_values["body"] = req.body;
 					}
 				}
 			} else if (form_ct || multipart_ct) {
@@ -4809,6 +5004,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 					expected = LogicalType::BOOLEAN;
 				} else if (tn == "VARCHAR" || tn == "TEXT" || tn == "STRING") {
 					expected = LogicalType::VARCHAR;
+				} else if (tn == "VARIANT") {
+					expected = LogicalType::VARIANT();
 				}
 			}
 			const bool is_exec_sql = exec_route && StringUtil::CIEquals(param_name, exec_param);
@@ -4847,16 +5044,25 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 			string raw;
 			bool from_default = false;
+			bool has_native_variant_default = false;
+			Value native_variant;
 
 			if (it == provided.end()) {
 				if (spec && spec->has_default) {
 					from_default = true;
 					if (spec->default_is_null) {
-						named_values[Identifier(param_name)] = BoundParameterData(Value());
+						named_values[Identifier(param_name)] =
+						    BoundParameterData(expected.id() == LogicalTypeId::UNKNOWN ? Value() : Value(expected));
 						// Constraints on absent optional NULL: skip (FastAPI).
 						continue;
 					}
-					raw = spec->default_raw;
+					if (expected.id() == LogicalTypeId::VARIANT) {
+						raw = spec->default_raw;
+						native_variant = spec->default_variant.DefaultCastAs(LogicalType::VARIANT());
+						has_native_variant_default = true;
+					} else {
+						raw = spec->default_raw;
+					}
 					// Defaults keep the declared source loc for error shape.
 				} else {
 					validation_issues.push_back({ValidationLocJson(loc_kind, param_name), "Field required", "missing"});
@@ -4866,16 +5072,20 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				loc_kind = it->second.first;
 				if (explicit_json_nulls.find(param_name) != explicit_json_nulls.end()) {
 					// A missing field reaches the default branch above. JSON null reaches
-					// here and is only accepted when the BODY SCHEMA admitted null or
-					// the parameter explicitly declared DEFAULT NULL.
+					// here; an unconstrained VARIANT includes null in its value domain.
+					const bool variant_nullable =
+					    expected.id() == LogicalTypeId::VARIANT &&
+					    !(spec && (spec->has_ge || spec->has_gt || spec->has_le || spec->has_lt ||
+					               spec->has_min_length || spec->has_max_length));
 					bool null_allowed = (loc_kind == "body" && !match.route.body_schema.empty()) ||
-					                    (spec && spec->has_default && spec->default_is_null);
+					                    (spec && spec->has_default && spec->default_is_null) || variant_nullable;
 					if (!null_allowed) {
 						validation_issues.push_back({ValidationLocJson(loc_kind, param_name),
 						                             "Input should be a valid " + expected.ToString(), "type_error"});
 						continue;
 					}
-					named_values[Identifier(param_name)] = BoundParameterData(Value());
+					named_values[Identifier(param_name)] =
+					    BoundParameterData(expected.id() == LogicalTypeId::UNKNOWN ? Value() : Value(expected));
 					continue;
 				}
 				raw = it->second.second;
@@ -4946,17 +5156,21 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			// from extracted JSON text and use their prepared types.
 			if (param_name == "body" && !match.route.body_type.empty() &&
 			    (expected.id() == LogicalTypeId::STRUCT || expected.id() == LogicalTypeId::LIST ||
-			     expected.id() == LogicalTypeId::MAP)) {
+			     expected.id() == LogicalTypeId::MAP || (body_type_has_variant && has_validated_typed_body))) {
 				Value typed_body = validated_typed_body;
 				if (!has_validated_typed_body) {
 					string err_json;
-					if (!TransformTypedBody(con, match.route.body_type, raw, typed_body, err_json)) {
+					bool transformed =
+					    body_type_has_variant
+					        ? TransformVariantTypedBody(con, match.route.body_type, raw, typed_body, err_json)
+					        : TransformTypedBody(con, match.route.body_type, raw, typed_body, err_json);
+					if (!transformed) {
 						SetJson(res, 422, err_json);
 						finish();
 						return;
 					}
 				}
-				if (typed_body.type() != expected) {
+				if (expected.id() != LogicalTypeId::UNKNOWN && typed_body.type() != expected) {
 					Value casted;
 					string cast_error;
 					if (!QuackapiTryCast(typed_body, expected, casted, &cast_error)) {
@@ -4974,7 +5188,47 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 
 			BoundParameterData bound;
 			string err_json;
-			if (!BindParamValue(raw, expected, loc_kind, param_name, bound, err_json)) {
+			bool has_native_variant = false;
+			if (expected.id() == LogicalTypeId::VARIANT && loc_kind == "body") {
+				auto json_it = json_body_values.find(param_name);
+				if (json_it != json_body_values.end()) {
+					if (!json_variant_extension_loaded) {
+						auto load = con.Query("LOAD json");
+						if (load->HasError()) {
+							validation_issues.push_back(
+							    {ValidationLocJson(loc_kind, param_name), "JSON extension unavailable", "value_error"});
+							continue;
+						}
+						json_variant_extension_loaded = true;
+					}
+					try {
+						auto json_value = Value(json_it->second).CastAs(*con.context, LogicalType::JSON());
+						native_variant = json_value.CastAs(*con.context, LogicalType::VARIANT());
+						has_native_variant = true;
+					} catch (std::exception &) {
+						validation_issues.push_back(
+						    {ValidationLocJson(loc_kind, param_name), "Input should be valid JSON", "json_invalid"});
+						continue;
+					}
+				}
+			}
+			if (expected.id() == LogicalTypeId::VARIANT && !has_native_variant) {
+				if (has_native_variant_default) {
+					has_native_variant = true;
+				} else {
+					try {
+						native_variant = Value(raw).CastAs(*con.context, LogicalType::VARIANT());
+						has_native_variant = true;
+					} catch (std::exception &) {
+						validation_issues.push_back(
+						    {ValidationLocJson(loc_kind, param_name), "Input should be a valid VARIANT", "type_error"});
+						continue;
+					}
+				}
+			}
+			if (has_native_variant) {
+				bound = BoundParameterData(native_variant);
+			} else if (!BindParamValue(raw, expected, loc_kind, param_name, bound, err_json)) {
 				validation_issues.push_back({ValidationLocJson(loc_kind, param_name),
 				                             "Input should be a valid " + expected.ToString(), "type_error"});
 				continue;
@@ -4992,13 +5246,16 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				// We re-cast from raw for constraint checking to avoid depending on
 				// BoundParameterData layout:
 				Value constraint_val;
-				if (expected.id() != LogicalTypeId::UNKNOWN && expected.id() != LogicalTypeId::VARCHAR) {
+				if (expected.id() == LogicalTypeId::VARIANT && has_native_variant) {
+					constraint_val = VariantValue::GetValue(native_variant);
+				} else if (expected.id() != LogicalTypeId::UNKNOWN && expected.id() != LogicalTypeId::VARCHAR) {
 					string cerr;
 					QuackapiTryCast(Value(raw), expected, constraint_val, &cerr);
 				} else {
 					constraint_val = Value(raw);
 				}
-				if (!CheckParamConstraints(*spec, raw, constraint_val, cmsg, ctype)) {
+				if (!CheckParamConstraints(*spec, raw, constraint_val, cmsg, ctype,
+				                           expected.id() == LogicalTypeId::VARIANT)) {
 					validation_issues.push_back({ValidationLocJson(loc_kind, param_name), cmsg, ctype});
 					continue;
 				}
@@ -5043,7 +5300,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				return;
 			}
 			if (IsPlainExecRoute(match.route, body_format)) {
-				// The same code quackapi_exec() runs, so a receipt reads the same either way.
+				// The same code quackapi_selfdispatch() runs, so a receipt reads the same either way.
 				auto response = QuackapiExecSql(
 				    con, sql_it->second.second, NumericCast<idx_t>(options.max_response_bytes), deadline,
 				    sql_it->second.first, exec_param, [&deadline]() { return deadline.Disconnected(); });
@@ -5227,6 +5484,48 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			return;
 		}
 
+		if (body_format == BodyFormat::PARQUET && !data_cols.empty()) {
+			ParquetResponseData parquet;
+			try {
+				parquet = SerializeResultParquet(
+				    con, *result, names, result->GetTypes(), data_cols, NumericCast<idx_t>(options.max_response_bytes),
+				    [&deadline]() { return deadline.Expired() || deadline.Disconnected(); });
+			} catch (const ResponseTooLarge &) {
+				SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+				finish();
+				return;
+			} catch (const ParquetRequestStopped &) {
+				if (deadline.Expired()) {
+					SetJson(res, 504, "{\"detail\":\"Query execution deadline exceeded\"}");
+				}
+				finish();
+				return;
+			} catch (const std::exception &ex) {
+				if (deadline.Expired()) {
+					SetJson(res, 504, "{\"detail\":\"Query execution deadline exceeded\"}");
+				} else if (!deadline.Disconnected()) {
+					SetJson(res, 500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
+				}
+				finish();
+				return;
+			}
+			rows_out = NumericCast<int64_t>(parquet.row_count);
+			for (const auto &cookie : parquet.cookies) {
+				res.set_header("Set-Cookie", cookie);
+			}
+			if (!parquet.location.empty()) {
+				res.set_header("Location", parquet.location);
+			}
+			if (parquet.row_count == 0 && match.route.empty_status != 0) {
+				SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
+			} else {
+				res.status = match.route.status;
+				res.set_content(std::move(parquet.body), "application/vnd.apache.parquet");
+			}
+			finish();
+			return;
+		}
+
 		// Encode JSON as native chunks are fetched; retain row Values only for other formats.
 		vector<vector<Value>> rows;
 		string json_body = object_envelope ? string() : "[";
@@ -5382,7 +5681,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			body = SerializeRowsCsv(names, data_cols, rows);
 			content_type = "text/csv; charset=utf-8";
 		} else if (body_format == BodyFormat::PARQUET) {
-			body = SerializeRowsParquet(con, names, result->GetTypes(), data_cols, rows);
+			body.clear(); // Non-empty Parquet results are handled from native chunks above.
 			content_type = "application/vnd.apache.parquet";
 		} else if (object_envelope) {
 			if (row_count > 1) {

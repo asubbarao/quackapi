@@ -4,11 +4,13 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/query_result.hpp"
 
 namespace duckdb {
 
@@ -26,6 +28,40 @@ string QuackapiJsonEscape(const string &input);
 //! name. $claims_* names are server-bound, never request SQL, so they do not
 //! qualify.
 bool QuackapiExecRouteParam(const string &handler_sql, string &param_name);
+
+//! Collect native query rows as a LIST<VARIANT> with one fixed STRUCT type per result.
+//! The byte limit measures DuckDB's native binary serialization of the complete list,
+//! including list, schema and row overhead; it is not an estimate of heap usage.
+struct QuackapiTypedResult {
+	Value rows;
+	Value columns;
+	QuackapiTypedResult();
+};
+
+class QuackapiTypedRowsTooLarge : public InvalidInputException {
+public:
+	explicit QuackapiTypedRowsTooLarge(const string &message) : InvalidInputException(message) {
+	}
+};
+
+class QuackapiTypedRowCollector {
+public:
+	QuackapiTypedRowCollector(vector<string> names, vector<LogicalType> types, idx_t max_bytes);
+	void AppendRow(vector<Value> values);
+	void AppendChunk(const DataChunk &chunk);
+	QuackapiTypedResult Finish();
+
+private:
+	idx_t column_count;
+	LogicalType row_type;
+	vector<Value> rows;
+	idx_t max_bytes;
+	idx_t empty_rows_bytes;
+	idx_t empty_result_bytes;
+	idx_t row_payload_bytes = 0;
+};
+
+QuackapiTypedResult QuackapiTypedRowsFromResult(QueryResult &result, idx_t max_bytes);
 
 //===--------------------------------------------------------------------===//
 // DDL from the 2.0 token view
@@ -144,7 +180,7 @@ inline void FinishDdlPlan(ParserExtensionPlanResult &result) {
 
 //! Emit the single VARCHAR status row and mark the apply TF finished.
 inline void EmitOneShotStatus(DataChunk &output, bool &finished, const string &message) {
-	output.SetValue(0, 0, Value(message));
+	output.data[0].SetValue(0, Value(message));
 	output.SetChildCardinality(1);
 	finished = true;
 }

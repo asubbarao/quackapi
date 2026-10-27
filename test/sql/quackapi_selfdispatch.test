@@ -1,5 +1,5 @@
-# name: test/sql/quackapi_exec.test
-# description: quackapi_exec(sql) answers what quackapi_post to an exec route answers, with no HTTP worker, so nested self-dispatch cannot exhaust the pool
+# name: test/sql/quackapi_selfdispatch.test
+# description: quackapi_selfdispatch(sql) answers what quackapi_post to an exec route answers, with no HTTP worker, so nested self-dispatch cannot exhaust the pool
 # group: [sql]
 
 require quackapi
@@ -15,15 +15,16 @@ SELECT * FROM quackapi_serve(29320, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29320
 
 # ---------------------------------------------------------------------------
-# The receipt is quackapi_post's struct
+# The local receipt extends transport metadata with native typed rows.
 # ---------------------------------------------------------------------------
 query I
-SELECT typeof(quackapi_exec('SELECT 1')) = typeof(quackapi_post('http://127.0.0.1:29320/sql', '{}'));
+SELECT typeof(quackapi_selfdispatch('SELECT 1').rows) = 'VARIANT[]'
+   AND typeof(quackapi_selfdispatch('SELECT 1').body_blob) = typeof(quackapi_post('http://127.0.0.1:29320/sql', '{}').body_blob);
 ----
 true
 
 query I
-SELECT quackapi_exec(NULL) IS NULL;
+SELECT quackapi_selfdispatch(NULL) IS NULL;
 ----
 true
 
@@ -52,7 +53,7 @@ query IIIIII
 WITH receipts AS (
     SELECT case_name,
            quackapi_post('http://127.0.0.1:29320/sql', json_object('sql', sql_text)::VARCHAR) AS http,
-           quackapi_exec(sql_text) AS exec
+           quackapi_selfdispatch(sql_text) AS exec
     FROM exec_cases
 )
 SELECT case_name,
@@ -80,7 +81,7 @@ types	200	true	true	true	true
 zero_rows	200	true	true	true	true
 
 query II
-SELECT (r).body, (r).headers['Content-Type'] FROM (SELECT quackapi_exec('SELECT 42 AS answer') AS r);
+SELECT (r).body, (r).headers['Content-Type'] FROM (SELECT quackapi_selfdispatch('SELECT 42 AS answer') AS r);
 ----
 [{"answer":42}]	application/json
 
@@ -88,14 +89,14 @@ query III
 SELECT (r).status,
        json_extract_string((r).body, '$.detail[0].loc'),
        contains(json_extract_string((r).body, '$.detail[0].msg'), 'Statement 2 of 3 failed')
-FROM (SELECT quackapi_exec('SELECT 1; SELECT nope FROM nowhere; SELECT 2') AS r);
+FROM (SELECT quackapi_selfdispatch('SELECT 1; SELECT nope FROM nowhere; SELECT 2') AS r);
 ----
 422	["body","sql"]	true
 
 # Location / Set-Cookie columns become headers, as on the route.
 query III
 SELECT (r).body, (r).headers['Location'], (r).headers['Set-Cookie']
-FROM (SELECT quackapi_exec('SELECT ''/next'' AS location, ''k=v'' AS set_cookie, 1 AS v') AS r);
+FROM (SELECT quackapi_selfdispatch('SELECT ''/next'' AS location, ''k=v'' AS set_cookie, 1 AS v') AS r);
 ----
 [{"v":1}]	/next	k=v
 
@@ -106,12 +107,12 @@ statement ok
 CREATE TABLE exec_hits (n INTEGER);
 
 query I
-SELECT (quackapi_exec('INSERT INTO exec_hits VALUES (1); SELECT nope FROM nowhere; INSERT INTO exec_hits VALUES (2)')).status;
+SELECT (quackapi_selfdispatch('INSERT INTO exec_hits VALUES (1); SELECT nope FROM nowhere; INSERT INTO exec_hits VALUES (2)')).status;
 ----
 422
 
 query I
-SELECT (quackapi_exec('CREATE TABLE exec_made AS SELECT 7 AS v')).status;
+SELECT (quackapi_selfdispatch('CREATE TABLE exec_made AS SELECT 7 AS v')).status;
 ----
 200
 
@@ -122,7 +123,7 @@ SELECT (SELECT list(n) FROM exec_hits), (SELECT list(v) FROM exec_made);
 
 # Forty concurrent execs each create a table and append to one shared table.
 query I
-SELECT list(DISTINCT (quackapi_exec('CREATE TABLE exec_t' || range || ' AS SELECT ' || range || ' AS v; INSERT INTO exec_hits VALUES (' || range || ' + 100)')).status)
+SELECT list(DISTINCT (quackapi_selfdispatch('CREATE TABLE exec_t' || range || ' AS SELECT ' || range || ' AS v; INSERT INTO exec_hits VALUES (' || range || ' + 100)')).status)
 FROM range(40);
 ----
 [200]
@@ -143,7 +144,7 @@ statement ok
 CREATE TABLE exec_clock AS SELECT get_current_timestamp() AS started;
 
 query I
-SELECT list(DISTINCT (quackapi_exec('SELECT sleep_ms(300) AS s')).status) FROM range(16);
+SELECT list(DISTINCT (quackapi_selfdispatch('SELECT sleep_ms(300) AS s')).status) FROM range(16);
 ----
 [200]
 
@@ -156,7 +157,7 @@ true
 # Nested self-dispatch: 40 x 5, and three levels deep
 # ---------------------------------------------------------------------------
 statement ok
-CREATE MACRO exec_sd(q) AS quackapi_exec(q);
+CREATE MACRO exec_sd(q) AS quackapi_selfdispatch(q);
 
 query II
 WITH outer_statements AS (
@@ -226,11 +227,11 @@ RESET GLOBAL quackapi_http_timeout_ms;
 
 
 # ---------------------------------------------------------------------------
-# quackapi_exec_max_threads bounds exec threads process-wide. Past it a row runs
+# quackapi_selfdispatch_max_threads bounds exec threads process-wide. Past it a row runs
 # on the calling thread instead of waiting, so a full process cannot deadlock.
 # ---------------------------------------------------------------------------
 statement ok
-SET GLOBAL quackapi_exec_max_threads = 2;
+SET GLOBAL quackapi_selfdispatch_max_threads = 2;
 
 statement ok
 DELETE FROM exec_clock;
@@ -240,7 +241,7 @@ INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 # Eight 300 ms rows on two threads: four waves.
 query I
-SELECT list(DISTINCT (quackapi_exec('SELECT sleep_ms(300) AS s')).status) FROM range(8);
+SELECT list(DISTINCT (quackapi_selfdispatch('SELECT sleep_ms(300) AS s')).status) FROM range(8);
 ----
 [200]
 
@@ -262,7 +263,7 @@ FROM (SELECT exec_sd(outer_sql) AS r FROM outer_statements);
 
 # 0: every row on the calling thread, one at a time.
 statement ok
-SET GLOBAL quackapi_exec_max_threads = 0;
+SET GLOBAL quackapi_selfdispatch_max_threads = 0;
 
 statement ok
 DELETE FROM exec_clock;
@@ -271,7 +272,7 @@ statement ok
 INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
-SELECT list(DISTINCT (quackapi_exec('SELECT sleep_ms(300) AS s')).status) FROM range(4);
+SELECT list(DISTINCT (quackapi_selfdispatch('SELECT sleep_ms(300) AS s')).status) FROM range(4);
 ----
 [200]
 
@@ -281,18 +282,18 @@ SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) >= 1100 FROM exec_c
 true
 
 statement ok
-RESET GLOBAL quackapi_exec_max_threads;
+RESET GLOBAL quackapi_selfdispatch_max_threads;
 
 statement ok
-SET quackapi_exec_max_threads = -1;
+SET quackapi_selfdispatch_max_threads = -1;
 
 statement error
-SELECT quackapi_exec('SELECT 1');
+SELECT quackapi_selfdispatch('SELECT 1');
 ----
-quackapi_exec_max_threads must be >= 0
+quackapi_selfdispatch_max_threads must be >= 0
 
 statement ok
-RESET quackapi_exec_max_threads;
+RESET quackapi_selfdispatch_max_threads;
 
 # ---------------------------------------------------------------------------
 # Budgets: quackapi_query_timeout_ms (504), quackapi_max_response_bytes (507)
@@ -301,7 +302,7 @@ statement ok
 SET quackapi_query_timeout_ms = 200;
 
 query II
-SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT 1; SELECT sum(range) FROM range(100000000000)') AS r);
+SELECT (r).status, (r).body FROM (SELECT quackapi_selfdispatch('SELECT 1; SELECT sum(range) FROM range(100000000000)') AS r);
 ----
 504	{"detail":"Query execution deadline exceeded"}
 
@@ -318,13 +319,13 @@ statement ok
 SET SESSION quackapi_query_timeout_ms = 200;
 
 query I
-SELECT (quackapi_exec('SELECT sleep_ms(400) AS a; SELECT 42 AS v')).status;
+SELECT (quackapi_selfdispatch('SELECT sleep_ms(400) AS a; SELECT 42 AS v')).status;
 ----
 504
 
 query II
 SELECT status, decode(body) FROM quackapi_request('POST', '/sql',
-  '{"sql":"SELECT (quackapi_exec(''SELECT sleep_ms(400) AS a; SELECT 42 AS v'')).body AS b"}', query_timeout_ms := 5000);
+  '{"sql":"SELECT (quackapi_selfdispatch(''SELECT sleep_ms(400) AS a; SELECT 42 AS v'')).body AS b"}', query_timeout_ms := 5000);
 ----
 200	[{"b":"[{\"v\":42}]"}]
 
@@ -346,7 +347,7 @@ http://127.0.0.1:29322
 
 # A request's deadline bounds the execs its SQL makes. (A caller that returns
 # while a row is blocked where no interrupt reaches is tested in
-# test/cpp/quackapi_exec_interrupt_test.cpp: only a Ctrl-C, which SQL cannot
+# test/cpp/quackapi_selfdispatch_interrupt_test.cpp: only a Ctrl-C, which SQL cannot
 # send, interrupts a caller before its rows' deadline.)
 statement ok
 DELETE FROM exec_clock;
@@ -356,7 +357,7 @@ INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
 SELECT status FROM quackapi_request('POST', '/sql',
-  '{"sql":"SELECT quackapi_exec(''SELECT sum(range) FROM range(100000000000)'') AS r"}', query_timeout_ms := 300);
+  '{"sql":"SELECT quackapi_selfdispatch(''SELECT sum(range) FROM range(100000000000)'') AS r"}', query_timeout_ms := 300);
 ----
 504
 
@@ -394,7 +395,7 @@ true
 # deadline ends: at 600 ms the request has 400 ms left, not its full 1000 ms.
 # As above, 200 or 504 depending on which acts first at the deadline.
 statement ok
-SET GLOBAL quackapi_exec_max_threads = 0;
+SET GLOBAL quackapi_selfdispatch_max_threads = 0;
 
 statement ok
 DELETE FROM exec_clock;
@@ -404,7 +405,7 @@ INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
 SELECT status IN (200, 504) FROM quackapi_request('POST', '/sql',
-  '{"sql":"SELECT sleep_ms(600) AS a; SELECT (quackapi_exec(''SELECT quackapi_post(''''http://127.0.0.1:29322/slow'''', '''''''') AS f'')).status AS r"}', query_timeout_ms := 1000);
+  '{"sql":"SELECT sleep_ms(600) AS a; SELECT (quackapi_selfdispatch(''SELECT quackapi_post(''''http://127.0.0.1:29322/slow'''', '''''''') AS f'')).status AS r"}', query_timeout_ms := 1000);
 ----
 true
 
@@ -414,15 +415,15 @@ SELECT epoch_ms(get_current_timestamp()) - epoch_ms(started) < 1350 FROM exec_cl
 true
 
 statement ok
-RESET GLOBAL quackapi_exec_max_threads;
+RESET GLOBAL quackapi_selfdispatch_max_threads;
 
 statement ok
 SET quackapi_max_response_bytes = 10;
 
 query II
-SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT repeat(''x'', 100) AS big') AS r);
+SELECT (r).status, (r).body FROM (SELECT quackapi_selfdispatch('SELECT repeat(''x'', 100) AS big') AS r);
 ----
-507	{"detail":"Response exceeds configured byte limit"}
+507	{"detail":"Native typed rows exceed configured byte limit"}
 
 # The cap is on the serialized body, as on the route: these values are 100 bytes
 # and their JSON is 2.7 KB.
@@ -430,9 +431,9 @@ statement ok
 SET quackapi_max_response_bytes = 1000;
 
 query II
-SELECT (r).status, (r).body FROM (SELECT quackapi_exec('SELECT 1 AS some_long_column_name FROM range(100)') AS r);
+SELECT (r).status, (r).body FROM (SELECT quackapi_selfdispatch('SELECT 1 AS some_long_column_name FROM range(100)') AS r);
 ----
-507	{"detail":"Response exceeds configured byte limit"}
+507	{"detail":"Native typed rows exceed configured byte limit"}
 
 query I
 SELECT status FROM quackapi_request('POST', '/sql', '{"sql":"SELECT 1 AS some_long_column_name FROM range(100)"}',
@@ -447,7 +448,7 @@ statement ok
 SET quackapi_query_timeout_ms = 0;
 
 statement error
-SELECT quackapi_exec('SELECT 1');
+SELECT quackapi_selfdispatch('SELECT 1');
 ----
 quackapi_query_timeout_ms must be > 0
 
@@ -455,7 +456,7 @@ statement ok
 RESET quackapi_query_timeout_ms;
 
 # ---------------------------------------------------------------------------
-# While a row access or masking policy is bound, quackapi_exec fails closed with
+# While a row access or masking policy is bound, quackapi_selfdispatch fails closed with
 # the exec route's 403: neither can rewrite arbitrary SQL to apply it.
 # ---------------------------------------------------------------------------
 statement ok
@@ -469,7 +470,7 @@ ALTER TABLE exec_secret MODIFY COLUMN e SET MASKING POLICY exec_mask;
 
 query III
 WITH receipts AS (
-    SELECT quackapi_exec('SELECT * FROM exec_secret') AS exec,
+    SELECT quackapi_selfdispatch('SELECT * FROM exec_secret') AS exec,
            quackapi_post('http://127.0.0.1:29320/sql', '{"sql":"SELECT * FROM exec_secret"}') AS http
 )
 SELECT exec.status, exec.status = http.status AND exec.body = http.body, exec.body FROM receipts;
@@ -483,7 +484,7 @@ statement ok
 DROP MASKING POLICY exec_mask;
 
 query I
-SELECT (quackapi_exec('SELECT * FROM exec_secret')).status;
+SELECT (quackapi_selfdispatch('SELECT * FROM exec_secret')).status;
 ----
 200
 

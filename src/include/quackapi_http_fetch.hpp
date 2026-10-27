@@ -24,9 +24,11 @@
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "quackapi_util.hpp"
 
 namespace duckdb {
 
@@ -41,6 +43,8 @@ struct QuackapiHttpFetchResult {
 	HTTPHeaders headers;
 	//! True when this call reused a pooled connection rather than dialling.
 	bool reused_connection = false;
+	//! Native schema and row values from local exec or explicitly decoded POST responses.
+	QuackapiTypedResult typed_result;
 
 	bool Ok() const {
 		return success && request_error.empty();

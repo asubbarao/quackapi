@@ -12,10 +12,224 @@ require nanoarrow
 statement ok
 CREATE ROUTE variant_sql POST '/sql' AS $sql;
 
+statement ok
+CREATE ROUTE variant_input POST '/variant-input' PARAM value VARIANT AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_query GET '/variant-query' PARAM value VARIANT AS SELECT typeof($value) AS kind, $value AS value;
+
+statement ok
+CREATE ROUTE variant_default GET '/variant-default' PARAM value VARIANT DEFAULT 123 AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_default_string GET '/variant-default-string' PARAM value VARIANT DEFAULT '123' AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_inferred_default GET '/variant-inferred-default' PARAM value DEFAULT 123 AS SELECT $value::VARIANT AS value;
+
+statement ok
+CREATE ROUTE variant_null_default POST '/variant-null-default' PARAM value VARIANT DEFAULT NULL AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_numeric_bound POST '/variant-numeric-bound' PARAM value VARIANT GE 10 AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_string_length POST '/variant-string-length' PARAM value VARIANT MIN_LENGTH 2 AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_body_default_number POST '/variant-body-default-number' PARAM value VARIANT DEFAULT 123 AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_body_default_string POST '/variant-body-default-string' PARAM value VARIANT DEFAULT '123' AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_null_bound POST '/variant-null-bound' PARAM value VARIANT DEFAULT NULL GE 10 AS SELECT $value AS value;
+
+statement ok
+CREATE ROUTE variant_output GET '/variant-output' AS SELECT '[1]'::JSON::VARIANT AS value;
+
+statement ok
+CREATE ROUTE variant_typed_input POST '/variant-typed-input'
+  BODY TYPE '{"value":"VARIANT"}'
+  AS SELECT ($body::STRUCT(value VARIANT)).value AS value;
+
+statement ok
+CREATE ROUTE variant_decimal_input POST '/variant-decimal-input'
+  BODY TYPE '{"d":"DECIMAL(24,4)","value":"VARIANT"}'
+  AS SELECT ($body::STRUCT(d DECIMAL(24,4), value VARIANT)).d::VARCHAR AS d,
+            ($body::STRUCT(d DECIMAL(24,4), value VARIANT)).value AS value;
+
 query I
 SELECT * FROM quackapi_serve(29324, host := '127.0.0.1', access_log := false);
 ----
 http://127.0.0.1:29324
+
+# JSON body tokens retain their native VARIANT type and nested nulls.
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-input', '{"value":{"items":[1,"123",null]}}');
+----
+200	[{"value":{"items":[1,"123",null]}}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-input', '{"value":"123"}');
+----
+200	[{"value":"123"}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-input', '{"value":123}');
+----
+200	[{"value":123}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-input', '{"value":null}');
+----
+200	[{"value":null}]
+
+query IIII
+SELECT status, error IS NULL, columns[1].type = get_type(NULL::VARIANT), rows[1].value IS NULL
+FROM quackapi_post('http://127.0.0.1:29324/variant-input', '{"value":null}', response_format := 'arrow');
+----
+200	true	true	true
+
+query I
+SELECT status FROM quackapi_request('POST', '/variant-input', '{}');
+----
+422
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-null-default', '{"value":null}');
+----
+200	[{"value":null}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-typed-input', '{"value":{"nested":[1,null]}}');
+----
+200	[{"value":{"nested":[1,null]}}]
+
+# Replacing only VARIANT leaves preserves exact native DECIMAL values.
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-decimal-input',
+  '{"d":12345678901234567890.1234,"value":{"nested":[1,null]}}');
+----
+200	[{"d":"12345678901234567890.1234","value":{"nested":[1,null]}}]
+
+# Replacing only VARIANT leaves preserves exact native DECIMAL values.
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-decimal-input',
+  '{"d":12345678901234567890.1234,"value":{"nested":[1,null]}}');
+----
+200	[{"d":"12345678901234567890.1234","value":{"nested":[1,null]}}]
+
+# Replacing only VARIANT leaves preserves exact native DECIMAL values.
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-decimal-input',
+  '{"d":12345678901234567890.1234,"value":{"nested":[1,null]}}');
+----
+200	[{"d":"12345678901234567890.1234","value":{"nested":[1,null]}}]
+
+# Numeric bounds inspect native VARIANT numbers and do not coerce JSON strings.
+query I
+SELECT status FROM quackapi_request('POST', '/variant-numeric-bound', '{"value":9}');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('POST', '/variant-numeric-bound', '{"value":10}');
+----
+200
+
+query I
+SELECT status FROM quackapi_request('POST', '/variant-numeric-bound', '{"value":"10"}');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('POST', '/variant-numeric-bound?value=10');
+----
+422
+
+# String length limits count Unicode code points for JSON VARIANT strings.
+query I
+SELECT status FROM quackapi_request('POST', '/variant-string-length', '{"value":"é"}');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('POST', '/variant-string-length', '{"value":"éé"}');
+----
+200
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/variant-default');
+----
+200	[{"value":123}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/variant-default-string');
+----
+200	[{"value":"123"}]
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/variant-inferred-default');
+----
+200	[{"value":123}]
+
+# Text wire locations remain strings even when they look like JSON.
+query III
+SELECT status, json_extract_string(decode(body), '$[0].kind'), json_extract_string(decode(body), '$[0].value')
+FROM quackapi_request('GET', '/variant-query?value=%5B1%5D');
+----
+200	VARIANT	[1]
+
+# OpenAPI reports text-wire VARIANT parameters as strings, while body alternatives preserve JSON types.
+query TIII
+SELECT json_extract_string(decode(body), '$.paths./variant-query.get.parameters[0].schema.type'),
+       json_extract(decode(body), '$.paths./variant-output.get.responses.200.content.application/json.schema.items.properties.value') = '{}',
+       json_extract(decode(body), '$.paths./variant-typed-input.post.requestBody.content.application/json.schema.properties.value') = '{}',
+       json_extract(decode(body), '$.paths./variant-numeric-bound.post.parameters[0].schema.not') = '{}'
+FROM quackapi_request('GET', '/openapi.json');
+----
+string	true	true	true
+
+query TTTTT
+SELECT json_extract_string(decode(body), '$.paths./variant-numeric-bound.post.parameters[0].required'),
+       json_extract_string(decode(body), '$.paths./variant-numeric-bound.post.requestBody.required'),
+       json_extract_string(decode(body), '$.paths./variant-numeric-bound.post.requestBody.content.application/json.schema.properties.value.type'),
+       json_extract_string(decode(body), '$.paths./variant-numeric-bound.post.requestBody.content.application/json.schema.properties.value.minimum'),
+       json_extract_string(decode(body), '$.paths./variant-numeric-bound.post.requestBody.content.application/json.schema.required[0]')
+FROM quackapi_request('GET', '/openapi.json');
+----
+false	true	number	10	value
+
+query TTTTT
+SELECT json_extract_string(decode(body), '$.paths./variant-string-length.post.parameters[0].required'),
+       json_extract_string(decode(body), '$.paths./variant-string-length.post.parameters[0].schema.type'),
+       json_extract_string(decode(body), '$.paths./variant-string-length.post.requestBody.required'),
+       json_extract_string(decode(body), '$.paths./variant-string-length.post.requestBody.content.application/json.schema.properties.value.type'),
+       json_extract_string(decode(body), '$.paths./variant-string-length.post.requestBody.content.application/json.schema.properties.value.minLength')
+FROM quackapi_request('GET', '/openapi.json');
+----
+false	string	false	string	2
+
+query TT
+SELECT json_type(decode(body)::JSON, '$.paths./variant-body-default-number.post.requestBody.content.application/json.schema.properties.value.default'),
+       json_type(decode(body)::JSON, '$.paths./variant-body-default-string.post.requestBody.content.application/json.schema.properties.value.default')
+FROM quackapi_request('GET', '/openapi.json');
+----
+UBIGINT	VARCHAR
+
+query TTT
+SELECT json_extract_string(decode(body), '$.paths./variant-null-bound.post.requestBody.content.application/json.schema.properties.value.anyOf[0].type'),
+       json_extract_string(decode(body), '$.paths./variant-null-bound.post.requestBody.content.application/json.schema.properties.value.anyOf[1].type'),
+       json_type(decode(body)::JSON, '$.paths./variant-null-bound.post.requestBody.content.application/json.schema.properties.value.default')
+FROM quackapi_request('GET', '/openapi.json');
+----
+number	null	NULL
+
+query IT
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-null-bound', '{"value":null}');
+----
+200	[{"value":null}]
 
 # Compare with the engine's own JSON conversion, not VARIANT's display text.
 query TTTT
@@ -25,7 +239,7 @@ WITH cases AS (
 ), receipts AS (
     SELECT document, document::JSON::VARIANT AS value,
            concat($q$SELECT '$q$, document, $q$'::JSON::VARIANT AS value$q$) AS sql,
-           quackapi_exec(sql) AS local,
+           quackapi_selfdispatch(sql) AS local,
            quackapi_post('http://127.0.0.1:29324/sql', json_object('sql', sql)::VARCHAR) AS http
     FROM cases
 )
@@ -43,7 +257,7 @@ FROM receipts ORDER BY document;
 200	200	true	true
 
 query I
-SELECT (quackapi_exec('SELECT NULL::VARIANT AS value')).body;
+SELECT (quackapi_selfdispatch('SELECT NULL::VARIANT AS value')).body;
 ----
 [{"value":null}]
 

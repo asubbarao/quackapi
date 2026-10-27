@@ -64,6 +64,38 @@ curl -X POST 'http://127.0.0.1:8000/users?name=fromq&age=9' \
 # [{"name":"fromq","age":9}]
 ```
 
+### Flexible fields with VARIANT
+
+Use a native VARIANT when a JSON field can contain different value kinds:
+
+```sql
+CREATE ROUTE inspect_payload POST '/inspect-payload'
+  PARAM payload VARIANT AS
+SELECT $payload AS payload, variant_typeof($payload) AS native_type;
+```
+
+An object or list stays structured; `"123"` remains a string and `123` remains a
+number. Explicit JSON null is valid for an unconstrained VARIANT. A missing
+required field still returns 422. A query, path, header, cookie or form value
+arrives as a VARIANT string, so query precedence also changes its value kind.
+`DEFAULT` literals keep their native SQL literal type. Numeric bounds require
+numbers and length constraints require strings; DEFAULT NULL permits explicit
+null even with those constraints.
+
+Use `BODY TYPE` when fields need declared types alongside flexible leaves:
+
+```sql
+CREATE ROUTE typed_payload POST '/typed-payload'
+  BODY TYPE '{"amount":"DECIMAL(24,4)","payload":"VARIANT"}' AS
+SELECT $body.amount AS amount, $body.payload AS payload;
+```
+
+The amount binds directly to DECIMAL while only the flexible leaf uses VARIANT.
+See [validation and nullability](../PYDANTIC_PARITY.md) for BODY SCHEMA
+intersections and OpenAPI behavior. JSON responses still have JSON's limited
+type vocabulary; use [typed Arrow/Parquet receipts](extension-composition.md#typed-arrow-and-parquet-replies)
+when the caller needs the native result types.
+
 ---
 
 ## Raw body (`$body`)

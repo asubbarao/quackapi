@@ -360,7 +360,7 @@ string TransformScalarToOpenApi(const string &declared_type) {
 	if (type == "UUID") {
 		return "{\"type\":\"string\",\"format\":\"uuid\"}";
 	}
-	if (type == "JSON" || type == "ANY") {
+	if (type == "JSON" || type == "ANY" || type == "VARIANT") {
 		return "{}";
 	}
 	return "{\"type\":\"string\"}";
@@ -387,6 +387,108 @@ string TransformNodeToOpenApi(const JsonNode &node) {
 	default:
 		return "{}";
 	}
+}
+
+bool TransformNodeHasVariant(const JsonNode &node) {
+	if (node.kind == JsonNodeKind::STRING) {
+		auto declared_type = node.scalar;
+		StringUtil::Trim(declared_type);
+		if (StringUtil::Upper(declared_type) == "VARIANT") {
+			return true;
+		}
+	}
+	for (const auto &child : node.children) {
+		if (TransformNodeHasVariant(child)) {
+			return true;
+		}
+	}
+	for (const auto &member : node.members) {
+		if (TransformNodeHasVariant(member.second)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+string SerializeTransformNode(const JsonNode &node, bool replace_variant) {
+	switch (node.kind) {
+	case JsonNodeKind::NIL:
+		return "null";
+	case JsonNodeKind::BOOL:
+	case JsonNodeKind::NUMBER:
+		return node.scalar;
+	case JsonNodeKind::STRING: {
+		auto value = node.scalar;
+		StringUtil::Trim(value);
+		if (replace_variant && StringUtil::Upper(value) == "VARIANT") {
+			value = "JSON";
+		} else {
+			value = node.scalar;
+		}
+		return "\"" + QuackapiJsonEscape(value) + "\"";
+	}
+	case JsonNodeKind::ARRAY: {
+		string result = "[";
+		for (idx_t i = 0; i < node.children.size(); i++) {
+			if (i > 0) {
+				result += ",";
+			}
+			result += SerializeTransformNode(node.children[i], replace_variant);
+		}
+		return result + "]";
+	}
+	case JsonNodeKind::OBJECT: {
+		string result = "{";
+		for (idx_t i = 0; i < node.members.size(); i++) {
+			if (i > 0) {
+				result += ",";
+			}
+			result += "\"" + QuackapiJsonEscape(node.members[i].first) +
+			          "\":" + SerializeTransformNode(node.members[i].second, replace_variant);
+		}
+		return result + "}";
+	}
+	}
+	return "null";
+}
+
+const JsonNode *FindTransformMember(const JsonNode &node, const string &name) {
+	for (const auto &member : node.members) {
+		if (StringUtil::CIEquals(member.first, name)) {
+			return &member.second;
+		}
+	}
+	return nullptr;
+}
+
+LogicalType RestoreVariantLeaves(const LogicalType &intermediate_type, const JsonNode &declaration) {
+	if (declaration.kind == JsonNodeKind::STRING) {
+		auto declared_type = declaration.scalar;
+		StringUtil::Trim(declared_type);
+		return StringUtil::Upper(declared_type) == "VARIANT" ? LogicalType::VARIANT() : intermediate_type;
+	}
+	if (declaration.kind == JsonNodeKind::OBJECT && intermediate_type.id() == LogicalTypeId::STRUCT) {
+		auto children = StructType::GetChildTypes(intermediate_type);
+		for (auto &child : children) {
+			auto declared_child = FindTransformMember(declaration, child.first.GetIdentifierName());
+			if (declared_child) {
+				child.second = RestoreVariantLeaves(child.second, *declared_child);
+			}
+		}
+		return LogicalType::STRUCT(std::move(children));
+	}
+	if (declaration.kind == JsonNodeKind::ARRAY && !declaration.children.empty()) {
+		if (intermediate_type.id() == LogicalTypeId::LIST) {
+			return LogicalType::LIST(
+			    RestoreVariantLeaves(ListType::GetChildType(intermediate_type), declaration.children[0]));
+		}
+		if (intermediate_type.id() == LogicalTypeId::ARRAY) {
+			return LogicalType::ARRAY(
+			    RestoreVariantLeaves(ArrayType::GetChildType(intermediate_type), declaration.children[0]),
+			    ArrayType::GetSize(intermediate_type));
+		}
+	}
+	return intermediate_type;
 }
 
 } // namespace
@@ -426,6 +528,30 @@ string QuackapiDuckdbTransformToOpenApi(const string &body_type) {
 		return "{}";
 	}
 	return TransformNodeToOpenApi(structure);
+}
+
+bool QuackapiDuckdbTransformHasVariant(const string &body_type) {
+	JsonNode structure;
+	return JsonReader(body_type).ParseDocument(structure) && TransformNodeHasVariant(structure);
+}
+
+bool QuackapiDuckdbTransformVariantLeavesAsJson(const string &body_type, string &normalized_body_type) {
+	JsonNode structure;
+	if (!JsonReader(body_type).ParseDocument(structure) || !TransformNodeHasVariant(structure)) {
+		return false;
+	}
+	normalized_body_type = SerializeTransformNode(structure, true);
+	return true;
+}
+
+bool QuackapiDuckdbTransformRestoreVariantLeaves(const LogicalType &intermediate_type, const string &body_type,
+                                                 LogicalType &result_type) {
+	JsonNode structure;
+	if (!JsonReader(body_type).ParseDocument(structure) || !TransformNodeHasVariant(structure)) {
+		return false;
+	}
+	result_type = RestoreVariantLeaves(intermediate_type, structure);
+	return true;
 }
 
 string QuackapiValidationErrorsJson(const vector<QuackapiValidationIssue> &issues) {

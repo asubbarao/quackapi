@@ -15,8 +15,14 @@ separate [registry pin](https://github.com/duckdb/community-extensions/blob/main
 Read the [migration notes](MIGRATION.md) when upgrading existing applications.
 
 DuckDB 2.0 native values carry route metadata and response data: numeric
-parameter limits retain their precision, JSON preserves `VARIANT`, and Arrow
-converts result batches directly. Large responses still buffer their HTTP body;
+parameter limits retain their precision, JSON preserves VARIANT value kinds,
+and Arrow converts result batches directly. JSON does not carry the full DuckDB
+type system. `quackapi_selfdispatch(sql)` returns native rows directly;
+`quackapi_post(..., response_format := 'arrow'|'parquet')` decodes typed HTTP
+replies into native VARIANT rows and logical TYPE metadata. See
+[typed replies](guide/extension-composition.md#typed-arrow-and-parquet-replies)
+and [VARIANT inputs](guide/request-bodies.md#flexible-fields-with-variant).
+Parquet output uses DuckDB 2.0 submitted COPY. Large responses still buffer their HTTP body;
 see [response budgets](RESOURCE_LIMITS.md) and the
 [JSON/Arrow benchmark](../bench/large_response.sql).
 

@@ -15,7 +15,7 @@ CREATE TABLE native_audit (id INTEGER, payload VARIANT);
 # The PEG parser must distinguish extension DDL from native trigger syntax,
 # including a semicolon inside a literal, in the same submitted SQL program.
 query II
-SELECT status, body FROM quackapi_exec($sql$
+SELECT status, body FROM quackapi_selfdispatch($sql$
 CREATE TRIGGER native_event_added AFTER INSERT ON native_events FOR EACH ROW
 INSERT INTO native_audit VALUES (NEW.id, NEW.payload);
 CREATE ROUTE native_insert POST '/native-event' AS

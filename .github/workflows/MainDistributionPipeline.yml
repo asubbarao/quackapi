@@ -142,9 +142,14 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_lifetime_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-lifetime-test
           /tmp/quackapi-lifetime-test
 
-      - name: Verify quackapi_exec interrupt
+      - name: Verify native typed result byte boundaries
         run: |
-          c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_exec_interrupt_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-exec-interrupt-test
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -Isrc/include -isystem duckdb/src/include test/cpp/quackapi_typed_row_budget_test.cpp src/quackapi_util.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-typed-row-budget-test
+          /tmp/quackapi-typed-row-budget-test
+
+      - name: Verify quackapi_selfdispatch interrupt
+        run: |
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_selfdispatch_interrupt_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-exec-interrupt-test
           /tmp/quackapi-exec-interrupt-test
 
       - name: Verify WebSocket streams

@@ -2,6 +2,7 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/variant.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
@@ -137,8 +138,12 @@ string DuckTypeToOas(const LogicalType &type) {
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::UNION:
 		return "{\"type\":\"object\"}";
+	case LogicalTypeId::VARIANT:
+		// VARIANT accepts any JSON value: object, array, scalar, or null.
+		return "{}";
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::BLOB:
+		return "{\"type\":\"string\"}";
 	case LogicalTypeId::UUID:
 		return "{\"type\":\"string\",\"format\":\"uuid\"}";
 	case LogicalTypeId::BIT:
@@ -175,6 +180,59 @@ ResponseMode ModeFor(const vector<string> &names) {
 		return ResponseMode::TEXT;
 	}
 	return ResponseMode::JSON;
+}
+
+bool IsVariantParam(const QuackapiParamSpec &spec) {
+	return StringUtil::CIEquals(spec.type_name, "VARIANT");
+}
+
+bool HasNumericParamBounds(const QuackapiParamSpec &spec) {
+	return spec.has_ge || spec.has_gt || spec.has_le || spec.has_lt;
+}
+
+string VariantDefaultJson(const QuackapiParamSpec &spec) {
+	if (!spec.has_default) {
+		return string();
+	}
+	if (spec.default_is_null) {
+		return "null";
+	}
+	auto variant = spec.default_variant.DefaultTryCastAs(LogicalType::VARIANT());
+	if (!variant) {
+		return string();
+	}
+	auto value = VariantValue::GetValue(*variant);
+	switch (value.type().id()) {
+	case LogicalTypeId::VARCHAR:
+		return JsonString(value.GetValue<string>());
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL: {
+		auto text = StringUtil::Lower(value.ToString());
+		return text == "nan" || text == "inf" || text == "-inf" ? string() : text;
+	}
+	default:
+		// Don't misrepresent non-scalar defaults as JSON text.
+		return string();
+	}
+}
+
+void AppendOasProperty(string &schema, const string &name, const string &json_value) {
+	if (schema.size() > 1) {
+		schema += ",";
+	}
+	schema += JsonString(name) + ":" + json_value;
 }
 
 string AuthKindString(QuackapiAuthKind kind) {
@@ -284,7 +342,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			return s.name;
 		};
 
-		auto ParamSchema = [&](LogicalType ptype, const QuackapiParamSpec *spec) {
+		auto ParamSchema = [&](LogicalType ptype, const QuackapiParamSpec *spec, bool text_wire) {
 			if (spec && !spec->type_name.empty()) {
 				auto t = StringUtil::Upper(spec->type_name);
 				if (t == "INTEGER" || t == "INT")
@@ -303,38 +361,72 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 					ptype = LogicalType::BOOLEAN;
 				else if (t == "VARCHAR" || t == "TEXT" || t == "STRING")
 					ptype = LogicalType::VARCHAR;
+				else if (t == "VARIANT")
+					ptype = LogicalType::VARIANT();
 			}
-			auto schema = ParamTypeToOas(ptype);
+			const bool impossible_text_numeric_variant =
+			    text_wire && ptype.id() == LogicalTypeId::VARIANT && spec && HasNumericParamBounds(*spec);
+			const bool impossible_body_variant = !text_wire && ptype.id() == LogicalTypeId::VARIANT && spec &&
+			                                     HasNumericParamBounds(*spec) &&
+			                                     (spec->has_min_length || spec->has_max_length);
+			const bool numeric_body_variant = !text_wire && ptype.id() == LogicalTypeId::VARIANT && spec &&
+			                                  HasNumericParamBounds(*spec) && !impossible_body_variant;
+			const bool string_body_variant = !text_wire && ptype.id() == LogicalTypeId::VARIANT && spec &&
+			                                 !HasNumericParamBounds(*spec) &&
+			                                 (spec->has_min_length || spec->has_max_length);
+			auto schema = impossible_text_numeric_variant                     ? string("{\"not\":{}}")
+			              : impossible_body_variant                           ? string("{\"not\":{}}")
+			              : numeric_body_variant                              ? string("{\"type\":\"number\"}")
+			              : string_body_variant                               ? string("{\"type\":\"string\"}")
+			              : text_wire && ptype.id() == LogicalTypeId::VARIANT ? string("{\"type\":\"string\"}")
+			                                                                  : ParamTypeToOas(ptype);
 			if (!spec || schema.empty() || schema.back() != '}')
 				return schema;
 			schema.pop_back();
-			if (spec->has_ge)
-				schema += ",\"minimum\":" + spec->ge.ToString();
-			if (spec->has_gt)
-				schema += ",\"exclusiveMinimum\":" + spec->gt.ToString();
-			if (spec->has_le)
-				schema += ",\"maximum\":" + spec->le.ToString();
-			if (spec->has_lt)
-				schema += ",\"exclusiveMaximum\":" + spec->lt.ToString();
-			if (spec->has_min_length)
-				schema += ",\"minLength\":" + std::to_string(spec->min_length);
-			if (spec->has_max_length)
-				schema += ",\"maxLength\":" + std::to_string(spec->max_length);
+			if (!impossible_text_numeric_variant && !impossible_body_variant) {
+				if (spec->has_ge)
+					AppendOasProperty(schema, "minimum", spec->ge.ToString());
+				if (spec->has_gt)
+					AppendOasProperty(schema, "exclusiveMinimum", spec->gt.ToString());
+				if (spec->has_le)
+					AppendOasProperty(schema, "maximum", spec->le.ToString());
+				if (spec->has_lt)
+					AppendOasProperty(schema, "exclusiveMaximum", spec->lt.ToString());
+				if (spec->has_min_length)
+					AppendOasProperty(schema, "minLength", std::to_string(spec->min_length));
+				if (spec->has_max_length)
+					AppendOasProperty(schema, "maxLength", std::to_string(spec->max_length));
+			}
 			if (spec->has_default) {
-				if (spec->default_is_null)
-					schema += ",\"default\":null";
+				if (spec->default_is_null && !text_wire && ptype.id() == LogicalTypeId::VARIANT) {
+					// OpenAPI 3.1 uses JSON Schema null, not the 3.0 nullable keyword.
+					schema = "{\"anyOf\":[" + schema + "},{\"type\":\"null\"}]";
+				} else if (spec->default_is_null)
+					AppendOasProperty(schema, "nullable", "true");
+				if (ptype.id() == LogicalTypeId::VARIANT) {
+					auto value = VariantDefaultJson(*spec);
+					if (!value.empty())
+						AppendOasProperty(schema, "default", value);
+				} else if (spec->default_is_null)
+					AppendOasProperty(schema, "default", "null");
 				else if (ptype.id() == LogicalTypeId::VARCHAR)
-					schema += ",\"default\":" + JsonString(spec->default_raw);
+					AppendOasProperty(schema, "default", JsonString(spec->default_raw));
 				else {
 					auto cast = Value(spec->default_raw).DefaultTryCastAs(ptype);
 					if (cast) {
 						auto value = StringUtil::Lower(cast->ToString());
 						if (value != "nan" && value != "inf" && value != "-inf")
-							schema += ",\"default\":" + value;
+							AppendOasProperty(schema, "default", value);
 					}
 				}
 			}
 			return schema + "}";
+		};
+		const bool body_capable = route.method == "POST" || route.method == "PUT" || route.method == "PATCH";
+		auto HasVariantBodyAlternative = [&](const QuackapiParamSpec *spec) {
+			return body_capable && spec && IsVariantParam(*spec) && spec->source != QuackapiParamSource::HEADER &&
+			       spec->source != QuackapiParamSource::COOKIE && !ListContains(path_params, spec->name) &&
+			       spec->external_name.empty() && ListContains(named_params, spec->name);
 		};
 
 		// parameters: path + header + cookie + query
@@ -351,7 +443,8 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				ptype = tit->second;
 			}
 			params_json += "{\"name\":" + JsonString(n) +
-			               ",\"in\":\"path\",\"required\":true,\"schema\":" + ParamSchema(ptype, FindSpec(n)) + "}";
+			               ",\"in\":\"path\",\"required\":true,\"schema\":" + ParamSchema(ptype, FindSpec(n), true) +
+			               "}";
 		}
 		for (auto &n : named_params) {
 			if (IsClaimsParamName(n) || ListContains(path_params, n)) {
@@ -367,6 +460,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				ptype = tit->second;
 			}
 			const QuackapiParamSpec *spec = FindSpec(n);
+			const bool variant_body_alternative = HasVariantBodyAlternative(spec);
 			string in_loc = "query";
 			string oas_name = n;
 			bool required = true;
@@ -384,9 +478,27 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 					required = false;
 				}
 			}
-			params_json += "{\"name\":" + JsonString(oas_name) + ",\"in\":" + JsonString(in_loc) +
-			               ",\"required\":" + (required ? "true" : "false") +
-			               ",\"schema\":" + ParamSchema(ptype, spec) + "}";
+			if (variant_body_alternative) {
+				required = false;
+			}
+			string input_description;
+			if (variant_body_alternative) {
+				if (HasNumericParamBounds(*spec)) {
+					input_description =
+					    "Text input cannot satisfy numeric VARIANT bounds; supply a JSON number in the request body.";
+				} else if (spec->has_default) {
+					input_description =
+					    "May be supplied as a text parameter or JSON body value; the parameter value takes precedence.";
+				} else {
+					input_description = "Supply this value as a parameter or in the JSON body; at least one is "
+					                    "required, and the parameter takes precedence.";
+				}
+			}
+			params_json +=
+			    "{\"name\":" + JsonString(oas_name) + ",\"in\":" + JsonString(in_loc) +
+			    ",\"required\":" + (required ? "true" : "false") +
+			    (input_description.empty() ? string() : ",\"description\":" + JsonString(input_description)) +
+			    ",\"schema\":" + ParamSchema(ptype, spec, true) + "}";
 		}
 		params_json += "]";
 
@@ -394,9 +506,47 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		// STRUCT/LIST/scalar shape and retain the exact declaration for
 		// DuckDB-aware clients.
 		string request_body_json;
-		if (!route.body_schema.empty() || !route.body_type.empty()) {
+		string variant_body_overlay;
+		vector<string> variant_body_required_props;
+		bool has_required_variant_input = false;
+		if (body_capable) {
+			string properties = "{";
+			bool first_property = true;
+			for (const auto &spec : route.params) {
+				if (!HasVariantBodyAlternative(&spec)) {
+					continue;
+				}
+				if (!spec.has_default) {
+					has_required_variant_input = true;
+				}
+				if (!first_property)
+					properties += ",";
+				first_property = false;
+				properties += JsonString(spec.name) + ":" + ParamSchema(LogicalType::VARIANT(), &spec, false);
+				if (!spec.has_default && HasNumericParamBounds(spec)) {
+					variant_body_required_props.push_back(spec.name);
+				}
+			}
+			if (!first_property) {
+				variant_body_overlay = "{\"type\":\"object\",\"properties\":" + properties + "}}";
+				if (!variant_body_required_props.empty()) {
+					variant_body_overlay.pop_back();
+					variant_body_overlay += ",\"required\":[";
+					for (idx_t i = 0; i < variant_body_required_props.size(); i++) {
+						if (i)
+							variant_body_overlay += ",";
+						variant_body_overlay += JsonString(variant_body_required_props[i]);
+					}
+					variant_body_overlay += "]}";
+				}
+			}
+		}
+		if (!route.body_schema.empty() || !route.body_type.empty() || !variant_body_overlay.empty()) {
 			string body_schema;
-			if (!route.body_schema.empty() && !route.body_type.empty()) {
+			const bool has_declared_body_schema = !route.body_schema.empty() || !route.body_type.empty();
+			if (!has_declared_body_schema) {
+				body_schema = variant_body_overlay;
+			} else if (!route.body_schema.empty() && !route.body_type.empty()) {
 				body_schema = "{\"allOf\":[" + route.body_schema + "," +
 				              QuackapiDuckdbTransformToOpenApi(route.body_type) +
 				              "],\"x-duckdb-json-transform\":" + JsonString(route.body_type) + "}";
@@ -411,9 +561,28 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 					body_schema = "{\"x-duckdb-json-transform\":" + JsonString(route.body_type) + "}";
 				}
 			}
+			if (has_declared_body_schema && !variant_body_overlay.empty()) {
+				body_schema = body_schema.empty() ? variant_body_overlay
+				                                  : "{\"allOf\":[" + body_schema + "," + variant_body_overlay + "]}";
+			}
+			const bool variant_body_required = !variant_body_required_props.empty();
+			const bool body_required = has_declared_body_schema || variant_body_required;
+			string body_description;
+			if (!variant_body_overlay.empty() && variant_body_required) {
+				body_description = "A JSON body is required for numeric-constrained VARIANT parameters.";
+			} else if (!variant_body_overlay.empty() && has_required_variant_input) {
+				body_description =
+				    "VARIANT values may also be supplied as text parameters; at least one required value must be "
+				    "present. Text parameters take precedence when both locations provide a value.";
+			} else if (!variant_body_overlay.empty()) {
+				body_description =
+				    "VARIANT values may be supplied as text parameters or JSON body values; defaults apply when "
+				    "omitted, and text parameters take precedence when both locations provide a value.";
+			}
 			request_body_json =
-			    "\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":" + body_schema +
-			    "}}},";
+			    "\"requestBody\":{\"required\":" + string(body_required ? "true" : "false") +
+			    (body_description.empty() ? string() : ",\"description\":" + JsonString(body_description)) +
+			    ",\"content\":{\"application/json\":{\"schema\":" + body_schema + "}}},";
 		}
 
 		// response schema (exclude location / set_cookie control columns)
@@ -610,7 +779,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 	doc += "\"openapi\":\"3.1.0\",";
 	doc += "\"info\":{";
 	doc += "\"title\":\"quackapi\",";
-	doc += "\"version\":\"0.1.0\",";
+	doc += "\"version\":\"0.2.0\",";
 	doc += "\"description\":" +
 	       JsonString("Generated from the live quackapi_routes() + quackapi_auths() registries. "
 	                  "Response schemas come from Prepare() column metadata. Path params :id → {id}. "

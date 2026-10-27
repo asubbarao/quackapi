@@ -58,8 +58,8 @@ int64_t QuackapiRemainingTimeoutMillis(int64_t fallback_ms);
 std::chrono::steady_clock::time_point QuackapiContextDeadline(ClientContext &context);
 
 //! A served request's own query_timeout_ms / max_response_bytes, recorded on its
-//! connection so quackapi_exec in the request's SQL applies the server's options.
+//! connection so quackapi_selfdispatch in the request's SQL applies the server's options.
 void QuackapiSetServingBudget(Connection &connection, int64_t query_timeout_ms, int64_t max_response_bytes);
-//! False outside a served request (and outside a quackapi_exec row started inside one).
+//! False outside a served request (and outside a quackapi_selfdispatch row started inside one).
 bool QuackapiGetServingBudget(ClientContext &context, int64_t &query_timeout_ms, int64_t &max_response_bytes);
 } // namespace duckdb

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 
@@ -20,12 +21,18 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/parser/sql_statement.hpp"
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/parallel/callback_async_task.hpp"
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/task.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
+
+#include "duckdb.h"
+#include "nanoarrow/nanoarrow_ipc.h"
 
 #include "httplib.hpp"
 #include "utf8proc_wrapper.hpp"
@@ -33,6 +40,265 @@
 namespace duckdb {
 
 namespace {
+
+enum class ResponseFormat : uint8_t { RAW, ARROW, PARQUET };
+
+ResponseFormat ParseResponseFormat(const string &format) {
+	if (format.empty() || StringUtil::Lower(format) == "raw") {
+		return ResponseFormat::RAW;
+	}
+	if (StringUtil::Lower(format) == "arrow") {
+		return ResponseFormat::ARROW;
+	}
+	if (StringUtil::Lower(format) == "parquet") {
+		return ResponseFormat::PARQUET;
+	}
+	throw InvalidInputException("response_format must be raw, arrow, or parquet");
+}
+
+string ExpectedResponseType(ResponseFormat format) {
+	return format == ResponseFormat::ARROW ? "application/vnd.apache.arrow.stream" : "application/vnd.apache.parquet";
+}
+
+bool AcceptsResponseType(const string &accept, const string &expected) {
+	int specificity = -1;
+	double accepted_quality = 0;
+	for (const auto &range : StringUtil::Split(StringUtil::Lower(accept), ',')) {
+		auto parts = StringUtil::Split(range, ';');
+		if (parts.empty())
+			continue;
+		auto media = QuackapiTrim(parts[0]);
+		const int match = media == expected ? 2 : media == "application/*" ? 1 : media == "*/*" ? 0 : -1;
+		if (match < specificity || match < 0)
+			continue;
+		double quality = 1;
+		for (idx_t i = 1; i < parts.size(); i++) {
+			auto parameter = StringUtil::Split(parts[i], '=');
+			if (parameter.size() != 2 || QuackapiTrim(parameter[0]) != "q")
+				continue;
+			try {
+				auto value = QuackapiTrim(parameter[1]);
+				size_t consumed;
+				quality = std::stod(value, &consumed);
+				if (consumed != value.size() || !(quality >= 0 && quality <= 1))
+					quality = 0;
+			} catch (const std::exception &) {
+				quality = 0;
+			}
+		}
+		accepted_quality = match > specificity ? quality : std::max(accepted_quality, quality);
+		specificity = match;
+	}
+	return accepted_quality > 0;
+}
+
+void ApplyResponseAccept(unordered_map<string, string> &headers, ResponseFormat format) {
+	if (format == ResponseFormat::RAW) {
+		return;
+	}
+	const auto expected = ExpectedResponseType(format);
+	string accept;
+	bool has_accept = false;
+	for (const auto &header : headers) {
+		if (StringUtil::Lower(header.first) == "accept") {
+			if (has_accept)
+				accept += ",";
+			accept += header.second;
+			has_accept = true;
+		}
+	}
+	if (has_accept && !AcceptsResponseType(accept, expected)) {
+		throw InvalidInputException("response_format conflicts with the supplied Accept header");
+	}
+	for (auto it = headers.begin(); it != headers.end();) {
+		if (StringUtil::Lower(it->first) == "accept")
+			it = headers.erase(it);
+		else
+			++it;
+	}
+	headers["Accept"] = expected;
+}
+
+bool HasResponseType(const HTTPHeaders &headers, ResponseFormat format) {
+	const auto expected = ExpectedResponseType(format);
+	for (auto &header : headers) {
+		if (StringUtil::Lower(header.first) == "content-type") {
+			auto parts = StringUtil::Split(header.second, ';');
+			return !parts.empty() && QuackapiTrim(StringUtil::Lower(parts[0])) == expected;
+		}
+	}
+	return false;
+}
+
+vector<string> ArrowColumnNames(const ArrowSchema &schema) {
+	vector<string> names;
+	for (int64_t i = 0; i < schema.n_children; i++) {
+		auto child = schema.children[i];
+		names.emplace_back(child && child->name ? child->name : "column_" + to_string(i + 1));
+	}
+	return names;
+}
+
+void CheckTypedDecodeDeadline(ClientContext &context, std::chrono::steady_clock::time_point deadline) {
+	context.BlockingInterruptCheck();
+	if (std::chrono::steady_clock::now() >= deadline) {
+		throw InvalidInputException("typed response decoding exceeded the request deadline");
+	}
+}
+
+QuackapiTypedResult TypedRowsFromArrowBody(ClientContext &context, DatabaseInstance &db, const string &body,
+                                           idx_t max_bytes, std::chrono::steady_clock::time_point deadline) {
+	ArrowBuffer buffer;
+	ArrowBufferInit(&buffer);
+	auto buffer_error = ArrowBufferAppend(&buffer, reinterpret_cast<const uint8_t *>(body.data()), body.size());
+	if (buffer_error != NANOARROW_OK) {
+		ArrowBufferReset(&buffer);
+		throw InvalidInputException("could not buffer Arrow IPC response");
+	}
+	ArrowIpcInputStream input {};
+	auto input_error = ArrowIpcInputStreamInitBuffer(&input, &buffer);
+	if (input_error != NANOARROW_OK) {
+		ArrowBufferReset(&buffer);
+		throw InvalidInputException("could not initialize Arrow IPC input");
+	}
+	ArrowArrayStream stream {};
+	ArrowIpcArrayStreamReaderOptions options {};
+	options.field_index = -1;
+	options.use_shared_buffers = 0;
+	auto stream_error = ArrowIpcArrayStreamReaderInit(&stream, &input, &options);
+	if (stream_error != NANOARROW_OK) {
+		if (input.release) {
+			input.release(&input);
+		}
+		throw InvalidInputException("invalid Arrow IPC response");
+	}
+	auto stream_guard =
+	    unique_ptr<ArrowArrayStream, std::function<void(ArrowArrayStream *)>>(&stream, [](ArrowArrayStream *s) {
+		    if (s->release)
+			    s->release(s);
+	    });
+	ArrowSchema schema {};
+	if (stream.get_schema(&stream, &schema) != 0) {
+		throw InvalidInputException("could not read Arrow IPC schema");
+	}
+	auto schema_guard = unique_ptr<ArrowSchema, std::function<void(ArrowSchema *)>>(&schema, [](ArrowSchema *s) {
+		if (s->release)
+			s->release(s);
+	});
+	auto names = ArrowColumnNames(schema);
+	Connection connection(db);
+	const auto c_connection = reinterpret_cast<duckdb_connection>(&connection);
+	duckdb_arrow_converted_schema converted = nullptr;
+	auto schema_error = duckdb_schema_from_arrow(c_connection, &schema, &converted);
+	if (schema_error) {
+		string message = duckdb_error_data_message(schema_error) ? duckdb_error_data_message(schema_error)
+		                                                         : "schema conversion failed";
+		duckdb_destroy_error_data(&schema_error);
+		throw InvalidInputException("Arrow schema conversion failed: %s", message);
+	}
+	auto converted_guard =
+	    unique_ptr<duckdb_arrow_converted_schema, std::function<void(duckdb_arrow_converted_schema *)>>(
+	        &converted, [](duckdb_arrow_converted_schema *s) {
+		        if (*s)
+			        duckdb_destroy_arrow_converted_schema(s);
+	        });
+	auto converted_schema = reinterpret_cast<ArrowTableSchema *>(converted);
+	QuackapiTypedRowCollector collector(names, converted_schema->GetTypes(), max_bytes);
+	for (;;) {
+		CheckTypedDecodeDeadline(context, deadline);
+		ArrowArray array {};
+		if (stream.get_next(&stream, &array) != 0) {
+			if (array.release)
+				array.release(&array);
+			throw InvalidInputException("could not decode Arrow IPC record batch");
+		}
+		if (!array.release) {
+			break;
+		}
+		duckdb_data_chunk native_chunk = nullptr;
+		auto array_error = duckdb_data_chunk_from_arrow(c_connection, &array, converted, &native_chunk);
+		if (array_error) {
+			string message = duckdb_error_data_message(array_error) ? duckdb_error_data_message(array_error)
+			                                                        : "array conversion failed";
+			duckdb_destroy_error_data(&array_error);
+			if (array.release)
+				array.release(&array);
+			throw InvalidInputException("Arrow array conversion failed: %s", message);
+		}
+		auto chunk_guard = unique_ptr<duckdb_data_chunk, std::function<void(duckdb_data_chunk *)>>(
+		    &native_chunk, [](duckdb_data_chunk *c) {
+			    if (*c)
+				    duckdb_destroy_data_chunk(c);
+		    });
+		auto &chunk = *reinterpret_cast<DataChunk *>(native_chunk);
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			if ((row & 255) == 0)
+				CheckTypedDecodeDeadline(context, deadline);
+			vector<Value> values;
+			values.reserve(chunk.ColumnCount());
+			for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+				values.emplace_back(chunk.GetValue(col, row));
+			}
+			collector.AppendRow(std::move(values));
+		}
+	}
+	return collector.Finish();
+}
+
+string ParquetTempPath(FileSystem &fs) {
+	string directory;
+#if defined(_WIN32) || defined(WIN32)
+	const char *temp = std::getenv("TEMP");
+	if (!temp || !temp[0])
+		temp = std::getenv("TMP");
+	directory = (temp && temp[0]) ? string(temp) : string(".");
+#else
+	const char *temp = std::getenv("TMPDIR");
+	directory = (temp && temp[0]) ? string(temp) : string("/tmp");
+#endif
+	auto uid = StringUtil::Replace(UUID::ToString(UUIDv7::GenerateRandomUUID()), "-", "");
+	return StringUtil::Replace(fs.JoinPath(directory, "quackapi_post_" + uid + ".parquet"), "\\", "/");
+}
+
+QuackapiTypedResult TypedRowsFromParquetBody(ClientContext &context, const string &body, idx_t max_bytes,
+                                             std::chrono::steady_clock::time_point deadline) {
+	if (body.size() > max_bytes) {
+		throw InvalidInputException("Parquet response exceeds quackapi_max_response_bytes");
+	}
+	Connection connection(*context.db);
+	QuackapiQueryDeadline query_deadline(connection, deadline, &context);
+	auto &fs = FileSystem::GetFileSystem(*connection.context);
+	auto path = ParquetTempPath(fs);
+	struct Cleanup {
+		FileSystem &fs;
+		string path;
+		~Cleanup() {
+			fs.TryRemoveFile(path);
+		}
+	} cleanup {fs, path};
+	auto file = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	if (!body.empty()) {
+		const auto written = file->Write(const_cast<char *>(body.data()), body.size());
+		if (written != NumericCast<int64_t>(body.size())) {
+			throw IOException("short write while staging Parquet response for native decode");
+		}
+	}
+	file->Close();
+	auto result = connection.Submit("SELECT * FROM read_parquet('" + StringUtil::Replace(path, "'", "''") + "')");
+	if (!result) {
+		throw InvalidInputException("Parquet response decode failed: no result");
+	}
+	QueryResultStream<ChunkFormat> stream(std::move(result));
+	CheckTypedDecodeDeadline(context, deadline);
+	auto chunk = stream.Fetch();
+	QuackapiTypedRowCollector collector(QuackapiNames(stream.GetNames()), stream.GetTypes(), max_bytes);
+	while (chunk) {
+		CheckTypedDecodeDeadline(context, deadline);
+		collector.AppendChunk(*chunk);
+		chunk = stream.Fetch();
+	}
+	return collector.Finish();
+}
 
 thread_local ClientContext *outbound_context = nullptr;
 struct ScopedOutboundContext {
@@ -395,6 +661,11 @@ LogicalType FetchResultType() {
 	children.emplace_back("error", LogicalType::VARCHAR);
 	children.emplace_back("reused_connection", LogicalType::BOOLEAN);
 	children.emplace_back("body_blob", LogicalType::BLOB);
+	child_list_t<LogicalType> column_fields;
+	column_fields.emplace_back("name", LogicalType::VARCHAR);
+	column_fields.emplace_back("type", LogicalType::TYPE());
+	children.emplace_back("columns", LogicalType::LIST(LogicalType::STRUCT(std::move(column_fields))));
+	children.emplace_back("rows", LogicalType::LIST(LogicalType::VARIANT()));
 	return LogicalType::STRUCT(std::move(children));
 }
 
@@ -417,6 +688,8 @@ Value ToValue(const QuackapiHttpFetchResult &result) {
 	                      result.request_error.empty() ? Value(LogicalType::VARCHAR) : Value(result.request_error));
 	children.emplace_back("reused_connection", Value::BOOLEAN(result.reused_connection));
 	children.emplace_back("body_blob", Value::BLOB_RAW(result.body));
+	children.emplace_back("columns", result.typed_result.columns);
+	children.emplace_back("rows", result.typed_result.rows);
 	return Value::STRUCT(std::move(children));
 }
 
@@ -561,6 +834,10 @@ void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &ski
 	context.BlockingInterruptCheck();
 }
 
+int64_t PositiveSetting(ClientContext &context, const string &name, int64_t fallback);
+void DecodePostResponse(ClientContext &context, DatabaseInstance &db, QuackapiHttpFetchResult &response,
+                        ResponseFormat format, std::chrono::steady_clock::time_point deadline);
+
 void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
 	const auto count = args.size();
@@ -570,9 +847,10 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<string> urls(count);
 	vector<string> bodies(count);
 	vector<string> content_types(count);
+	vector<ResponseFormat> response_formats(count, ResponseFormat::RAW);
 	vector<unordered_map<string, string>> headers(count);
 	vector<std::chrono::steady_clock::time_point> deadlines(count);
-	const auto positional_count = args.ColumnCount() - 1;
+	const auto positional_count = args.ColumnCount() - 2;
 	for (idx_t i = 0; i < count; i++) {
 		auto url = args.data[0].GetValue(i);
 		if (url.IsNull()) {
@@ -589,6 +867,8 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		if (skip[i]) {
 			continue;
 		}
+		auto response_format = args.data[args.ColumnCount() - 2].GetValue(i);
+		response_formats[i] = ParseResponseFormat(response_format.IsNull() ? "raw" : response_format.ToString());
 		auto timeout = args.data[args.ColumnCount() - 1].GetValue(i);
 		const auto call_timeout_ms = timeout.IsNull() ? 0 : timeout.GetValue<int64_t>();
 		if (!timeout.IsNull() && call_timeout_ms <= 0) {
@@ -608,12 +888,15 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		if (positional_count > 3) {
 			headers[i] = HeadersFromValue(args.data[3].GetValue(i));
 		}
+		ApplyResponseAccept(headers[i], response_formats[i]);
 	}
 
 	vector<QuackapiHttpFetchResult> out(count);
 	FanOutRequests(state.GetContext(), count, skip, out, [&](idx_t i) {
 		ScopedOutboundDeadline per_call(deadlines[i]);
-		return QuackapiHttpFetch::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
+		auto response = QuackapiHttpFetch::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
+		DecodePostResponse(state.GetContext(), db, response, response_formats[i], deadlines[i]);
+		return response;
 	});
 
 	for (idx_t i = 0; i < count; i++) {
@@ -631,6 +914,36 @@ int64_t PositiveSetting(ClientContext &context, const string &name, int64_t fall
 		throw InvalidInputException("%s must be > 0", name);
 	}
 	return value;
+}
+
+void DecodePostResponse(ClientContext &context, DatabaseInstance &db, QuackapiHttpFetchResult &response,
+                        ResponseFormat format, std::chrono::steady_clock::time_point deadline) {
+	if (format == ResponseFormat::RAW || static_cast<int>(response.status) < 200 ||
+	    static_cast<int>(response.status) >= 300) {
+		return;
+	}
+	try {
+		if (!HasResponseType(response.headers, format)) {
+			throw InvalidInputException("response Content-Type does not match response_format");
+		}
+		int64_t serving_timeout = 0, response_limit = 0;
+		if (!QuackapiGetServingBudget(context, serving_timeout, response_limit)) {
+			response_limit = PositiveSetting(context, "quackapi_max_response_bytes", 16 * 1024 * 1024);
+		}
+		const auto max_bytes = NumericCast<idx_t>(response_limit);
+		if (response.body.size() > max_bytes) {
+			throw InvalidInputException("response body exceeds quackapi_max_response_bytes");
+		}
+		auto typed_result = format == ResponseFormat::ARROW
+		                        ? TypedRowsFromArrowBody(context, db, response.body, max_bytes, deadline)
+		                        : TypedRowsFromParquetBody(context, response.body, max_bytes, deadline);
+		CheckTypedDecodeDeadline(context, deadline);
+		response.typed_result = std::move(typed_result);
+	} catch (const InterruptException &) {
+		throw;
+	} catch (const std::exception &e) {
+		response.request_error = e.what();
+	}
 }
 
 int64_t NonNegativeSetting(ClientContext &context, const string &name, int64_t fallback) {
@@ -664,7 +977,7 @@ idx_t ReserveExecTasks(idx_t wanted, int64_t cap) {
 	}
 }
 
-//! One quackapi_exec call, retained by its native tasks, so a caller that
+//! One quackapi_selfdispatch call, retained by its native tasks, so a caller that
 //! gives up (interrupt, deadline) returns while a row is still blocked in a host call.
 struct ExecCall {
 	shared_ptr<DatabaseInstance> db;
@@ -742,6 +1055,7 @@ QuackapiHttpFetchResult ExecReceipt(QuackapiExecResponse response) {
 	receipt.status = static_cast<HTTPStatusCode>(response.status);
 	receipt.reason = quackapi_httplib::status_message(response.status);
 	receipt.body = std::move(response.body);
+	receipt.typed_result = std::move(response.typed_result);
 	for (auto &header : response.headers) {
 		receipt.headers.Insert(header.first, header.second);
 	}
@@ -784,11 +1098,11 @@ void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
 			return call.cancelled || (parent && parent->IsInterrupted());
 		};
 		receipt = ExecReceipt(
-		    QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql", cancelled));
+		    QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql", cancelled, true));
 	} catch (std::exception &e) {
 		receipt.request_error = e.what();
 	} catch (...) {
-		receipt.request_error = "unknown error during quackapi_exec";
+		receipt.request_error = "unknown error during quackapi_selfdispatch";
 	}
 	std::lock_guard<std::mutex> guard(call.mutex);
 	call.out[i] = std::move(receipt);
@@ -893,7 +1207,7 @@ public:
 				result.reset();
 				return false;
 			}
-			auto response = QuackapiExecResult(*result, call.max_response_bytes);
+			auto response = QuackapiExecResult(*result, call.max_response_bytes, true);
 			return Finish(deadline->Expired() ? QuackapiExecTimeoutResponse() : std::move(response));
 		} catch (std::exception &ex) {
 			return Finish(std::chrono::steady_clock::now() >= call.deadline
@@ -1001,7 +1315,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 		active++;
 	}
 
-	const auto max_threads = NonNegativeSetting(context, "quackapi_exec_max_threads", 256);
+	const auto max_threads = NonNegativeSetting(context, "quackapi_selfdispatch_max_threads", 256);
 
 	// An exec route answers 403 while any policy is bound: its SQL cannot be rewritten.
 	auto &quackapi_state = QuackapiState::Get(*context.db);
@@ -1117,6 +1431,7 @@ struct FetchTableBindData : public TableFunctionData {
 	string url;
 	string body;
 	string content_type = "application/json";
+	ResponseFormat response_format = ResponseFormat::RAW;
 	int64_t timeout_ms = 0;
 	unordered_map<string, string> headers;
 	unique_ptr<FunctionData> Copy() const override {
@@ -1224,21 +1539,25 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	ScalarFunction post2("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR}, result_type, PostScalar);
 	post2.SetVolatile();
 	post2.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post2.GetSignature().AddKeywordOnly("response_format", LogicalType::VARCHAR, Value("raw"));
 	post2.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	ScalarFunction post2j("quackapi_post", {LogicalType::VARCHAR, LogicalType::JSON()}, result_type, PostScalar);
 	post2j.SetVolatile();
 	post2j.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post2j.GetSignature().AddKeywordOnly("response_format", LogicalType::VARCHAR, Value("raw"));
 	post2j.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	ScalarFunction post3("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     result_type, PostScalar);
 	post3.SetVolatile();
 	post3.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post3.GetSignature().AddKeywordOnly("response_format", LogicalType::VARCHAR, Value("raw"));
 	post3.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	ScalarFunction post4("quackapi_post",
 	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, header_type}, result_type,
 	                     PostScalar);
 	post4.SetVolatile();
 	post4.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post4.GetSignature().AddKeywordOnly("response_format", LogicalType::VARCHAR, Value("raw"));
 	post4.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	post_set.AddFunction(post2);
 	post_set.AddFunction(post2j);
@@ -1266,6 +1585,11 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    if (headers != input.named_parameters.end() && !headers->second.IsNull()) {
 			    bind->headers = HeadersFromValue(headers->second);
 		    }
+		    auto response_format = input.named_parameters.find("response_format");
+		    if (response_format != input.named_parameters.end() && !response_format->second.IsNull()) {
+			    bind->response_format = ParseResponseFormat(response_format->second.GetValue<string>());
+		    }
+		    ApplyResponseAccept(bind->headers, bind->response_format);
 		    auto timeout = input.named_parameters.find("timeout_ms");
 		    if (timeout != input.named_parameters.end() && !timeout->second.IsNull()) {
 			    bind->timeout_ms = timeout->second.GetValue<int64_t>();
@@ -1284,26 +1608,29 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    state->perform = [&bind, db, deadline, &context]() {
 			    ScopedOutboundDeadline scoped(deadline);
 			    ScopedOutboundContext context_scope(context);
-			    return QuackapiHttpFetch::Post(*db, bind.url, bind.body, bind.content_type, bind.headers);
+			    auto response = QuackapiHttpFetch::Post(*db, bind.url, bind.body, bind.content_type, bind.headers);
+			    DecodePostResponse(context, *db, response, bind.response_format, deadline);
+			    return response;
 		    };
 		    return std::move(state);
 	    });
 	AddNamedParameter(post_tf, "headers", header_type);
 	AddNamedParameter(post_tf, "content_type", LogicalType::VARCHAR);
+	AddNamedParameter(post_tf, "response_format", LogicalType::VARCHAR);
 	AddNamedParameter(post_tf, "timeout_ms", LogicalType::BIGINT);
 	loader.RegisterFunction(post_tf);
 
-	// Same receipt as quackapi_post to an exec route; volatile for the same reason.
-	ScalarFunction exec("quackapi_exec", {LogicalType::VARCHAR}, result_type, ExecScalar);
+	// Local execution preserves native result rows in addition to receipt metadata.
+	ScalarFunction exec("quackapi_selfdispatch", {LogicalType::VARCHAR}, result_type, ExecScalar);
 	exec.SetVolatile();
 	RegisterFallible(loader, exec);
 
 	TableFunction exec_tf(
-	    "quackapi_exec", {LogicalType::VARCHAR}, AsyncReceiptExec,
+	    "quackapi_selfdispatch", {LogicalType::VARCHAR}, AsyncReceiptExec,
 	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
 	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
 		    if (input.inputs[0].IsNull()) {
-			    throw InvalidInputException("quackapi_exec table argument must be non-NULL");
+			    throw InvalidInputException("quackapi_selfdispatch table argument must be non-NULL");
 		    }
 		    auto bind = make_uniq<ExecTableBindData>();
 		    bind->sql = input.inputs[0].GetValue<string>();

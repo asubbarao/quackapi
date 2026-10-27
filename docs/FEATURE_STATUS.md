@@ -4,7 +4,7 @@
 **Source of truth:** this checkout's source tree and versioned tests; cited report paths are historical evidence only.
 **Rule:** implemented claims below are backed by source or tests. Design studies and external packaging notes remain explicitly labelled.
 **Publication:** this ledger is not a release receipt. Community packages follow the separate registry pin and signed build pipeline; see [migration notes](MIGRATION.md).
-**Current validation:** [PR #58 CI](https://github.com/asubbarao/quackapi/actions/runs/40426089540) passed all five platform builds and 63 SQL suites with zero skips at application head `ee3034ca`. Historical 89-case and corpus figures below describe earlier experiments; the reviewed candidate also passed 93 conformance cases.
+**Current validation:** [PR #59 checks](https://github.com/asubbarao/quackapi/pull/59/checks) track the current candidate across five platforms and the PostgreSQL/HTTP integration job. The versioned SQL suite contains 72 files, including native typed receipts, VARIANT inputs and Parquet. Historical 89-case and corpus figures below describe earlier experiments; the current HTTP conformance harness has 93 cases.
 
 **Evidence index**
 
@@ -12,7 +12,7 @@
 |----------|----------------|
 | `rg 'CREATE …' src/` + registered functions in `src/` | 8 CREATE nouns plus the lifecycle, request, auth, queue, HTTP, GraphQL, middleware, policy, stream, and bridge functions |
 | `ls test/sql test/http test/conformance` | Versioned tests for each surface |
-| `bash test/conformance/run.sh` → `/tmp/quackapi_conformance_rerun/` | **Live** FastAPI harness: **89/89 PASS (100%)** |
+| `bash test/conformance/run.sh` → `/tmp/quackapi_conformance_rerun/` | Historical FastAPI harness run: **89/89 PASS**; use the current CI HTTP contract step for current evidence |
 | `/tmp/quackapi_fastapi_eq/SCORECARD.md` | **Stale** baseline: **62/89 (69.7%)** pre body/form/multipart/cookies/headers/redirect/openapi/redoc |
 | `/tmp/quackapi_corpus/{PYTHON,RUBY,GO,NODE,SPEC}.md` + IR parquets | 1576 routes · 4204 model fields · 36 repos |
 | `/tmp/quackapi_{fromfast,rails_bridge,pydantic_bridge,handler_bridge}.md` | Bridge status + fidelity |
@@ -90,7 +90,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 ### 1.4 Registered SQL functions (live `duckdb_functions()`)
 
 ```
-quackapi_ack, quackapi_add_api_key, quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_exec, quackapi_graphql_routes,
+quackapi_ack, quackapi_add_api_key, quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_selfdispatch, quackapi_graphql_routes,
 quackapi_graphql_tables, quackapi_groups, quackapi_http_pool,
 quackapi_middlewares, quackapi_nack, quackapi_policies,
 quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,
@@ -183,7 +183,9 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **Signed cookie sessions + CSRF** | not built | `/tmp/quackapi_spec_sessions/SPEC.md` |
 | **Middleware BEFORE/AFTER SQL** | **shipped** — `CREATE MIDDLEWARE` around ordinary routes and `quackapi_request` | `docs/MIDDLEWARE.md`, middleware tests |
 | **Response gzip/zstd** | **shipped** — Accept-Encoding negotiate; `compression` serve knobs | `quackapi_server.cpp` MaybeCompress |
-| **FORMAT / Accept** | **shipped** json/ndjson/csv/**parquet**/**arrow** (IPC stream via community nanoarrow) | format tests; Accept stream/file |
+| **FORMAT / Accept** | **implemented** json/ndjson/csv/**parquet**/**arrow**; Arrow uses vendored nanoarrow IPC encoding, Parquet uses native DuckDB 2.0 submitted COPY | format tests; Accept stream/file |
+| **Typed SQL receipts** | **implemented** scalar/table `quackapi_post(..., response_format := 'arrow'\|'parquet')` and local `quackapi_selfdispatch`; native `rows LIST<VARIANT>` and `columns LIST<STRUCT(name VARCHAR, type TYPE)>`, including empty schemas | `quackapi_post_typed_rows.test`, `quackapi_selfdispatch_typed_rows.test` |
+| **VARIANT request inputs** | **implemented** JSON value kinds, native defaults, mixed typed BODY TYPE fields, nullability and OpenAPI alternatives | `quackapi_variant.test` |
 | **GraphQL thin v0** | **shipped** — dual surface (REST + GQL → SQL); allowlist + **`CREATE GRAPHQL ROUTE`** | `quackapi_graphql.cpp`, `graphql-v0.md` |
 | **In-process TestClient** `quackapi_request` | **shipped** — `quackapi_request(method, path [, body])` → status/body/content_type (no TCP) | `test/sql/quackapi_request.test` |
 | **Rate limit (HTTP)** | **shipped** — `RATE LIMIT n PER s [BY ip\|token]` → 429 | `rate_limit.test.sh` |
@@ -284,7 +286,7 @@ now shipped, while the remaining rows are partial or not built.
 | 12 | `spec_rate_limit` | RATE LIMIT + 429 + Retry-After | **S** | THIN-GLUE + in-process counters | **Yes** — `RATE LIMIT … BY ip\|token\|key` |
 | 13 | `spec_request_id` | X-Request-ID + `$request_id` + access_log table | **S** | THIN-GLUE + core uuid/table | **Yes** — stderr and table-backed access logs |
 | 14 | `spec_route_groups` | APIRouter-style prefix/tags/default auth | **S** | THIN-GLUE DDL expand | **Yes** — `CREATE GROUP` / `CREATE API GROUP` |
-| 15 | `spec_serdes` | `FORMAT` JSON/NDJSON/CSV/Parquet/Arrow + Accept | **M** (S for JSON/NDJSON/CSV) | CORE writers + **HAVE-EXT(`nanoarrow`)** | **Yes** — explicit formats and default Accept negotiation |
+| 15 | `spec_serdes` | `FORMAT` JSON/NDJSON/CSV/Parquet/Arrow + Accept | **M** (S for JSON/NDJSON/CSV) | Native DuckDB conversion/COPY + vendored nanoarrow IPC | **Yes** — explicit formats and default Accept negotiation |
 | 16 | `spec_sessions` | Signed cookie sessions + CSRF | **M** | THIN-GLUE C++ cookie HMAC + table | **No** |
 | 17 | `spec_static_files` | `static_prefix` + file/blob download + disposition | **S** | THIN-GLUE; httplib mount/ranges exist | **Partial** — `static_dir` only |
 | 18 | `spec_streaming` | Chunked NDJSON/SSE + cancel on disconnect | **M** | THIN-GLUE ContentProvider + Interrupt | **Partial** — **`CREATE STREAM` SSE**; full NDJSON STREAM clause / cancel polish open |
@@ -295,7 +297,7 @@ now shipped, while the remaining rows are partial or not built.
 
 | Report | Takeaway |
 |--------|----------|
-| `/tmp/quackapi_arrow.md` | Arrow/ADBC/Airport are **client** codecs/Flight clients — compose `nanoarrow` for FORMAT ARROW, do not embed Flight server in quackapi |
+| `/tmp/quackapi_arrow.md` | Historical client-composition notes. Current FORMAT ARROW and typed POST use native DuckDB conversion and vendored nanoarrow IPC; no Flight server is embedded |
 | `/tmp/quackapi_scope9.md` | **2/9 USEFUL-NOW** (netquack, inflector); skip false friends (http_stats, harbor-as-lib, nsv, query_condition_cache-as-HTTP-cache) |
 | `/tmp/quackapi_scope_free.md` | **`ai`** + **`duckdb_mcp`** USEFUL-NOW for route AI tasks / MCP gateway without reinventing FastAPI-mcp |
 

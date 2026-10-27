@@ -64,6 +64,8 @@ struct QuackapiParamSpec {
 	bool default_is_null = false;
 	//! Raw default literal (digits / true / false / unquoted text). Empty when default_is_null.
 	string default_raw;
+	//! Original literal type/value, retained across DDL planning for VARIANT binding.
+	Value default_variant;
 	bool has_ge = false;
 	Value ge;
 	bool has_gt = false;
