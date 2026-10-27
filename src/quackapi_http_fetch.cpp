@@ -60,6 +60,38 @@ string ExpectedResponseType(ResponseFormat format) {
 	return format == ResponseFormat::ARROW ? "application/vnd.apache.arrow.stream" : "application/vnd.apache.parquet";
 }
 
+bool AcceptsResponseType(const string &accept, const string &expected) {
+	int specificity = -1;
+	double accepted_quality = 0;
+	for (const auto &range : StringUtil::Split(StringUtil::Lower(accept), ',')) {
+		auto parts = StringUtil::Split(range, ';');
+		if (parts.empty())
+			continue;
+		auto media = QuackapiTrim(parts[0]);
+		const int match = media == expected ? 2 : media == "application/*" ? 1 : media == "*/*" ? 0 : -1;
+		if (match < specificity || match < 0)
+			continue;
+		double quality = 1;
+		for (idx_t i = 1; i < parts.size(); i++) {
+			auto parameter = StringUtil::Split(parts[i], '=');
+			if (parameter.size() != 2 || QuackapiTrim(parameter[0]) != "q")
+				continue;
+			try {
+				auto value = QuackapiTrim(parameter[1]);
+				size_t consumed;
+				quality = std::stod(value, &consumed);
+				if (consumed != value.size() || !(quality >= 0 && quality <= 1))
+					quality = 0;
+			} catch (const std::exception &) {
+				quality = 0;
+			}
+		}
+		accepted_quality = match > specificity ? quality : std::max(accepted_quality, quality);
+		specificity = match;
+	}
+	return accepted_quality > 0;
+}
+
 void ApplyResponseAccept(unordered_map<string, string> &headers, ResponseFormat format) {
 	if (format == ResponseFormat::RAW) {
 		return;
@@ -67,9 +99,10 @@ void ApplyResponseAccept(unordered_map<string, string> &headers, ResponseFormat 
 	const auto expected = ExpectedResponseType(format);
 	for (auto &header : headers) {
 		if (StringUtil::Lower(header.first) == "accept") {
-			if (StringUtil::Lower(header.second).find(expected) == string::npos) {
+			if (!AcceptsResponseType(header.second, expected)) {
 				throw InvalidInputException("response_format conflicts with the supplied Accept header");
 			}
+			header.second = expected;
 			return;
 		}
 	}
@@ -80,7 +113,8 @@ bool HasResponseType(const HTTPHeaders &headers, ResponseFormat format) {
 	const auto expected = ExpectedResponseType(format);
 	for (auto &header : headers) {
 		if (StringUtil::Lower(header.first) == "content-type") {
-			return StringUtil::Lower(header.second).find(expected) == 0;
+			auto parts = StringUtil::Split(header.second, ';');
+			return !parts.empty() && QuackapiTrim(StringUtil::Lower(parts[0])) == expected;
 		}
 	}
 	return false;

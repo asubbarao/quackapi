@@ -57,6 +57,24 @@ SELECT * FROM quackapi_serve(29322, host := '127.0.0.1', access_log := false);
 ----
 http://127.0.0.1:29322
 
+statement error response_format conflicts
+SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
+                     map(['Accept'], ['application/vnd.apache.arrow.stream;q=0']), response_format := 'arrow');
+
+statement error response_format conflicts
+SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
+                     map(['Accept'], ['*/*;q=1, application/vnd.apache.arrow.stream;q=0']), response_format := 'arrow');
+
+query I
+SELECT bool_and(receipt.error IS NULL AND receipt.rows IS NOT NULL)
+FROM (
+  SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
+                      map(['Accept'], [accept]), response_format := 'arrow') AS receipt
+  FROM (SELECT unnest(['*/*', 'application/*', 'application/vnd.apache.arrow.stream;q=0.5']) AS accept)
+);
+----
+true
+
 # Native VARIANT leaves retain types that JSON cannot represent.
 query I
 SELECT bool_and(receipt.error IS NULL AND receipt.status = 200

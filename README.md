@@ -521,6 +521,24 @@ FROM quackapi_dequeue('emails', 10);
 
 Worker = compose community `cronjob` (or a drain route). See [`docs/QUEUE.md`](docs/QUEUE.md).
 
+### Native VARIANT inputs
+
+Declare a flexible body field as `PARAM payload VARIANT` and use it directly:
+
+```sql
+CREATE ROUTE inspect_payload POST '/inspect-payload'
+  PARAM payload VARIANT AS
+SELECT $payload AS payload, variant_typeof($payload) AS native_type;
+```
+
+A JSON object, list, number, boolean or null keeps its value kind. A value from
+the query string, path, header or cookie remains a string. Missing required
+fields fail validation; an explicit JSON null is valid for an unconstrained
+VARIANT. Numeric and string-length constraints require matching value kinds.
+Native default literals retain their types. `BODY TYPE` can mix declared fields
+such as `DECIMAL(24,4)` with `VARIANT` leaves without routing the declared fields
+through JSON-number inference.
+
 ### Parquet file responses
 
 `FORMAT PARQUET` returns a complete Parquet file body with content type
