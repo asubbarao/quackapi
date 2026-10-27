@@ -115,7 +115,7 @@ jobs:
 
       - name: Run quackapi SQLLogic
         env:
-          DUCKDB_TEST_ON_INIT: "INSTALL http_request FROM community; LOAD http_request;"
+          DUCKDB_TEST_ON_INIT: "INSTALL http_request FROM community; LOAD http_request; INSTALL sitting_duck FROM community; LOAD sitting_duck;"
         run: make test_release T='"test/sql/quackapi*"'
 
       - name: Verify embedded importer SQL
@@ -124,7 +124,7 @@ jobs:
       - name: Verify native Quack integration
         env:
           DUCKDB_TEST_ON_INIT: "INSTALL quack; LOAD quack;"
-        run: make test_release T='"test/sql/quackapi_quack_bridge.test" "test/sql/quackapi_native_protocol.test"'
+        run: make test_release T='"test/sql/quackapi_quack_bridge.test,test/sql/quackapi_native_protocol.test"'
 
       - name: Verify socket write deadlines
         run: python3 test/python/test_write_deadline.py build/release/duckdb build/release/extension/quackapi/quackapi.duckdb_extension
