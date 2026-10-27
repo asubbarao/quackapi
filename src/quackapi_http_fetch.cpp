@@ -28,12 +28,27 @@
 #include "duckdb/parallel/task.hpp"
 
 #include "httplib.hpp"
+#include "utf8proc_wrapper.hpp"
 
 namespace duckdb {
 
 namespace {
 
+thread_local ClientContext *outbound_context = nullptr;
+struct ScopedOutboundContext {
+	explicit ScopedOutboundContext(ClientContext &context) : previous(outbound_context) {
+		outbound_context = &context;
+	}
+	~ScopedOutboundContext() {
+		outbound_context = previous;
+	}
+	ClientContext *previous;
+};
+
 constexpr idx_t MAX_IDLE_PER_HOST = 64;
+constexpr idx_t MAX_IDLE_TOTAL = 256;
+constexpr idx_t MAX_POOL_HOSTS = 256;
+constexpr auto IDLE_POOL_TTL = std::chrono::minutes(5);
 // Concurrency cap when one chunk carries many independent calls. Kept at or below
 // MAX_IDLE_PER_HOST so a fan-out cannot dial more sockets than the pool will keep,
 // which would turn every burst into a churn of one-shot connections.
@@ -86,6 +101,7 @@ struct HostPool {
 	vector<PooledUtil> util_idle;
 	idx_t dialed = 0;
 	idx_t reused = 0;
+	std::chrono::steady_clock::time_point last_used = std::chrono::steady_clock::now();
 };
 
 struct ConnectionPool {
@@ -98,6 +114,35 @@ struct ConnectionPool {
 	unordered_map<string, HostPool> hosts;
 };
 
+// The caller holds pool.lock. Eviction also bounds metadata for one-off hosts.
+HostPool &PoolHost(ConnectionPool &pool, const string &key) {
+	const auto now = std::chrono::steady_clock::now();
+	for (auto it = pool.hosts.begin(); it != pool.hosts.end();) {
+		if (now - it->second.last_used > IDLE_POOL_TTL)
+			it = pool.hosts.erase(it);
+		else
+			++it;
+	}
+	if (pool.hosts.find(key) == pool.hosts.end() && pool.hosts.size() >= MAX_POOL_HOSTS) {
+		auto oldest = pool.hosts.begin();
+		for (auto it = pool.hosts.begin(); it != pool.hosts.end(); ++it) {
+			if (it->second.last_used < oldest->second.last_used)
+				oldest = it;
+		}
+		pool.hosts.erase(oldest);
+	}
+	auto &host = pool.hosts[key];
+	host.last_used = now;
+	return host;
+}
+
+idx_t TotalIdleClients(const ConnectionPool &pool) {
+	idx_t count = 0;
+	for (const auto &entry : pool.hosts)
+		count += entry.second.plain_idle.size() + entry.second.util_idle.size();
+	return count;
+}
+
 //! Split "http://host:port/a/b?c" into origin + path. Mirrors HTTPUtil::DecomposeURL.
 void SplitURL(const string &url, string &origin, string &path) {
 	HTTPUtil::DecomposeURL(url, path, origin);
@@ -108,165 +153,6 @@ void SplitURL(const string &url, string &origin, string &path) {
 
 bool IsPlainHTTP(const string &url) {
 	return StringUtil::StartsWith(StringUtil::Lower(url), "http://");
-}
-
-//! Split "http://host:port" (from SplitURL origin) into host + port.
-void SplitOriginHostPort(const string &origin, string &host, int &port) {
-	host.clear();
-	port = 80;
-	string rest = origin;
-	if (StringUtil::StartsWith(StringUtil::Lower(rest), "http://")) {
-		rest = rest.substr(7);
-	} else if (StringUtil::StartsWith(StringUtil::Lower(rest), "https://")) {
-		rest = rest.substr(8);
-		port = 443;
-	}
-	// Strip any leftover path (should not be present on an origin).
-	auto slash = rest.find('/');
-	if (slash != string::npos) {
-		rest = rest.substr(0, slash);
-	}
-	auto colon = rest.rfind(':');
-	if (colon != string::npos && rest.find(']') == string::npos) {
-		// hostname:port (skip IPv6 bracket form for this test seam)
-		host = rest.substr(0, colon);
-		port = std::stoi(rest.substr(colon + 1));
-	} else if (colon != string::npos && rest.front() == '[') {
-		// [ipv6]:port
-		auto br = rest.rfind(']');
-		if (br != string::npos && br + 1 < rest.size() && rest[br + 1] == ':') {
-			host = rest.substr(1, br - 1);
-			port = std::stoi(rest.substr(br + 2));
-		} else {
-			host = rest;
-		}
-	} else {
-		host = rest;
-	}
-}
-
-//! Parse a raw HTTP/1.x response into status + body. Tolerates truncation.
-void ParseRawHttpResponse(const string &raw, QuackapiHttpFetchResult &out) {
-	auto header_end = raw.find("\r\n\r\n");
-	string header_block;
-	if (header_end == string::npos) {
-		header_block = raw;
-		out.body.clear();
-	} else {
-		header_block = raw.substr(0, header_end);
-		out.body = raw.substr(header_end + 4);
-	}
-	auto line_end = header_block.find("\r\n");
-	string status_line = line_end == string::npos ? header_block : header_block.substr(0, line_end);
-	// "HTTP/1.1 200 OK"
-	auto sp1 = status_line.find(' ');
-	if (sp1 != string::npos) {
-		auto sp2 = status_line.find(' ', sp1 + 1);
-		string code = sp2 == string::npos ? status_line.substr(sp1 + 1) : status_line.substr(sp1 + 1, sp2 - sp1 - 1);
-		try {
-			int status = std::stoi(code);
-			out.status = HTTPUtil::ToStatusCode(status);
-			out.success = status >= 200 && status < 400;
-			if (sp2 != string::npos) {
-				out.reason = status_line.substr(sp2 + 1);
-			}
-		} catch (...) {
-			out.request_error = "failed to parse HTTP status line";
-		}
-	} else if (!raw.empty()) {
-		out.request_error = "malformed HTTP response";
-	}
-	if (line_end != string::npos) {
-		idx_t pos = line_end + 2;
-		while (pos < header_block.size()) {
-			auto next = header_block.find("\r\n", pos);
-			string line = next == string::npos ? header_block.substr(pos) : header_block.substr(pos, next - pos);
-			auto colon = line.find(':');
-			if (colon != string::npos) {
-				string key = line.substr(0, colon);
-				string val = line.substr(colon + 1);
-				StringUtil::Trim(key);
-				StringUtil::Trim(val);
-				out.headers.Insert(key, val);
-			}
-			if (next == string::npos) {
-				break;
-			}
-			pos = next + 2;
-		}
-	}
-}
-
-//! Plain HTTP GET that sends the request, waits stall_ms, then reads. Matches
-//! a raw socket that stops reading — the only client shape that trips httplib
-//! server write_timeout / ApplyRouteIoTimeout.
-QuackapiHttpFetchResult PlainGetWithStall(const string &url, const unordered_map<string, string> &extra_headers,
-                                          int32_t stall_ms) {
-	QuackapiHttpFetchResult out;
-	string origin, path;
-	SplitURL(url, origin, path);
-	string host;
-	int port = 80;
-	SplitOriginHostPort(origin, host, port);
-	if (host.empty()) {
-		out.request_error = "stall_ms: could not parse host from URL";
-		return out;
-	}
-
-	quackapi_httplib::Error conn_error = quackapi_httplib::Error::Success;
-	auto sock = quackapi_httplib::detail::create_client_socket(
-	    host, "", port, AF_UNSPEC, /*tcp_nodelay=*/true, /*ipv6_v6only=*/false,
-	    quackapi_httplib::default_socket_options, OUTBOUND_CONNECT_TIMEOUT_SECONDS, 0, OUTBOUND_TIMEOUT_SECONDS, 0,
-	    OUTBOUND_TIMEOUT_SECONDS, 0, /*intf=*/"", conn_error);
-	if (sock == INVALID_SOCKET) {
-		out.request_error = "stall_ms connect: " + quackapi_httplib::to_string(conn_error);
-		return out;
-	}
-
-	string req = "GET " + path + " HTTP/1.1\r\nHost: " + host;
-	if (port != 80) {
-		req += ":" + std::to_string(port);
-	}
-	req += "\r\nConnection: close\r\n";
-	for (auto &kv : extra_headers) {
-		req += kv.first + ": " + kv.second + "\r\n";
-	}
-	req += "\r\n";
-
-	const char *send_ptr = req.data();
-	size_t send_left = req.size();
-	while (send_left > 0) {
-		auto n = quackapi_httplib::detail::send_socket(sock, send_ptr, send_left, CPPHTTPLIB_SEND_FLAGS);
-		if (n <= 0) {
-			quackapi_httplib::detail::close_socket(sock);
-			out.request_error = "stall_ms: send failed";
-			return out;
-		}
-		send_ptr += n;
-		send_left -= static_cast<size_t>(n);
-	}
-
-	if (stall_ms > 0) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
-	}
-
-	string raw;
-	char buf[16384];
-	while (true) {
-		auto n = quackapi_httplib::detail::read_socket(sock, buf, sizeof(buf), CPPHTTPLIB_RECV_FLAGS);
-		if (n <= 0) {
-			break;
-		}
-		raw.append(buf, static_cast<size_t>(n));
-	}
-	quackapi_httplib::detail::close_socket(sock);
-
-	if (raw.empty()) {
-		out.request_error = "stall_ms: empty response (peer closed during stall)";
-		return out;
-	}
-	ParseRawHttpResponse(raw, out);
-	return out;
 }
 
 unique_ptr<quackapi_httplib::Client> DialPlain(const string &origin) {
@@ -319,7 +205,7 @@ QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
 	{
 		auto &pool = ConnectionPool::Get();
 		std::lock_guard<std::mutex> guard(pool.lock);
-		auto &host = pool.hosts[origin];
+		auto &host = PoolHost(pool, origin);
 		if (!host.plain_idle.empty()) {
 			client = std::move(host.plain_idle.back().client);
 			host.plain_idle.pop_back();
@@ -344,8 +230,13 @@ QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
 	QuackapiHttpFetchResult result;
 	bool healthy = false;
 	try {
+		unique_ptr<QuackapiCancellationGuard> cancellation;
+		if (outbound_context) {
+			cancellation = make_uniq<QuackapiCancellationGuard>(*outbound_context, [&client]() { client->stop(); });
+		}
 		auto res = call(*client);
-		healthy = res.error() == quackapi_httplib::Error::Success;
+		healthy =
+		    res.error() == quackapi_httplib::Error::Success && !(outbound_context && outbound_context->IsInterrupted());
 		result = FromHttplibResult(res);
 	} catch (...) {
 		// Drop the client on the floor; a half-written socket is not reusable.
@@ -356,8 +247,8 @@ QuackapiHttpFetchResult WithPlainClient(const string &origin, CALL &&call) {
 	if (healthy) {
 		auto &pool = ConnectionPool::Get();
 		std::lock_guard<std::mutex> guard(pool.lock);
-		auto &host = pool.hosts[origin];
-		if (host.plain_idle.size() < MAX_IDLE_PER_HOST) {
+		auto &host = PoolHost(pool, origin);
+		if (host.plain_idle.size() < MAX_IDLE_PER_HOST && TotalIdleClients(pool) < MAX_IDLE_TOTAL) {
 			host.plain_idle.push_back(PooledPlain {std::move(client)});
 		}
 	}
@@ -379,7 +270,7 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 	{
 		auto &pool = ConnectionPool::Get();
 		std::lock_guard<std::mutex> guard(pool.lock);
-		auto &host = pool.hosts[key];
+		auto &host = PoolHost(pool, key);
 		if (!host.util_idle.empty()) {
 			client = std::move(host.util_idle.back().client);
 			host.util_idle.pop_back();
@@ -401,8 +292,8 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 	if (client && result.request_error.empty()) {
 		auto &pool = ConnectionPool::Get();
 		std::lock_guard<std::mutex> guard(pool.lock);
-		auto &host = pool.hosts[key];
-		if (host.util_idle.size() < MAX_IDLE_PER_HOST) {
+		auto &host = PoolHost(pool, key);
+		if (host.util_idle.size() < MAX_IDLE_PER_HOST && TotalIdleClients(pool) < MAX_IDLE_TOTAL) {
 			host.util_idle.push_back(PooledUtil {std::move(client)});
 		}
 	}
@@ -414,38 +305,6 @@ QuackapiHttpFetchResult WithUtilClient(DatabaseInstance &db, const string &url, 
 //===--------------------------------------------------------------------===//
 // Public API
 //===--------------------------------------------------------------------===//
-
-string QuackapiHttpFetch::ActiveHttpUtilName(DatabaseInstance &db) {
-	return HTTPUtil::Get(db).GetName();
-}
-
-QuackapiHttpFetchResult QuackapiHttpFetch::Get(DatabaseInstance &db, const string &url,
-                                               const unordered_map<string, string> &extra_headers, int32_t stall_ms) {
-	if (stall_ms < 0) {
-		throw InvalidInputException("quackapi_fetch stall_ms must be >= 0");
-	}
-	if (stall_ms > 0) {
-		if (!IsPlainHTTP(url)) {
-			throw InvalidInputException("quackapi_fetch stall_ms requires an http:// URL (plain TCP stall seam)");
-		}
-		return PlainGetWithStall(url, extra_headers, stall_ms);
-	}
-	if (IsPlainHTTP(url)) {
-		string origin, path;
-		SplitURL(url, origin, path);
-		auto headers = ToHttplibHeaders(extra_headers);
-		return WithPlainClient(origin, [&](quackapi_httplib::Client &client) { return client.Get(path, headers); });
-	}
-
-	return WithUtilClient(db, url, [&](HTTPUtil &http_util, HTTPParams &params, unique_ptr<HTTPClient> &client) {
-		HTTPHeaders headers(db);
-		InsertExtraHeaders(headers, extra_headers);
-		GetRequestInfo request(url, headers, params, /*response_handler=*/nullptr,
-		                       /*content_handler=*/nullptr);
-		request.try_request = true;
-		return FromResponse(http_util.Request(request, client));
-	});
-}
 
 QuackapiHttpFetchResult QuackapiHttpFetch::Post(DatabaseInstance &db, const string &url, const string &body,
                                                 const string &content_type,
@@ -535,6 +394,7 @@ LogicalType FetchResultType() {
 	children.emplace_back("headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
 	children.emplace_back("error", LogicalType::VARCHAR);
 	children.emplace_back("reused_connection", LogicalType::BOOLEAN);
+	children.emplace_back("body_blob", LogicalType::BLOB);
 	return LogicalType::STRUCT(std::move(children));
 }
 
@@ -548,12 +408,15 @@ Value ToValue(const QuackapiHttpFetchResult &result) {
 	child_list_t<Value> children;
 	children.emplace_back("status", Value::INTEGER(static_cast<int32_t>(result.status)));
 	children.emplace_back("reason", Value(result.reason));
-	children.emplace_back("body", Value(result.body));
+	children.emplace_back("body", Utf8Proc::IsValid(result.body.data(), result.body.size())
+	                                  ? Value(result.body)
+	                                  : Value(LogicalType::VARCHAR));
 	children.emplace_back("headers", Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(header_keys),
 	                                            std::move(header_values)));
 	children.emplace_back("error",
 	                      result.request_error.empty() ? Value(LogicalType::VARCHAR) : Value(result.request_error));
 	children.emplace_back("reused_connection", Value::BOOLEAN(result.reused_connection));
+	children.emplace_back("body_blob", Value::BLOB_RAW(result.body));
 	return Value::STRUCT(std::move(children));
 }
 
@@ -572,17 +435,6 @@ unordered_map<string, string> HeadersFromValue(const Value &value) {
 		out[kv[0].ToString()] = kv[1].IsNull() ? string() : kv[1].ToString();
 	}
 	return out;
-}
-
-int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
-	if (args.ColumnCount() <= col) {
-		return 0;
-	}
-	auto v = args.data[col].GetValue(row);
-	if (v.IsNull()) {
-		return 0;
-	}
-	return v.GetValue<int32_t>();
 }
 
 //! Issue one independent outbound call per row of a chunk, CONCURRENTLY.
@@ -605,11 +457,12 @@ int32_t StallMsFromArgs(DataChunk &args, idx_t row, idx_t col) {
 //! request there is no other deadline, so this is what stops a call to a peer that went silent.
 //! The deadline is read from the connection too: a call evaluated on a DuckDB worker thread
 //! (a parallel scan) never sees the request thread's deadline.
-std::chrono::steady_clock::time_point OutboundDeadline(ClientContext &context) {
+std::chrono::steady_clock::time_point OutboundDeadline(ClientContext &context, int64_t call_timeout_ms = 0) {
 	auto deadline = QuackapiContextDeadline(context);
 	Value setting;
-	if (context.TryGetCurrentSetting("quackapi_http_timeout_ms", setting) && !setting.IsNull()) {
-		const auto timeout_ms = setting.GetValue<int64_t>();
+	if (call_timeout_ms > 0 ||
+	    (context.TryGetCurrentSetting("quackapi_http_timeout_ms", setting) && !setting.IsNull())) {
+		const auto timeout_ms = call_timeout_ms > 0 ? call_timeout_ms : setting.GetValue<int64_t>();
 		if (timeout_ms <= 0) {
 			throw InvalidInputException("quackapi_http_timeout_ms must be > 0");
 		}
@@ -654,10 +507,11 @@ template <class PERFORM>
 void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &skip, vector<QuackapiHttpFetchResult> &out,
                     PERFORM &&perform) {
 	context.BlockingInterruptCheck();
-	ScopedOutboundDeadline scoped(context);
+	ScopedOutboundDeadline scoped(QuackapiContextDeadline(context));
 	const auto deadline = QuackapiCurrentDeadline();
 	auto run_one = [&](idx_t i) {
 		ScopedOutboundDeadline scoped_row(deadline);
+		ScopedOutboundContext context_scope(context);
 		try {
 			out[i] = perform(i);
 		} catch (std::exception &e) {
@@ -707,55 +561,6 @@ void FanOutRequests(ClientContext &context, idx_t count, const vector<bool> &ski
 	context.BlockingInterruptCheck();
 }
 
-void FetchScalar(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	const auto count = args.size();
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-
-	// Extract every argument up front, single-threaded: DataChunk/Vector reads are
-	// not safe to interleave with the fan-out below. stall_ms is validated here too,
-	// so its InvalidInputException still reaches the caller instead of being captured
-	// into a per-row error by the fan-out.
-	vector<bool> skip(count, false);
-	vector<string> urls(count);
-	vector<unordered_map<string, string>> headers(count);
-	vector<int32_t> stalls(count, 0);
-	for (idx_t i = 0; i < count; i++) {
-		auto url = args.data[0].GetValue(i);
-		if (url.IsNull()) {
-			skip[i] = true;
-			continue;
-		}
-		urls[i] = url.ToString();
-		if (args.ColumnCount() == 2) {
-			// Overload is either (url, headers MAP) or (url, stall_ms INTEGER).
-			if (args.data[1].GetType().id() == LogicalTypeId::INTEGER ||
-			    args.data[1].GetType().id() == LogicalTypeId::BIGINT) {
-				stalls[i] = StallMsFromArgs(args, i, 1);
-			} else {
-				headers[i] = HeadersFromValue(args.data[1].GetValue(i));
-			}
-		} else if (args.ColumnCount() >= 3) {
-			headers[i] = HeadersFromValue(args.data[1].GetValue(i));
-			stalls[i] = StallMsFromArgs(args, i, 2);
-		}
-		if (stalls[i] < 0) {
-			throw InvalidInputException("quackapi_fetch stall_ms must be >= 0");
-		}
-		if (stalls[i] > 0 && !IsPlainHTTP(urls[i])) {
-			throw InvalidInputException("quackapi_fetch stall_ms requires an http:// URL (plain TCP stall seam)");
-		}
-	}
-
-	vector<QuackapiHttpFetchResult> out(count);
-	FanOutRequests(state.GetContext(), count, skip, out,
-	               [&](idx_t i) { return QuackapiHttpFetch::Get(db, urls[i], headers[i], stalls[i]); });
-
-	for (idx_t i = 0; i < count; i++) {
-		result.SetValue(i, skip[i] ? Value(FetchResultType()) : ToValue(out[i]));
-	}
-}
-
 void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &db = *state.GetContext().db;
 	const auto count = args.size();
@@ -766,29 +571,48 @@ void PostScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<string> bodies(count);
 	vector<string> content_types(count);
 	vector<unordered_map<string, string>> headers(count);
+	vector<std::chrono::steady_clock::time_point> deadlines(count);
+	const auto positional_count = args.ColumnCount() - 1;
 	for (idx_t i = 0; i < count; i++) {
 		auto url = args.data[0].GetValue(i);
 		if (url.IsNull()) {
 			skip[i] = true;
 			continue;
 		}
+		// Keep positional NULL behavior while the optional timeout defaults to NULL.
+		for (idx_t col = 1; col < positional_count; col++) {
+			if (args.data[col].GetValue(i).IsNull()) {
+				skip[i] = true;
+				break;
+			}
+		}
+		if (skip[i]) {
+			continue;
+		}
+		auto timeout = args.data[args.ColumnCount() - 1].GetValue(i);
+		const auto call_timeout_ms = timeout.IsNull() ? 0 : timeout.GetValue<int64_t>();
+		if (!timeout.IsNull() && call_timeout_ms <= 0) {
+			throw InvalidInputException("timeout_ms must be > 0");
+		}
+		deadlines[i] = OutboundDeadline(state.GetContext(), call_timeout_ms);
 		urls[i] = url.ToString();
 		auto body = args.data[1].GetValue(i);
 		bodies[i] = body.IsNull() ? string() : body.ToString();
 		content_types[i] = "application/json";
-		if (args.ColumnCount() > 2) {
+		if (positional_count > 2) {
 			auto ct = args.data[2].GetValue(i);
 			if (!ct.IsNull()) {
 				content_types[i] = ct.ToString();
 			}
 		}
-		if (args.ColumnCount() > 3) {
+		if (positional_count > 3) {
 			headers[i] = HeadersFromValue(args.data[3].GetValue(i));
 		}
 	}
 
 	vector<QuackapiHttpFetchResult> out(count);
 	FanOutRequests(state.GetContext(), count, skip, out, [&](idx_t i) {
+		ScopedOutboundDeadline per_call(deadlines[i]);
 		return QuackapiHttpFetch::Post(db, urls[i], bodies[i], content_types[i], headers[i]);
 	});
 
@@ -1293,8 +1117,8 @@ struct FetchTableBindData : public TableFunctionData {
 	string url;
 	string body;
 	string content_type = "application/json";
+	int64_t timeout_ms = 0;
 	unordered_map<string, string> headers;
-	int32_t stall_ms = 0;
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<FetchTableBindData>(*this);
 	}
@@ -1385,99 +1209,6 @@ void PoolExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	output.SetChildCardinality(row);
 }
 
-//! Concurrent GETs — the seam SQLLogic needs for claim-race / fan-out tests.
-//! `FROM range(n)` around scalar quackapi_fetch constant-folds to one request;
-//! this table function schedules n native async I/O tasks, one receipt per attempt.
-struct ParallelFetchBindData : public TableFunctionData {
-	string url;
-	int32_t n = 1;
-	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<ParallelFetchBindData>(*this);
-	}
-};
-
-struct ParallelFetchRow {
-	int32_t idx = 0;
-	int32_t status = 0;
-	string body;
-	string error;
-};
-
-struct ParallelFetchGlobalState : public GlobalTableFunctionState {
-	vector<ParallelFetchRow> rows;
-	idx_t offset = 0;
-	bool scheduled = false;
-};
-
-unique_ptr<FunctionData> ParallelFetchBind(ClientContext &, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
-	auto bind = make_uniq<ParallelFetchBindData>();
-	bind->url = input.inputs[0].GetValue<string>();
-	bind->n = input.inputs[1].GetValue<int32_t>();
-	if (bind->n < 1) {
-		throw InvalidInputException("quackapi_parallel_fetch: n must be >= 1");
-	}
-	if (bind->n > 256) {
-		throw InvalidInputException("quackapi_parallel_fetch: n max is 256");
-	}
-	names = {"idx", "status", "body", "error"};
-	return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR};
-	return std::move(bind);
-}
-
-unique_ptr<GlobalTableFunctionState> ParallelFetchInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto &bind = input.bind_data->Cast<ParallelFetchBindData>();
-	auto state = make_uniq<ParallelFetchGlobalState>();
-	state->rows.resize(NumericCast<idx_t>(bind.n));
-	return std::move(state);
-}
-
-void ParallelFetchExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	context.BlockingInterruptCheck();
-	auto &bind = data_p.bind_data->Cast<ParallelFetchBindData>();
-	auto &state = data_p.global_state->Cast<ParallelFetchGlobalState>();
-	if (!state.scheduled) {
-		state.scheduled = true;
-		const auto deadline = OutboundDeadline(context);
-		vector<unique_ptr<AsyncTask>> tasks;
-		for (int32_t i = 0; i < bind.n; i++) {
-			auto db = context.db;
-			tasks.push_back(make_uniq<CallbackAsyncTask>([&state, &bind, db, i, deadline]() {
-				ScopedOutboundDeadline scoped(deadline);
-				auto &row = state.rows[NumericCast<idx_t>(i)];
-				row.idx = i;
-				try {
-					auto res = QuackapiHttpFetch::Get(*db, bind.url);
-					row.status = static_cast<int32_t>(res.status);
-					row.body = std::move(res.body);
-					row.error = std::move(res.request_error);
-				} catch (std::exception &ex) {
-					row.error = ex.what();
-				} catch (...) {
-					row.error = "unknown error during outbound HTTP request";
-				}
-			}));
-		}
-		auto pending = AsyncResult::FromTasks(std::move(tasks), TaskSchedulerType::ASYNC);
-		if (data_p.HandleBlocked(pending)) {
-			return;
-		}
-	}
-	context.BlockingInterruptCheck();
-	idx_t row = 0;
-	while (state.offset < state.rows.size() && row < STANDARD_VECTOR_SIZE) {
-		auto &r = state.rows[state.offset];
-		output.SetValue(0, row, Value::INTEGER(r.idx));
-		output.SetValue(1, row, Value::INTEGER(r.status));
-		output.SetValue(2, row, Value(r.body));
-		output.SetValue(3, row, r.error.empty() ? Value(LogicalType::VARCHAR) : Value(r.error));
-		row++;
-		state.offset++;
-	}
-	output.SetChildCardinality(row);
-	data_p.async_result = AsyncResult::FromChunk(output);
-}
-
 } // namespace
 
 void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
@@ -1489,72 +1220,26 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	// with a fixed URL executes ONE request and copies the answer 1000 times.
 	// That is wrong for a function with side effects and it silently invalidates
 	// any benchmark built on it.
-	ScalarFunctionSet fetch_set("quackapi_fetch");
-	ScalarFunction fetch1("quackapi_fetch", {LogicalType::VARCHAR}, result_type, FetchScalar);
-	fetch1.SetVolatile();
-	ScalarFunction fetch2("quackapi_fetch", {LogicalType::VARCHAR, header_type}, result_type, FetchScalar);
-	fetch2.SetVolatile();
-	// stall_ms: after send, wait N ms before reading (socket write-timeout test seam).
-	ScalarFunction fetch_stall("quackapi_fetch", {LogicalType::VARCHAR, LogicalType::INTEGER}, result_type,
-	                           FetchScalar);
-	fetch_stall.SetVolatile();
-	ScalarFunction fetch_hdr_stall("quackapi_fetch", {LogicalType::VARCHAR, header_type, LogicalType::INTEGER},
-	                               result_type, FetchScalar);
-	fetch_hdr_stall.SetVolatile();
-	fetch_set.AddFunction(fetch1);
-	fetch_set.AddFunction(fetch2);
-	fetch_set.AddFunction(fetch_stall);
-	fetch_set.AddFunction(fetch_hdr_stall);
-	RegisterFallible(loader, fetch_set);
-
-	// Table form exposes named stall_ms := N (scalars have no named_parameters).
-	TableFunction fetch_tf(
-	    "quackapi_fetch", {LogicalType::VARCHAR}, AsyncReceiptExec,
-	    [](ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-	       vector<Identifier> &names) -> unique_ptr<FunctionData> {
-		    auto bind = make_uniq<FetchTableBindData>();
-		    if (input.inputs.empty() || input.inputs[0].IsNull()) {
-			    throw InvalidInputException("quackapi_fetch(url, stall_ms := N): url must be non-NULL");
-		    }
-		    bind->url = input.inputs[0].ToString();
-		    auto headers_it = input.named_parameters.find("headers");
-		    if (headers_it != input.named_parameters.end() && !headers_it->second.IsNull()) {
-			    bind->headers = HeadersFromValue(headers_it->second);
-		    }
-		    auto stall_it = input.named_parameters.find("stall_ms");
-		    if (stall_it != input.named_parameters.end() && !stall_it->second.IsNull()) {
-			    bind->stall_ms = stall_it->second.GetValue<int32_t>();
-		    }
-		    ReceiptColumns(return_types, names);
-		    return std::move(bind);
-	    },
-	    [](ClientContext &context, TableFunctionInitInput &input) -> unique_ptr<GlobalTableFunctionState> {
-		    auto &bind = input.bind_data->Cast<FetchTableBindData>();
-		    auto state = make_uniq<FetchTableGlobalState>();
-		    const auto deadline = OutboundDeadline(context);
-		    auto db = context.db;
-		    state->perform = [&bind, db, deadline]() {
-			    ScopedOutboundDeadline scoped(deadline);
-			    return QuackapiHttpFetch::Get(*db, bind.url, bind.headers, bind.stall_ms);
-		    };
-		    return std::move(state);
-	    });
-	AddNamedParameter(fetch_tf, "headers", header_type);
-	AddNamedParameter(fetch_tf, "stall_ms", LogicalType::INTEGER);
-	loader.RegisterFunction(fetch_tf);
-
 	ScalarFunctionSet post_set("quackapi_post");
 	ScalarFunction post2("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR}, result_type, PostScalar);
 	post2.SetVolatile();
+	post2.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post2.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	ScalarFunction post2j("quackapi_post", {LogicalType::VARCHAR, LogicalType::JSON()}, result_type, PostScalar);
 	post2j.SetVolatile();
+	post2j.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post2j.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	ScalarFunction post3("quackapi_post", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                     result_type, PostScalar);
 	post3.SetVolatile();
+	post3.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post3.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	ScalarFunction post4("quackapi_post",
 	                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, header_type}, result_type,
 	                     PostScalar);
 	post4.SetVolatile();
+	post4.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	post4.GetSignature().AddKeywordOnly("timeout_ms", LogicalType::BIGINT, Value(LogicalType::BIGINT));
 	post_set.AddFunction(post2);
 	post_set.AddFunction(post2j);
 	post_set.AddFunction(post3);
@@ -1581,22 +1266,31 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 		    if (headers != input.named_parameters.end() && !headers->second.IsNull()) {
 			    bind->headers = HeadersFromValue(headers->second);
 		    }
+		    auto timeout = input.named_parameters.find("timeout_ms");
+		    if (timeout != input.named_parameters.end() && !timeout->second.IsNull()) {
+			    bind->timeout_ms = timeout->second.GetValue<int64_t>();
+			    if (bind->timeout_ms <= 0) {
+				    throw InvalidInputException("timeout_ms must be > 0");
+			    }
+		    }
 		    ReceiptColumns(types, names);
 		    return std::move(bind);
 	    },
 	    [](ClientContext &context, TableFunctionInitInput &input) -> unique_ptr<GlobalTableFunctionState> {
 		    auto &bind = input.bind_data->Cast<FetchTableBindData>();
 		    auto state = make_uniq<FetchTableGlobalState>();
-		    const auto deadline = OutboundDeadline(context);
+		    const auto deadline = OutboundDeadline(context, bind.timeout_ms);
 		    auto db = context.db;
-		    state->perform = [&bind, db, deadline]() {
+		    state->perform = [&bind, db, deadline, &context]() {
 			    ScopedOutboundDeadline scoped(deadline);
+			    ScopedOutboundContext context_scope(context);
 			    return QuackapiHttpFetch::Post(*db, bind.url, bind.body, bind.content_type, bind.headers);
 		    };
 		    return std::move(state);
 	    });
 	AddNamedParameter(post_tf, "headers", header_type);
 	AddNamedParameter(post_tf, "content_type", LogicalType::VARCHAR);
+	AddNamedParameter(post_tf, "timeout_ms", LogicalType::BIGINT);
 	loader.RegisterFunction(post_tf);
 
 	// Same receipt as quackapi_post to an exec route; volatile for the same reason.
@@ -1641,10 +1335,6 @@ void RegisterQuackapiHttpFetchFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(exec_tf);
 
 	loader.RegisterFunction(TableFunction("quackapi_http_pool", {}, PoolExec, PoolBind, PoolInit));
-
-	TableFunction parallel_fetch("quackapi_parallel_fetch", {LogicalType::VARCHAR, LogicalType::INTEGER},
-	                             ParallelFetchExec, ParallelFetchBind, ParallelFetchInit);
-	loader.RegisterFunction(parallel_fetch);
 }
 
 } // namespace duckdb

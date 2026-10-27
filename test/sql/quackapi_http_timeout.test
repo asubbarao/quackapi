@@ -10,7 +10,7 @@ statement ok
 CREATE ROUTE slow POST '/slow' AS SELECT sleep_ms(1500) AS slept;
 
 statement ok
-CREATE ROUTE slow_get GET '/slow_get' AS SELECT sleep_ms(1500) AS slept;
+CREATE ROUTE slow_get POST '/slow_get' AS SELECT sleep_ms(1500) AS slept;
 
 query I
 SELECT * FROM quackapi_serve(29302, host := '127.0.0.1', access_log := false);
@@ -28,7 +28,7 @@ FROM (SELECT quackapi_post('http://127.0.0.1:29302/slow', '{}') AS r);
 true	true
 
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29302/slow_get')).error IS NOT NULL;
+SELECT (quackapi_post('http://127.0.0.1:29302/slow_get', '')).error IS NOT NULL;
 ----
 true
 

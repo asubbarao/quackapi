@@ -4,6 +4,19 @@
 
 require quackapi
 
+require http_request
+
+statement ok
+SET http_request_cache = false;
+
+# Test-local adapter: keep body assertions textual while using the standard HTTP extension.
+statement ok
+CREATE MACRO test_http_get(u, h := MAP{}) AS (SELECT {'status': r.status, 'body': decode(r.body), 'headers': r.headers} FROM (SELECT http_get(u, h) AS r));
+
+statement ok
+CREATE MACRO test_http_get_table(u, h := MAP{}) AS TABLE SELECT r.* FROM (SELECT test_http_get(u, h) AS r);
+
+
 statement ok
 CREATE TABLE telemetry_status_log (
   request_id VARCHAR,
@@ -19,7 +32,7 @@ SELECT * FROM quackapi_serve(29580, host := '127.0.0.1', access_log := 'telemetr
 http://127.0.0.1:29580
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29580/health').status;
+SELECT test_http_get('http://127.0.0.1:29580/health').status;
 ----
 200
 
@@ -58,7 +71,7 @@ stderr
 
 query I
 SELECT contains(body, '"telemetry"') AND contains(body, '"access_log_overflow_count"')
-FROM quackapi_fetch('http://127.0.0.1:29581/healthz');
+FROM test_http_get_table('http://127.0.0.1:29581/healthz');
 ----
 true
 

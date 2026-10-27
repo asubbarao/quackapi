@@ -34,6 +34,7 @@ class Value;
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
+static constexpr int64_t QUACKAPI_MAX_PAYLOAD_MAX_LENGTH = 1024ll * 1024ll * 1024ll;
 
 //! Default HTTP worker thread-pool size (httplib TaskQueue).
 static constexpr size_t QUACKAPI_DEFAULT_WORKER_THREADS = 32;
@@ -67,6 +68,10 @@ struct QuackapiServeOptions {
 	//! Empty = CORS disabled. "*" = reflect any Origin (or * when no Origin).
 	//! Otherwise a comma-separated allow-list of origins.
 	string cors_origins;
+	//! Hard maximum request-body bytes accepted by this server. Defaults to 8 MiB.
+	int64_t max_request_bytes = static_cast<int64_t>(QUACKAPI_PAYLOAD_MAX_LENGTH);
+	//! Treat downstream socket EOF as cancellation (opt-in; half-close is otherwise legal).
+	bool cancel_on_disconnect = false;
 
 	// --- Batteries: logging (ON by default) ---
 	//! Access log + server log verbosity. Default INFO.
@@ -150,10 +155,6 @@ struct QuackapiServeOptions {
 	idx_t compression_min_bytes = 1024;
 
 	// --- Native Postgres (optional; same shape as FastAPI+psycopg) ---
-	//! When non-empty, simple routes execute via libpq (thread-local conn,
-	//! fresh PQexecParams per request) instead of DuckDB ATTACH.
-	//! Empty = DuckDB path only. Example: postgresql://user:pass@127.0.0.1:5432/db
-	string pg_dsn;
 };
 
 //! One completed request, shared by the stderr and table access-log sinks.
@@ -328,6 +329,8 @@ private:
 	string NextRequestId(DatabaseInstance &db);
 	void EmitAccessLog(const QuackapiRequestRecord &entry);
 	void MaybeCompressResponse(const quackapi_httplib::Request &req, quackapi_httplib::Response &res);
+	//! Choose a route-specific payload ceiling after headers arrive and before httplib reads the body.
+	void SetRequestPayloadLimit(quackapi_httplib::Request &req) const;
 
 	weak_ptr<DatabaseInstance> db_ptr;
 	string host;
@@ -351,12 +354,10 @@ private:
 //! Optional body for POST/PUT/PATCH (Content-Type application/json when non-empty).
 //! req_headers: optional request headers (e.g. X-Request-ID, Accept, Authorization).
 //! headers_out: response header map (first value per name; case as httplib stores it).
-//! Optional pg_dsn: when non-empty, in-process dispatch uses the native libpq
-//! path (same as quackapi_serve(..., pg_dsn := ...)). Empty keeps DuckDB-only.
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers = nullptr,
-                              unordered_map<string, string> *headers_out = nullptr, const string &pg_dsn = string(),
+                              unordered_map<string, string> *headers_out = nullptr,
                               const QuackapiServeOptions *request_options = nullptr);
 
 //! What an exec route (`AS $sql`) with default STATUS/FORMAT/ENVELOPE answers for one SQL text.

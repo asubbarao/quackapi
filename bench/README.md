@@ -49,7 +49,7 @@ Workers bind the **same port** via kernel `SO_REUSEPORT` (httplib default). The 
 
 | Stack | Process | Port | Data path |
 |-------|---------|------|-----------|
-| **quackapi-w1** | one DuckDB + quackapi | `8000` | **`pg_dsn` libpq** parameterized execution; ATTACH kept as fallback |
+| **quackapi-w1** | one DuckDB + quackapi | `8000` | DuckDB `postgres` extension against an attached PostgreSQL catalog |
 | **quackapi-w8** | 8 DuckDB processes + `SO_REUSEPORT` | `8000` | same, pool capped per worker |
 | **fastapi-w1** | uvicorn `--workers 1` | `8001` | psycopg3 `ConnectionPool` |
 | **fastapi-w8** | uvicorn `--workers 8` | `8001` | same app, multi-process |
@@ -86,12 +86,9 @@ If Postgres is down: `podman start pgedge-n1`.
   `SO_REUSEPORT`** (w8): DuckDB CLI + quackapi (`-unsigned`, `-init /dev/null`).
 - **32 httplib worker threads** (w1); fewer per process when multi-worker.
 - Handlers are pure SQL via `CREATE ROUTE` (see `routes.sql`).
-- **Scoreboard path:** `quackapi_serve(…, pg_dsn := 'postgresql://…')` —
-  parameterized **libpq** execution against the same server as FastAPI.
-- The launcher attaches the configured `PG_DSN` as DuckDB fallback before loading
-  `routes.sql`; the attachment is not the hot path.
-  when `pg_dsn` is set. See [PG_ATTACH_CONCURRENCY.md](./PG_ATTACH_CONCURRENCY.md)
-  for why ATTACH alone collapsed under concurrency (pre-libpq).
+- Routes run through DuckDB's `postgres` extension and the attached `pg` catalog.
+  Historical numbers for the removed direct-libpq adapter are not comparable
+  without a fresh run using this configuration.
 - In-memory DuckDB holds routes only — **not** a copy of `bench_rows`.
 
 ### fastapi (port 8001)

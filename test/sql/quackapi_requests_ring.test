@@ -4,6 +4,19 @@
 
 require quackapi
 
+require http_request
+
+statement ok
+SET http_request_cache = false;
+
+# Test-local adapter: keep body assertions textual while using the standard HTTP extension.
+statement ok
+CREATE MACRO test_http_get(u, h := MAP{}) AS (SELECT {'status': r.status, 'body': decode(r.body), 'headers': r.headers} FROM (SELECT http_get(u, h) AS r));
+
+statement ok
+CREATE MACRO test_http_get_table(u, h := MAP{}) AS TABLE SELECT r.* FROM (SELECT test_http_get(u, h) AS r);
+
+
 # No listener means the built-in ring surface is an empty relation.
 query I
 SELECT count(*) FROM quackapi_requests();
@@ -26,17 +39,17 @@ SELECT * FROM quackapi_serve(29561, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29561
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29561/ring/first').status;
+SELECT test_http_get('http://127.0.0.1:29561/ring/first').status;
 ----
 200
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29561/ring/missing').status;
+SELECT test_http_get('http://127.0.0.1:29561/ring/missing').status;
 ----
 404
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29561/ring/second').status;
+SELECT test_http_get('http://127.0.0.1:29561/ring/second').status;
 ----
 200
 
@@ -60,7 +73,7 @@ SELECT * FROM quackapi_serve(29566, host := '127.0.0.1', access_log := false,
 http://127.0.0.1:29566
 
 query I
-SELECT (quackapi_fetch(
+SELECT (test_http_get(
   'http://127.0.0.1:29566/ring/first?token=abc&q=x',
   MAP {'Authorization': 'Bearer do-not-store', 'x-tenant-id': 'tenant-42'}
 )).status;
@@ -87,7 +100,7 @@ SELECT * FROM quackapi_serve(29567, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29567
 
 query I
-SELECT status FROM quackapi_fetch('http://127.0.0.1:29567/ring/second');
+SELECT status FROM test_http_get_table('http://127.0.0.1:29567/ring/second');
 ----
 200
 
@@ -108,13 +121,13 @@ SELECT * FROM quackapi_serve(29562, host := '127.0.0.1', access_log := false, re
 http://127.0.0.1:29562
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-one').status;
+SELECT test_http_get('http://127.0.0.1:29562/ring/two-one').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-two').status;
+SELECT test_http_get('http://127.0.0.1:29562/ring/two-two').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29562/ring/two-three').status;
+SELECT test_http_get('http://127.0.0.1:29562/ring/two-three').status;
 
 query I
 SELECT count(*) FROM quackapi_requests(29562);
@@ -138,10 +151,10 @@ SELECT * FROM quackapi_serve(29563, host := '127.0.0.1', access_log := false, re
 http://127.0.0.1:29563
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29563/ring/zero-one').status;
+SELECT test_http_get('http://127.0.0.1:29563/ring/zero-one').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29563/ring/zero-two').status;
+SELECT test_http_get('http://127.0.0.1:29563/ring/zero-two').status;
 
 query I
 SELECT count(*) FROM quackapi_requests(29563);
@@ -163,10 +176,10 @@ SELECT * FROM quackapi_serve(29565, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29565
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29565/ring/setting-one').status;
+SELECT test_http_get('http://127.0.0.1:29565/ring/setting-one').status;
 
 statement ok
-SELECT quackapi_fetch('http://127.0.0.1:29565/ring/setting-two').status;
+SELECT test_http_get('http://127.0.0.1:29565/ring/setting-two').status;
 
 query I
 SELECT count(*) FROM quackapi_requests(29565);
@@ -188,7 +201,7 @@ SELECT * FROM quackapi_serve(29564, host := '127.0.0.1', access_log := false);
 http://127.0.0.1:29564
 
 query I
-SELECT quackapi_fetch('http://127.0.0.1:29564/ring/fail?sql=SELECT%20nope%20FROM%20nowhere').status;
+SELECT test_http_get('http://127.0.0.1:29564/ring/fail?sql=SELECT%20nope%20FROM%20nowhere').status;
 ----
 500
 

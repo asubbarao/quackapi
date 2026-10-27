@@ -108,7 +108,7 @@ FROM quackapi_servers();
 -- GET /healthz → {"status":"ok", …, "http_client":"curl", "http_client_reason":""}
 
 -- Active HTTPUtil name (MultiCurl / HTTPFS-Curl after curl_httpfs, Built-In otherwise)
-SELECT quackapi_http_util_name();
+SELECT curl_httpfs_http_util_name();
 ```
 
 ### Manual load (optional)

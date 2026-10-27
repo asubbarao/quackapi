@@ -4,6 +4,19 @@
 
 require quackapi
 
+require http_request
+
+statement ok
+SET http_request_cache = false;
+
+# Test-local adapter: keep body assertions textual while using the standard HTTP extension.
+statement ok
+CREATE MACRO test_http_get(u, h := MAP{}) AS (SELECT {'status': r.status, 'body': decode(r.body), 'headers': r.headers} FROM (SELECT http_get(u, h) AS r));
+
+statement ok
+CREATE MACRO test_http_get_table(u, h := MAP{}) AS TABLE SELECT r.* FROM (SELECT test_http_get(u, h) AS r);
+
+
 statement ok
 CREATE TABLE access_log (
   request_id VARCHAR,
@@ -80,7 +93,7 @@ SELECT * FROM quackapi_serve(29461, host := '127.0.0.1', access_log := 'access_l
 http://127.0.0.1:29461
 
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+SELECT (test_http_get('http://127.0.0.1:29461/access-log')).status;
 ----
 200
 
@@ -98,7 +111,7 @@ DROP TABLE access_log_retry;
 # The request still succeeds while the writer is backing off and the missing
 # table means its access row cannot be appended.
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+SELECT (test_http_get('http://127.0.0.1:29461/access-log')).status;
 ----
 200
 
@@ -123,7 +136,7 @@ statement ok
 SELECT sleep_ms(1200);
 
 query I
-SELECT (quackapi_fetch('http://127.0.0.1:29461/access-log')).status;
+SELECT (test_http_get('http://127.0.0.1:29461/access-log')).status;
 ----
 200
 
@@ -148,7 +161,7 @@ http://127.0.0.1:29231
 
 query I
 SELECT contains(body, '"access_log_overflow_count":0')
-FROM quackapi_fetch('http://127.0.0.1:29231/healthz');
+FROM test_http_get_table('http://127.0.0.1:29231/healthz');
 ----
 true
 

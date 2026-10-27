@@ -63,27 +63,46 @@ field_types AS (
   JOIN source_ast t
     ON t.file_path = f.file AND t.parent_id = f.field_id AND t.type = 'type'
 ),
+field_call_defaults AS (
+  SELECT call.node_id, call.file_path,
+         bool_or(CASE
+           WHEN arg.type = 'keyword_argument' AND arg.name = 'default'
+             THEN value.type IS DISTINCT FROM 'ellipsis'
+           WHEN arg.type = 'keyword_argument' AND arg.name = 'default_factory'
+             THEN value.type NOT IN ('none', 'ellipsis')
+           WHEN arg.sibling_index = 1 AND arg.type NOT IN ('keyword_argument', 'ellipsis', ')', 'comment')
+             THEN true
+           ELSE false
+         END) AS has_default
+  FROM source_ast call
+  JOIN source_ast args
+    ON args.file_path = call.file_path AND args.parent_id = call.node_id AND args.type = 'argument_list'
+  JOIN source_ast arg
+    ON arg.file_path = args.file_path AND arg.parent_id = args.node_id
+  LEFT JOIN source_ast value
+    ON value.file_path = arg.file_path AND value.parent_id = arg.node_id AND value.sibling_index = 2
+  WHERE call.type = 'call' AND list_last(string_split(call.name, '.')) = 'Field'
+  GROUP BY ALL
+),
 field_defaults AS (
-  SELECT f.field_id, f.file, true AS has_default, rhs.peek AS default_expr
+  SELECT f.field_id, f.file,
+         CASE WHEN rhs.type = 'ellipsis' THEN false
+              WHEN fc.node_id IS NOT NULL THEN fc.has_default
+              ELSE true END AS has_default,
+         rhs.peek AS default_expr
   FROM field_nodes f
   JOIN source_ast eq
     ON eq.file_path = f.file AND eq.parent_id = f.field_id AND eq.type = '='
   LEFT JOIN source_ast rhs
     ON rhs.file_path = f.file AND rhs.parent_id = f.field_id
    AND rhs.sibling_index = eq.sibling_index + 1
+  LEFT JOIN field_call_defaults fc ON fc.file_path = rhs.file_path AND fc.node_id = rhs.node_id
 )
 SELECT
   f.model_name,
   f.field_name,
   coalesce(nullif(trim(ft.field_type), ''), 'Any') AS field_type,
-  (
-    NOT coalesce(fd.has_default, false)
-    AND NOT (
-      coalesce(ft.field_type, '') ILIKE '%Optional[%'
-      OR coalesce(ft.field_type, '') ILIKE '%| None%'
-      OR coalesce(ft.field_type, '') ILIKE '%None |%'
-    )
-  ) AS is_required,
+  NOT coalesce(fd.has_default, false) AS is_required,
   (
     coalesce(ft.field_type, '') ILIKE '%Optional[%'
     OR coalesce(ft.field_type, '') ILIKE '%| None%'

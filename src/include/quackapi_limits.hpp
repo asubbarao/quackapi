@@ -3,11 +3,26 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <functional>
 
 namespace duckdb {
 class ClientContext;
 class Connection;
 struct QuackapiDeadlineState;
+struct QuackapiCancellationState;
+
+//! Calls the action when a query is interrupted. Destroy before the context or
+//! action's resources; teardown waits for any in-flight action to finish.
+class QuackapiCancellationGuard {
+public:
+	QuackapiCancellationGuard(ClientContext &context, std::function<void()> action);
+	~QuackapiCancellationGuard();
+	QuackapiCancellationGuard(const QuackapiCancellationGuard &) = delete;
+	QuackapiCancellationGuard &operator=(const QuackapiCancellationGuard &) = delete;
+
+private:
+	std::shared_ptr<QuackapiCancellationState> state;
+};
 
 //! Shared watchdog, not a new OS thread for every request. The guard must die
 //! before its Connection; teardown synchronizes with any in-flight interrupt.
@@ -22,6 +37,9 @@ public:
 	                      bool thread_affine = true);
 	~QuackapiQueryDeadline();
 	bool Expired() const;
+	//! Probe is polled by the shared watchdog while this guard is alive.
+	void WatchDisconnect(std::function<bool()> probe);
+	bool Disconnected() const;
 	QuackapiQueryDeadline(const QuackapiQueryDeadline &) = delete;
 	QuackapiQueryDeadline &operator=(const QuackapiQueryDeadline &) = delete;
 

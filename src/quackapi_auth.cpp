@@ -453,12 +453,6 @@ static string ClaimsToJson(const unordered_map<string, string> &claims) {
 	return out;
 }
 
-//! Parse claims_json produced by ClaimsToJson back into a map (for REST rebind).
-static void ParseClaimsJson(DatabaseInstance &db, const string &json, unordered_map<string, string> &claims) {
-	unordered_map<string, bool> nulls;
-	ParseJsonObjectClaims(db, json, claims, nulls);
-}
-
 QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_name, const string &auth_string) {
 	QuackapiAuth auth;
 	if (!QuackapiState::Get(db).GetAuth(scheme_name, auth)) {
@@ -510,29 +504,8 @@ QuackapiAuthResult VerifyAuthScheme(DatabaseInstance &db, const string &scheme_n
 	return Fail500("Unknown authentication kind");
 }
 
-//! Mirror of quack_server.cpp EvaluateAuthQuery — run a one-shot SQL auth probe.
-template <typename... ARGS>
-static Value EvaluateAuthQuery(DatabaseInstance &db, const string &sql, ARGS... values) {
-	Connection dummy_connection(db);
-	auto auth_result = dummy_connection.Query(sql, values...);
-	if (!auth_result || auth_result->HasError()) {
-		return Value();
-	}
-	auto chunk = auth_result->Fetch();
-	if (!chunk || chunk->size() == 0) {
-		return Value();
-	}
-	return chunk->GetValue(0, 0);
-}
-
-//! Timing-safe token equality — same contract as quack_check_token
-//! (duckdb-quack src/quack_extension.cpp QuackAuthToken).
-static bool TimingSafeTokenEqual(const string &a, const string &b) {
-	return QuackapiConstantTimeEquals(a, b);
-}
-
 //===--------------------------------------------------------------------===//
-// CheckAuth — REST path goes through SQL (quack EvaluateAuthQuery shape)
+// CheckAuth — shared native verifier for REST and the SQL bridge
 //===--------------------------------------------------------------------===//
 
 QuackapiAuthResult CheckAuth(DatabaseInstance &db, const QuackapiRoute &route,
@@ -550,39 +523,11 @@ QuackapiAuthResult CheckAuth(DatabaseInstance &db, const QuackapiRoute &route,
 
 	string auth_string = ExtractAuthString(auth, headers);
 
-	// Dispatch via SQL so the REST plane and quack's authentication_function
-	// share one policy entrypoint (quackapi_verify_auth). Same pattern as
-	// QuackServer::HandleMessageInternal CONNECTION_REQUEST:
-	//   SELECT <auth_fn>(?, ?, ?)
-	// (duckdb-quack src/quack_server.cpp ~L279-L281).
-	auto struct_val =
-	    EvaluateAuthQuery(db, "SELECT quackapi_verify_auth(?, ?)", Value(route.require_auth), Value(auth_string));
-	if (struct_val.IsNull() || struct_val.type().id() != LogicalTypeId::STRUCT) {
-		// Function missing or error — fail closed via direct policy (still no
-		// private header-only branch that skips the engine).
-		return VerifyAuthScheme(db, route.require_auth, auth_string);
-	}
-
-	auto &children = StructValue::GetChildren(struct_val);
-	auto &child_types = StructType::GetChildTypes(struct_val.type());
-	// Field order: ok, status, body, www_authenticate, claims_json
-	if (children.size() < 5) {
-		return Fail500("quackapi_verify_auth returned unexpected shape");
-	}
-	QuackapiAuthResult result;
-	result.ok = !children[0].IsNull() && children[0].GetValue<bool>();
-	result.status = children[1].IsNull() ? 401 : children[1].GetValue<int32_t>();
-	result.body = children[2].IsNull() ? string() : children[2].GetValue<string>();
-	result.www_authenticate = children[3].IsNull() ? string() : children[3].GetValue<string>();
-	if (result.ok && !children[4].IsNull()) {
-		ParseClaimsJson(db, children[4].GetValue<string>(), result.claims);
-	}
-	(void)child_types;
-	return result;
+	return VerifyAuthScheme(db, route.require_auth, auth_string);
 }
 
 //===--------------------------------------------------------------------===//
-// quack-compatible auth bridge scalars
+// REST auth SQL verifier
 //===--------------------------------------------------------------------===//
 
 namespace {
@@ -616,59 +561,13 @@ void QuackapiVerifyAuthFunction(DataChunk &args, ExpressionState &state, Vector 
 	}
 }
 
-//! Drop-in for SET quack_authentication_function = 'quackapi_authentication'.
-//! Signature matches quack_check_token (session_id, auth_string, token) → BOOLEAN
-//! (duckdb-quack src/quack_extension.cpp L131-L136).
-//! Accepts either the server token (timing-safe) OR any registered CREATE AUTH scheme.
-void QuackapiAuthenticationFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &db = *state.GetContext().db;
-	// args: session_id, auth_string, token — session_id unused for token equality
-	// (same as quack_check_token which only compares args[1] and args[2]).
-	// Fall through: try every registered CREATE AUTH scheme against auth_string.
-	// Lets a co-located quack_serve share API_KEY/JWT policy with REST.
-	auto schemes = QuackapiState::Get(db).SnapshotAuths();
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
-		string auth_string = args.GetValue(1, row).IsNull() ? string() : args.GetValue(1, row).GetValue<string>();
-		string token = args.GetValue(2, row).IsNull() ? string() : args.GetValue(2, row).GetValue<string>();
-		bool ok = !auth_string.empty() && !token.empty() && TimingSafeTokenEqual(auth_string, token);
-		if (!ok) {
-			for (auto &scheme : schemes) {
-				if (VerifyAuthScheme(db, scheme.name, auth_string).ok) {
-					ok = true;
-					break;
-				}
-			}
-		}
-		result.SetValue(row, Value::BOOLEAN(ok));
-	}
-}
-
-//! Drop-in for SET quack_authorization_function = 'quackapi_authorization'.
-//! Same contract as quack_nop_authorization: return the query unchanged
-//! (duckdb-quack src/quack_extension.cpp QuackDummyAuthorization).
-void QuackapiAuthorizationFunction(DataChunk &args, ExpressionState &, Vector &result) {
-	// args: session_id, query_string
-	result.Reference(args.data[1]);
-}
-
 } // namespace
 
-void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader) {
+void RegisterQuackapiVerifyAuthFunction(ExtensionLoader &loader) {
 	ScalarFunction verify("quackapi_verify_auth", {LogicalType::VARCHAR, LogicalType::VARCHAR}, VerifyAuthReturnType(),
 	                      QuackapiVerifyAuthFunction);
 	verify.SetVolatile();
 	RegisterFallible(loader, verify);
-
-	ScalarFunction authn("quackapi_authentication", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                     LogicalType::BOOLEAN, QuackapiAuthenticationFunction);
-	authn.SetVolatile();
-	RegisterFallible(loader, authn);
-
-	ScalarFunction authz("quackapi_authorization", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                     QuackapiAuthorizationFunction);
-	authz.SetVolatile();
-	RegisterFallible(loader, authz);
 }
 
 //===--------------------------------------------------------------------===//
@@ -947,7 +846,9 @@ ParserExtensionPlanResult AuthDdlPlan(ParserExtensionInfo *, ClientContext &,
 //===--------------------------------------------------------------------===//
 
 struct AuthsBindData : public TableFunctionData {
-	bool finished = false;
+	idx_t offset = 0;
+	bool initialized = false;
+	vector<QuackapiAuth> auths;
 };
 
 unique_ptr<FunctionData> AuthsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
@@ -963,12 +864,13 @@ unique_ptr<FunctionData> AuthsBind(ClientContext &, TableFunctionBindInput &, ve
 
 void AuthsExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &bind_data = data_p.bind_data->CastNoConst<AuthsBindData>();
-	if (bind_data.finished) {
-		return;
+	if (!bind_data.initialized) {
+		bind_data.auths = QuackapiState::Get(*context.db).SnapshotAuths();
+		bind_data.initialized = true;
 	}
-	auto auths = QuackapiState::Get(*context.db).SnapshotAuths();
 	idx_t row = 0;
-	for (auto &auth : auths) {
+	for (; bind_data.offset < bind_data.auths.size() && row < STANDARD_VECTOR_SIZE; bind_data.offset++) {
+		auto &auth = bind_data.auths[bind_data.offset];
 		output.SetValue(0, row, Value(auth.name));
 		output.SetValue(1, row, Value(AuthKindToString(auth.kind)));
 		// For JWT, header is empty/unused; report Authorization conceptually.
@@ -980,7 +882,6 @@ void AuthsExec(ClientContext &context, TableFunctionInput &data_p, DataChunk &ou
 		row++;
 	}
 	output.SetChildCardinality(row);
-	bind_data.finished = true;
 }
 
 //===--------------------------------------------------------------------===//

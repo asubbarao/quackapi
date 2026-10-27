@@ -1,0 +1,20 @@
+# name: test/sql/quackapi_openapi_contract_regression.test
+# description: Declared parameter contracts appear in OpenAPI
+# group: [sql]
+
+require quackapi
+
+require json
+
+statement ok
+CREATE ROUTE openapi_contract GET '/openapi-contract' PARAM n INTEGER GE 1 LE 100 DEFAULT 10 AS SELECT $n AS n;
+
+query I
+SELECT json_extract_string(decode(body), '$.paths."/openapi-contract".get.parameters[0].schema.type') FROM quackapi_request('GET', '/openapi.json');
+----
+integer
+
+query III
+SELECT json_extract(decode(body), '$.paths."/openapi-contract".get.parameters[0].schema.minimum'), json_extract(decode(body), '$.paths."/openapi-contract".get.parameters[0].schema.maximum'), json_extract(decode(body), '$.paths."/openapi-contract".get.parameters[0].schema.default') FROM quackapi_request('GET', '/openapi.json');
+----
+1.0	100.0	10

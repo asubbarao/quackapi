@@ -12,6 +12,7 @@
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -467,7 +468,7 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 						i += 2;
 						continue;
 					}
-					table = result;
+					table = rest.substr(0, i + 1);
 					rest = QuackapiTrim(rest.substr(i + 1));
 					break;
 				}
@@ -953,7 +954,7 @@ string QuotePolicyTableIdentity(const PolicyTableIdentity &identity) {
 }
 
 //! Replace a policy signature argument without touching SQL string literals.
-string ReplacePolicyIdentifier(const string &expr, const string &from, const string &to) {
+string ReplacePolicyIdentifiers(const string &expr, const vector<string> &from, const vector<string> &to) {
 	string out;
 	bool in_str = false;
 	for (idx_t i = 0; i < expr.size();) {
@@ -975,13 +976,51 @@ string ReplacePolicyIdentifier(const string &expr, const string &from, const str
 			out += expr[i++];
 			continue;
 		}
+		if (expr[i] == '"') {
+			idx_t begin = i++;
+			string token;
+			while (i < expr.size()) {
+				if (expr[i] == '"') {
+					if (i + 1 < expr.size() && expr[i + 1] == '"') {
+						token += '"';
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				token += expr[i++];
+			}
+			bool replaced = false;
+			for (idx_t j = 0; j < from.size() && j < to.size(); j++) {
+				if (SameCatalogIdentifier(token, from[j])) {
+					out += QuoteCatalogIdentifier(to[j]);
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) {
+				out += expr.substr(begin, i - begin);
+			}
+			continue;
+		}
 		if (IsIdentStart(expr[i])) {
 			idx_t end = i + 1;
 			while (end < expr.size() && IsIdentChar(expr[end])) {
 				end++;
 			}
 			auto token = expr.substr(i, end - i);
-			out += SameCatalogIdentifier(token, from) ? to : token;
+			bool replaced = false;
+			for (idx_t j = 0; j < from.size() && j < to.size(); j++) {
+				if (SameCatalogIdentifier(token, from[j])) {
+					out += QuoteCatalogIdentifier(to[j]);
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) {
+				out += token;
+			}
 			i = end;
 			continue;
 		}
@@ -1000,6 +1039,8 @@ struct PolicyRewriteContext {
 	bool deny_unauthenticated = false;
 	string error;
 	unordered_map<string, bool> view_cache;
+	unordered_map<string, bool> macro_cache;
+	vector<string> cte_names;
 
 	PolicyRewriteContext(DatabaseInstance &db_p, const vector<QuackapiRowAccessBinding> &rap_bindings_p,
 	                     const vector<QuackapiMaskingBinding> &mask_bindings_p, bool authenticated_p)
@@ -1025,9 +1066,9 @@ bool IsCatalogView(PolicyRewriteContext &ctx, const PolicyTableIdentity &identit
 		is_view = cached->second;
 		return true;
 	}
-	auto result = ctx.con.Query(
-	    "SELECT 1 FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ? LIMIT 1",
-	    Value(identity.catalog), Value(identity.schema), Value(identity.table));
+	auto result = ctx.con.Query("SELECT 1 FROM duckdb_views() WHERE lower(database_name) = lower(?) AND "
+	                            "lower(schema_name) = lower(?) AND lower(view_name) = lower(?) LIMIT 1",
+	                            Value(identity.catalog), Value(identity.schema), Value(identity.table));
 	if (result->HasError()) {
 		return false;
 	}
@@ -1063,6 +1104,30 @@ bool RewritePolicyExpression(ParsedExpression &expression, PolicyRewriteContext 
 		return false;
 	}
 	try {
+		if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expression.Cast<FunctionExpression>();
+			auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+			auto cached = ctx.macro_cache.find(name);
+			bool is_macro;
+			if (cached == ctx.macro_cache.end()) {
+				auto result = ctx.con.Query("SELECT 1 FROM duckdb_functions() WHERE lower(function_name) = ? AND "
+				                            "function_type = 'macro' LIMIT 1",
+				                            Value(name));
+				if (result->HasError()) {
+					ctx.Reject("policy enforcement could not inspect function dependencies");
+					return false;
+				}
+				auto chunk = result->Fetch();
+				is_macro = chunk && chunk->size() > 0;
+				ctx.macro_cache.emplace(name, is_macro);
+			} else {
+				is_macro = cached->second;
+			}
+			if (is_macro) {
+				ctx.Reject("policy enforcement rejects scalar macro dependencies");
+				return false;
+			}
+		}
 		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 			auto &subquery = expression.Cast<SubqueryExpression>();
 			if (!subquery.Subquery() || !RewritePolicySelect(*subquery.SubqueryMutable(), ctx)) {
@@ -1115,6 +1180,14 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 	switch (ref->type) {
 	case TableReferenceType::BASE_TABLE: {
 		auto &base = ref->Cast<BaseTableRef>();
+		const auto &name = base.GetQualifiedName();
+		if (name.Schema().empty() && name.Catalog().empty()) {
+			for (auto it = ctx.cte_names.rbegin(); it != ctx.cte_names.rend(); ++it) {
+				if (SameCatalogIdentifier(*it, name.Name().GetIdentifierName())) {
+					return true;
+				}
+			}
+		}
 		auto identity = IdentityFromBaseRef(base, ctx.default_catalog);
 		bool is_view = false;
 		if (!IsCatalogView(ctx, identity, is_view)) {
@@ -1169,13 +1242,8 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 				ctx.Reject("row-access policy binding references a missing policy");
 				return false;
 			}
-			where_expr = rap_storage.expression;
-			for (idx_t i = 0; i < rap_storage.arg_columns.size() && i < rap_binding->columns.size(); i++) {
-				if (!SameCatalogIdentifier(rap_storage.arg_columns[i], rap_binding->columns[i])) {
-					where_expr =
-					    ReplacePolicyIdentifier(where_expr, rap_storage.arg_columns[i], rap_binding->columns[i]);
-				}
-			}
+			where_expr =
+			    ReplacePolicyIdentifiers(rap_storage.expression, rap_storage.arg_columns, rap_binding->columns);
 			rap = &rap_storage;
 		}
 
@@ -1256,11 +1324,21 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 }
 
 bool RewritePolicyQueryNode(QueryNode &node, PolicyRewriteContext &ctx) {
+	struct CteScope {
+		vector<string> &names;
+		idx_t size;
+		~CteScope() {
+			names.resize(size);
+		}
+	} scope {ctx.cte_names, ctx.cte_names.size()};
 	for (auto &entry : node.cte_map.map) {
 		if (!entry.second || !entry.second->query_node || !RewritePolicyQueryNode(*entry.second->query_node, ctx)) {
 			ctx.Reject("policy enforcement could not inspect a common table expression");
 			return false;
 		}
+		// DuckDB binds a non-recursive definition with only preceding CTEs
+		// visible. Its own name (and later names) may still refer to base tables.
+		ctx.cte_names.push_back(entry.first.GetIdentifierName());
 	}
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {

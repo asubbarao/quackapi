@@ -1,13 +1,15 @@
 # quackapi tests (community extension style)
 
-**Only SQLLogic.** CI runs them via DuckDB `unittest`. No bash harness, no ports.
+SQLLogic tests cover handler behavior through DuckDB `unittest`. Separate socket
+tests cover behavior that requires a real connection, including disconnects,
+write backpressure, payload limits, WebSockets, and database lifetime.
 
 ```bash
 # build (local extension)
 CMAKE_BUILD_PARALLEL_LEVEL=4 MAKEFLAGS=-j4 make release
 
 # run all quackapi SQLLogic tests (same path extension CI uses)
-./build/release/test/unittest "test/sql/quackapi*"
+make test_release T='"test/sql/quackapi*"'
 ```
 
 ## How it works
@@ -26,8 +28,15 @@ Text bodies: `decode(body)`. Binary: slice BLOB / `octet_length`.
 test/sql/quackapi_*.test   ← the product tests
 ```
 
-Do **not** add `test/http/*.sh`. If a behavior cannot be asserted through
-`quackapi_request`, extend the TestClient (headers/body), not a shell script.
+Use `quackapi_request` for behavior that can be asserted in process. Use the
+existing `test/cpp/` and `test/python/` socket tests when the behavior depends on
+connection lifetime or transport I/O. The distribution workflow builds and runs
+these tests in addition to SQLLogic.
+
+The complete SQL run needs `http_request`, `sitting_duck`, and native `quack`
+available through `DUCKDB_TEST_ON_INIT`. Set `QUACKAPI_NETWORK_TESTS=1` for the
+cronjob integration and `QUACKAPI_TEST_PG_DSN` to a disposable PostgreSQL database
+for the PostgreSQL integration. Without these settings, those two suites skip.
 
 ## Examples
 

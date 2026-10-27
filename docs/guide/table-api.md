@@ -1,6 +1,8 @@
 # CREATE API FOR TABLE — instant read CRUD
 
-One statement expands a table (or view) into **two GET routes**: list all rows, and get one row by key.
+One statement expands a table (or view) into **two GET routes**: list rows with bounded pagination, and get one row by key.
+
+The list endpoint defaults to 100 rows; `?limit=...` accepts 1–1000 and `?offset=...` starts at 0. Use a unique key for stable ordering.
 
 Read-only in this version — no POST/PUT/DELETE scaffold. Generated routes are ordinary registry rows (`DROP ROUTE` works on each).
 
@@ -16,7 +18,7 @@ SELECT 1 AS id, '24-000117' AS case_no;
 
 CREATE API FOR TABLE cases;
 -- registers:
---   GET /cases        → SELECT * FROM "cases"
+--   GET /cases        → SELECT * FROM "cases" ORDER BY "id" LIMIT $limit OFFSET $offset
 --   GET /cases/:id    → SELECT * FROM "cases" WHERE "id" = $id
 ```
 

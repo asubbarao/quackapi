@@ -1,0 +1,22 @@
+# name: test/sql/quackapi_pydantic_contract.test
+# description: Pydantic nullability and requiredness are independent
+# group: [sql]
+
+require quackapi
+
+require sitting_duck
+
+query IIII
+SELECT field_name, is_required, is_optional, has_default
+FROM quack_from_models('fastapi', 'test/fixtures/pydantic_contract')
+ORDER BY field_line;
+----
+nullable	true	true	false
+nullable_default	false	true	true
+explicit	true	false	false
+factory	false	false	true
+bare	true	false	false
+metadata	true	false	false
+named_ellipsis	true	false	false
+named_default	false	false	true
+positional_default	false	false	true

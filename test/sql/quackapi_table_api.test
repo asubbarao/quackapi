@@ -98,3 +98,35 @@ statement error
 CREATE API FOR TABLE cases KEY 'id"x';
 ----
 KEY must be a bare identifier
+
+# A collision in the second generated route must not publish the first.
+statement ok
+CREATE TABLE atomic_api (id INTEGER);
+
+statement ok
+CREATE ROUTE atomic_collision GET '/atomic_api/:id' AS SELECT 1 AS value;
+
+statement error
+CREATE API FOR TABLE atomic_api;
+----
+
+query I
+SELECT status FROM quackapi_request('GET', '/atomic_api');
+----
+404
+
+query I
+SELECT count(*) FROM quackapi_routes() WHERE name IN ('atomic_api_list', 'atomic_api_get');
+----
+0
+
+# Generated list routes have bounded pagination and stable key ordering.
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/api/documents?limit=1&offset=1');
+----
+200	[]
+
+query I
+SELECT status FROM quackapi_request('GET', '/api/documents?limit=1001');
+----
+422

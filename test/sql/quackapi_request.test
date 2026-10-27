@@ -22,6 +22,11 @@ CREATE ROUTE item GET '/items/:id' AS SELECT $id::INTEGER AS id;
 ----
 Route item: GET /items/:id
 
+query I
+CREATE ROUTE limited POST '/limited' WITH (max_request_bytes := 1024) AS SELECT 1;
+----
+Route limited: POST /limited
+
 # ---------------------------------------------------------------------------
 # GET registered route → 200 + JSON array body
 # body is BLOB (binary-safe for parquet/arrow). Text via decode(body)
@@ -55,6 +60,12 @@ query II
 SELECT status, decode(body) FROM quackapi_request('POST', '/add', '{"a":2,"b":3}');
 ----
 200	[{"sum":5}]
+
+# In-process request bodies obey the route limit too (body already buffered).
+query I
+SELECT status FROM quackapi_request('POST', '/limited', '{"blob":"' || repeat('x', 2048) || '"}');
+----
+413
 
 # ---------------------------------------------------------------------------
 # Built-in health (no serve needed)

@@ -1,0 +1,108 @@
+# name: test/sql/quackapi_policy_regression.test
+# description: Policy lookup and simultaneous parameter substitution
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE AUTH regression_key AS API_KEY;
+
+statement ok
+SELECT * FROM quackapi_add_api_key('regression_key', 'regression-secret', 'alice');
+
+statement ok
+CREATE TABLE regression_rows (id INTEGER, b INTEGER, c INTEGER);
+
+statement ok
+INSERT INTO regression_rows VALUES (1, 1, 1), (2, 1, 2);
+
+statement ok
+CREATE ROW ACCESS POLICY regression_equal AS (a INTEGER, b INTEGER) RETURNS BOOLEAN USING (a = b);
+
+statement ok
+ALTER TABLE regression_rows ADD ROW ACCESS POLICY regression_equal ON (b, c);
+
+statement ok
+CREATE ROUTE regression_collision GET '/regression-collision' REQUIRE regression_key AS SELECT id FROM regression_rows ORDER BY id;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/regression-collision', headers := MAP {'X-API-Key': 'regression-secret'});
+----
+200	[{"id":1}]
+
+# A later CTE does not shadow a physical table in an earlier definition.
+statement ok
+CREATE ROUTE regression_cte_later GET '/regression-cte-later' AS WITH first_rows AS (SELECT * FROM regression_rows), regression_rows AS (SELECT 99 AS id, 0 AS b, 0 AS c) SELECT * FROM first_rows;
+
+query I
+SELECT status FROM quackapi_request('GET', '/regression-cte-later');
+----
+403
+
+statement ok
+CREATE VIEW "RegressionView" AS SELECT * FROM regression_rows;
+
+statement ok
+CREATE ROUTE regression_view GET '/regression-view' AS SELECT * FROM regressionview;
+
+query I
+SELECT status FROM quackapi_request('GET', '/regression-view');
+----
+403
+
+statement ok
+CREATE TABLE "regression quoted" (v INTEGER);
+
+statement ok
+INSERT INTO "regression quoted" VALUES (1);
+
+statement ok
+CREATE ROW ACCESS POLICY regression_positive AS (x INTEGER) RETURNS BOOLEAN USING (x > 0);
+
+statement ok
+ALTER TABLE "regression quoted" ADD ROW ACCESS POLICY regression_positive ON (v);
+
+statement ok
+CREATE ROUTE regression_quoted GET '/regression-quoted' AS SELECT * FROM "regression quoted";
+
+query I
+SELECT status FROM quackapi_request('GET', '/regression-quoted');
+----
+403
+
+statement ok
+CREATE MACRO regression_scalar() AS (SELECT count(*) FROM regression_rows);
+
+statement ok
+CREATE ROUTE regression_macro GET '/regression-macro' AS SELECT regression_scalar() AS count;
+
+query I
+SELECT status FROM quackapi_request('GET', '/regression-macro');
+----
+403
+
+statement ok
+CREATE ROUTE regression_cte GET '/regression-cte' REQUIRE regression_key AS WITH regression_rows AS (SELECT * FROM main.regression_rows WHERE false) SELECT * FROM regression_rows;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/regression-cte', headers := MAP {'X-API-Key': 'regression-secret'});
+----
+200	[]
+
+# A non-recursive CTE can refer to its same-named physical table in its body.
+# The CTE name must only shadow that table after its definition is inspected.
+statement ok
+CREATE ROUTE regression_cte_self GET '/regression-cte-self' AS WITH regression_rows AS (SELECT * FROM regression_rows) SELECT * FROM regression_rows;
+
+query I
+SELECT status FROM quackapi_request('GET', '/regression-cte-self');
+----
+403
+
+statement ok
+CREATE ROUTE regression_cte_self_auth GET '/regression-cte-self-auth' REQUIRE regression_key AS WITH regression_rows AS (SELECT * FROM regression_rows) SELECT id FROM regression_rows ORDER BY id;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/regression-cte-self-auth', headers := MAP {'X-API-Key': 'regression-secret'});
+----
+200	[{"id":1}]

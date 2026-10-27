@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boot stack A (quackapi). Each process is a full DuckDB: routes + libpq pg_dsn.
+# Boot stack A (quackapi). Each process is a full DuckDB: routes + DuckDB postgres extension.
 # WORKERS=1 (default) → one process on PORT.
 # WORKERS=N → N processes all bind PORT via SO_REUSEPORT (httplib default) —
 #   kernel distributes accepts (same idea as uvicorn multi-worker, no proxy tax).
@@ -53,9 +53,8 @@ emit_sql() {
     printf "SET pg_pool_max_connections = %s;\nSET pg_pool_acquire_mode = 'wait';\nSET threads = %s;\n" "$pool" "$duck_threads"
     printf "ATTACH '%s' AS pg (TYPE postgres);\n" "$PG_DSN_SQL"
     cat "$ROUTES"
-    # pg_dsn → libpq path (FastAPI-shaped). Same DSN as ATTACH.
-    printf "SELECT * FROM quackapi_serve(%s, host := '%s', access_log := false, enable_logging := false, worker_threads := %s, pg_dsn := '%s');\n" \
-      "$port" "$HOST_SQL" "$httpt" "$PG_DSN_SQL"
+    printf "SELECT * FROM quackapi_serve(%s, host := '%s', access_log := false, enable_logging := false, worker_threads := %s);\n" \
+      "$port" "$HOST_SQL" "$httpt"
 }
 
 boot_one() {

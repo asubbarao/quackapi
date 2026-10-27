@@ -85,11 +85,7 @@ TableFunction GetApplyAuthFunction();
 TableFunction GetQuackapiAuthsFunction();
 TableFunction GetQuackapiAddApiKeyFunction();
 
-//! Register quack-compatible auth scalars:
-//!   quackapi_authentication(session_id, auth_string, token) → BOOLEAN
-//!   quackapi_authorization(session_id, query) → VARCHAR
-//!   quackapi_verify_auth(scheme, auth_string) → STRUCT(...)
-//! so SET quack_authentication_function='quackapi_authentication' works.
-void RegisterQuackAuthBridgeFunctions(ExtensionLoader &loader);
+//! Register the SQL auth verifier used by REST route authentication.
+void RegisterQuackapiVerifyAuthFunction(ExtensionLoader &loader);
 
 } // namespace duckdb

@@ -52,8 +52,16 @@ struct QuackapiDeadlineState {
 	ClientContext *parent = nullptr;
 	QuackapiClock::time_point deadline;
 	std::atomic<bool> expired {false};
+	std::atomic<bool> disconnected {false};
+	std::function<bool()> disconnect_probe;
 	shared_ptr<QuackapiContextBudget> budget;
 	QuackapiClock::rep budget_previous = 0;
+};
+
+struct QuackapiCancellationState {
+	std::mutex mutex;
+	ClientContext *context = nullptr;
+	std::function<void()> action;
 };
 
 class DeadlineWatchdog {
@@ -76,6 +84,15 @@ public:
 		states.push_back(state);
 		wake.notify_one();
 	}
+	void Add(const std::shared_ptr<QuackapiCancellationState> &state) {
+		std::lock_guard<std::mutex> guard(mutex);
+		cancellations.erase(
+		    std::remove_if(cancellations.begin(), cancellations.end(),
+		                   [](const std::weak_ptr<QuackapiCancellationState> &item) { return item.expired(); }),
+		    cancellations.end());
+		cancellations.push_back(state);
+		wake.notify_one();
+	}
 
 private:
 	void Run() {
@@ -94,8 +111,29 @@ private:
 					if (now >= state->deadline) {
 						state->expired = true;
 						state->connection->Interrupt();
+					} else if (state->disconnected || (state->disconnect_probe && state->disconnect_probe())) {
+						state->disconnected = true;
+						state->connection->Interrupt();
 					} else if (state->parent && state->parent->IsInterrupted()) {
 						state->connection->Interrupt();
+					}
+				}
+				++it;
+			}
+			for (auto it = cancellations.begin(); it != cancellations.end();) {
+				auto state = it->lock();
+				if (!state) {
+					it = cancellations.erase(it);
+					continue;
+				}
+				std::lock_guard<std::mutex> state_guard(state->mutex);
+				if (state->context && state->action && state->context->IsInterrupted()) {
+					// Execute once, synchronously with guard teardown. Never let an
+					// exception from a transport callback escape the watchdog.
+					auto action = std::move(state->action);
+					try {
+						action();
+					} catch (...) {
 					}
 				}
 				++it;
@@ -106,12 +144,26 @@ private:
 	std::condition_variable wake;
 	bool stopping = false;
 	std::vector<std::weak_ptr<QuackapiDeadlineState>> states;
+	std::vector<std::weak_ptr<QuackapiCancellationState>> cancellations;
 	std::thread worker;
 };
 
 static DeadlineWatchdog &Watchdog() {
 	static DeadlineWatchdog watchdog;
 	return watchdog;
+}
+
+QuackapiCancellationGuard::QuackapiCancellationGuard(ClientContext &context, std::function<void()> action)
+    : state(std::make_shared<QuackapiCancellationState>()) {
+	state->context = &context;
+	state->action = std::move(action);
+	Watchdog().Add(state);
+}
+
+QuackapiCancellationGuard::~QuackapiCancellationGuard() {
+	std::lock_guard<std::mutex> guard(state->mutex);
+	state->context = nullptr;
+	state->action = nullptr;
 }
 
 QuackapiQueryDeadline::QuackapiQueryDeadline(Connection &connection, int64_t timeout_ms) : previous(current_deadline) {
@@ -139,6 +191,7 @@ QuackapiQueryDeadline::~QuackapiQueryDeadline() {
 		std::lock_guard<std::mutex> guard(state->mutex);
 		state->connection = nullptr;
 		state->parent = nullptr;
+		state->disconnect_probe = nullptr;
 	}
 	// Restore only if no later guard on this connection replaced the deadline.
 	auto ours = state->deadline.time_since_epoch().count();
@@ -149,6 +202,13 @@ QuackapiQueryDeadline::~QuackapiQueryDeadline() {
 }
 bool QuackapiQueryDeadline::Expired() const {
 	return state->expired || QuackapiClock::now() >= state->deadline;
+}
+void QuackapiQueryDeadline::WatchDisconnect(std::function<bool()> probe) {
+	std::lock_guard<std::mutex> guard(state->mutex);
+	state->disconnect_probe = std::move(probe);
+}
+bool QuackapiQueryDeadline::Disconnected() const {
+	return state->disconnected;
 }
 QuackapiClock::time_point QuackapiCurrentDeadline() {
 	return current_deadline;

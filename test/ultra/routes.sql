@@ -90,6 +90,12 @@ CREATE ROUTE matrix_compressed GET '/matrix/compressed'
 CREATE ROUTE matrix_small GET '/matrix/small'
   AS SELECT 'small' AS payload;
 
+CREATE ROUTE matrix_png GET '/matrix/image.png' FORMAT binary
+  AS SELECT ('PNG' || repeat('p', 4093))::BLOB AS body, 'image/png' AS content_type;
+
+CREATE ROUTE matrix_jpeg GET '/matrix/image.jpg' FORMAT binary
+  AS SELECT ('JPEG' || repeat('j', 4092))::BLOB AS body, 'image/jpeg' AS content_type;
+
 CREATE ROUTE matrix_ndjson GET '/matrix/ndjson' FORMAT ndjson
   AS SELECT id, name, price, tags FROM matrix_items ORDER BY id;
 

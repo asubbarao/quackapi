@@ -36,33 +36,6 @@ FROM range(4) t(i) ORDER BY i;
 2	true
 3	false
 
-query IT
-SELECT i, quackapi_authentication('session', CASE WHEN i % 2 = 0 THEN 'server-key' ELSE 'invalid' END, 'server-key')
-FROM range(4) t(i) ORDER BY i;
-----
-0	true
-1	false
-2	true
-3	false
-
-query IT
-SELECT i, quackapi_authentication('session', CASE WHEN i % 2 = 0 THEN 'edge-valid-key' ELSE 'invalid' END, 'server-key')
-FROM range(4) t(i) ORDER BY i;
-----
-0	true
-1	false
-2	true
-3	false
-
-query IT
-SELECT i, quackapi_authorization('session', 'SELECT ' || i::VARCHAR)
-FROM range(4) t(i) ORDER BY i;
-----
-0	SELECT 0
-1	SELECT 1
-2	SELECT 2
-3	SELECT 3
-
 statement ok
 CREATE AUTH edge_jwt AS JWT (SECRET 'jwt-edge-secret');
 

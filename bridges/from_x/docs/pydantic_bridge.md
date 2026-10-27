@@ -397,3 +397,5 @@ Full transcript: `/tmp/quackapi_pydantic_bridge/curl_transcript.txt`.
 ---
 
 **Bottom line:** Every Pydantic field on the locus ROH contracts becomes real quackapi validation today via **BODY SCHEMA (json_schema) + typed `$params` + PARAM GE/LE**, not name-only. Path/query 422 already matches FastAPI `loc/msg/type`. Body validation is **semantically real** (required, types, enum, nested, min/max, pattern) but **loc is coarse** (`body._schema`) and **optional body binds need C++**. EmailStr should compose **anofox_tabular**, never `format:email`, until format checkers land.
+
+The extractor reports nullability (`is_optional`) separately from omission (`is_required` / `has_default`). A nullable annotation without a default remains required in Pydantic v2; `Field(...)` is also required. `default_factory` supplies a default.

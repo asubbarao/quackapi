@@ -1,0 +1,37 @@
+# name: test/sql/quackapi_static_precedence.test
+# description: API routes precede colliding static assets
+# group: [sql]
+
+require quackapi
+
+require http_request
+
+statement ok
+SET http_request_cache = false;
+
+# Test-local adapter: keep body assertions textual while using the standard HTTP extension.
+statement ok
+CREATE MACRO test_http_get(u, h := MAP{}) AS (SELECT {'status': r.status, 'body': decode(r.body), 'headers': r.headers} FROM (SELECT http_get(u, h) AS r));
+
+statement ok
+CREATE MACRO test_http_get_table(u, h := MAP{}) AS TABLE SELECT r.* FROM (SELECT test_http_get(u, h) AS r);
+
+
+statement ok
+CREATE ROUTE static_collision GET '/collision.txt' AS SELECT 'route' AS source;
+
+statement ok
+SELECT * FROM quackapi_serve(29347, host := '127.0.0.1', static_dir := 'test/fixtures/static_precedence', access_log := false);
+
+query II
+SELECT r.status, r.body FROM (SELECT test_http_get('http://127.0.0.1:29347/collision.txt') AS r);
+----
+200	[{"source":"route"}]
+
+query II
+SELECT r.status, starts_with(r.body, 'fallback file') FROM (SELECT test_http_get('http://127.0.0.1:29347/fallback.txt') AS r);
+----
+200	true
+
+statement ok
+SELECT * FROM quackapi_stop(29347);

@@ -67,6 +67,20 @@ FROM quackapi_streams();
 -- transport is 'sse' (GET) or 'ws' (WS)
 ```
 
+An interval stream can expose progress that a separate worker persists in a
+table:
+
+```sql
+CREATE STREAM job_progress GET '/jobs/:job_id/events' WITH (interval='500ms') AS
+SELECT status, percent, updated_at
+FROM job_status
+WHERE job_id = $job_id::BIGINT;
+```
+
+Each poll reads the latest row. This is useful for long-running work started by
+a queue worker or another process; a normal `quackapi_post` call waits for the
+whole upstream response and does not forward its incremental output as SSE.
+
 ---
 
 ## WebSocket
@@ -98,13 +112,13 @@ ws.onopen = () => ws.send('hello');
   403 (policy, or a browser `Origin` that is neither this server nor in `cors_origins`),
   422 (a missing or invalid parameter), 503 (too many open sessions).
   A plain HTTP request to a WS path gets 426.
-- Each open session holds one HTTP worker thread, so at most half of `worker_threads`
+- Each open SSE or WebSocket session holds one HTTP worker thread. Together they share a limit of at most half of `worker_threads`
   (at least one) are admitted at a time; the rest stay free for HTTP.
 - A failed SELECT closes with 1011 and the error as the reason; going past
   `max_response_bytes` for the whole session closes with 1009.
 - `quackapi_stop` closes open sessions within 100 ms. A client that stops partway
   through a frame is dropped after the serve `read_timeout_sec`.
-- The access log gets one row per session, status 101, when it ends.
+- The access log gets one row when each session ends: status 101 for WebSocket, 200 for SSE.
 
 ---
 

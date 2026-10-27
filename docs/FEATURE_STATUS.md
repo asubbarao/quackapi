@@ -82,22 +82,19 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 | **SSE stream** | `CREATE STREAM … GET '/path' AS <select>` | stream SQL + HTTP | `StreamingResponse` / SSE |
 | **WebSocket** | **built** — `CREATE STREAM … WS` (push rows, or reply per `$message`) | `quackapi_stream.test`, `test/cpp/quackapi_websocket_test.cpp` | `WebSocket` |
 | **Row access + masking policies** | CREATE … POLICY + ALTER TABLE bind | policy SQL + HTTP | — (DB-native leapfrog) |
-| Quack RPC auth bridge | `quackapi_authentication` / `quackapi_authorization` | `quackapi_quack_bridge.test` | N/A (DuckDB quack sibling) |
+| Quack RPC authentication | Native core Quack hooks/defaults; no REST auto-wiring | `quackapi_quack_bridge.test` | DuckDB core Quack |
 | Security / key hashing | auth + security tests | `quackapi_security.test` | secret storage patterns |
 
 ### 1.4 Registered SQL functions (live `duckdb_functions()`)
 
 ```
-quackapi_ack, quackapi_add_api_key, quackapi_authentication, quackapi_authorization,
-quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_exec, quackapi_fetch, quackapi_graphql_routes,
-quackapi_graphql_tables, quackapi_groups, quackapi_http_pool, quackapi_http_util_name,
-quackapi_last_write_timeout_sec, quackapi_middlewares, quackapi_nack, quackapi_policies,
-quackapi_parallel_fetch, quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,
+quackapi_ack, quackapi_add_api_key, quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_exec, quackapi_graphql_routes,
+quackapi_graphql_tables, quackapi_groups, quackapi_http_pool,
+quackapi_middlewares, quackapi_nack, quackapi_policies,
+quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,
 quackapi_routes, quackapi_serve, quackapi_servers, quackapi_stop, quackapi_streams,
 quackapi_verify_auth, quackapi_wait,
-quack_from_fastapi, quack_from_fastapi_models, quack_from_rails, quack_from_rails_models,
-quack_from_express, quack_from_express_models, quack_from_gin, quack_from_gin_models,
-quack_from_x_sql, quack_from_x_sql_relpath
+quack_from_routes, quack_from_models
 ```
 
 Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.
@@ -219,7 +216,7 @@ OpenAPI-universal path (highest leverage): `/tmp/quackapi_corpus/SPEC.md` — `q
 
 | Bridge | Status | Proof | Next |
 |--------|--------|-------|------|
-| **`quack_from_fastapi`** | **partial one-caller** (shell + pure SQL, not in-tree C++ TF yet) | fastapi-realworld **pass=10 fail=0** (19 routes registered, 25 models); locus ROH **pass=10 fail=0** | C++ `quack_from_fastapi(path)` TVF | `/tmp/quackapi_fromfast.md` |
+| **`quack_from_fastapi`** | **partial one-caller** (shell + pure SQL, not in-tree C++ TF yet) | fastapi-realworld **pass=10 fail=0** (19 routes registered, 25 models); locus ROH **pass=10 fail=0** | C++ `quack_from_routes('fastapi', path)` TVF | `/tmp/quackapi_fromfast.md` |
 | **`quack_from_rails`** | **proven one-caller (partial runtime fidelity)** | rails-realworld **pass=14 fail=0**; handlers = SQL façades not Ruby | `quack_from_express` | `/tmp/quackapi_rails_bridge.md` |
 | **`quack_from_openapi` / JSON Schema** | **designed + corpus specs**; highest-leverage multi-stack path | SPEC + petstore YAML fixtures | bulk emit + serve recipe | `/tmp/quackapi_corpus/SPEC.md` |
 | **Express / Nest / Koa / Fastify** | **IR only** (Node corpus 182 routes) | NODE.md | shell bridge not shipped as one-caller |

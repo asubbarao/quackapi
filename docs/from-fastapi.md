@@ -26,7 +26,7 @@ Across public frameworks, a multi-language IR corpus was extracted:
 
 ## What `quack_from_fastapi` does
 
-**Status:** partial one-caller (shell + pure SQL). Not yet an in-tree C++ table function named `quack_from_fastapi(path)`.
+**Status:** partial one-caller (shell + pure SQL). Not yet an in-tree C++ table function named `quack_from_routes('fastapi', path)`.
 
 Operational shape:
 

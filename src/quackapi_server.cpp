@@ -37,7 +37,6 @@
 #include "quackapi_auth.hpp"
 #include "quackapi_graphql.hpp"
 #include "quackapi_openapi.hpp"
-#include "quackapi_pg.hpp"
 #include "quackapi_policy.hpp"
 #include "quackapi_limits.hpp"
 #include "quackapi_middleware.hpp"
@@ -92,6 +91,8 @@ thread_local unique_ptr<QuackapiPendingWebSocket> quackapi_pending_ws;
 
 //! httplib Server subclass: stash the live Stream/socket for per-route IO timeouts.
 struct QuackapiHttplibServer : quackapi_httplib::Server {
+	std::function<void(quackapi_httplib::Request &)> request_setup;
+
 	bool process_and_close_socket(socket_t sock) override {
 		std::string remote_addr;
 		int remote_port = 0;
@@ -108,7 +109,11 @@ struct QuackapiHttplibServer : quackapi_httplib::Server {
 			    quackapi_tls_sock = sock;
 			    quackapi_tls_stream = &strm;
 			    auto ok = process_request(strm, remote_addr, remote_port, local_addr, local_port, close_connection,
-			                              connection_closed, nullptr);
+			                              connection_closed, [this](quackapi_httplib::Request &req) {
+				                              if (request_setup) {
+					                              request_setup(req);
+				                              }
+			                              });
 			    // Restore accept-time SO_* after handler+write (per-route TIMEOUT may
 			    // have raised them). Next keep-alive SocketStream still uses serve defaults.
 			    quackapi_httplib::detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, read_timeout_sec_,
@@ -134,9 +139,7 @@ struct QuackapiHttplibServer : quackapi_httplib::Server {
 //! SO_* is restored to serve defaults in QuackapiHttplibServer after
 //! process_request returns (keep-alive safe). Do not restore in a HandleRequest
 //! destructor — that runs before httplib's write_response.
-//! Records the applied write deadline on qa_state only after this path runs
-//! (early return leaves the serve-level seed from HandleRequest unchanged).
-void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
+void ApplyRouteIoTimeout(time_t timeout_sec) {
 	if (timeout_sec <= 0) {
 		return;
 	}
@@ -149,7 +152,6 @@ void ApplyRouteIoTimeout(time_t timeout_sec, QuackapiState &qa_state) {
 		quackapi_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_RCVTIMEO, timeout_sec, 0);
 		quackapi_httplib::detail::set_socket_opt_time(quackapi_tls_sock, SOL_SOCKET, SO_SNDTIMEO, timeout_sec, 0);
 	}
-	qa_state.SetLastEffectiveWriteTimeoutSec(static_cast<int32_t>(timeout_sec));
 }
 
 //! Content-Encoding choice after Accept-Encoding negotiation.
@@ -256,8 +258,9 @@ bool IsAlreadyCompressedContentType(const string &content_type) {
 		ct = ct.substr(0, semi);
 	}
 	StringUtil::Trim(ct);
-	// SVG is text-like and compresses well; other images are already compressed.
-	if (StringUtil::StartsWith(ct, "image/") && ct != "image/svg+xml") {
+	// Treat the image media type as opaque. Some formats compress further, but
+	// callers may serve already-encoded assets and expect byte-for-byte identity.
+	if (StringUtil::StartsWith(ct, "image/")) {
 		return true;
 	}
 	if (StringUtil::StartsWith(ct, "audio/") || StringUtil::StartsWith(ct, "video/")) {
@@ -274,7 +277,15 @@ bool IsAlreadyCompressedContentType(const string &content_type) {
 	    "application/x-brotli",
 	    "application/x-compress",
 	    "application/x-xz",
+	    "application/x-bzip",
+	    "application/x-bzip2",
+	    "application/x-lzip",
+	    "application/x-lzma",
+	    "application/x-lz4",
+	    "application/x-snappy-framed",
+	    "application/x-7z-compressed",
 	    "application/x-rar-compressed",
+	    "application/vnd.rar",
 	    "application/wasm",
 	    "font/woff",
 	    "font/woff2",
@@ -896,13 +907,20 @@ const QuackapiParamSpec *FindParamSpec(const vector<QuackapiParamSpec> &specs, c
 //! msg/type when violated.
 bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, const Value &bound, string &msg,
                            string &err_type) {
-	// String length constraints use the raw request string (FastAPI min_length/max_length).
-	if (spec.has_min_length && raw.size() < spec.min_length) {
+	// The binder validates UTF-8 before calling this function. Count code points,
+	// not bytes, to match character-based min_length/max_length constraints.
+	idx_t character_count = 0;
+	for (unsigned char byte : raw) {
+		if ((byte & 0xc0) != 0x80) {
+			character_count++;
+		}
+	}
+	if (spec.has_min_length && character_count < spec.min_length) {
 		msg = StringUtil::Format("String should have at least %llu characters", (unsigned long long)spec.min_length);
 		err_type = "string_too_short";
 		return false;
 	}
-	if (spec.has_max_length && raw.size() > spec.max_length) {
+	if (spec.has_max_length && character_count > spec.max_length) {
 		msg = StringUtil::Format("String should have at most %llu characters", (unsigned long long)spec.max_length);
 		err_type = "string_too_long";
 		return false;
@@ -1373,10 +1391,13 @@ ResponseMode ResponseModeFor(const vector<string> &names) {
 }
 
 //! Wire format for multi-row data responses (not html/text column modes).
-enum class BodyFormat { JSON, NDJSON, CSV, PARQUET, ARROW };
+enum class BodyFormat { JSON, NDJSON, CSV, PARQUET, ARROW, BINARY };
 
 BodyFormat ParseBodyFormatToken(const string &token) {
 	auto t = StringUtil::Lower(token);
+	if (t == "binary") {
+		return BodyFormat::BINARY;
+	}
 	if (t == "ndjson") {
 		return BodyFormat::NDJSON;
 	}
@@ -1443,7 +1464,7 @@ double ParseAcceptQ(const string &token) {
 BodyFormat ResolveBodyFormat(const QuackapiRoute &route, const quackapi_httplib::Request &req) {
 	auto route_fmt = StringUtil::Lower(route.response_format.empty() ? "json" : route.response_format);
 	if (route_fmt == "ndjson" || route_fmt == "csv" || route_fmt == "parquet" || route_fmt == "arrow" ||
-	    route_fmt == "arrows") {
+	    route_fmt == "arrows" || route_fmt == "binary") {
 		return ParseBodyFormatToken(route_fmt);
 	}
 	// Default / explicit json: negotiate Accept when present.
@@ -2593,6 +2614,49 @@ static QuackapiRequestRecord MakeRequestRecord(const quackapi_httplib::Request &
                                                const string &parent_span_id, bool sampled,
                                                const QuackapiServeOptions &options);
 
+void QuackapiHttpServer::SetRequestPayloadLimit(quackapi_httplib::Request &req) const {
+	const int64_t hard_limit = std::max<int64_t>(1, options.max_request_bytes);
+	const int64_t default_route_limit = std::min<int64_t>(QUACKAPI_PAYLOAD_MAX_LENGTH, hard_limit);
+	int64_t route_limit = default_route_limit;
+	auto db = db_ptr.lock();
+	if (db) {
+		const auto routes = QuackapiState::Get(*db).LiveRoutes();
+		for (const auto &route : *routes) {
+			if (route.method != req.method) {
+				continue;
+			}
+			vector<std::pair<string, string>> captures;
+			if (MatchPattern(route.pattern, req.path, captures)) {
+				route_limit = route.max_request_bytes > 0 ? route.max_request_bytes : default_route_limit;
+			}
+		}
+		if (req.method == "HEAD") {
+			bool head_route_found = false;
+			for (const auto &route : *routes) {
+				if (route.method == "HEAD") {
+					vector<std::pair<string, string>> captures;
+					if (MatchPattern(route.pattern, req.path, captures)) {
+						head_route_found = true;
+					}
+				}
+			}
+			if (!head_route_found) {
+				for (const auto &route : *routes) {
+					if (route.method != "GET") {
+						continue;
+					}
+					vector<std::pair<string, string>> captures;
+					if (MatchPattern(route.pattern, req.path, captures)) {
+						route_limit = route.max_request_bytes > 0 ? route.max_request_bytes : default_route_limit;
+					}
+				}
+			}
+		}
+	}
+	const int64_t effective = std::min(route_limit, hard_limit);
+	req.payload_max_length = static_cast<size_t>(effective);
+}
+
 QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_p, int port_p,
                                        const QuackapiServeOptions &opts, bool bind_and_listen)
     : db_ptr(db.shared_from_this()), host(host_p), port(port_p), cors_origins(opts.cors_origins), options(opts),
@@ -2612,12 +2676,15 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	}
 
 	server = make_uniq<QuackapiHttplibServer>();
+	static_cast<QuackapiHttplibServer &>(*server).request_setup = [this](quackapi_httplib::Request &req) {
+		SetRequestPayloadLimit(req);
+	};
 	if (options.request_ring > 0) {
 		request_ring = make_uniq<QuackapiRequestRing>(static_cast<size_t>(options.request_ring));
 	}
 
 	// Static files (FastAPI StaticFiles equivalent). httplib checks file
-	// requests before route handlers, so API routes always win over files.
+	// requests before route handlers; the pre-routing hook below gives API routes precedence.
 	if (!opts.static_dir.empty() && !server->set_mount_point("/", opts.static_dir)) {
 		throw IOException("quackapi: static_dir \"%s\" is not a directory", opts.static_dir);
 	}
@@ -2689,8 +2756,9 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	server->set_write_timeout(opts.write_timeout_sec > 0 ? static_cast<time_t>(opts.write_timeout_sec)
 	                                                     : QUACKAPI_DEFAULT_IO_TIMEOUT_SEC);
 	server->set_tcp_nodelay(true);
-	// Cap request bodies to avoid unbounded memory DoS (httplib default is SIZE_MAX).
-	server->set_payload_max_length(QUACKAPI_PAYLOAD_MAX_LENGTH);
+	// Hard-cap all request bodies. Header-phase setup may lower this further for
+	// a matched route, but can never raise it past the operator's serve ceiling.
+	server->set_payload_max_length(static_cast<size_t>(options.max_request_bytes));
 
 	auto handler = [this](const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
 		HandleRequest(req, res);
@@ -2710,8 +2778,42 @@ QuackapiHttpServer::QuackapiHttpServer(DatabaseInstance &db, const string &host_
 	// protocols, so an upgrade with no WS stream, a denied policy or a bad
 	// parameter is answered over HTTP instead.
 	server->set_pre_routing_handler([this](const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
-		return RejectWebSocket(req, res) ? quackapi_httplib::Server::HandlerResponse::Handled
-		                                 : quackapi_httplib::Server::HandlerResponse::Unhandled;
+		using Response = quackapi_httplib::Server::HandlerResponse;
+		if (RejectWebSocket(req, res)) {
+			return Response::Handled;
+		}
+		if (quackapi_httplib::detail::is_websocket_upgrade(req) || (req.method != "GET" && req.method != "HEAD") ||
+		    options.static_dir.empty()) {
+			return Response::Unhandled;
+		}
+		auto db = db_ptr.lock();
+		if (!db)
+			return Response::Unhandled;
+		if (req.path == "/openapi.json" || req.path == "/docs" || req.path == "/docs/" || req.path == "/redoc" ||
+		    req.path == "/redoc/" || req.path == "/graphql" || req.path == "/graphql/schema" ||
+		    req.path == "/graphql/schema/" ||
+		    (options.health_routes && (req.path == "/health" || req.path == "/healthz"))) {
+			HandleRequest(req, res);
+			return Response::Handled;
+		}
+		auto &state = QuackapiState::Get(*db);
+		vector<std::pair<string, string>> captures;
+		for (const auto &route : *state.LiveRoutes()) {
+			if ((route.method == req.method || (req.method == "HEAD" && route.method == "GET")) &&
+			    MatchPattern(route.pattern, req.path, captures)) {
+				HandleRequest(req, res);
+				return Response::Handled;
+			}
+		}
+		for (const auto &stream : *state.LiveStreams()) {
+			if (stream.transport != QuackapiStreamTransport::WS &&
+			    (stream.method == req.method || (req.method == "HEAD" && stream.method == "GET")) &&
+			    MatchPattern(stream.pattern, req.path, captures)) {
+				HandleRequest(req, res);
+				return Response::Handled;
+			}
+		}
+		return Response::Unhandled;
 	});
 	server->WebSocket(".*", [this](const quackapi_httplib::Request &req, quackapi_httplib::ws::WebSocket &ws) {
 		HandleWebSocket(req, ws);
@@ -2765,8 +2867,7 @@ void ParseQueryStringIntoParams(const string &query, quackapi_httplib::Params &p
 void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const string &path_in, const string &body,
                               int &status_out, string &body_out, string &content_type_out,
                               const unordered_map<string, string> *req_headers,
-                              unordered_map<string, string> *headers_out, const string &pg_dsn,
-                              const QuackapiServeOptions *request_options) {
+                              unordered_map<string, string> *headers_out, const QuackapiServeOptions *request_options) {
 	// Quiet defaults for SQL tests unless request_options explicitly enables logging.
 	QuackapiServeOptions opts;
 	if (request_options) {
@@ -2776,7 +2877,6 @@ void QuackapiInProcessRequest(DatabaseInstance &db, const string &method, const 
 	}
 	opts.compression = QuackapiCompressionMode::OFF;
 	opts.health_routes = true;
-	opts.pg_dsn = pg_dsn;
 	// No TCP — Dispatch only.
 	QuackapiHttpServer server(db, "127.0.0.1", 0, opts, /*bind_and_listen=*/false);
 
@@ -3958,7 +4058,6 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				if (!MethodListContains(methods_for_path, "HEAD")) {
 					methods_for_path.push_back("HEAD");
 				}
-				break;
 			}
 		}
 		if (!match.matched) {
@@ -3975,6 +4074,19 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				}
 			}
 		}
+	}
+	// Synthetic quackapi_request calls arrive with an already-buffered body, so
+	// httplib's header-phase limit cannot apply. Keep their behavior aligned with
+	// TCP requests before OPTIONS/404 handling, auth, middleware, or SQL work.
+	const int64_t hard_body_limit = std::max<int64_t>(1, options.max_request_bytes);
+	const int64_t default_body_limit = std::min<int64_t>(QUACKAPI_PAYLOAD_MAX_LENGTH, hard_body_limit);
+	const int64_t route_body_limit =
+	    match.matched && match.route.max_request_bytes > 0 ? match.route.max_request_bytes : default_body_limit;
+	const auto effective_body_limit = static_cast<size_t>(std::min(route_body_limit, hard_body_limit));
+	if (req.body.size() > effective_body_limit) {
+		SetJson(res, 413, "{\"detail\":\"Request body too large\"}");
+		finish();
+		return;
 	}
 
 	// OPTIONS: FastAPI without CORSMiddleware returns 405 for unregistered
@@ -4152,8 +4264,23 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				int64_t query_timeout_ms = 30000;
 				idx_t max_bytes = 0;
 				idx_t sent_bytes = 0;
+				int64_t rows_sent = 0;
+				std::atomic<idx_t> *session_count = nullptr;
+				~SseProviderState() {
+					if (session_count)
+						session_count->fetch_sub(1);
+				}
 			};
 			auto state = make_shared_ptr<SseProviderState>();
+			if (server) {
+				if (websocket_sessions.fetch_add(1) >= websocket_session_limit) {
+					websocket_sessions.fetch_sub(1);
+					SetJson(res, 503, "{\"detail\":\"Too many open stream sessions\"}");
+					finish();
+					return;
+				}
+				state->session_count = &websocket_sessions;
+			}
 			state->con = con;
 			state->handler_sql = stream_sql;
 			state->query_timeout_ms = options.query_timeout_ms;
@@ -4170,10 +4297,11 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			// CORS before provider install — headers already on res when provider runs.
 			ApplyCorsHeaders(req, res);
 
+			res.set_header("X-Request-ID", request_id);
 			res.set_chunked_content_provider(
 			    "text/event-stream",
-			    [state](size_t /*offset*/, quackapi_httplib::DataSink &sink) -> bool {
-				    if (state->closed) {
+			    [this, state](size_t /*offset*/, quackapi_httplib::DataSink &sink) -> bool {
+				    if (state->closed || (server && !is_running.load())) {
 					    sink.done();
 					    return true;
 				    }
@@ -4205,7 +4333,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 							    auto step = remaining > 100 ? 100 : remaining;
 							    std::this_thread::sleep_for(std::chrono::milliseconds(step));
 							    remaining -= step;
-							    if (!sink.is_writable()) {
+							    if ((server && !is_running.load()) || !sink.is_writable()) {
 								    state->closed = true;
 								    return false;
 							    }
@@ -4229,6 +4357,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 						    buf += event;
 					    }
 					    state->sent_bytes += buf.size();
+					    state->rows_sent += static_cast<int64_t>(chunk->size());
 					    if (!buf.empty() && !sink.write(buf.data(), buf.size())) {
 						    state->closed = true;
 						    return false;
@@ -4244,7 +4373,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 					    return false;
 				    }
 			    },
-			    [state](bool /*success*/) {
+			    [this, state, req, t0, received_at_micros, request_id, route_name, route_path, trace_id, span_id,
+			     parent_span_id, sampled](bool /*success*/) {
 				    try {
 					    if (state->con) {
 						    state->con->Interrupt();
@@ -4254,6 +4384,14 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				    state->result.reset();
 				    state->prepared.reset();
 				    state->closed = true;
+				    quackapi_httplib::Response completed;
+				    completed.status = 200;
+				    completed.set_header("Content-Length", std::to_string(state->sent_bytes));
+				    auto elapsed =
+				        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+				    EmitAccessLog(MakeRequestRecord(req, completed, request_id, route_name, route_path, elapsed,
+				                                    received_at_micros, -1, -1, state->rows_sent, trace_id, span_id,
+				                                    parent_span_id, sampled, options));
 			    });
 			// Do not call finish() again — CORS already applied; provider owns body.
 			return;
@@ -4271,22 +4409,15 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 	// Per-route IO timeout (CREATE ROUTE … TIMEOUT / WITH (timeout_sec := N)).
 	// Extends httplib SocketStream select deadlines + SO_RCVTIMEO/SO_SNDTIMEO for
 	// this connection through handler execute and response write.
-	// Seed introspection with serve write_timeout_sec; ApplyRouteIoTimeout
-	// overwrites only when it actually applies a route override.
-	qa_state.SetLastEffectiveWriteTimeoutSec(options.write_timeout_sec);
 	if (match.route.timeout_sec > 0) {
-		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec), qa_state);
+		ApplyRouteIoTimeout(static_cast<time_t>(match.route.timeout_sec));
 	}
 
 	// ---- AUTH ENFORCEMENT (before prepare/execute) ----
 	route_name = match.route.name;
 	route_path = match.route.pattern;
 	// Public routes (require_auth empty) pass through unchanged.
-	// Auth is evaluated through the SQL surface (quackapi_verify_auth), the
-	// same EvaluateAuthQuery shape quack uses for CONNECTION_REQUEST
-	// (duckdb-quack src/quack_server.cpp). CREATE AUTH DDL remains the policy
-	// definition layer; quack_authentication_function can point at
-	// quackapi_authentication so the RPC plane shares that policy.
+	// REST auth uses quackapi_verify_auth; core Quack RPC keeps its own hooks.
 	auto headers = CollectHeaders(req);
 	auto auth_result = CheckAuth(*db, match.route, headers);
 	if (match.route.rate_limit_n > 0 && match.route.rate_limit_per_sec > 0) {
@@ -4338,6 +4469,12 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		const auto elapsed_ms =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 		QuackapiQueryDeadline deadline(con, std::max<int64_t>(1, options.query_timeout_ms - elapsed_ms));
+		// Synthetic quackapi_request calls have no socket; httplib's default
+		// callback reports closed. The real socket remains owned by httplib until
+		// this handler returns, and guard teardown synchronizes with the watchdog.
+		if (options.cancel_on_disconnect && quackapi_tls_sock != INVALID_SOCKET && req.remote_port >= 0) {
+			deadline.WatchDisconnect(req.is_connection_closed);
+		}
 		QuackapiSetServingBudget(con, options.query_timeout_ms, options.max_response_bytes);
 		auto &middleware_registry = QuackapiMiddlewareRegistry::Get(*db);
 		if (!middleware_registry.Snapshot(QuackapiMiddlewarePhase::BEFORE, match.route.group_name).empty() ||
@@ -4405,7 +4542,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			provided[kv.first] = {"path", kv.second};
 		}
 		// Server-stamped request id — bindable as $request_id in handler SQL
-		// (and libpq path). Wins over any client query/path of the same name.
+		// Wins over any client query/path of the same name.
 		provided["request_id"] = {"server", request_id};
 		provided["trace_id"] = {"server", trace_id};
 		provided["span_id"] = {"server", span_id};
@@ -4444,9 +4581,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		}
 
 		// ---- REQUEST BODY BINDING (POST/PUT/PATCH) ----
-		// Body fills `provided` BEFORE prepare + before optional libpq path.
-		// INSERT…RETURNING cannot prepare via DuckDB ATTACH; libpq handles it.
-		// Named params inferred from handler SQL (prepare may never run).
+		// Bind body values before preparing the DuckDB handler.
 		bool body_method = IsBodyMethod(req.method);
 		bool has_body_named = false;
 		bool needs_json_field_extraction = false;
@@ -4551,29 +4686,44 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 						provided["body"] = {"body", req.body};
 					}
 				}
-			} else if (form_ct) {
-				case_insensitive_map_t<string> form_fields;
-				ParseFormUrlEncoded(req.body, form_fields);
-				for (auto &kv : form_fields) {
-					provided[kv.first] = {"body", kv.second};
+			} else if (form_ct || multipart_ct) {
+				if (!match.route.body_schema.empty() || !match.route.body_type.empty()) {
+					SetJson(res, 422,
+					        ValidationErrorJsonBody("BODY SCHEMA and BODY TYPE require JSON", "model_attributes_type"));
+					finish();
+					return;
 				}
-				if (has_body_named && provided.find("body") == provided.end()) {
-					provided["body"] = {"body", req.body};
-				}
-			} else if (multipart_ct) {
-				for (auto &kv : req.form.fields) {
-					provided[kv.first] = {"body", kv.second.content};
-				}
-				for (auto &kv : req.form.files) {
-					provided[kv.first] = {"body", kv.second.content};
-					string fname_key = kv.first + "_filename";
-					provided[fname_key] = {"body", kv.second.filename};
-					if (provided.find("filename") == provided.end()) {
-						provided["filename"] = {"body", kv.second.filename};
+				if (form_ct) {
+					case_insensitive_map_t<string> form_fields;
+					ParseFormUrlEncoded(req.body, form_fields);
+					for (auto &kv : form_fields) {
+						auto existing = provided.find(kv.first);
+						if (existing == provided.end() || existing->second.first == "query") {
+							provided[kv.first] = {"body", kv.second};
+						}
 					}
-				}
-				if (has_body_named && provided.find("body") == provided.end()) {
-					provided["body"] = {"body", req.body};
+					if (has_body_named && provided.find("body") == provided.end()) {
+						provided["body"] = {"body", req.body};
+					}
+				} else {
+					for (auto &kv : req.form.fields) {
+						if (provided.find(kv.first) == provided.end()) {
+							provided[kv.first] = {"body", kv.second.content};
+						}
+					}
+					for (auto &kv : req.form.files) {
+						if (provided.find(kv.first) == provided.end()) {
+							provided[kv.first] = {"body", kv.second.content};
+						}
+						string fname_key = kv.first + "_filename";
+						provided[fname_key] = {"body", kv.second.filename};
+						if (provided.find("filename") == provided.end()) {
+							provided["filename"] = {"body", kv.second.filename};
+						}
+					}
+					if (has_body_named && provided.find("body") == provided.end()) {
+						provided["body"] = {"body", req.body};
+					}
 				}
 			} else if (!media.empty() && !req.body.empty() && needs_body_fields) {
 				// Wrong Content-Type for a body-expecting route (FastAPI model_attributes_type).
@@ -4592,33 +4742,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 		}
 
-		// Native Postgres path (optional): same model as FastAPI+psycopg —
-		// thread-local libpq, fresh PQexecParams per request. BEFORE DuckDB
-		// prepare so INSERT…RETURNING and other ATTACH-hostile SQL still work.
-		if (!options.pg_dsn.empty() && !exec_route) {
-			string pg_body, pg_err;
-			auto pg_result =
-			    QuackapiTryPgNative(options.pg_dsn, handler_sql, provided, options.max_response_bytes, pg_body, pg_err);
-			if (pg_result == QuackapiPgNativeResult::SUCCESS) {
-				SetJson(res, match.route.status, pg_body);
-				finish();
-				return;
-			}
-			if (pg_result == QuackapiPgNativeResult::FAILED) {
-				if (pg_err == "PostgreSQL deadline exceeded") {
-					SetJson(res, 504, "{\"detail\":\"Query execution deadline exceeded\"}");
-				} else if (pg_err == "PostgreSQL response exceeds configured byte limit") {
-					SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
-				} else {
-					SetJson(res, 502, "{\"detail\":\"Upstream database request failed\"}");
-				}
-				finish();
-				return;
-			}
-			// Fall through only when native execution is proven inapplicable.
-		}
-
-		// DuckDB prepare (after libpq short-circuit). Fresh prepare every request:
+		// Fresh DuckDB prepare every request:
 		// no SQL-keyed body/plan cache — mutable tables and volatile functions
 		// (now/uuid) must re-execute.
 		if (has_body_named && !match.route.body_type.empty() && !exec_route) {
@@ -4713,6 +4837,18 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 
 			auto it = provided.find(param_name);
+			// A declared header or cookie cannot be satisfied by another source.
+			if (spec && (spec->source == QuackapiParamSource::HEADER || spec->source == QuackapiParamSource::COOKIE)) {
+				const string required_source = spec->source == QuackapiParamSource::HEADER ? "header" : "cookie";
+				if (it != provided.end() && it->second.first != required_source) {
+					it = provided.end();
+				}
+			} else if (spec && !spec->external_name.empty() && !IsPathParam(match.route.pattern, param_name)) {
+				it = provided.find(spec->external_name);
+				if (it != provided.end() && it->second.first != "query") {
+					it = provided.end();
+				}
+			}
 			// Default loc for missing errors: path / header / cookie / query.
 			string loc_kind = "query";
 			if (IsPathParam(match.route.pattern, param_name)) {
@@ -4792,7 +4928,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 					continue;
 				}
 			} else if (!is_exec_sql &&
-			           (expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR)) {
+			           (expected.id() == LogicalTypeId::UNKNOWN || expected.id() == LogicalTypeId::VARCHAR) &&
+			           !(spec && !spec->type_name.empty())) {
 				// If raw is not a strict integer but DuckDB would accept it as
 				// INTEGER (float/scientific/hex-ish), reject so execute-time
 				// `$param::INTEGER` cannot round. Plain non-numeric strings
@@ -4926,9 +5063,9 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 			if (IsPlainExecRoute(match.route, body_format)) {
 				// The same code quackapi_exec() runs, so a receipt reads the same either way.
-				auto response =
-				    QuackapiExecSql(con, sql_it->second.second, NumericCast<idx_t>(options.max_response_bytes),
-				                    deadline, sql_it->second.first, exec_param);
+				auto response = QuackapiExecSql(
+				    con, sql_it->second.second, NumericCast<idx_t>(options.max_response_bytes), deadline,
+				    sql_it->second.first, exec_param, [&deadline]() { return deadline.Disconnected(); });
 				sql_execute_ms =
 				    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started)
 				        .count();
@@ -4938,8 +5075,9 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				return;
 			}
 			string exec_error;
-			const bool exec_ok = ExecuteRequestSql(con, sql_it->second.second, result, exec_error,
-			                                       [&deadline]() { return deadline.Expired(); });
+			const bool exec_ok = ExecuteRequestSql(con, sql_it->second.second, result, exec_error, [&deadline]() {
+				return deadline.Expired() || deadline.Disconnected();
+			});
 			sql_execute_ms =
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - execute_started).count();
 			if (!exec_ok) {
@@ -5051,9 +5189,20 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 		}
 
+		vector<string> data_names;
+		for (auto c : data_cols) {
+			data_names.push_back(names[c]);
+		}
+		auto mode = ResponseModeFor(data_names);
+		const bool object_envelope =
+		    StringUtil::Lower(match.route.response_envelope.empty() ? "array" : match.route.response_envelope) ==
+		    "object";
+		const bool count_json_bytes =
+		    body_format == BodyFormat::JSON && mode == ResponseMode::JSON && !data_cols.empty();
+
 		// Materialize rows once so we can apply headers then serialize body.
 		vector<vector<Value>> rows;
-		idx_t response_value_bytes = 0;
+		idx_t response_value_bytes = count_json_bytes && !object_envelope ? 2 : 0;
 		while (true) {
 			auto chunk = result->Fetch();
 			if (!chunk || chunk->size() == 0) {
@@ -5064,7 +5213,21 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				cols.resize(chunk->ColumnCount());
 				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
 					cols[col] = chunk->GetValue(col, row);
-					response_value_bytes += cols[col].ToString().size();
+					if (!count_json_bytes) {
+						response_value_bytes += cols[col].type().id() == LogicalTypeId::BLOB && !cols[col].IsNull()
+						                            ? cols[col].GetValueUnsafe<string>().size()
+						                            : cols[col].ToString().size();
+					}
+					if (response_value_bytes > static_cast<idx_t>(options.max_response_bytes)) {
+						SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+						finish();
+						return;
+					}
+				}
+				if (count_json_bytes) {
+					response_value_bytes += SerializeRowJsonObject(names, data_cols, cols).size();
+					if (!object_envelope && !rows.empty())
+						response_value_bytes++;
 					if (response_value_bytes > static_cast<idx_t>(options.max_response_bytes)) {
 						SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
 						finish();
@@ -5095,13 +5258,6 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			res.set_header("Set-Cookie", cv);
 		}
 
-		// HTML/TEXT mode uses the single remaining data column name.
-		vector<string> data_names;
-		for (auto c : data_cols) {
-			data_names.push_back(names[c]);
-		}
-		auto mode = ResponseModeFor(data_names);
-
 		// 0-row EMPTY STATUS: override success STATUS (any FORMAT / html/text).
 		if (rows.empty() && match.route.empty_status != 0) {
 			SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
@@ -5125,6 +5281,43 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			return;
 		}
 
+		// Explicit binary mode returns exactly one BLOB without string or base64 encoding.
+		if (body_format == BodyFormat::BINARY) {
+			idx_t body_col = names.size(), type_col = names.size();
+			for (auto col : data_cols) {
+				if (StringUtil::CIEquals(names[col], "body"))
+					body_col = col;
+				else if (StringUtil::CIEquals(names[col], "content_type"))
+					type_col = col;
+			}
+			if (rows.size() != 1 || body_col == names.size() || rows[0][body_col].IsNull() ||
+			    result->GetTypes()[body_col].id() != LogicalTypeId::BLOB ||
+			    data_cols.size() != (type_col == names.size() ? 1 : 2)) {
+				SetJson(res, 500,
+				        "{\"detail\":\"FORMAT binary requires one row with a BLOB body and optional content_type\"}");
+				finish();
+				return;
+			}
+			string content_type = "application/octet-stream";
+			if (type_col != names.size() && !rows[0][type_col].IsNull()) {
+				content_type = rows[0][type_col].ToString();
+				bool invalid_content_type = content_type.empty();
+				for (unsigned char ch : content_type) {
+					if (ch < 0x20 || ch == 0x7f)
+						invalid_content_type = true;
+				}
+				if (invalid_content_type) {
+					SetJson(res, 500, "{\"detail\":\"Invalid binary content_type\"}");
+					finish();
+					return;
+				}
+			}
+			res.status = match.route.status;
+			res.set_content(rows[0][body_col].GetValueUnsafe<string>(), content_type);
+			finish();
+			return;
+		}
+
 		// HTML/TEXT mode: a single data column named `html`/`text` serves its raw
 		// string value (e.g. SELECT tera_render(...) AS html). Multiple rows are
 		// concatenated in order, so a query returning fragments streams a page.
@@ -5144,10 +5337,6 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			finish();
 			return;
 		}
-
-		const bool object_envelope =
-		    StringUtil::Lower(match.route.response_envelope.empty() ? "array" : match.route.response_envelope) ==
-		    "object";
 
 		// Serialize rows: json array | json object | ndjson | csv | parquet | arrow.
 		string body;

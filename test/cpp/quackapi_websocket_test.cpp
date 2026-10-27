@@ -15,6 +15,7 @@
 #include "duckdb.hpp"
 #include "httplib.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -87,6 +88,36 @@ int main() {
 			       "interval stream re-runs its SELECT");
 			Expect(clock_type::now() - start >= std::chrono::milliseconds(150), "re-runs wait for the interval");
 			client.close();
+		}
+
+		{
+			// A long-interval SSE stream shares admission with WebSockets and stops promptly.
+			Run(connection, "CREATE STREAM slow_sse GET '/slow-sse' WITH (interval='30s') AS SELECT 1 AS n");
+			Run(connection,
+			    "SELECT * FROM quackapi_serve(29334, host := '127.0.0.1', access_log := false, worker_threads := 2)");
+			std::atomic<bool> received {false};
+			std::thread reader([&received] {
+				quackapi_httplib::Client http("127.0.0.1", 29334);
+				http.set_read_timeout(5, 0);
+				http.Get("/slow-sse", [&received](const char *, size_t) {
+					received.store(true);
+					return true;
+				});
+			});
+			for (int i = 0; i < 100 && !received.load(); i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			if (!received.load()) {
+				Run(connection, "SELECT * FROM quackapi_stop(29334)");
+				reader.join();
+				throw std::runtime_error("SSE did not deliver its first event");
+			}
+			int websocket_status = UpgradeStatus("ws://127.0.0.1:29334/rooms/lobby?nick=bob");
+			const auto start = clock_type::now();
+			Run(connection, "SELECT * FROM quackapi_stop(29334)");
+			reader.join();
+			auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock_type::now() - start).count();
+			Expect(websocket_status == 503, "SSE and WebSocket sessions share their admission limit");
+			Expect(elapsed < 1500, "stopping a long-interval SSE stream does not wait for its next poll");
 		}
 
 		{

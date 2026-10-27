@@ -86,6 +86,8 @@ curl -X POST http://127.0.0.1:8000/echo-body \
 
 ## Form urlencoded
 
+`BODY TYPE` and `BODY SCHEMA` require JSON; form and multipart requests are rejected for those routes. Path captures and server-generated request IDs take precedence over form fields.
+
 `Content-Type: application/x-www-form-urlencoded` binds form fields the same way:
 
 ```sql
@@ -166,7 +168,28 @@ curl -X POST http://127.0.0.1:8000/users \
 
 ## Body size limit
 
-Request bodies larger than **8 MiB** are rejected with **413**.
+Request bodies larger than **8 MiB** are rejected with **413** by default. A
+route can set a smaller or larger limit with `WITH (max_request_bytes := ...)`;
+the server's `max_request_bytes` serve option is the hard ceiling and defaults
+to 8 MiB. Raising that ceiling does not change routes that omit the route option.
+
+```sql
+-- Allow image or other larger uploads on this route only. The server must
+-- also be started with max_request_bytes at least this large.
+CREATE ROUTE upload POST '/uploads'
+  WITH (max_request_bytes := 12582912)
+  AS SELECT length($body::VARCHAR) AS bytes;
+
+SELECT * FROM quackapi_serve(
+  8000,
+  max_request_bytes := 16777216
+);
+```
+
+Limits are bytes, must be positive, and a route limit above the serve ceiling
+is capped by the serve ceiling. `quackapi_routes()` exposes the explicit
+route limit in its `max_request_bytes` column; `NULL` means the default 8 MiB
+route limit.
 
 ---
 

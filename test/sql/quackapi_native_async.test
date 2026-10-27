@@ -4,6 +4,19 @@
 
 require quackapi
 
+require http_request
+
+statement ok
+SET http_request_cache = false;
+
+# Test-local adapter: keep body assertions textual while using the standard HTTP extension.
+statement ok
+CREATE MACRO test_http_get(u, h := MAP{}) AS (SELECT {'status': r.status, 'body': decode(r.body), 'headers': r.headers} FROM (SELECT http_get(u, h) AS r));
+
+statement ok
+CREATE MACRO test_http_get_table(u, h := MAP{}) AS TABLE SELECT r.* FROM (SELECT test_http_get(u, h) AS r);
+
+
 require json
 
 statement ok
@@ -30,16 +43,17 @@ statement ok
 CALL enable_logging(['AsyncTaskSchedule'], level := 'debug', storage := 'memory');
 
 query II
-SELECT status, body FROM quackapi_fetch('http://127.0.0.1:29325/async');
+SELECT status, body FROM test_http_get_table('http://127.0.0.1:29325/async');
 ----
 200	[{"hit":1}]
 
-# Multiple native I/O tasks share two engine workers; requests fire once each.
-query II
-SELECT list(idx ORDER BY idx), list_sort(list(json_extract(body::JSON, '$[0].hit')::INTEGER))
-FROM quackapi_parallel_fetch('http://127.0.0.1:29325/async', 5);
+# Unique URLs and a disabled request cache ensure the community HTTP client
+# performs one independent request for each input row.
+query I
+SELECT list_sort(list(json_extract(body::JSON, '$[0].hit')::INTEGER))
+FROM range(5) t(i), LATERAL test_http_get_table('http://127.0.0.1:29325/async?i=' || i);
 ----
-[0, 1, 2, 3, 4]	[2, 3, 4, 5, 6]
+[2, 3, 4, 5, 6]
 
 query II
 SELECT status, body FROM quackapi_post('http://127.0.0.1:29325/async', '{"n":42}');

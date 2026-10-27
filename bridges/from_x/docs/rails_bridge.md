@@ -1,15 +1,15 @@
 # quack_from_rails — Rails → quackapi bridge
 
-**Status:** proven on rails-realworld  
-**Shape:** same as `quack_from_fastapi` (path → IR → CREATE ROUTE → FIFO register → serve)  
-**Binary:** `/Users/aloksubbarao/personal/quackapi/build/release/duckdb -unsigned` + `LOAD quackapi`  
+**Status:** proven on rails-realworld
+**Shape:** same shell-driver workflow as FastAPI (path → IR → CREATE ROUTE → FIFO register → serve); native metadata extraction uses `quack_from_routes('rails', path)` and `quack_from_models('rails', path)`.
+**Binary:** `/Users/aloksubbarao/personal/quackapi/build/release/duckdb -unsigned` + `LOAD quackapi`
 **No C++ changes** (read-only on extension; all work under `/tmp`)
 
 ---
 
 ## One-liner
 
-**`quack_from_rails` is a real one-caller (partial runtime fidelity): one shell entrypoint imports Rails routes+validations into live quackapi; handlers are SQL façades, not Ruby controllers.** Next: `quack_from_express`.
+**The Rails shell driver is a real one-caller (partial runtime fidelity): it imports Rails routes+validations into live quackapi; handlers are SQL façades, not Ruby controllers.** Native SQL extraction is available through the shared route/model table functions. Next bridge: Express.
 
 ---
 
@@ -67,7 +67,7 @@ First-class bridge: point at a Rails app root and get registered `CREATE ROUTE`s
 
 ### IR schema (parity with Python)
 
-**Routes:** `framework, method, path, handler_name, file, start_line, repo, evidence`  
+**Routes:** `framework, method, path, handler_name, file, start_line, repo, evidence`
 **Models:** `framework, model_name, field_name, field_type, is_optional, has_default, is_required, default_expr, file, field_line, repo, declared_annotation`
 
 ### Mapping table
@@ -134,8 +134,8 @@ SELECT $id::INTEGER AS id, $slug::VARCHAR AS slug, 'comments#destroy' AS handler
 
 ## 3. Proof transcript (rails-realworld)
 
-**App:** `/tmp/quackapi_corpus/ruby/rails-realworld` (gothinkster RealWorld)  
-**Port:** `18926`  
+**App:** `/tmp/quackapi_corpus/ruby/rails-realworld` (gothinkster RealWorld)
+**Port:** `18926`
 **Full log:** `/tmp/quackapi_fromrails/out/rails-realworld/e2e_transcript.txt`
 
 ### Registry (`quackapi_routes` via CREATE status lines)
@@ -265,11 +265,11 @@ Ranked by real-world web/API framework popularity (GitHub stars + Stack Overflow
 
 ## 6. Improvements made this run
 
-1. **Path-scoped extractor** — any Rails app root, not only corpus batch  
-2. **Strong-params noise filter** — drop `before_action` / devise sanitizer false positives (`Params` junk)  
-3. **Required semantics** — only ActiveModel presence marks required; permit is whitelist only  
-4. **Rails body wrap** — `require(:article)` → nested JSON Schema under resource key  
-5. **FIFO one-caller** — same serve path as fastapi; disown hold so piped prove scripts exit  
+1. **Path-scoped extractor** — any Rails app root, not only corpus batch
+2. **Strong-params noise filter** — drop `before_action` / devise sanitizer false positives (`Params` junk)
+3. **Required semantics** — only ActiveModel presence marks required; permit is whitelist only
+4. **Rails body wrap** — `require(:article)` → nested JSON Schema under resource key
+5. **FIFO one-caller** — same serve path as fastapi; disown hold so piped prove scripts exit
 
 ---
 
@@ -277,9 +277,9 @@ Ranked by real-world web/API framework popularity (GitHub stars + Stack Overflow
 
 | Question | Answer |
 |----------|--------|
-| Is `quack_from_rails('/path')` a real one-caller? | **Yes (partial)** — one script: extract → register → serve |
+| Is the Rails shell driver a real one-caller? | **Yes (partial)** — one script: extract → register → serve |
 | Full Rails runtime? | **No** — SQL façades + validation, not AR/Devise/filters |
 | Proof bar met? | **Yes** — `quackapi_routes()` shows imports; ≥3 curls work; 14/14 e2e |
 | Next bridge | **`quack_from_express`** |
 
-**`quack_from_rails` = real one-caller yes/partial + next=`quack_from_express`.**
+**Rails shell driver = real one-caller yes/partial + next bridge=Express.**

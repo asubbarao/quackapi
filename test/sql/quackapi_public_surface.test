@@ -1,0 +1,24 @@
+# name: test/sql/quackapi_public_surface.test
+# description: Removed aliases and test helpers are absent from the public SQL catalog
+# group: [sql]
+
+require quackapi
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name IN (
+ 'quackapi_fetch', 'quackapi_parallel_fetch', 'quackapi_last_write_timeout_sec',
+ 'quackapi_http_util_name', 'quackapi_authentication', 'quackapi_authorization',
+ 'quack_from_fastapi', 'quack_from_rails', 'quack_from_express', 'quack_from_gin',
+ 'quack_from_fastapi_models', 'quack_from_rails_models',
+ 'quack_from_express_models', 'quack_from_gin_models',
+ 'quack_from_x_sql', 'quack_from_x_sql_relpath');
+----
+0
+
+query I
+SELECT count(DISTINCT function_name) FROM duckdb_functions()
+WHERE function_name IN ('quack_from_routes', 'quack_from_models',
+ 'quackapi_post', 'quackapi_ack', 'quackapi_renew', 'quackapi_verify_auth');
+----
+6

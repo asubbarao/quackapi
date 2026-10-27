@@ -337,7 +337,7 @@ RESET GLOBAL quackapi_query_timeout_ms;
 # A peer that answers after 2.5 s, on its own workers so abandoned calls to it
 # never hold a worker the other servers need.
 statement ok
-CREATE ROUTE exec_slow GET '/slow' AS SELECT sleep_ms(2500) AS slept;
+CREATE ROUTE exec_slow POST '/slow' AS SELECT sleep_ms(2500) AS slept;
 
 query I
 SELECT * FROM quackapi_serve(29322, host := '127.0.0.1', access_log := false, worker_threads := 32);
@@ -380,7 +380,7 @@ INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
 SELECT status IN (200, 504) FROM quackapi_request('POST', '/sql',
-  '{"sql":"SELECT count((quackapi_fetch(''http://127.0.0.1:29322/slow'')).status) AS n FROM exec_wide WHERE i % 122880 = 0"}', query_timeout_ms := 300);
+  '{"sql":"SELECT count((quackapi_post(''http://127.0.0.1:29322/slow'', '''')).status) AS n FROM exec_wide WHERE i % 122880 = 0"}', query_timeout_ms := 300);
 ----
 true
 
@@ -404,7 +404,7 @@ INSERT INTO exec_clock VALUES (get_current_timestamp());
 
 query I
 SELECT status IN (200, 504) FROM quackapi_request('POST', '/sql',
-  '{"sql":"SELECT sleep_ms(600) AS a; SELECT (quackapi_exec(''SELECT quackapi_fetch(''''http://127.0.0.1:29322/slow'''') AS f'')).status AS r"}', query_timeout_ms := 1000);
+  '{"sql":"SELECT sleep_ms(600) AS a; SELECT (quackapi_exec(''SELECT quackapi_post(''''http://127.0.0.1:29322/slow'''', '''''''') AS f'')).status AS r"}', query_timeout_ms := 1000);
 ----
 true
 

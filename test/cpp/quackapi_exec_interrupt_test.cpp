@@ -106,10 +106,10 @@ int main() {
 			duckdb::Connection connection(database);
 			Run(connection, "LOAD quackapi");
 			Run(connection, "SET quackapi_query_timeout_ms = 20000");
-			Run(connection, "CREATE ROUTE slow GET '/slow' AS SELECT sleep_ms(3000) AS slept");
+			Run(connection, "CREATE ROUTE slow POST '/slow' AS SELECT sleep_ms(3000) AS slept");
 			Run(connection, "SELECT * FROM quackapi_serve(29340, host := '127.0.0.1', access_log := false)");
 			caller_ms = InterruptAfter300Ms(
-			    connection, "SELECT quackapi_exec('SELECT quackapi_fetch(''http://127.0.0.1:29340/slow'') AS f')");
+			    connection, "SELECT quackapi_exec('SELECT quackapi_post(''http://127.0.0.1:29340/slow'', '''') AS f')");
 			Run(connection, "SELECT * FROM quackapi_stop(29340)");
 		}
 		printf("2. caller returned %lld ms after the interrupt\n", caller_ms);
@@ -203,9 +203,9 @@ int main() {
 	duckdb::DuckDB peer_database(nullptr);
 	duckdb::Connection peer(peer_database);
 	Run(peer, "LOAD quackapi");
-	Run(peer, "CREATE ROUTE slow GET '/slow' AS SELECT sleep_ms(1500) AS slept");
+	Run(peer, "CREATE ROUTE slow POST '/slow' AS SELECT sleep_ms(1500) AS slept");
 	Run(peer, "SELECT * FROM quackapi_serve(29341, host := '127.0.0.1', access_log := false, worker_threads := 8)");
-	const std::string blocked_row = "SELECT quackapi_fetch(''http://127.0.0.1:29341/slow'') AS f";
+	const std::string blocked_row = "SELECT quackapi_post(''http://127.0.0.1:29341/slow'', '''') AS f";
 	{
 		const std::string path = "quackapi_exec_close_test.duckdb";
 		std::remove(path.c_str());

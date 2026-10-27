@@ -4,6 +4,17 @@
 
 require quackapi
 
+require http_request
+
+statement ok
+SET http_request_cache = false;
+
+statement ok
+CREATE MACRO test_http_get(u, h := MAP{}) AS (SELECT {'status': r.status, 'body': decode(r.body), 'headers': r.headers} FROM (SELECT http_get(u, h) AS r));
+
+statement ok
+CREATE MACRO test_http_get_table(u, h := MAP{}) AS TABLE SELECT r.* FROM (SELECT test_http_get(u, h) AS r);
+
 require json
 
 # ---------------------------------------------------------------------------
@@ -191,9 +202,9 @@ http://127.0.0.1:29270
 query III
 SELECT list(json_extract(body::JSON, '$[0].id')::BIGINT)
          FILTER (WHERE status = 200 AND body != '[]') AS winner_ids,
-       bool_and(status = 200 AND error IS NULL) AS all_ok,
-       len(list(idx) FILTER (WHERE body = '[]')) AS empty_n
-FROM quackapi_parallel_fetch('http://127.0.0.1:29270/q/rclaim?t=9', 8);
+       bool_and(status = 200) AS all_ok,
+       len(list(i) FILTER (WHERE body = '[]')) AS empty_n
+FROM range(8) t(i), LATERAL test_http_get_table('http://127.0.0.1:29270/q/rclaim?t=9&i=' || i);
 ----
 [3]	true	7
 

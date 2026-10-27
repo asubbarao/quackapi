@@ -40,44 +40,38 @@ void QuackapiState::PublishStreams() {
 }
 
 void QuackapiState::AddRoute(const QuackapiRoute &route, bool or_replace) {
+	AddRoutes({route}, or_replace);
+}
+
+void QuackapiState::AddRoutes(const vector<QuackapiRoute> &new_routes, bool or_replace) {
 	std::lock_guard<std::mutex> lock(routes_mutex);
-	// Method+pattern must be unique across route names (GraphQL mounts already
-	// enforce path uniqueness). Otherwise OR REPLACE onto another route's path
-	// leaves two handlers and last-match / duplicate OpenAPI keys.
-	auto collides = [&](const QuackapiRoute &candidate, const string &ignore_name) -> const QuackapiRoute * {
-		for (auto &other : routes) {
-			if (other.name == ignore_name) {
-				continue;
-			}
-			if (other.method == candidate.method && other.pattern == candidate.pattern) {
-				return &other;
-			}
-		}
-		return nullptr;
-	};
-	for (auto it = routes.begin(); it != routes.end(); ++it) {
-		if (it->name == route.name) {
-			if (!or_replace) {
-				throw InvalidInputException("Route \"%s\" already exists — use CREATE OR REPLACE ROUTE", route.name);
-			}
-			if (auto *hit = collides(route, route.name)) {
+	// Validate and update a private copy. No route becomes visible on failure.
+	auto proposed = routes;
+	for (const auto &route : new_routes) {
+		auto existing = proposed.end();
+		for (auto it = proposed.begin(); it != proposed.end(); ++it) {
+			if (it->name == route.name) {
+				existing = it;
+				if (!or_replace) {
+					throw InvalidInputException("Route \"%s\" already exists — use CREATE OR REPLACE ROUTE",
+					                            route.name);
+				}
+			} else if (it->method == route.method && it->pattern == route.pattern) {
 				throw InvalidInputException("Route path \"%s %s\" already used by route \"%s\"", route.method,
-				                            route.pattern, hit->name);
+				                            route.pattern, it->name);
 			}
-			*it = route;
-			PublishRoutes();
-			// OR REPLACE is a new registration — do not inherit spent rate-limit windows.
-			ClearRouteRateLimit(route.name);
-			return;
+		}
+		if (existing == proposed.end()) {
+			proposed.push_back(route);
+		} else {
+			*existing = route;
 		}
 	}
-	if (auto *hit = collides(route, string())) {
-		throw InvalidInputException("Route path \"%s %s\" already used by route \"%s\"", route.method, route.pattern,
-		                            hit->name);
-	}
-	routes.push_back(route);
+	routes = std::move(proposed);
 	PublishRoutes();
-	ClearRouteRateLimit(route.name);
+	for (const auto &route : new_routes) {
+		ClearRouteRateLimit(route.name);
+	}
 }
 
 bool QuackapiState::DropRoute(const string &name) {

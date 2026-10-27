@@ -31,7 +31,7 @@ for worker_count in 1 8; do
   [[ "$generated" == *"SET threads = ${expected_threads};"* ]]
   [[ "$generated" == *"worker_threads := ${expected_http}"* ]]
   [[ "$generated" == *"ATTACH 'host=isolated.invalid dbname=bench password=''synthetic''' AS pg"* ]]
-  [[ "$generated" == *"pg_dsn := 'host=isolated.invalid dbname=bench password=''synthetic'''"* ]]
+  [[ "$generated" != *"pg_dsn :="* ]]
 done
 
 # The real start helper must refuse an occupied port without signaling anything.

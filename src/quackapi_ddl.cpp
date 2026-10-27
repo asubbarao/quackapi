@@ -314,16 +314,42 @@ bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
 	return true;
 }
 
+bool ParseRouteRequestBytes(const string &raw, int64_t &out_bytes, string &err) {
+	if (raw.empty()) {
+		err = "must be a positive integer byte count";
+		return false;
+	}
+	for (auto c : raw) {
+		if (c < '0' || c > '9') {
+			err = "must be a positive integer byte count";
+			return false;
+		}
+	}
+	try {
+		size_t consumed = 0;
+		const auto parsed = std::stoll(raw, &consumed);
+		if (consumed != raw.size() || parsed <= 0) {
+			err = "must be a positive integer byte count";
+			return false;
+		}
+		out_bytes = parsed;
+		return true;
+	} catch (...) {
+		err = "must be a positive integer byte count no larger than 9223372036854775807";
+		return false;
+	}
+}
+
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
+//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow|binary]
 //!     [ENVELOPE array|object] [EMPTY STATUS <n> [BODY '<json>']]
 //!     [TIMEOUT <n>|'30s'|'5m'] [SCHEDULE '<6-field cron, seconds first>']
 //!     [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>'] [BODY TYPE '<duckdb-json-structure>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
 //!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
-//!     [WITH (timeout_sec [=|:=] <n>|'30s')]
+//!     [WITH (timeout_sec [=|:=] <n>|'30s', max_request_bytes [=|:=] <bytes>)]
 //!     AS <select>
 //!   DROP ROUTE <name>
 //!
@@ -414,6 +440,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	int empty_status = 0;
 	string empty_body;
 	int32_t timeout_sec = 0;
+	int64_t max_request_bytes = 0;
 	string schedule;
 	bool schedule_seen = false;
 	string schedule_error;
@@ -552,21 +579,22 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			rest = QuackapiTrim(rest.substr(token_end));
 			continue;
 		}
-		// [FORMAT json|ndjson|csv|parquet|arrow]
+		// [FORMAT json|ndjson|csv|parquet|arrow|binary]
 		if (StringUtil::StartsWith(rest_upper, "FORMAT") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
 			rest = QuackapiTrim(rest.substr(6));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
-				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, parquet, or arrow");
+				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, parquet, arrow, or binary");
 			}
 			auto fmt = StringUtil::Lower(rest.substr(0, token_end));
 			// "arrows" is a friendly alias of the nanoarrow COPY format name.
 			if (fmt == "arrows") {
 				fmt = "arrow";
 			}
-			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow") {
-				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, parquet, or arrow");
+			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow" &&
+			    fmt != "binary") {
+				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, parquet, arrow, or binary");
 			}
 			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));
@@ -1024,7 +1052,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		rest_upper = StringUtil::Upper(rest);
 	}
 
-	// [WITH (timeout_sec [=|:=] <n>|'30s')] — may appear immediately before AS
+	// [WITH (timeout_sec [=|:=] <n>|'30s', max_request_bytes := <bytes>)] — before AS
 	if (StringUtil::StartsWith(rest_upper, "WITH") &&
 	    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '(')) {
 		rest = QuackapiTrim(rest.substr(4));
@@ -1038,9 +1066,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		auto inner = QuackapiTrim(rest.substr(1, close - 1));
 		rest = QuackapiTrim(rest.substr(close + 1));
 		if (inner.empty()) {
-			return ParserExtensionParseResult("WITH (...) is empty — expected timeout_sec");
+			return ParserExtensionParseResult("WITH (...) is empty — expected timeout_sec or max_request_bytes");
 		}
-		// Split on commas for future options; only timeout_sec today.
+		// Split on commas; options remain independently optional.
 		idx_t part_start = 0;
 		while (part_start <= inner.size()) {
 			idx_t comma = inner.find(',', part_start);
@@ -1054,23 +1082,35 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					sep_len = 1;
 				}
 				if (eq == string::npos) {
-					return ParserExtensionParseResult("WITH option must be timeout_sec [=|:=] <n> — got \"" + part +
-					                                  "\"");
+					return ParserExtensionParseResult("WITH option must be timeout_sec or max_request_bytes — got \"" +
+					                                  part + "\"");
 				}
 				auto key = StringUtil::Lower(QuackapiTrim(part.substr(0, eq)));
 				auto val = QuackapiTrim(part.substr(eq + sep_len));
-				if (key != "timeout_sec" && key != "timeout") {
-					return ParserExtensionParseResult("Unknown WITH option \"" + key + "\" — expected timeout_sec");
+				if (key == "timeout_sec" || key == "timeout") {
+					string terr;
+					int32_t sec = 0;
+					if (!ParseRouteTimeoutSec(val, sec, terr)) {
+						return ParserExtensionParseResult("timeout_sec: " + terr);
+					}
+					if (timeout_sec > 0) {
+						return ParserExtensionParseResult("TIMEOUT / timeout_sec specified more than once");
+					}
+					timeout_sec = sec;
+				} else if (key == "max_request_bytes") {
+					string bytes_error;
+					int64_t bytes = 0;
+					if (!ParseRouteRequestBytes(val, bytes, bytes_error)) {
+						return ParserExtensionParseResult("max_request_bytes: " + bytes_error);
+					}
+					if (max_request_bytes > 0) {
+						return ParserExtensionParseResult("max_request_bytes specified more than once");
+					}
+					max_request_bytes = bytes;
+				} else {
+					return ParserExtensionParseResult("Unknown WITH option \"" + key +
+					                                  "\" — expected timeout_sec or max_request_bytes");
 				}
-				string terr;
-				int32_t sec = 0;
-				if (!ParseRouteTimeoutSec(val, sec, terr)) {
-					return ParserExtensionParseResult("timeout_sec: " + terr);
-				}
-				if (timeout_sec > 0) {
-					return ParserExtensionParseResult("TIMEOUT / timeout_sec specified more than once");
-				}
-				timeout_sec = sec;
 			}
 			if (comma == string::npos) {
 				break;
@@ -1111,6 +1151,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.empty_status = empty_status;
 	data->route.empty_body = empty_body;
 	data->route.timeout_sec = timeout_sec;
+	data->route.max_request_bytes = max_request_bytes;
 	data->route.schedule = schedule;
 	return ParserExtensionParseResult(std::move(data));
 }
@@ -1182,6 +1223,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	}
 	if (input.inputs.size() > 20 && !input.inputs[20].IsNull()) {
 		bind_data->route.schedule = input.inputs[20].GetValue<string>();
+	}
+	if (input.inputs.size() > 21 && !input.inputs[21].IsNull()) {
+		bind_data->route.max_request_bytes = input.inputs[21].GetValue<int64_t>();
 	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
@@ -1286,19 +1330,8 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			                    ? unique_ptr<PreparedStatement>()
 			                    : con.Prepare(bind_data.route.handler_sql);
 			if (prepared && prepared->HasError()) {
-				// Native libpq path (pg_dsn): handler SQL is Postgres dialect and may
-				// not prepare under DuckDB (domains, DO, INSERT…RETURNING, …). Allow
-				// CREATE when pg_dsn is configured; request time uses libpq, else 500.
-				auto err = prepared->GetError();
-				auto el = StringUtil::Lower(err);
-				bool pg_returning = StringUtil::Contains(el, "returning clause not yet supported") &&
-				                    StringUtil::Contains(el, "postgres");
-				Value pg_dsn_setting;
-				bool has_pg_dsn = context.TryGetCurrentSetting("quackapi_pg_dsn", pg_dsn_setting) &&
-				                  !pg_dsn_setting.IsNull() && !pg_dsn_setting.GetValue<string>().empty();
-				if (!pg_returning && !has_pg_dsn) {
-					throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name, err);
-				}
+				throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name,
+				                            prepared->GetError());
 			}
 		}
 		state.AddRoute(bind_data.route, bind_data.or_replace);
@@ -1317,14 +1350,14 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyRouteFunction() {
 	// action, or_replace, name, method, pattern, handler, status, require_auth,
 	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format,
-	// envelope, empty_status, empty_body, timeout_sec, body_type, schedule
+	// envelope, empty_status, empty_body, timeout_sec, body_type, schedule, max_request_bytes
 	return MakeApplyDdlFunction("quackapi_apply_route",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
 	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR},
+	                             LogicalType::VARCHAR, LogicalType::BIGINT},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
@@ -1354,6 +1387,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::INTEGER(data.route.timeout_sec));
 	result.parameters.push_back(Value(data.route.body_type));
 	result.parameters.push_back(Value(data.route.schedule));
+	result.parameters.push_back(Value::BIGINT(data.route.max_request_bytes));
 	FinishDdlPlan(result);
 	return result;
 }

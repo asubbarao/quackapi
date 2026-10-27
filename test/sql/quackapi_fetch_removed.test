@@ -1,0 +1,15 @@
+# name: test/sql/quackapi_fetch_removed.test
+# description: Removed GET API is absent while pooled POST remains
+# group: [sql]
+
+require quackapi
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'quackapi_fetch';
+----
+0
+
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE function_name = 'quackapi_post';
+----
+true

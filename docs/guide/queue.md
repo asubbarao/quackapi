@@ -153,3 +153,26 @@ DROP QUEUE default;
 
 - [CREATE STREAM](stream.md) — push events while jobs run  
 - Deeper notes: [QUEUE.md](../QUEUE.md)
+
+## Enqueue in the caller's transaction
+
+`quackapi_enqueue` uses a separate connection and commits independently. To
+atomically write an application row and a job, create the queue first, then
+insert the job into its durable table inside the same transaction:
+
+```sql
+CREATE QUEUE default;
+BEGIN TRANSACTION;
+INSERT INTO orders VALUES (42, 'new');
+INSERT INTO quackapi_jobs
+  (id, queue, payload, status, attempts, max_attempts, visible_at, created_at, updated_at)
+VALUES
+  (nextval('quackapi_job_seq'), 'default', '{"order_id":42}', 'pending', 0, 3,
+   now()::TIMESTAMP, now()::TIMESTAMP, now()::TIMESTAMP);
+COMMIT;
+```
+
+Use the queue's configured `max_attempts` for the inserted row. A rollback
+removes both rows, though sequence IDs may have gaps. The queue must already
+exist and the caller must use the durable job schema shown above; unlike
+`quackapi_enqueue`, this direct insert does not validate the queue name.

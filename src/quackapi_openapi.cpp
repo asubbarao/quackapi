@@ -5,6 +5,9 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
 
 #include "quackapi_state.hpp"
 #include "quackapi_util.hpp"
@@ -223,6 +226,26 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			}
 		}
 
+		// DuckDB can defer binding a parameterized SELECT and report a placeholder
+		// column named "unknown". Recover explicit SELECT aliases from the AST.
+		if (!exec_route && col_names.size() == 1 && col_names[0] == "unknown") {
+			try {
+				auto parser = Parser::GetBuiltinParser();
+				parser.ParseQuery(route.handler_sql);
+				if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
+					auto &statement = parser.statements[0]->Cast<SelectStatement>();
+					if (statement.node && statement.node->type == QueryNodeType::SELECT_NODE) {
+						auto &select = statement.node->Cast<SelectNode>();
+						if (select.select_list.size() == 1 && select.select_list[0]->HasAlias()) {
+							col_names[0] = select.select_list[0]->GetAlias().GetIdentifierName();
+						}
+					}
+				}
+			} catch (...) {
+				// Leave the planner's metadata unchanged when the SQL is not a simple SELECT.
+			}
+		}
+
 		auto path_params = PathParamNames(route.pattern);
 		auto oas_path = OasPath(route.pattern);
 		// Filter special response columns from response schema mode.
@@ -261,6 +284,59 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			return s.name;
 		};
 
+		auto ParamSchema = [&](LogicalType ptype, const QuackapiParamSpec *spec) {
+			if (spec && !spec->type_name.empty()) {
+				auto t = StringUtil::Upper(spec->type_name);
+				if (t == "INTEGER" || t == "INT")
+					ptype = LogicalType::INTEGER;
+				else if (t == "BIGINT")
+					ptype = LogicalType::BIGINT;
+				else if (t == "SMALLINT")
+					ptype = LogicalType::SMALLINT;
+				else if (t == "TINYINT")
+					ptype = LogicalType::TINYINT;
+				else if (t == "DOUBLE")
+					ptype = LogicalType::DOUBLE;
+				else if (t == "FLOAT" || t == "REAL")
+					ptype = LogicalType::FLOAT;
+				else if (t == "BOOLEAN" || t == "BOOL")
+					ptype = LogicalType::BOOLEAN;
+				else if (t == "VARCHAR" || t == "TEXT" || t == "STRING")
+					ptype = LogicalType::VARCHAR;
+			}
+			auto schema = ParamTypeToOas(ptype);
+			if (!spec || schema.empty() || schema.back() != '}')
+				return schema;
+			schema.pop_back();
+			if (spec->has_ge)
+				schema += ",\"minimum\":" + std::to_string(spec->ge);
+			if (spec->has_gt)
+				schema += ",\"exclusiveMinimum\":" + std::to_string(spec->gt);
+			if (spec->has_le)
+				schema += ",\"maximum\":" + std::to_string(spec->le);
+			if (spec->has_lt)
+				schema += ",\"exclusiveMaximum\":" + std::to_string(spec->lt);
+			if (spec->has_min_length)
+				schema += ",\"minLength\":" + std::to_string(spec->min_length);
+			if (spec->has_max_length)
+				schema += ",\"maxLength\":" + std::to_string(spec->max_length);
+			if (spec->has_default) {
+				if (spec->default_is_null)
+					schema += ",\"default\":null";
+				else if (ptype.id() == LogicalTypeId::VARCHAR)
+					schema += ",\"default\":" + JsonString(spec->default_raw);
+				else {
+					auto cast = Value(spec->default_raw).DefaultTryCastAs(ptype);
+					if (cast) {
+						auto value = StringUtil::Lower(cast->ToString());
+						if (value != "nan" && value != "inf" && value != "-inf")
+							schema += ",\"default\":" + value;
+					}
+				}
+			}
+			return schema + "}";
+		};
+
 		// parameters: path + header + cookie + query
 		string params_json = "[";
 		bool first_param = true;
@@ -275,7 +351,7 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				ptype = tit->second;
 			}
 			params_json += "{\"name\":" + JsonString(n) +
-			               ",\"in\":\"path\",\"required\":true,\"schema\":" + ParamTypeToOas(ptype) + "}";
+			               ",\"in\":\"path\",\"required\":true,\"schema\":" + ParamSchema(ptype, FindSpec(n)) + "}";
 		}
 		for (auto &n : named_params) {
 			if (IsClaimsParamName(n) || ListContains(path_params, n)) {
@@ -295,6 +371,8 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			string oas_name = n;
 			bool required = true;
 			if (spec) {
+				if (!spec->external_name.empty())
+					oas_name = WireName(*spec);
 				if (spec->source == QuackapiParamSource::HEADER) {
 					in_loc = "header";
 					oas_name = WireName(*spec);
@@ -307,8 +385,8 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				}
 			}
 			params_json += "{\"name\":" + JsonString(oas_name) + ",\"in\":" + JsonString(in_loc) +
-			               ",\"required\":" + (required ? "true" : "false") + ",\"schema\":" + ParamTypeToOas(ptype) +
-			               "}";
+			               ",\"required\":" + (required ? "true" : "false") +
+			               ",\"schema\":" + ParamSchema(ptype, spec) + "}";
 		}
 		params_json += "]";
 
@@ -342,7 +420,12 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		string response_schema;
 		string content_type;
 		string response_desc;
-		if (mode == ResponseMode::HTML) {
+		auto response_format = StringUtil::Lower(route.response_format);
+		if (response_format == "binary") {
+			content_type = "application/octet-stream";
+			response_desc = "Raw binary body; the handler may provide a different content_type";
+			response_schema = "{\"type\":\"string\",\"format\":\"binary\"}";
+		} else if (mode == ResponseMode::HTML) {
 			content_type = "text/html";
 			response_desc = "HTML response";
 			response_schema = "{\"type\":\"string\",\"description\":\"Raw HTML body (single-column handler AS html)\"}";
@@ -350,6 +433,15 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			content_type = "text/plain";
 			response_desc = "Plain text response";
 			response_schema = "{\"type\":\"string\",\"description\":\"Raw text body (single-column handler AS text)\"}";
+		} else if (response_format == "arrow" || response_format == "arrows" || response_format == "parquet") {
+			content_type =
+			    response_format == "parquet" ? "application/vnd.apache.parquet" : "application/vnd.apache.arrow.stream";
+			response_desc = "Binary tabular response";
+			response_schema = "{\"type\":\"string\",\"format\":\"binary\"}";
+		} else if (response_format == "csv" || response_format == "ndjson") {
+			content_type = response_format == "csv" ? "text/csv" : "application/x-ndjson";
+			response_desc = "Tabular text response";
+			response_schema = "{\"type\":\"string\"}";
 		} else if (data_col_names.empty()) {
 			content_type = "application/json";
 			response_desc = "Empty body (redirect / Set-Cookie control columns only)";

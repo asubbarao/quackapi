@@ -222,7 +222,7 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `quackapi_serve([port], host, static_dir, cors_origins, memory_limit, log_level, access_log, enable_logging, health_routes, threads, preserve_insertion_order, enable_http_metadata_cache, worker_threads, keep_alive_max_count, keep_alive_timeout_sec, read_timeout_sec, write_timeout_sec, compression, compression_min_bytes, http_client, pg_dsn, block, query_timeout_ms, max_response_bytes, max_pending_requests)` | table | Start listener (default `127.0.0.1:8000`) |
+| `quackapi_serve([port], host, static_dir, cors_origins, memory_limit, log_level, access_log, enable_logging, health_routes, threads, preserve_insertion_order, enable_http_metadata_cache, worker_threads, keep_alive_max_count, keep_alive_timeout_sec, read_timeout_sec, write_timeout_sec, compression, compression_min_bytes, http_client, block, query_timeout_ms, max_response_bytes, max_pending_requests)` | table | Start listener (default `127.0.0.1:8000`) |
 | `quackapi_wait(port [, timeout_ms], host := …)` | table | TCP readiness probe → `ready`, `listen_url` |
 | `quackapi_stop([port])` | table | Stop one or all servers |
 | `quackapi_routes()` | table | Registry: name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec |
@@ -238,7 +238,6 @@ related modules). Auto-detection on the community site will list overloads after
 | `quackapi_add_api_key(auth, key, subject)` | table | Store SHA-256 hash of key |
 | `quackapi_auths()` | table | name, kind, header (no secrets) |
 | `quackapi_verify_auth(scheme, auth_string)` | scalar | Policy engine probe |
-| `quackapi_authentication` / `quackapi_authorization` | scalar | Bridges for core quack RPC settings |
 
 ### Groups
 
@@ -278,10 +277,8 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `quackapi_fetch(url[, headers])` | scalar | Pooled outbound GET → `STRUCT(status, reason, body, headers, error, reused_connection)` |
 | `quackapi_post(url, body[, ct[, headers]])` | scalar | Pooled outbound POST, same result shape |
 | `quackapi_http_pool()` | table | Outbound pool per origin: `host, idle, dialed, reused` |
-| `quackapi_http_util_name()` | scalar | Active outbound HTTPUtil name |
 | `quackapi_request(method, path [, body], …)` | table | In-process request → status, BLOB body, content type, headers |
 | `quackapi_middlewares()` | table | Inspect SQL middleware definitions |
 
