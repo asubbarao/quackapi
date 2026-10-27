@@ -21,13 +21,11 @@ SELECT list(CASE
                    AND result.rows[1].value = input_order * 10
             END ORDER BY input_order)
 FROM (
-  SELECT input_order, result
-  FROM (VALUES
-    (1, 'SELECT 10 AS value'),
-    (2, 'SELECT * FROM missing_selfdispatch_table'),
-    (3, 'SELECT 30 AS value')
-  ) AS inputs(input_order, sql)
-  CROSS JOIN LATERAL (SELECT quackapi_selfdispatch(sql) AS result)
+  SELECT input_order, quackapi_selfdispatch(sql) AS result
+  FROM (
+    SELECT unnest(['SELECT 10 AS value', 'SELECT * FROM missing_selfdispatch_table', 'SELECT 30 AS value']) AS sql,
+           unnest([1, 2, 3]) AS input_order
+  ) AS inputs
 );
 ----
 [true, true, true]

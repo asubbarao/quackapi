@@ -76,6 +76,30 @@ query I
 SELECT bool_and(receipt.error IS NULL AND receipt.rows IS NOT NULL)
 FROM (
   SELECT quackapi_post('http://127.0.0.1:29322/post-negotiated', '', 'application/json',
+                      map(keys, [wildcard, exact]), response_format := 'arrow') AS receipt
+  FROM (SELECT unnest(['*/*', '*/*;q=0']) AS wildcard,
+               unnest(['application/vnd.apache.arrow.stream;q=0.5', 'application/vnd.apache.arrow.stream;q=0.5']) AS exact,
+               unnest([['Accept', 'accept'], ['accept', 'Accept']]) AS keys)
+);
+----
+true
+
+statement error
+SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
+                     map(['Accept', 'accept'], ['*/*', 'application/vnd.apache.arrow.stream;q=0']), response_format := 'arrow');
+----
+response_format conflicts
+
+statement error
+SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
+                     map(['accept', 'Accept'], ['application/vnd.apache.arrow.stream;q=0', '*/*']), response_format := 'arrow');
+----
+response_format conflicts
+
+query I
+SELECT bool_and(receipt.error IS NULL AND receipt.rows IS NOT NULL)
+FROM (
+  SELECT quackapi_post('http://127.0.0.1:29322/post-negotiated', '', 'application/json',
                       map(['Accept'], [accept]), response_format := 'arrow') AS receipt
   FROM (SELECT unnest(['*/*', 'application/*', 'application/vnd.apache.arrow.stream;q=0.5']) AS accept)
 );

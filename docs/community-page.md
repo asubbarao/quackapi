@@ -306,8 +306,8 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `quackapi_post(url, body[, ct[, headers]], timeout_ms := …)` | scalar/table | Pooled outbound POST; receipt includes exact `body_blob`; `body` is NULL for invalid UTF-8 |
-| `quackapi_selfdispatch(sql)` | scalar/table | Execute local SQL on a fresh connection; same receipt shape |
+| `quackapi_post(url, body[, ct[, headers]], response_format := 'raw', timeout_ms := …)` | scalar/table | Pooled outbound POST; exact `body_blob`; `body` is NULL for invalid UTF-8. `arrow`/`parquet` decode native `rows` and `columns`; raw/default leaves those fields NULL |
+| `quackapi_selfdispatch(sql)` | scalar/table | Execute local SQL on a fresh connection; native `rows` and `columns` are captured before JSON serialization |
 | `quackapi_http_pool()` | table | Outbound pool per origin: `host, idle, dialed, reused` |
 | `quackapi_request(method, path [, body], …)` | table | In-process request → status, BLOB body, content type, headers |
 | `quackapi_middlewares()` | table | Inspect SQL middleware definitions |

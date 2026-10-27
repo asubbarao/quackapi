@@ -97,14 +97,24 @@ void ApplyResponseAccept(unordered_map<string, string> &headers, ResponseFormat 
 		return;
 	}
 	const auto expected = ExpectedResponseType(format);
-	for (auto &header : headers) {
+	string accept;
+	bool has_accept = false;
+	for (const auto &header : headers) {
 		if (StringUtil::Lower(header.first) == "accept") {
-			if (!AcceptsResponseType(header.second, expected)) {
-				throw InvalidInputException("response_format conflicts with the supplied Accept header");
-			}
-			header.second = expected;
-			return;
+			if (has_accept)
+				accept += ",";
+			accept += header.second;
+			has_accept = true;
 		}
+	}
+	if (has_accept && !AcceptsResponseType(accept, expected)) {
+		throw InvalidInputException("response_format conflicts with the supplied Accept header");
+	}
+	for (auto it = headers.begin(); it != headers.end();) {
+		if (StringUtil::Lower(it->first) == "accept")
+			it = headers.erase(it);
+		else
+			++it;
 	}
 	headers["Accept"] = expected;
 }

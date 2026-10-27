@@ -1711,7 +1711,7 @@ string SerializeRowsCsv(const vector<string> &names, const vector<idx_t> &data_c
 	return body;
 }
 
-//! Create the typed staging table used by the Parquet and Arrow writers.
+//! Create the typed staging table used by the native Parquet writer.
 void CreateTempTableForSerdes(Connection &con, const string &table, const vector<string> &names,
                               const vector<LogicalType> &types, const vector<idx_t> &data_cols, const char *label) {
 	string create_sql = "CREATE TEMP TABLE " + table + " (";
@@ -1743,7 +1743,7 @@ void FillTempTableForSerdes(Connection &con, const string &table, const vector<s
 	con.Append(*table_info, chunks);
 }
 
-//! OS temp dir + basename for parquet/arrow scratch files. Never hardcode /tmp
+//! OS temp dir + basename for Parquet scratch files. Never hardcode /tmp
 //! (Windows CI has no /tmp). Paths use forward slashes for SQL COPY literals.
 string SerdesTempFilePath(FileSystem &fs, const string &filename) {
 	string dir;

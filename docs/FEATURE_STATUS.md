@@ -183,7 +183,9 @@ These are **not** counted against the 100% harness score; they are product/roadm
 | **Signed cookie sessions + CSRF** | not built | `/tmp/quackapi_spec_sessions/SPEC.md` |
 | **Middleware BEFORE/AFTER SQL** | **shipped** — `CREATE MIDDLEWARE` around ordinary routes and `quackapi_request` | `docs/MIDDLEWARE.md`, middleware tests |
 | **Response gzip/zstd** | **shipped** — Accept-Encoding negotiate; `compression` serve knobs | `quackapi_server.cpp` MaybeCompress |
-| **FORMAT / Accept** | **shipped** json/ndjson/csv/**parquet**/**arrow** (IPC stream via community nanoarrow) | format tests; Accept stream/file |
+| **FORMAT / Accept** | **implemented** json/ndjson/csv/**parquet**/**arrow**; Arrow uses vendored nanoarrow IPC encoding, Parquet uses native DuckDB 2.0 submitted COPY | format tests; Accept stream/file |
+| **Typed SQL receipts** | **implemented** scalar/table `quackapi_post(..., response_format := 'arrow'\|'parquet')` and local `quackapi_selfdispatch`; native `rows LIST<VARIANT>` and `columns LIST<STRUCT(name VARCHAR, type TYPE)>`, including empty schemas | `quackapi_post_typed_rows.test`, `quackapi_selfdispatch_typed_rows.test` |
+| **VARIANT request inputs** | **implemented** JSON value kinds, native defaults, mixed typed BODY TYPE fields, nullability and OpenAPI alternatives | `quackapi_variant.test` |
 | **GraphQL thin v0** | **shipped** — dual surface (REST + GQL → SQL); allowlist + **`CREATE GRAPHQL ROUTE`** | `quackapi_graphql.cpp`, `graphql-v0.md` |
 | **In-process TestClient** `quackapi_request` | **shipped** — `quackapi_request(method, path [, body])` → status/body/content_type (no TCP) | `test/sql/quackapi_request.test` |
 | **Rate limit (HTTP)** | **shipped** — `RATE LIMIT n PER s [BY ip\|token]` → 429 | `rate_limit.test.sh` |
@@ -284,7 +286,7 @@ now shipped, while the remaining rows are partial or not built.
 | 12 | `spec_rate_limit` | RATE LIMIT + 429 + Retry-After | **S** | THIN-GLUE + in-process counters | **Yes** — `RATE LIMIT … BY ip\|token\|key` |
 | 13 | `spec_request_id` | X-Request-ID + `$request_id` + access_log table | **S** | THIN-GLUE + core uuid/table | **Yes** — stderr and table-backed access logs |
 | 14 | `spec_route_groups` | APIRouter-style prefix/tags/default auth | **S** | THIN-GLUE DDL expand | **Yes** — `CREATE GROUP` / `CREATE API GROUP` |
-| 15 | `spec_serdes` | `FORMAT` JSON/NDJSON/CSV/Parquet/Arrow + Accept | **M** (S for JSON/NDJSON/CSV) | CORE writers + **HAVE-EXT(`nanoarrow`)** | **Yes** — explicit formats and default Accept negotiation |
+| 15 | `spec_serdes` | `FORMAT` JSON/NDJSON/CSV/Parquet/Arrow + Accept | **M** (S for JSON/NDJSON/CSV) | Native DuckDB conversion/COPY + vendored nanoarrow IPC | **Yes** — explicit formats and default Accept negotiation |
 | 16 | `spec_sessions` | Signed cookie sessions + CSRF | **M** | THIN-GLUE C++ cookie HMAC + table | **No** |
 | 17 | `spec_static_files` | `static_prefix` + file/blob download + disposition | **S** | THIN-GLUE; httplib mount/ranges exist | **Partial** — `static_dir` only |
 | 18 | `spec_streaming` | Chunked NDJSON/SSE + cancel on disconnect | **M** | THIN-GLUE ContentProvider + Interrupt | **Partial** — **`CREATE STREAM` SSE**; full NDJSON STREAM clause / cancel polish open |

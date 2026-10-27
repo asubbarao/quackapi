@@ -43,15 +43,17 @@ community json_schema extension is used only when that clause is declared.
 | Several missing or invalid handler parameters | One 422 containing every independent field error; locations retain body, path, query, header, or cookie. |
 | Nested BODY SCHEMA failure | A validator JSON Pointer such as /items/0/qty becomes ["body","items",0,"qty"]. |
 | Field absent | PARAM ... DEFAULT ... applies its declared default; DEFAULT NULL binds SQL NULL. |
-| Explicit JSON null | Distinct from a missing member and from the string "null". It binds SQL NULL only when a BODY SCHEMA accepts null or the parameter declares DEFAULT NULL. |
+| Explicit JSON null | Distinct from a missing member and from the string "null". It binds SQL NULL when a BODY SCHEMA accepts null, the parameter declares DEFAULT NULL, or the parameter is an unconstrained VARIANT. |
 | JSON string "null" | Remains a string and is type-checked normally. |
 | Query/path integers | Reject decimal and scientific spellings that DuckDB would otherwise round; constraints run after a successful native cast. |
 
 Declare `PARAM value VARIANT` when a request field accepts arbitrary JSON. For a
 JSON body field, QuackAPI binds the JSON token as a native DuckDB `VARIANT`,
 preserving object, list, scalar, and nested-null shapes; a JSON string such as
-`"123"` stays distinct from the number `123`. A top-level explicit null still
-follows the explicit-null rule above. Query, path, header, cookie, and form
+`"123"` stays distinct from the number `123`. An unconstrained VARIANT accepts
+explicit null; a missing required field still fails validation. Constrained
+VARIANT parameters accept null only through DEFAULT NULL or an accepting BODY
+SCHEMA. Query, path, header, cookie, and form
 values arrive as text, so a `VARIANT` parameter at those locations contains a
 VARIANT string: a query value such as `[1]` is not parsed as a JSON array.
 `PARAM ... DEFAULT` literals keep their declared SQL literal type for VARIANT
@@ -66,6 +68,10 @@ native declaration remains in x-duckdb-json-transform. When both clauses are
 present, OpenAPI intersects the JSON Schema and the generated native shape.
 OpenAPI uses `{}` for a `VARIANT` JSON value, meaning any JSON shape; a
 VARIANT parameter on a text wire location is documented as a string.
+Numeric constraints require a JSON number and length constraints require a
+string. OpenAPI describes these body alternatives and keeps declared BODY
+SCHEMA/BODY TYPE restrictions through `allOf`. Nullable VARIANT defaults use
+OpenAPI 3.1's JSON Schema null alternative.
 
 ## Deliberate boundaries
 

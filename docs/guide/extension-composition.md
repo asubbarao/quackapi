@@ -100,6 +100,37 @@ FROM quackapi_post('https://api.example.com/jobs', '{"run":true}',
 `quackapi_http_timeout_ms` for that call. The caller's query deadline or a
 served route's `query_timeout_ms` remains an outer cap and wins if shorter.
 
+### Typed Arrow and Parquet replies
+
+Select a typed response directly on `quackapi_post` instead of reparsing JSON or
+passing a curl pipe to a reader. Both scalar and table forms decode the returned
+binary bytes natively:
+
+```sql
+-- Assumes an exec route at /sql on the selected QuackAPI service.
+SELECT receipt.rows[1].amount AS amount, receipt.columns
+FROM (
+  SELECT quackapi_post('http://127.0.0.1:8000/sql',
+                      '{"sql":"SELECT 12345678901234567890.1234::DECIMAL(24,4) AS amount"}',
+                      response_format := 'arrow') AS receipt
+);
+```
+
+Use `response_format := 'parquet'` for a Parquet reply. `rows` is a
+`LIST<VARIANT>` whose values retain native type tags; `columns` is a
+`LIST<STRUCT(name VARCHAR, type TYPE)>` and retains schema even for empty or
+all-null results. The raw bytes remain in `body_blob`. Raw/default responses
+and failed decoding leave the typed fields NULL; decode errors are recorded in
+`error` while preserving the original status and bytes.
+
+When the SQL targets the same database, `quackapi_selfdispatch(sql)` produces
+these native fields directly before JSON serialization, using a fresh local
+connection and the caller's privileges. It does not apply route authentication
+or middleware. JSON text in `body` remains available for callers that need it.
+See [request budgets](../RESOURCE_LIMITS.md) for buffering and temporary-storage
+limits and the [function reference](../reference/functions.md#outbound-post-and-local-execution)
+for receipt and timeout details.
+
 ### POST / partner call via community `http_client`
 
 When you need explicit POST + headers (not just GET of a URL):
