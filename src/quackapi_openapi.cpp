@@ -398,7 +398,10 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 					AppendOasProperty(schema, "maxLength", std::to_string(spec->max_length));
 			}
 			if (spec->has_default) {
-				if (spec->default_is_null)
+				if (spec->default_is_null && !text_wire && ptype.id() == LogicalTypeId::VARIANT) {
+					// OpenAPI 3.1 uses JSON Schema null, not the 3.0 nullable keyword.
+					schema = "{\"anyOf\":[" + schema + "},{\"type\":\"null\"}]";
+				} else if (spec->default_is_null)
 					AppendOasProperty(schema, "nullable", "true");
 				if (ptype.id() == LogicalTypeId::VARIANT) {
 					auto value = VariantDefaultJson(*spec);

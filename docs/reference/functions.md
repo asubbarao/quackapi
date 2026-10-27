@@ -377,8 +377,10 @@ decoding is requested, and is then a `LIST<VARIANT>` that preserves DuckDB types
 Successful empty results retain their schema in `columns` and have an empty
 `rows` list. The default
 format is `raw`; `arrow` decodes Arrow IPC streams and `parquet` decodes Parquet
-responses. These modes set the matching `Accept` header unless the caller supplies
-one, and reject an incompatible `Accept` value. They decode only successful
+responses. These modes set the matching `Accept` header. A supplied header must
+allow that media type with positive quality, respecting more specific refusals;
+compatible wildcard or weighted headers are narrowed to the selected format.
+They decode only successful
 responses with the matching `Content-Type`; a decode failure is recorded in
 `error` while the original status and `body_blob` remain available. The body and
 native serialized `{columns, rows}` result are each limited by

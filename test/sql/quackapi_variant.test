@@ -43,6 +43,9 @@ statement ok
 CREATE ROUTE variant_body_default_string POST '/variant-body-default-string' PARAM value VARIANT DEFAULT '123' AS SELECT $value AS value;
 
 statement ok
+CREATE ROUTE variant_null_bound POST '/variant-null-bound' PARAM value VARIANT DEFAULT NULL GE 10 AS SELECT $value AS value;
+
+statement ok
 CREATE ROUTE variant_output GET '/variant-output' AS SELECT '[1]'::JSON::VARIANT AS value;
 
 statement ok
@@ -214,6 +217,19 @@ SELECT json_type(decode(body)::JSON, '$.paths./variant-body-default-number.post.
 FROM quackapi_request('GET', '/openapi.json');
 ----
 UBIGINT	VARCHAR
+
+query TTT
+SELECT json_extract_string(decode(body), '$.paths./variant-null-bound.post.requestBody.content.application/json.schema.properties.value.anyOf[0].type'),
+       json_extract_string(decode(body), '$.paths./variant-null-bound.post.requestBody.content.application/json.schema.properties.value.anyOf[1].type'),
+       json_type(decode(body)::JSON, '$.paths./variant-null-bound.post.requestBody.content.application/json.schema.properties.value.default')
+FROM quackapi_request('GET', '/openapi.json');
+----
+number	null	NULL
+
+query IT
+SELECT status, decode(body) FROM quackapi_request('POST', '/variant-null-bound', '{"value":null}');
+----
+200	[{"value":null}]
 
 # Compare with the engine's own JSON conversion, not VARIANT's display text.
 query TTTT

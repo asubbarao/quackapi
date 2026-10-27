@@ -37,6 +37,9 @@ statement ok
 CREATE ROUTE post_json POST '/post-json' AS SELECT 'plain text' AS text;
 
 statement ok
+CREATE ROUTE post_negotiated POST '/post-negotiated' AS SELECT 1 AS value;
+
+statement ok
 CREATE ROUTE post_expanded_parquet POST '/post-expanded-parquet' FORMAT PARQUET AS
 SELECT repeat('x', 4096) AS value FROM range(1024);
 
@@ -57,18 +60,22 @@ SELECT * FROM quackapi_serve(29322, host := '127.0.0.1', access_log := false);
 ----
 http://127.0.0.1:29322
 
-statement error response_format conflicts
+statement error
 SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
                      map(['Accept'], ['application/vnd.apache.arrow.stream;q=0']), response_format := 'arrow');
+----
+response_format conflicts
 
-statement error response_format conflicts
+statement error
 SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
                      map(['Accept'], ['*/*;q=1, application/vnd.apache.arrow.stream;q=0']), response_format := 'arrow');
+----
+response_format conflicts
 
 query I
 SELECT bool_and(receipt.error IS NULL AND receipt.rows IS NOT NULL)
 FROM (
-  SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', 'application/json',
+  SELECT quackapi_post('http://127.0.0.1:29322/post-negotiated', '', 'application/json',
                       map(['Accept'], [accept]), response_format := 'arrow') AS receipt
   FROM (SELECT unnest(['*/*', 'application/*', 'application/vnd.apache.arrow.stream;q=0.5']) AS accept)
 );
