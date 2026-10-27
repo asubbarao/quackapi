@@ -1,0 +1,136 @@
+# name: test/sql/quackapi_selfdispatch_typed_rows.test
+# description: Native typed result rows in local selfdispatch receipts
+# group: [sql]
+
+require quackapi
+
+query II
+SELECT row.x::INTEGER, row.x_1::INTEGER
+FROM quackapi_selfdispatch('SELECT 1 AS x, 2 AS x')
+CROSS JOIN UNNEST(rows) AS t(row);
+----
+1	2
+
+# A failed input has a NULL row list and does not prevent later SQL inputs from
+# succeeding in the same vectorized scalar call.
+query I
+SELECT list(CASE
+              WHEN input_order = 2 THEN result.status = 422 AND result.rows IS NULL
+              ELSE result.status = 200
+                   AND len(result.rows) = 1
+                   AND result.rows[1].value = input_order * 10
+            END ORDER BY input_order)
+FROM (
+  SELECT input_order, result
+  FROM (VALUES
+    (1, 'SELECT 10 AS value'),
+    (2, 'SELECT * FROM missing_selfdispatch_table'),
+    (3, 'SELECT 30 AS value')
+  ) AS inputs(input_order, sql)
+  CROSS JOIN LATERAL (SELECT quackapi_selfdispatch(sql) AS result)
+);
+----
+[true, true, true]
+
+query I
+SELECT success.rows IS NOT NULL
+       AND len(success.rows) = 0
+       AND failed.rows IS NULL
+       AND success.columns IS NOT NULL
+       AND len(success.columns) = 1
+       AND success.columns[1].name = 'value'
+       AND success.columns[1].type = get_type(NULL::INTEGER)
+FROM (
+  SELECT quackapi_selfdispatch('SELECT 1 AS value WHERE false') AS success,
+         quackapi_selfdispatch('SELECT * FROM missing_selfdispatch_table') AS failed
+);
+----
+true
+
+# Empty and all-NULL results retain their native schema types.
+query I
+SELECT len(empty.rows) = 0
+       AND empty.columns[1].name = 'i'
+       AND empty.columns[1].type = get_type(NULL::INTEGER)
+       AND empty.columns[2].name = 'd'
+       AND empty.columns[2].type = get_type(NULL::DECIMAL(5,2))
+       AND nulls.rows[1].i IS NULL
+       AND nulls.rows[1].d IS NULL
+       AND nulls.columns[1].type = get_type(NULL::INTEGER)
+       AND nulls.columns[2].type = get_type(NULL::DECIMAL(8,2))
+FROM (
+  SELECT quackapi_selfdispatch('SELECT 1::INTEGER AS i, 1.25::DECIMAL(5,2) AS d WHERE false') AS empty,
+         quackapi_selfdispatch('SELECT NULL::INTEGER AS i, NULL::DECIMAL(8,2) AS d') AS nulls
+);
+----
+true
+
+# Schema names use the same native duplicate-name normalization as row fields.
+query I
+SELECT receipt.columns[1].name = 'x'
+       AND receipt.columns[2].name = 'x_1'
+       AND variant_typeof(receipt.rows[1]) = 'OBJECT(x, x_1)'
+       AND receipt.rows[1].x = 1
+       AND receipt.rows[1].x_1 = 2
+FROM (SELECT quackapi_selfdispatch('SELECT 1 AS x, 2 AS x') AS receipt);
+----
+true
+
+query I
+SELECT quackapi_selfdispatch(NULL::VARCHAR) IS NULL;
+----
+true
+
+query I
+SELECT variant_typeof(first.rows[1]) = 'OBJECT(first_value)'
+       AND first.rows[1].first_value = 1
+       AND variant_typeof(second.rows[1]) = 'OBJECT(second_value)'
+       AND second.rows[1].second_value = 'two'
+FROM (
+  SELECT quackapi_selfdispatch('SELECT 1 AS first_value') AS first,
+         quackapi_selfdispatch('SELECT ''two'' AS second_value') AS second
+);
+----
+true
+
+# Values are captured from DuckDB before JSON serialization. BIGINT and DECIMAL
+# keep their exact values, while nested collections, NULLs and binary data stay
+# typed inside the VARIANT row object.
+query I
+SELECT variant_typeof(row) = 'OBJECT(bigint_value, blob_value, decimal_value, nested_value, null_value, ts_value)'
+       AND variant_typeof(row.bigint_value) = 'INT64'
+       AND row.bigint_value = 9007199254740993
+       AND starts_with(variant_typeof(row.decimal_value), 'DECIMAL(')
+       AND row.decimal_value = 12345678901234567890.1234
+       AND variant_typeof(row.ts_value) = 'TIMESTAMP_MICROS_TZ'
+       AND variant_typeof(row.blob_value) = 'BLOB'
+       AND row.blob_value = from_hex('00ff')
+       AND row.nested_value.items[2] IS NULL
+       AND row.null_value IS NULL
+FROM (
+  SELECT unnest(receipt.rows) AS row
+  FROM (
+    SELECT quackapi_selfdispatch($sql$
+      SELECT 9007199254740993::BIGINT AS bigint_value,
+             12345678901234567890.1234::DECIMAL(24, 4) AS decimal_value,
+             TIMESTAMPTZ '2026-10-27 12:00:00+00' AS ts_value,
+             from_hex('00ff') AS blob_value,
+             struct_pack(items := [1, NULL::INTEGER, 3]) AS nested_value,
+             NULL::INTEGER AS null_value
+    $sql$) AS receipt
+  )
+);
+----
+true
+
+# The table form exposes the same typed row list and its elements can be
+# expanded without parsing the JSON body.
+query I
+SELECT status = 200
+       AND len(rows) = 2
+       AND variant_typeof(rows[1]) = 'OBJECT(value)'
+       AND rows[1].value = 1
+       AND rows[2].value = 2
+FROM quackapi_selfdispatch('SELECT unnest([1, 2]) AS value');
+----
+true

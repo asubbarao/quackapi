@@ -365,13 +365,28 @@ SELECT id, payload, status FROM quackapi_jobs WHERE status = 'done';
 
 ## Outbound POST and local execution
 
-### `quackapi_post(url, body[, content_type[, headers]], timeout_ms := …)`
+### `quackapi_post(url, body[, content_type[, headers]], response_format := 'raw', timeout_ms := …)`
 
 Both scalar and table forms return `status, reason, body, headers, error,
-reused_connection, body_blob`. `body_blob` preserves exact bytes; `body` is NULL
-for invalid UTF-8. Default content type is `application/json`. The keyword-only
-positive `timeout_ms` overrides `quackapi_http_timeout_ms` for one call without
-extending the enclosing query deadline. NULL input produces a NULL scalar receipt.
+reused_connection, body_blob, columns, rows`. `body_blob` preserves exact bytes;
+`body` is NULL for invalid UTF-8. `columns` is NULL unless `response_format`
+requests native decoding, and is then a `LIST<STRUCT(name VARCHAR, type TYPE)>`
+with DuckDB's native logical types (for example, display a type as text with
+`columns[1].type::VARCHAR`). `rows` is likewise NULL unless native
+decoding is requested, and is then a `LIST<VARIANT>` that preserves DuckDB types.
+Successful empty results retain their schema in `columns` and have an empty
+`rows` list. The default
+format is `raw`; `arrow` decodes Arrow IPC streams and `parquet` decodes Parquet
+responses. These modes set the matching `Accept` header unless the caller supplies
+one, and reject an incompatible `Accept` value. They decode only successful
+responses with the matching `Content-Type`; a decode failure is recorded in
+`error` while the original status and `body_blob` remain available. The body and
+native serialized `{columns, rows}` result are each limited by
+`quackapi_max_response_bytes`. Parquet
+decoding uses a uniquely named DuckDB temporary file because the native reader
+accepts paths; it is removed after each decode. The keyword-only positive
+`timeout_ms` overrides `quackapi_http_timeout_ms` for one call without extending
+the enclosing query deadline. NULL input produces a NULL scalar receipt.
 
 ```sql
 SELECT status, body_blob
@@ -384,16 +399,19 @@ FROM quackapi_post('https://api.example.com/jobs', '{"run":true}',
 Reports `host, idle, dialed, reused` per origin. Retention is bounded to 64 idle
 clients per origin, 256 idle clients overall, and 256 origin entries.
 
-### `quackapi_exec(sql)`
+### `quackapi_selfdispatch(sql)`
 
-Scalar/table execution of a SQL batch on a fresh local connection, with the
-same receipt fields as POST. Statements run in order and the final result
+Scalar/table execution of a SQL batch on a fresh local connection, returning
+`status, reason, body, headers, error, reused_connection, body_blob, columns, rows`.
+`columns` is `LIST<STRUCT(name VARCHAR, type TYPE)>` and retains native names and
+logical types for successful results, including
+empty results; `rows` contains native `VARIANT` row objects. Statements run in order and the final result
 answers. Errors stop the batch; earlier statements are not automatically rolled
 back. Policy-bound databases fail closed with 403. Caller deadlines and response
 budgets propagate into nested execution; NULL scalar input produces NULL.
 
 This runs with the SQL caller's privileges and does not apply route auth,
-middleware, rate limits, or access logging. See the [README](../../README.md#quackapi_execsql-the-exec-route-without-http)
+middleware, rate limits, or access logging. See the [README](../../README.md#quackapi_selfdispatchsql-the-exec-route-without-http)
 for execution scheduling, visibility and error details.
 
 ---
@@ -436,7 +454,7 @@ not application-facing functions.
 | `SET quackapi_max_response_bytes = N` | Uncompressed response cap; default `16777216` |
 | `SET quackapi_max_request_bytes = N` | Server upload ceiling; default `8388608`, maximum `1073741824`; routes without an explicit override still use 8 MiB |
 | `SET quackapi_max_pending_requests = N` | Pending request cap; default `256` |
-| `SET quackapi_exec_max_threads = N` | Process-wide scalar exec task admission cap (no private worker threads); exhausted admission runs inline; default `256`, `0` always inline |
+| `SET quackapi_selfdispatch_max_threads = N` | Process-wide self-dispatch task admission cap (no private worker threads); exhausted admission runs inline; default `256`, `0` always inline |
 | `SET quackapi_graphql_allow_all = true\|false` | Legacy global GraphQL open mode; default `false` |
 
 ```sql

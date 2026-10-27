@@ -46,7 +46,7 @@ bool IsParamTypeName(const string &tok) {
 	return u == "INTEGER" || u == "INT" || u == "BIGINT" || u == "SMALLINT" || u == "TINYINT" || u == "HUGEINT" ||
 	       u == "UBIGINT" || u == "UINTEGER" || u == "USMALLINT" || u == "UTINYINT" || u == "DOUBLE" || u == "FLOAT" ||
 	       u == "REAL" || u == "DECIMAL" || u == "NUMERIC" || u == "VARCHAR" || u == "TEXT" || u == "STRING" ||
-	       u == "BOOLEAN" || u == "BOOL";
+	       u == "BOOLEAN" || u == "BOOL" || u == "VARIANT";
 }
 
 Value ParseNumericParamBound(const string &literal_text) {
@@ -137,7 +137,8 @@ const LogicalType &ParamSpecType() {
 	                                              {"min_length", LogicalType::UBIGINT},
 	                                              {"max_length", LogicalType::UBIGINT},
 	                                              {"source", LogicalType::UTINYINT},
-	                                              {"external_name", LogicalType::VARCHAR}});
+	                                              {"external_name", LogicalType::VARCHAR},
+	                                              {"default_variant", LogicalType::VARIANT()}});
 	return type;
 }
 
@@ -145,17 +146,19 @@ Value ParamSpecsValue(const vector<QuackapiParamSpec> &specs) {
 	vector<Value> entries;
 	entries.reserve(specs.size());
 	for (const auto &spec : specs) {
-		entries.push_back(
-		    Value::STRUCT(ParamSpecType(),
-		                  {Value(spec.name), Value(spec.type_name), Value::BOOLEAN(spec.has_default),
-		                   spec.default_is_null ? Value(LogicalType::VARCHAR) : Value(spec.default_raw),
-		                   spec.has_ge ? spec.ge.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
-		                   spec.has_gt ? spec.gt.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
-		                   spec.has_le ? spec.le.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
-		                   spec.has_lt ? spec.lt.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
-		                   spec.has_min_length ? Value::UBIGINT(spec.min_length) : Value(LogicalType::UBIGINT),
-		                   spec.has_max_length ? Value::UBIGINT(spec.max_length) : Value(LogicalType::UBIGINT),
-		                   Value::UTINYINT(static_cast<uint8_t>(spec.source)), Value(spec.external_name)}));
+		entries.push_back(Value::STRUCT(
+		    ParamSpecType(),
+		    {Value(spec.name), Value(spec.type_name), Value::BOOLEAN(spec.has_default),
+		     spec.default_is_null ? Value(LogicalType::VARCHAR) : Value(spec.default_raw),
+		     spec.has_ge ? spec.ge.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		     spec.has_gt ? spec.gt.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		     spec.has_le ? spec.le.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		     spec.has_lt ? spec.lt.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		     spec.has_min_length ? Value::UBIGINT(spec.min_length) : Value(LogicalType::UBIGINT),
+		     spec.has_max_length ? Value::UBIGINT(spec.max_length) : Value(LogicalType::UBIGINT),
+		     Value::UTINYINT(static_cast<uint8_t>(spec.source)), Value(spec.external_name),
+		     spec.has_default && !spec.default_is_null ? spec.default_variant.DefaultCastAs(LogicalType::VARIANT())
+		                                               : Value(LogicalType::VARIANT())}));
 	}
 	return Value::LIST(ParamSpecType(), std::move(entries));
 }
@@ -184,6 +187,7 @@ vector<QuackapiParamSpec> ParamSpecsFromValue(const Value &value) {
 		spec.max_length = spec.has_max_length ? fields[9].GetValue<uint64_t>() : 0;
 		spec.source = static_cast<QuackapiParamSource>(fields[10].GetValue<uint8_t>());
 		spec.external_name = fields[11].GetValue<string>();
+		spec.default_variant = fields[12].IsNull() ? Value() : VariantValue::GetValue(fields[12]);
 		specs.push_back(std::move(spec));
 	}
 	return specs;
@@ -903,6 +907,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					auto parser = Parser::GetBuiltinParser();
 					auto expression = parser.ParseSingleExpression(after_key.substr(0, end));
 					spec.default_raw = expression->Cast<ConstantExpression>().GetLiteral().text;
+					spec.default_variant = expression->Cast<ConstantExpression>().GetLiteral().ToValue();
 					spec.default_is_null = false;
 					rest = QuackapiTrim(after_key.substr(end));
 				} else {
@@ -915,6 +920,15 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					} else {
 						spec.default_is_null = false;
 						spec.default_raw = lit;
+						auto parser = Parser::GetBuiltinParser();
+						auto expression = parser.ParseSingleExpression(lit);
+						if (expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
+							spec.default_variant = expression->Cast<ConstantExpression>().GetLiteral().ToValue();
+						} else {
+							// Existing PARAM defaults also allow bare text; preserve
+							// that as a string when it is not a SQL constant literal.
+							spec.default_variant = Value(lit);
+						}
 					}
 				}
 				continue;

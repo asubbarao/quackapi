@@ -63,12 +63,12 @@ SELECT status, body FROM quackapi_post('http://127.0.0.1:29325/async', '{"n":42}
 # With no background CPU worker, a submitted query advances a task at a time
 # on the async scheduler and resumes the source only when its receipt is ready.
 query II
-SELECT status, body FROM quackapi_exec('SELECT 1 AS first; SELECT sum(range) AS total FROM range(1000000)');
+SELECT status, body FROM quackapi_selfdispatch('SELECT 1 AS first; SELECT sum(range) AS total FROM range(1000000)');
 ----
 200	[{"total":499999500000}]
 
 query II
-SELECT status, body FROM quackapi_exec('SELECT nextval(''async_hits'') AS hit');
+SELECT status, body FROM quackapi_selfdispatch('SELECT nextval(''async_hits'') AS hit');
 ----
 200	[{"hit":7}]
 
@@ -80,7 +80,7 @@ SELECT currval('async_hits');
 # Prepared plans retain immutable arguments; execution state belongs to each
 # pipeline, so the second execution cannot reuse an exhausted receipt.
 statement ok
-PREPARE async_prepared AS SELECT status, body FROM quackapi_exec('SELECT 42 AS answer');
+PREPARE async_prepared AS SELECT status, body FROM quackapi_selfdispatch('SELECT 42 AS answer');
 
 query II
 EXECUTE async_prepared;
@@ -105,7 +105,7 @@ statement ok
 SET async_threads = 0;
 
 query II
-SELECT status, body FROM quackapi_exec('SELECT 42 AS answer');
+SELECT status, body FROM quackapi_selfdispatch('SELECT 42 AS answer');
 ----
 200	[{"answer":42}]
 
@@ -114,7 +114,7 @@ statement ok
 SET quackapi_max_response_bytes = 1;
 
 query I
-SELECT status FROM quackapi_exec('SET search_path = ''main''');
+SELECT status FROM quackapi_selfdispatch('SET search_path = ''main''');
 ----
 507
 
@@ -128,7 +128,7 @@ statement ok
 SET quackapi_query_timeout_ms = 50;
 
 query I
-SELECT status FROM quackapi_exec('SELECT sum(range) FROM range(100000000000)');
+SELECT status FROM quackapi_selfdispatch('SELECT sum(range) FROM range(100000000000)');
 ----
 504
 

@@ -27,4 +27,15 @@ string QuackapiValidationBodyPointerLoc(const string &pointer, const string &jso
 //! truth; this only projects its native STRUCT/LIST/scalar shape for clients.
 string QuackapiDuckdbTransformToOpenApi(const string &body_type);
 
+//! True when a DuckDB json_transform declaration contains a VARIANT leaf.
+bool QuackapiDuckdbTransformHasVariant(const string &body_type);
+
+//! Replace VARIANT leaves in a json_transform declaration with JSON so the
+//! native JSON transformer can preserve other declared types such as DECIMAL.
+bool QuackapiDuckdbTransformVariantLeavesAsJson(const string &body_type, string &normalized_body_type);
+
+//! Restore only declaration-marked VARIANT leaves in an intermediate type.
+bool QuackapiDuckdbTransformRestoreVariantLeaves(const LogicalType &intermediate_type, const string &body_type,
+                                                 LogicalType &result_type);
+
 } // namespace duckdb

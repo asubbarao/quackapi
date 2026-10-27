@@ -112,18 +112,28 @@ Query.Farm on DuckDB 2.0; see [request bodies](guide/request-bodies.md) for setu
 |---------------|-----------|
 | Multiple columns / ordinary names | `application/json` — **array of row objects** |
 | `FORMAT ARROW` / Arrow Accept | Arrow IPC stream; BLOB columns are Arrow byte arrays |
+| `FORMAT PARQUET` / Parquet Accept | Complete native Parquet file, `application/vnd.apache.parquet` |
 | `FORMAT binary` | Exact BLOB body from one row, with optional `content_type` |
 | Single column `html` | `text/html; charset=utf-8` |
 | Single column `text` | `text/plain; charset=utf-8` |
 | Column `location` | sets `Location` (pair with `STATUS 3xx`) |
 | Column `set_cookie` / `set-cookie` | sets `Set-Cookie` (stripped from JSON) |
 
-JSON types follow DuckDB column types, including native `VARIANT` objects,
-lists, scalars and nulls. JSON rows are encoded once as chunks are fetched;
-Arrow converts native chunk vectors without rebuilding each row. Both formats
+JSON preserves `VARIANT` objects, lists, scalars and nulls as JSON values, but
+does not retain DuckDB's full type information. Arrow and Parquet carry native
+schema information. JSON rows are encoded once as chunks are fetched; Arrow
+converts native chunk vectors without rebuilding each row. Parquet uses native
+chunk append and DuckDB 2.0 query submission/completion for `COPY`. These formats
 buffer the complete HTTP body and enforce the configured response cap. See
 [request budgets](RESOURCE_LIMITS.md) and the
 [large-response benchmark](../bench/large_response.sql).
+
+SQL callers use `quackapi_post(..., response_format := 'arrow'|'parquet')` to
+decode a binary response directly into `rows LIST<VARIANT>` and
+`columns LIST<STRUCT(name VARCHAR, type TYPE)>`. No curl pipe or JSON round trip
+is needed. `quackapi_selfdispatch(sql)` produces the same native fields directly
+from a fresh connection to the current database. Empty results retain their
+column types. The raw HTTP bytes remain available as `body_blob`.
 
 ### Error shapes (verified)
 
@@ -297,7 +307,7 @@ related modules). Auto-detection on the community site will list overloads after
 | Name | Kind | Purpose |
 |------|------|---------|
 | `quackapi_post(url, body[, ct[, headers]], timeout_ms := …)` | scalar/table | Pooled outbound POST; receipt includes exact `body_blob`; `body` is NULL for invalid UTF-8 |
-| `quackapi_exec(sql)` | scalar/table | Execute local SQL on a fresh connection; same receipt shape |
+| `quackapi_selfdispatch(sql)` | scalar/table | Execute local SQL on a fresh connection; same receipt shape |
 | `quackapi_http_pool()` | table | Outbound pool per origin: `host, idle, dialed, reused` |
 | `quackapi_request(method, path [, body], …)` | table | In-process request → status, BLOB body, content type, headers |
 | `quackapi_middlewares()` | table | Inspect SQL middleware definitions |

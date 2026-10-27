@@ -35,7 +35,7 @@ These observations mean that
 switching to it requires attention to side effects, credentials and security.
 The `quackapi_post` function remains while these gaps are unresolved.
 `quackapi_fetch` has been removed; use native readers for files and
-`http_request` for HTTP response metadata; `quackapi_exec` remains an independent in-process
+`http_request` for HTTP response metadata; `quackapi_selfdispatch` remains an independent in-process
 SQL execution function.
 
 A local DuckDB 2.0.0 probe with eight distinct URLs, a 200 ms server delay,

@@ -47,6 +47,16 @@ community json_schema extension is used only when that clause is declared.
 | JSON string "null" | Remains a string and is type-checked normally. |
 | Query/path integers | Reject decimal and scientific spellings that DuckDB would otherwise round; constraints run after a successful native cast. |
 
+Declare `PARAM value VARIANT` when a request field accepts arbitrary JSON. For a
+JSON body field, QuackAPI binds the JSON token as a native DuckDB `VARIANT`,
+preserving object, list, scalar, and nested-null shapes; a JSON string such as
+`"123"` stays distinct from the number `123`. A top-level explicit null still
+follows the explicit-null rule above. Query, path, header, cookie, and form
+values arrive as text, so a `VARIANT` parameter at those locations contains a
+VARIANT string: a query value such as `[1]` is not parsed as a JSON array.
+`PARAM ... DEFAULT` literals keep their declared SQL literal type for VARIANT
+defaults.
+
 ## OpenAPI
 
 /openapi.json publishes BODY SCHEMA directly as the operation requestBody. A
@@ -54,6 +64,8 @@ BODY TYPE-only route recursively projects its declared STRUCT fields, LIST
 items, and scalar formats into OpenAPI properties, items, and types. The exact
 native declaration remains in x-duckdb-json-transform. When both clauses are
 present, OpenAPI intersects the JSON Schema and the generated native shape.
+OpenAPI uses `{}` for a `VARIANT` JSON value, meaning any JSON shape; a
+VARIANT parameter on a text wire location is documented as a string.
 
 ## Deliberate boundaries
 

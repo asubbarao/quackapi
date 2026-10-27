@@ -14,6 +14,7 @@ set(NANOARROW_SOURCES
     third_party/nanoarrow/src/nanoarrow/ipc/codecs.c
     third_party/nanoarrow/src/nanoarrow/ipc/decoder.c
     third_party/nanoarrow/src/nanoarrow/ipc/encoder.c
+    third_party/nanoarrow/src/nanoarrow/ipc/reader.c
     third_party/nanoarrow/thirdparty/flatcc/src/runtime/builder.c
     third_party/nanoarrow/thirdparty/flatcc/src/runtime/emitter.c
     third_party/nanoarrow/thirdparty/flatcc/src/runtime/refmap.c

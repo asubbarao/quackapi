@@ -1,0 +1,203 @@
+# name: test/sql/quackapi_post_typed_rows.test
+# description: Explicit Arrow and Parquet post responses decode to native typed receipt rows
+# group: [sql]
+
+require quackapi
+
+require parquet
+
+statement ok
+CREATE VIEW post_native_variant AS
+SELECT struct_pack(on_date := DATE '2024-05-06', bytes := from_hex('00ff'),
+                   amount := 12345678901234567890.1234::DECIMAL(24,4))::VARIANT AS value;
+
+statement ok
+CREATE ROUTE native_variant_arrow POST '/native-variant-arrow' FORMAT ARROW AS SELECT * FROM post_native_variant;
+
+statement ok
+CREATE ROUTE native_variant_parquet POST '/native-variant-parquet' FORMAT PARQUET AS SELECT * FROM post_native_variant;
+
+statement ok
+CREATE ROUTE post_arrow POST '/post-arrow' FORMAT ARROW AS
+SELECT 9007199254740993::BIGINT AS big_value,
+       12345678901234567890.1234::DECIMAL(24, 4) AS decimal_value,
+       TIMESTAMPTZ '2024-05-06 07:08:09.123456+00' AS ts_value,
+       [1, 2, NULL]::INTEGER[] AS list_value,
+       NULL::VARCHAR AS null_value;
+
+statement ok
+CREATE ROUTE post_parquet POST '/post-parquet' FORMAT PARQUET AS
+SELECT 9007199254740993::BIGINT AS big_value,
+       12345678901234567890.1234::DECIMAL(24, 4) AS decimal_value,
+       TIMESTAMPTZ '2024-05-06 07:08:09.123456+00' AS ts_value,
+       [1, 2, NULL]::INTEGER[] AS list_value,
+       NULL::VARCHAR AS null_value;
+
+statement ok
+CREATE ROUTE post_json POST '/post-json' AS SELECT 'plain text' AS text;
+
+statement ok
+CREATE ROUTE post_expanded_parquet POST '/post-expanded-parquet' FORMAT PARQUET AS
+SELECT repeat('x', 4096) AS value FROM range(1024);
+
+statement ok
+CREATE ROUTE nested_typed_post GET '/nested-typed-post' AS
+SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', response_format := 'arrow').rows IS NOT NULL AS typed;
+
+statement ok
+CREATE ROUTE post_empty_arrow POST '/post-empty-arrow' FORMAT ARROW AS
+SELECT 1::INTEGER AS empty_i, 1.25::DECIMAL(6, 2) AS empty_d WHERE false;
+
+statement ok
+CREATE ROUTE post_empty_parquet POST '/post-empty-parquet' FORMAT PARQUET AS
+SELECT 1::INTEGER AS empty_i, 1.25::DECIMAL(6, 2) AS empty_d WHERE false;
+
+query I
+SELECT * FROM quackapi_serve(29322, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29322
+
+# Native VARIANT leaves retain types that JSON cannot represent.
+query I
+SELECT bool_and(receipt.error IS NULL AND receipt.status = 200
+       AND receipt.columns[1].type = get_type(NULL::VARIANT)
+       AND variant_typeof(receipt.rows[1].value.on_date) = 'DATE'
+       AND variant_typeof(receipt.rows[1].value.bytes) = 'BLOB'
+       AND receipt.rows[1].value.bytes::BLOB = from_hex('00ff')
+       AND receipt.rows[1].value.amount = 12345678901234567890.1234::DECIMAL(24,4))
+FROM (
+  SELECT quackapi_post('http://127.0.0.1:29322/native-variant-' || format, '', response_format := format) AS receipt
+  FROM (SELECT unnest(['arrow', 'parquet']) AS format)
+);
+----
+true
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29322/post-arrow', '', response_format := 'arrow')).status;
+----
+200
+
+query I
+SELECT r.rows IS NOT NULL AND len(r.rows) = 1
+       AND variant_typeof(r.rows[1].big_value) = 'INT64'
+       AND r.rows[1].big_value = 9007199254740993
+       AND r.rows[1].decimal_value = 12345678901234567890.1234::DECIMAL(24, 4)
+       AND variant_typeof(r.rows[1].ts_value) = 'TIMESTAMP_MICROS_TZ'
+       AND r.rows[1].list_value[1] = 1
+       AND r.rows[1].list_value[3] IS NULL
+       AND r.rows[1].null_value IS NULL
+       AND octet_length(r.body_blob) > 0
+       AND starts_with(r.headers['Content-Type'], 'application/vnd.apache.arrow.stream')
+FROM (SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '', response_format := 'arrow') AS r);
+----
+true
+
+# Empty binary responses still preserve their imported native schema.
+query I
+SELECT arrow.status = 200
+       AND arrow.rows IS NOT NULL AND len(arrow.rows) = 0
+       AND arrow.columns[1].name = 'empty_i' AND arrow.columns[1].type = get_type(NULL::INTEGER)
+       AND arrow.columns[2].name = 'empty_d' AND arrow.columns[2].type = get_type(NULL::DECIMAL(6,2))
+       AND parquet.status = 200
+       AND parquet.rows IS NOT NULL AND len(parquet.rows) = 0
+       AND parquet.columns[1].name = 'empty_i' AND parquet.columns[1].type = get_type(NULL::INTEGER)
+       AND parquet.columns[2].name = 'empty_d' AND parquet.columns[2].type = get_type(NULL::DECIMAL(6,2))
+FROM (
+  SELECT quackapi_post('http://127.0.0.1:29322/post-empty-arrow', '', response_format := 'arrow') AS arrow,
+         quackapi_post('http://127.0.0.1:29322/post-empty-parquet', '', response_format := 'parquet') AS parquet
+);
+----
+true
+
+query I
+SELECT status = 200 AND rows IS NOT NULL AND len(rows) = 1
+       AND variant_typeof(rows[1].big_value) = 'INT64'
+       AND rows[1].big_value = 9007199254740993
+       AND rows[1].decimal_value = 12345678901234567890.1234::DECIMAL(24, 4)
+       AND variant_typeof(rows[1].ts_value) = 'TIMESTAMP_MICROS_TZ'
+FROM quackapi_post('http://127.0.0.1:29322/post-arrow', '', response_format := 'arrow');
+----
+true
+
+query I
+SELECT r.rows IS NOT NULL AND len(r.rows) = 1
+       AND r.rows[1].big_value = 9007199254740993
+       AND r.rows[1].decimal_value = 12345678901234567890.1234::DECIMAL(24, 4)
+       AND variant_typeof(r.rows[1].ts_value) = 'TIMESTAMP_MICROS_TZ'
+       AND r.rows[1].list_value[2] = 2
+       AND r.rows[1].null_value IS NULL
+       AND octet_length(r.body_blob) > 0
+       AND starts_with(r.headers['Content-Type'], 'application/vnd.apache.parquet')
+FROM (SELECT quackapi_post('http://127.0.0.1:29322/post-parquet', '', response_format := 'parquet') AS r);
+----
+true
+
+query I
+SELECT status = 200 AND rows IS NOT NULL AND len(rows) = 1
+       AND rows[1].big_value = 9007199254740993
+       AND rows[1].decimal_value = 12345678901234567890.1234::DECIMAL(24, 4)
+       AND variant_typeof(rows[1].ts_value) = 'TIMESTAMP_MICROS_TZ'
+FROM quackapi_post('http://127.0.0.1:29322/post-parquet', '', response_format := 'parquet');
+----
+true
+
+query I
+SELECT r.rows IS NULL AND r.status = 200 AND r.body_blob IS NOT NULL
+FROM (SELECT quackapi_post('http://127.0.0.1:29322/post-arrow', '') AS r);
+----
+true
+
+query I
+SELECT r.status = 200 AND r.rows IS NULL AND r.error IS NOT NULL AND r.body_blob IS NOT NULL
+FROM (SELECT quackapi_post('http://127.0.0.1:29322/post-json', '', response_format := 'arrow') AS r);
+----
+true
+
+statement ok
+SET quackapi_max_response_bytes = 64;
+
+query II
+SELECT status, decode(body)
+FROM quackapi_request('GET', '/nested-typed-post', max_response_bytes := 1048576);
+----
+200	[{"typed":true}]
+
+statement ok
+SET quackapi_max_response_bytes = 65536;
+
+query I
+SELECT status = 200 AND rows IS NULL AND columns IS NULL AND error IS NOT NULL
+       AND octet_length(body_blob) <= 65536
+FROM quackapi_post('http://127.0.0.1:29322/post-expanded-parquet', '', response_format := 'parquet');
+----
+true
+
+query I
+SELECT status = 507 AND rows IS NULL AND columns IS NULL
+FROM quackapi_selfdispatch($sql$SELECT repeat('x', 131072) AS location$sql$);
+----
+true
+
+statement ok
+RESET quackapi_max_response_bytes;
+
+query I
+SELECT status = 200 AND rows IS NULL AND error IS NOT NULL AND body_blob IS NOT NULL
+FROM quackapi_post('http://127.0.0.1:29322/post-json', '', response_format := 'arrow');
+----
+true
+
+query I
+SELECT bool_and(
+           CASE WHEN url = 'http://127.0.0.1:29322/post-arrow'
+                THEN receipt.rows IS NOT NULL AND receipt.status = 200
+                ELSE receipt.rows IS NULL AND receipt.status = 404
+           END
+       )
+FROM (
+    SELECT url, quackapi_post(url, '', response_format := 'arrow') AS receipt
+    FROM (SELECT unnest(['http://127.0.0.1:29322/post-arrow',
+                         'http://127.0.0.1:29322/not-found']) AS url) AS endpoints
+);
+----
+true

@@ -46,7 +46,7 @@ outbound POST waits for a complete response and does not relay token streams.
   routes at 8 MiB. Both chunked and Content-Length requests are enforced.
 - Policy rewriting follows CTE scope, including same-name physical tables and
   ordered CTE definitions. Unsupported policy-sensitive macros fail closed.
-  Exec routes and `quackapi_exec` fail closed while policies are bound.
+  Exec routes and `quackapi_selfdispatch` fail closed while policies are bound.
 - Explicit parameter sources are respected. Length constraints count Unicode
   code points. `BODY TYPE` binds typed values and OpenAPI uses the same types.
   Route parameter metadata uses native DuckDB lists and structs internally;
@@ -60,6 +60,19 @@ outbound POST waits for a complete response and does not relay token streams.
 - JSON responses encode each row once as result chunks arrive. Arrow responses
   convert native chunk vectors directly, including native `VARIANT` values.
   Both still buffer the complete HTTP body; see [request budgets](RESOURCE_LIMITS.md).
+- Local execution is named `quackapi_selfdispatch`, with setting
+  `quackapi_selfdispatch_max_threads`. Its receipt adds native `rows LIST<VARIANT>`
+  and `columns LIST<STRUCT(name VARCHAR, type TYPE)>`, captured before JSON
+  serialization. `quackapi_post` accepts `response_format := 'arrow'|'parquet'`
+  to decode binary replies into the same fields; the default `raw` leaves them
+  NULL. Both scalar and table forms support typed replies, including empty schemas.
+- `PARAM ... VARIANT` preserves JSON body value kinds and native default literal
+  types. Query/header/path/cookie values remain strings. Explicit JSON null is a
+  valid unconstrained VARIANT; a missing required value still fails validation.
+  `BODY TYPE` can mix exact typed fields with VARIANT leaves.
+- Parquet responses consume the executed native chunks and use DuckDB 2.0's
+  submitted native `COPY` query. They retain the complete file before sending;
+  see request budgets for staging and decoding limits.
 - FastAPI model extraction treats `Field()`, metadata-only `Field(...)`, and
   `default=...` as required. Real defaults/default factories are distinguished
   structurally; extraction does not execute Python factories or validators.

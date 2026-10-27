@@ -1,0 +1,101 @@
+# name: test/sql/quackapi_parquet_native.test
+# description: Parquet responses preserve native typed chunks, empty schemas, headers, and byte caps
+# group: [sql]
+
+require quackapi
+
+require parquet
+
+statement ok
+CREATE ROUTE typed_parquet GET '/typed-parquet' FORMAT parquet AS
+SELECT i::BIGINT AS id,
+       (i % 7)::SMALLINT AS small_value,
+       (i * 1.25)::DECIMAL(12, 2) AS amount,
+       CASE WHEN i % 5 = 0 THEN NULL ELSE ('v' || i::VARCHAR)::VARCHAR END AS label,
+       [i::BIGINT, NULL, (i + 1)::BIGINT] AS items,
+       struct_pack(k := i::BIGINT, valid := (i % 2 = 0)) AS payload
+FROM range(6000) AS t(i);
+
+# Persist the HTTP BLOB as a real Parquet file, then inspect it with DuckDB's native reader.
+statement ok
+COPY (SELECT body FROM quackapi_request('GET', '/typed-parquet'))
+TO '__TEST_DIR__/quackapi_native_parquet_roundtrip.parquet' (FORMAT BLOB);
+
+query TTTTTTII
+SELECT typeof(first(id)), typeof(first(small_value)), typeof(first(amount)),
+       typeof(first(label)), typeof(first(items)), typeof(first(payload)),
+       (array_agg(id ORDER BY id) = range(6000))::INTEGER,
+       bool_and(small_value = (id % 7)::SMALLINT
+                AND amount = (id * 1.25)::DECIMAL(12, 2)
+                AND (label IS NULL) = (id % 5 = 0)
+                AND list_extract(items, 1) = id AND list_extract(items, 2) IS NULL
+                AND list_extract(items, 3) = id + 1
+                AND payload.k = id AND payload.valid = (id % 2 = 0))::INTEGER
+FROM read_parquet('__TEST_DIR__/quackapi_native_parquet_roundtrip.parquet');
+----
+BIGINT	SMALLINT	DECIMAL(12,2)	VARCHAR	BIGINT[]	STRUCT(k BIGINT, "valid" BOOLEAN)	1	1
+
+statement ok
+CREATE ROUTE empty_parquet GET '/empty-parquet' FORMAT parquet AS
+SELECT 1::INTEGER AS id WHERE false;
+
+statement ok
+COPY (SELECT body FROM quackapi_request('GET', '/empty-parquet'))
+TO '__TEST_DIR__/quackapi_native_parquet_empty.parquet' (FORMAT BLOB);
+
+query II
+SELECT status, content_type FROM quackapi_request('GET', '/empty-parquet');
+----
+200	application/vnd.apache.parquet
+
+query I
+SELECT coalesce(len(array_agg(id)), 0)
+FROM read_parquet('__TEST_DIR__/quackapi_native_parquet_empty.parquet');
+----
+0
+
+query TTTTTT
+DESCRIBE SELECT * FROM read_parquet('__TEST_DIR__/quackapi_native_parquet_empty.parquet');
+----
+id	INTEGER	YES	NULL	NULL	NULL
+
+statement ok
+CREATE ROUTE empty_parquet_status GET '/empty-parquet-status' FORMAT parquet EMPTY STATUS 404 BODY '{"detail":"gone"}' AS
+SELECT 1::INTEGER AS id WHERE false;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/empty-parquet-status');
+----
+404	{"detail":"gone"}
+
+statement ok
+CREATE ROUTE parquet_headers GET '/parquet-headers' FORMAT parquet AS
+SELECT 'https://example.test/next' AS location,
+       'sid=typed; HttpOnly' AS set_cookie,
+       17::INTEGER AS id;
+
+query III
+SELECT status,
+       map_contains(headers, 'Location'),
+       map_contains(headers, 'Set-Cookie')
+FROM quackapi_request('GET', '/parquet-headers');
+----
+200	true	true
+
+statement ok
+CREATE ROUTE parquet_cap GET '/parquet-cap' FORMAT parquet AS
+SELECT range::BIGINT AS id, 'sid=must-not-leak' AS set_cookie FROM range(10000);
+
+query III
+SELECT status,
+       map_contains(headers, 'Set-Cookie'),
+       contains(decode(body), 'Response exceeds configured byte limit')
+FROM quackapi_request('GET', '/parquet-cap', max_response_bytes := 1024);
+----
+507	false	true
+
+query II
+SELECT status, map_contains(headers, 'Set-Cookie')
+FROM quackapi_request('GET', '/parquet-headers', max_response_bytes := 1048576);
+----
+200	true

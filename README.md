@@ -148,23 +148,24 @@ curl -X POST http://127.0.0.1:8000/sql -H 'X-API-Key: …' \
 An exec route executes arbitrary SQL with the server's privileges. Keep it on
 loopback or behind `REQUIRE`.
 
-#### `quackapi_exec(sql)`: the exec route without HTTP
+#### `quackapi_selfdispatch(sql)`: the exec route without HTTP
 
-`quackapi_exec(sql)` returns the receipt `quackapi_post` gives for
+`quackapi_selfdispatch(sql)` returns the receipt `quackapi_post` gives for
 `POST {"sql": sql}` to an exec route — same `STRUCT(status, reason, body,
-headers, error, reused_connection, body_blob)`, same status codes and bodies — but runs the
+headers, error, reused_connection, body_blob, columns, rows)`, same status codes and bodies — but runs the
 SQL on this process's own database, so no HTTP worker is involved:
 
 ```sql
--- self-dispatch: one generated statement per row, results as receipts
-SELECT list((quackapi_exec('SELECT ' || range || ' AS v')).body) FROM range(3);
--- ['[{"v":0}]', '[{"v":1}]', '[{"v":2}]']
+-- One receipt per statement, with native values before JSON serialization.
+SELECT receipt.rows[1].v AS v
+FROM (SELECT quackapi_selfdispatch('SELECT ' || range || '::BIGINT AS v') AS receipt FROM range(3));
+-- 0, 1, 2: each v retains its native INT64 type inside VARIANT.
 ```
 
 A self-post holds a server worker while the SQL it posted posts again, so nested
 fan-outs (`array_agg(quackapi_post(...))` inside posted SQL) exhaust a fixed
 `worker_threads` pool and wait on each other until their timeouts.
-`quackapi_exec` uses a fresh `Connection` per row and DuckDB 2.0's task scheduler.
+`quackapi_selfdispatch` uses a fresh `Connection` per row and DuckDB 2.0's task scheduler.
 Nested scalar calls execute inline rather than waiting for capacity in their
 own pool. Table calls submit a resumable query and yield the SQL pipeline.
 An exec route with no `STATUS`, `EMPTY STATUS`, `ENVELOPE object` or non-JSON
@@ -173,8 +174,8 @@ An exec route with no `STATUS`, `EMPTY STATUS`, `ENVELOPE object` or non-JSON
 | Behavior | Detail |
 |----------|--------|
 | **Execution** | Every statement completes in order on a fresh connection; the last one answers. Scalar batches admit up to 32 native tasks; execution concurrency follows DuckDB's `threads` setting |
-| **Threads** | `quackapi_exec_max_threads` (default 256) caps admitted scalar exec tasks across calls, preserving the setting name. It creates no private worker threads. Nested calls, a single engine thread, or exhausted admission run inline. `0` always runs scalar rows inline |
-| **Response** | JSON array, `html`/`text` column modes, `location`/`set_cookie` columns as `headers`; `[]` for a final `SET`/`PRAGMA`. No `Accept` negotiation |
+| **Threads** | `quackapi_selfdispatch_max_threads` (default 256) caps admitted scalar tasks across calls. It creates no private worker threads. Nested calls, a single engine thread, or exhausted admission run inline. `0` always runs scalar rows inline |
+| **Response** | JSON array, `html`/`text` column modes, `location`/`set_cookie` columns as `headers`; `[]` for a final `SET`/`PRAGMA`. `columns` is `LIST<STRUCT(name VARCHAR, type TYPE)>` with native logical types (`columns[1].type::VARCHAR` displays the type name); `rows` is `LIST<VARIANT>` of native row structs. Empty results retain `columns` and return `rows = []`. No `Accept` negotiation |
 | **Errors** | 422 `{"detail":[{"loc":["body","sql"],…}]}` for a failing statement, 504 past the deadline, 507 past `quackapi_max_response_bytes`, 500 for an internal error. `error` is set only when no response could be produced; `NULL` in, `NULL` out |
 | **Budget** | Inside a served request (a route, `quackapi_request`), the server's `query_timeout_ms` and `max_response_bytes`, as the exec route uses; elsewhere the session's `quackapi_query_timeout_ms` (default 30 s) and `quackapi_max_response_bytes`. A nested call inherits its caller's budget |
 | **Deadline** | One absolute deadline per call, inherited by nested SQL and outbound I/O. Native query execution checks it alongside `max_execution_time`. Caller interruption cancels admitted rows. Blocked native tasks remain owned and are drained before the database closes; inline work returns at its next interrupt point |
@@ -189,13 +190,15 @@ The table forms release the pipeline while work is pending:
 -- Native file readers replace the removed GET helper.
 SELECT content FROM read_text('https://example.com');
 FROM quackapi_post('https://example.com/api', '{"n":42}', content_type := 'application/json');
-FROM quackapi_exec('SELECT 42 AS answer');
+FROM quackapi_selfdispatch('SELECT 42 AS answer');
 ```
 
 They emit the receipt fields as columns. HTTP tasks run on DuckDB's `async_threads`
 pool; submitted SQL advances through native query tasks and completion. The scalar
 forms retain row-wise NULL handling and the existing STRUCT result. Native VARIANT
-objects and arrays serialize as JSON values rather than display strings. Native
+objects, arrays, scalars, and nulls serialize as JSON values rather than display
+strings. `quackapi_post` sends the supplied body text unchanged; it does not
+serialize SQL VARIANT values for the caller. Native
 triggers execute in the mutation's own transaction through HTTP and local exec.
 The caller's native `max_execution_time` deadline also bounds nested execution
 and outbound I/O; an expired native limit raises DuckDB's timeout error.
@@ -376,7 +379,7 @@ the “PDF service” is a function call in the same address space — not an RP
 | Setting | `SET quackapi_http_timeout_ms = N` | default `600000`; maximum outbound call duration absent a shorter outer deadline |
 | Setting | `SET quackapi_max_response_bytes = N` | default `16777216` uncompressed bytes |
 | Setting | `SET quackapi_max_pending_requests = N` | default `256` |
-| Setting | `SET quackapi_exec_max_threads = N` | default `256`; past it `quackapi_exec` rows run on the calling thread; `0` = always |
+| Setting | `SET quackapi_selfdispatch_max_threads = N` | default `256`; past it `quackapi_selfdispatch` rows run on the calling thread; `0` = always |
 | Setting | `SET quackapi_graphql_allow_all = true\|false` | default `false`; legacy GraphQL open mode |
 
 `access_log` defaults to structured stderr JSON; `false` disables it and a table
@@ -531,6 +534,21 @@ SELECT 42::BIGINT AS id, 'verified' AS label;
 Save the HTTP body directly as a `.parquet` file and open it with `read_parquet`.
 The URL suffix is optional; `FORMAT PARQUET` selects the encoding. A browser
 attachment filename is configured separately through `Content-Disposition`.
+DuckDB 2.0's native query submission and completion APIs write the Parquet file
+from the already executed result chunks. QuackAPI retains the completed file
+body before sending it; this is not progressive HTTP delivery.
+
+For SQL callers, decode a binary reply directly into a typed receipt:
+
+```sql
+SELECT receipt.rows[1].id AS id, receipt.columns
+FROM (SELECT quackapi_post('http://127.0.0.1:8000/sql',
+                          '{"sql":"SELECT 42::BIGINT AS id"}',
+                          response_format := 'parquet') AS receipt);
+```
+
+Use `response_format := 'arrow'` for Arrow IPC instead. Both forms consume the
+binary HTTP body directly; no curl pipe or JSON reparsing is needed.
 
 ### Arrow responses and binary data
 
@@ -619,9 +637,9 @@ CREATE ROUTE ask POST '/ask' AS
 
 | Function | Role |
 |----------|------|
-| `quackapi_post(url, body[, content_type[, headers]], timeout_ms := …)` | Scalar or table POST (`content_type` defaults to `application/json`); both forms return exact `body_blob` bytes |
+| `quackapi_post(url, body[, content_type[, headers]], response_format := 'raw', timeout_ms := …)` | Scalar or table POST (`content_type` defaults to `application/json`); both forms return exact `body_blob` bytes, `columns LIST<STRUCT(name VARCHAR, type TYPE)>`, and `rows LIST<VARIANT>`. `arrow` and `parquet` decode native response types; raw/default and failures leave `columns`/`rows` NULL |
 | `quackapi_http_pool()` | per-origin `host, idle, dialed, reused` |
-| `quackapi_exec(sql)` | the receipt `quackapi_post` gives from an exec route, computed in-process — see [`quackapi_exec`](#quackapi_execsql-the-exec-route-without-http) |
+| `quackapi_selfdispatch(sql)` | the receipt `quackapi_post` gives from an exec route, computed in-process — see [`quackapi_selfdispatch`](#quackapi_selfdispatchsql-the-exec-route-without-http) |
 
 The pool retains at most 64 idle clients per origin, 256 idle clients overall,
 and 256 origin entries; overflow clients are not retained for reuse.

@@ -90,7 +90,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 ### 1.4 Registered SQL functions (live `duckdb_functions()`)
 
 ```
-quackapi_ack, quackapi_add_api_key, quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_exec, quackapi_graphql_routes,
+quackapi_ack, quackapi_add_api_key, quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_selfdispatch, quackapi_graphql_routes,
 quackapi_graphql_tables, quackapi_groups, quackapi_http_pool,
 quackapi_middlewares, quackapi_nack, quackapi_policies,
 quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,

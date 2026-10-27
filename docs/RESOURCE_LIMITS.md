@@ -37,6 +37,24 @@ checked before compression. The response cap does not replace DuckDB's
 `memory_limit`: query operators and materialized results can allocate memory
 before serialization.
 
+Parquet output consumes native result chunks without executing the handler
+again. It appends those chunks to a temporary staging table and uses DuckDB
+2.0's submitted native `COPY` query to write a temporary file. The completed file
+size is checked before allocating the HTTP body; both temporary objects are
+removed on success or failure. The staging data and file can grow before this
+final encoded-size check, so DuckDB memory and temporary-storage limits still
+matter.
+
+`quackapi_selfdispatch` collects native `rows` and `columns` before JSON
+serialization. The serialized native result is checked incrementally against
+the response cap, including schema and row-list overhead. Typed
+`quackapi_post(..., response_format := 'arrow'|'parquet')` applies the same check
+while decoding. The incoming HTTP body is buffered before its size check; the
+cap is not a transport-level download or heap-allocation limit. A decode failure
+retains the original HTTP status and bytes, records `error`, and leaves typed
+fields NULL. The enclosing request's deadline and response cap take precedence
+over session defaults.
+
 PostgreSQL access uses DuckDB's `postgres` extension and its connection and
 query controls. The former quackapi-specific `pg_dsn` execution path is removed.
 
