@@ -13,6 +13,12 @@ browser ──► DuckDB [ quackapi · pdf · tera · fakeit · webbed · … ]
 There is no app server, no ORM, and no schema re-declared in a second language.
 The query already types the response.
 
+This README documents the source in this checkout. Community installation uses
+the commit pinned in the [DuckDB extension registry](https://github.com/duckdb/community-extensions/blob/main/extensions/quackapi/description.yml),
+so new APIs become available there only after that descriptor is updated and
+its signed builds are published. See [migration notes](docs/MIGRATION.md) when
+upgrading an existing application.
+
 > **Thesis:** the backend *is* the database.  
 > Prior art: PostgREST, Datasette, Hasura, Oracle APEX. The novel part is one
 > **embedded OLAP** process as DB + HTTP framework + (optional) PDF/renderer,
@@ -358,7 +364,7 @@ the “PDF service” is a function call in the same address space — not an RP
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_telemetry_flush` | `([port])` — drain pending sink rows without stopping | `status` |
-| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule` |
+| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule, max_request_bytes` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = leave DuckDB `memory_limit` alone |
@@ -424,7 +430,7 @@ SET memory_limit = '4GB';
 SELECT * FROM quackapi_serve(8000);
 ```
 
-Request body limit: **8 MiB** (`413` when exceeded).
+Default request body limit: **8 MiB** (`413` when exceeded).
 For a larger image upload, raise both the route limit and server ceiling; the
 effective cap is the smaller value:
 
@@ -595,9 +601,12 @@ CREATE ROUTE ask POST '/ask' AS
 
 | Function | Role |
 |----------|------|
-| `quackapi_post(url, body[, content_type[, headers]])` | POST, same result shape (`content_type` defaults to `application/json`); both forms return exact `body_blob` bytes |
+| `quackapi_post(url, body[, content_type[, headers]], timeout_ms := …)` | Scalar or table POST (`content_type` defaults to `application/json`); both forms return exact `body_blob` bytes |
 | `quackapi_http_pool()` | per-origin `host, idle, dialed, reused` |
 | `quackapi_exec(sql)` | the receipt `quackapi_post` gives from an exec route, computed in-process — see [`quackapi_exec`](#quackapi_execsql-the-exec-route-without-http) |
+
+The pool retains at most 64 idle clients per origin, 256 idle clients overall,
+and 256 origin entries; overflow clients are not retained for reuse.
 
 The plain-HTTP client keeps connections across route executions. An earlier
 benchmark against an Ollama endpoint measured **39.1ms p50** without pooling

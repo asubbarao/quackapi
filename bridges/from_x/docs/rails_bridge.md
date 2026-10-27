@@ -1,3 +1,8 @@
+> Historical experiment report. Temporary scripts, corpus percentages and facade
+> demonstrations below are not current shipped entrypoints. The extension now
+> exposes `quack_from_routes(framework, path)` and `quack_from_models(framework, path)`
+> for metadata only; see [current bridge documentation](../README.md).
+
 # quack_from_rails — Rails → quackapi bridge
 
 **Status:** proven on rails-realworld

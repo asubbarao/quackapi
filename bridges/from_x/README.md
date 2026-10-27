@@ -69,10 +69,13 @@ test/sql/quackapi_from_x_*.test         sqllogictests
 
 ## What translates automatically
 
-1. **Routing** — decorator/DSL syntax → `(method, path, handler_name)` IR →
-   `CREATE ROUTE … AS SELECT …`
-2. **Request-body validation** — Pydantic / class-validator / Rails validates+
-   strong-params / Go struct tags → field IR → `BODY SCHEMA` JSON Schema
+1. **Routing metadata** — decorator/DSL syntax → `(method, path, handler_name)` IR.
+2. **Model metadata** — Pydantic / class-validator / Rails validates+
+   strong-params / Go struct tags → field IR.
+
+The functions return metadata only. Review the rows, map source types, and write
+`CREATE ROUTE` handlers and request validation separately. They do not generate
+or register a complete SQL application. See the [migration guide](../../docs/from-fastapi.md).
 
 ## Escape hatch
 

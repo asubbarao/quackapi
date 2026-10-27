@@ -1,9 +1,9 @@
 # quackapi — Community Extensions documentation
 
-> Draft content for the hosted page at  
-> `https://duckdb.org/community_extensions/extensions/quackapi`  
-> (generated from `description.yml` fields + auto-detected functions after load).  
-> This file is the fuller, source-verified reference used to keep those fields honest.
+> Source reference for the [DuckDB extension page](https://duckdb.org/community_extensions/extensions/quackapi).
+> The hosted page is generated from `duckdb/community-extensions`, not this file.
+> Repository documentation follows this checkout; community installation follows
+> the registry's exact commit pin and successful signed builds.
 
 ---
 
@@ -43,12 +43,16 @@ INSTALL quackapi FROM community;
 LOAD quackapi;
 ```
 
-| Platform | Community signed |
+| Platform | Repository build target |
 |----------|------------------|
-| `linux_amd64`, `linux_arm64` | yes |
-| `osx_amd64`, `osx_arm64` | yes |
-| `windows_*` | not yet (use [GitHub Releases](https://github.com/asubbarao/quackapi/releases) + `-unsigned`) |
-| `wasm_*` | excluded |
+| `linux_amd64`, `linux_arm64` | supported |
+| `osx_amd64`, `osx_arm64` | supported |
+| `windows_amd64` | supported (MSVC) |
+| `wasm_*`, Windows MinGW/rtools/arm64 | excluded |
+
+Build support does not establish that a particular commit is already on the
+community CDN. The [registry descriptor](https://github.com/duckdb/community-extensions/blob/main/extensions/quackapi/description.yml)
+selects the published source. See [migration notes](MIGRATION.md) for API changes.
 
 From source (any platform, including Windows MSVC):
 
@@ -76,6 +80,8 @@ CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
   [REQUIRE <auth>]
   [GROUP <group> | IN GROUP <group>]
   [BODY SCHEMA '<json-schema>']
+  [BODY TYPE '<duckdb-json-structure>']
+  [WITH (max_request_bytes = <bytes>)]
   [PARAM <name> [<type>] [HEADER|COOKIE|QUERY [wire-name]]
          [DEFAULT <lit>] [GE|GT|LE|LT <n>] [MIN_LENGTH|MAX_LENGTH <n>] …]
   AS <select>;
@@ -93,15 +99,20 @@ DROP ROUTE <name>;
 | REQUIRE | Named scheme from `CREATE AUTH` |
 | PARAM | Optional types, defaults, numeric/string constraints, header/cookie sources |
 | BODY SCHEMA | Optional JSON Schema string for request body validation |
+| BODY TYPE | Native DuckDB STRUCT/LIST/scalar validation and matching OpenAPI schema |
 | Handler | Prepared at CREATE; invalid SQL fails CREATE (not first request) |
 
-Routes update **live** while the server is running.
+Routes update **live** while the server is running. Failed replacement leaves
+the existing route intact. `BODY SCHEMA` uses the `json_schema` extension from
+Query.Farm on DuckDB 2.0; see [request bodies](guide/request-bodies.md) for setup.
 
 ### Response modes
 
 | Handler shape | HTTP body |
 |---------------|-----------|
 | Multiple columns / ordinary names | `application/json` — **array of row objects** |
+| `FORMAT ARROW` / Arrow Accept | Arrow IPC stream; BLOB columns are Arrow byte arrays |
+| `FORMAT binary` | Exact BLOB body from one row, with optional `content_type` |
 | Single column `html` | `text/html; charset=utf-8` |
 | Single column `text` | `text/plain; charset=utf-8` |
 | Column `location` | sets `Location` (pair with `STATUS 3xx`) |
@@ -117,7 +128,7 @@ JSON types follow DuckDB column types (numbers, booleans, nulls, nested lists/st
 | Unknown path | **404** |
 | Wrong method | **405** + `Allow` |
 | Auth failure | **401** |
-| Body too large (> 8 MiB) | **413** |
+| Body exceeds effective route/server upload limit (8 MiB default) | **413** |
 | Handler internal error | **500** `{"detail":"Internal Server Error"}` (SQL text not leaked) |
 
 ---
@@ -222,11 +233,13 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `quackapi_serve([port], host, static_dir, cors_origins, memory_limit, log_level, access_log, enable_logging, health_routes, threads, preserve_insertion_order, enable_http_metadata_cache, worker_threads, keep_alive_max_count, keep_alive_timeout_sec, read_timeout_sec, write_timeout_sec, compression, compression_min_bytes, http_client, block, query_timeout_ms, max_response_bytes, max_pending_requests)` | table | Start listener (default `127.0.0.1:8000`) |
+| `quackapi_serve([port], …)` | table | Start listener (default `127.0.0.1:8000`); resource, upload, cancellation, telemetry and transport options in the [function reference](reference/functions.md) |
 | `quackapi_wait(port [, timeout_ms], host := …)` | table | TCP readiness probe → `ready`, `listen_url` |
 | `quackapi_stop([port])` | table | Stop one or all servers |
-| `quackapi_routes()` | table | Registry: name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec |
+| `quackapi_routes()` | table | Registry: name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule, max_request_bytes |
 | `quackapi_servers()` | table | host, port, listen_url, http_client, http_client_reason |
+| `quackapi_requests([port])` | table | Bounded recent request ring |
+| `quackapi_telemetry_status([port])` / `quackapi_telemetry_flush([port])` | table | Inspect sinks / synchronously drain pending telemetry |
 | `quackapi_cors_origins` | setting | CORS allow-list (`*` or CSV); empty = off |
 | `quackapi_compression` / `quackapi_compression_min_bytes` | settings | Response coding (`auto`, `gzip`, `zstd`, `off`) and 1024-byte default threshold |
 
@@ -260,6 +273,7 @@ related modules). Auto-detection on the community site will list overloads after
 | `quackapi_enqueue` | scalar | Enqueue JSON/text payload → job_id |
 | `quackapi_dequeue` | table | Claim up to n jobs |
 | `quackapi_ack` / `quackapi_nack` | scalar | Complete / retry / dead-letter |
+| `quackapi_renew` | scalar | Extend the active delivery-generation lease |
 | `quackapi_queues()` | table | depth, in_flight, dead, options |
 | `quackapi_jobs` | table (catalog) | Durable job rows |
 
@@ -277,17 +291,19 @@ related modules). Auto-detection on the community site will list overloads after
 
 | Name | Kind | Purpose |
 |------|------|---------|
-| `quackapi_post(url, body[, ct[, headers]])` | scalar | Pooled outbound POST, same result shape |
+| `quackapi_post(url, body[, ct[, headers]], timeout_ms := …)` | scalar/table | Pooled outbound POST; receipt includes exact `body_blob`; `body` is NULL for invalid UTF-8 |
+| `quackapi_exec(sql)` | scalar/table | Execute local SQL on a fresh connection; same receipt shape |
 | `quackapi_http_pool()` | table | Outbound pool per origin: `host, idle, dialed, reused` |
 | `quackapi_request(method, path [, body], …)` | table | In-process request → status, BLOB body, content type, headers |
 | `quackapi_middlewares()` | table | Inspect SQL middleware definitions |
+| `quack_from_routes(framework, path)` / `quack_from_models(framework, path)` | table | AST metadata for fastapi, rails, express and gin; no handler translation |
 
 Internal apply helpers (`quackapi_apply_route`, `quackapi_apply_auth`, …) exist
 for the planner and are not part of the public app API.
 
 ---
 
-## Platforms & signed-build feasibility
+## Platforms & build
 
 | Item | Value |
 |------|--------|
@@ -309,10 +325,9 @@ Repo workflow: `duckdb/extension-ci-tools` pinned to
 `fe955ed3a046b0324cac2c691e73d8d776a7d5cc`, `duckdb_version: v2.0.0`,
 same `exclude_archs` as `description.yml`.
 
-**Feasibility:** high for the non-excluded platforms — pure CMake extension
-template shape, no exotic system libraries. Blocker before first signed publish:
-clean release tag with **no merge-conflict markers** in `src/`, green
-`make release` + `test/http/run_all.sh` on at least one host arch.
+The repository workflow builds and tests all five target architectures. Community
+publication separately requires an accepted descriptor update and successful
+signing; a repository CI result alone does not update the hosted package.
 
 ---
 
@@ -325,12 +340,15 @@ clean release tag with **no merge-conflict markers** in `src/`, green
    persist.
 3. **Serve memory limit** — `quackapi_serve` leaves DuckDB's `memory_limit`
    alone; cap it with `memory_limit := '512MB'` or `SET quackapi_memory_limit`.
-4. **Body size** — 8 MiB max payload.
+4. **Body size** — 8 MiB default. Server `max_request_bytes` is the hard ceiling
+   (maximum 1 GiB); route `WITH (max_request_bytes = …)` opts into a larger upload
+   within it. Raising only the server ceiling leaves routes at 8 MiB.
 5. **JWT** — HS256 only.
 6. **Table API** — read-only GET scaffold.
 7. **WebSockets are streams only** (`CREATE STREAM … WS`), without `REQUIRE` auth or middleware.
-8. **Unsigned until accepted** — community `INSTALL` path goes live after the
-   community-extensions PR and signing pipeline succeed.
+8. **Cancellation** — `cancel_on_disconnect := true` interrupts route SQL and
+   blocked plain-HTTP POSTs. HTTPS abort support is backend-limited. Upstream
+   jobs need their own cancellation APIs; POST does not relay token streams.
 
 ---
 
