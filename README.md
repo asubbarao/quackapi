@@ -518,6 +518,20 @@ FROM quackapi_dequeue('emails', 10);
 
 Worker = compose community `cronjob` (or a drain route). See [`docs/QUEUE.md`](docs/QUEUE.md).
 
+### Parquet file responses
+
+`FORMAT PARQUET` returns a complete Parquet file body with content type
+`application/vnd.apache.parquet`:
+
+```sql
+CREATE ROUTE export GET '/export.parquet' FORMAT PARQUET AS
+SELECT 42::BIGINT AS id, 'verified' AS label;
+```
+
+Save the HTTP body directly as a `.parquet` file and open it with `read_parquet`.
+The URL suffix is optional; `FORMAT PARQUET` selects the encoding. A browser
+attachment filename is configured separately through `Content-Disposition`.
+
 ### Arrow responses and binary data
 
 A route can return an Arrow IPC stream, including `BLOB` values as binary data:

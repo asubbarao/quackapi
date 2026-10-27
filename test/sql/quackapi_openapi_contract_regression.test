@@ -17,4 +17,4 @@ integer
 query III
 SELECT json_extract(decode(body), '$.paths."/openapi-contract".get.parameters[0].schema.minimum'), json_extract(decode(body), '$.paths."/openapi-contract".get.parameters[0].schema.maximum'), json_extract(decode(body), '$.paths."/openapi-contract".get.parameters[0].schema.default') FROM quackapi_request('GET', '/openapi.json');
 ----
-1.0	100.0	10
+1	100	10
