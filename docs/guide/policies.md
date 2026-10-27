@@ -129,7 +129,8 @@ Names must be unique across both policy kinds.
 
 ## Design notes
 
-- Policies are **helpers**, not a full multi-tenant RBAC product.  
+- Policies are **helpers**, not a full multi-tenant RBAC product.
+- With policy bindings present, view, table-macro, table-function and scalar-macro reads are rejected when their dependencies cannot be safely inspected. Scalar macros are rejected conservatively even if unrelated to the protected table.
 - Prefer JWT claims you control (`tenant`, `role`) over trusting query params.  
 - Combine with [CREATE GROUP](groups.md) so every `/api/v1/*` route requires the same auth scheme.
 

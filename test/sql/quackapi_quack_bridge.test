@@ -1,12 +1,63 @@
 # name: test/sql/quackapi_quack_bridge.test
-# description: quack auth bridge at request time (verify_auth via REQUIRE + bridged route body)
+# description: REST auth stays independent of core Quack RPC callbacks
 # group: [sql]
 
 require quackapi
 
 require json
 
+require quack
+
 # require json: CheckAuth rebinds claims_json from quackapi_verify_auth via json_*.
+
+# ---------------------------------------------------------------------------
+# User-configured core Quack callbacks remain in place when quackapi is served.
+# REST CREATE AUTH must not silently change RPC authentication/authorization.
+# ---------------------------------------------------------------------------
+query II
+SELECT current_setting('quack_authentication_function'), current_setting('quack_authorization_function');
+----
+quack_check_token	quack_nop_authorization
+
+query I
+SELECT * FROM quackapi_serve(29328, host := '127.0.0.1', access_log := false, http_client := 'httplib');
+----
+http://127.0.0.1:29328
+
+query II
+SELECT current_setting('quack_authentication_function'), current_setting('quack_authorization_function');
+----
+quack_check_token	quack_nop_authorization
+
+statement ok
+SELECT * FROM quackapi_stop(29328);
+
+statement ok
+CREATE MACRO custom_quack_auth(sid, client_token, server_token) AS client_token = server_token;
+
+statement ok
+CREATE MACRO custom_quack_authorize(sid, query) AS query;
+
+statement ok
+SET GLOBAL quack_authentication_function = 'custom_quack_auth';
+
+statement ok
+SET GLOBAL quack_authorization_function = 'custom_quack_authorize';
+
+query II
+SELECT current_setting('quack_authentication_function'), current_setting('quack_authorization_function');
+----
+custom_quack_auth	custom_quack_authorize
+
+query I
+SELECT * FROM quackapi_serve(29328, host := '127.0.0.1', access_log := false, http_client := 'httplib');
+----
+http://127.0.0.1:29328
+
+query II
+SELECT current_setting('quack_authentication_function'), current_setting('quack_authorization_function');
+----
+custom_quack_auth	custom_quack_authorize
 
 # ---------------------------------------------------------------------------
 # Setup — API_KEY scheme + REQUIRE route (CheckAuth → quackapi_verify_auth)
@@ -49,7 +100,7 @@ FROM quackapi_request(
 200
 
 # ---------------------------------------------------------------------------
-# Bridged route — expected body over a real request
+# REST route — expected body
 # ---------------------------------------------------------------------------
 query II
 SELECT status, decode(body)
@@ -72,3 +123,14 @@ query I
 DROP AUTH bridge_keys;
 ----
 Dropped auth bridge_keys
+
+query I
+SELECT * FROM quackapi_stop(29328);
+----
+Stopped quackapi server on port 29328
+
+statement ok
+RESET GLOBAL quack_authentication_function;
+
+statement ok
+RESET GLOBAL quack_authorization_function;

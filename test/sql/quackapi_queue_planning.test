@@ -1,0 +1,40 @@
+# name: test/sql/quackapi_queue_planning.test
+# description: Queue mutations happen at execution, never during planning
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE QUEUE planning;
+
+statement ok
+EXPLAIN SELECT quackapi_enqueue('planning', '{}');
+
+statement ok
+PREPARE enqueue_plan AS SELECT quackapi_enqueue('planning', '{}');
+
+query I
+SELECT depth FROM quackapi_queues() WHERE name = 'planning';
+----
+0
+
+statement ok
+EXECUTE enqueue_plan;
+
+statement ok
+EXECUTE enqueue_plan;
+
+query I
+SELECT depth FROM quackapi_queues() WHERE name = 'planning';
+----
+2
+
+query I
+SELECT count(DISTINCT id) FROM (SELECT quackapi_enqueue('planning', '{}') AS id FROM range(3));
+----
+3
+
+query I
+SELECT depth FROM quackapi_queues() WHERE name = 'planning';
+----
+5

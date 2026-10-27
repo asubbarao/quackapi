@@ -48,7 +48,7 @@ SELECT
 FROM read_text($url);
 
 CREATE OR REPLACE ROUTE http_util GET '/http_util' AS
-SELECT quackapi_http_util_name() AS http_util;
+SELECT curl_httpfs_http_util_name() AS http_util;
 
 SELECT * FROM quackapi_serve(18080);
 ```
@@ -59,9 +59,46 @@ curl -sS "http://127.0.0.1:18080/http_util"
 # [{"http_util":"MultiCurl"}]   # when curl_httpfs is active
 ```
 
-There is **no** public SQL `quackapi_fetch` / `quackapi_post`. C++ `QuackapiHttpFetch`
-is an internal HTTPUtil helper (OAuth/OIDC wave). Route authors use **SQL readers**
-or a community HTTP extension.
+`quackapi_post` provides pooled outbound POST. The former `quackapi_fetch` SQL function has been removed. For remote data
+files, DuckDB's `read_json`, `read_csv`, and `read_parquet` are alternatives
+that parse the data directly. For general HTTP calls, community extensions
+`http_client` and `http_request` are separate alternatives; `http_request`
+documents concurrent requests within a chunk. They expose overlapping function
+names, so choose the extension that fits your application.
+
+For a binary file response, use DuckDB 2.0's `read_blob` and quackapi's
+`FORMAT binary` route. This reads bytes without converting them to UTF-8:
+
+```sql
+CREATE ROUTE logo GET '/logo' FORMAT binary AS
+SELECT content AS body, 'image/png' AS content_type
+FROM read_blob('/srv/www/logo.png');
+```
+
+When the upstream response status or headers are needed, the community
+`http_request` extension's `http_get` returns a response struct with a BLOB
+body; it is an optional extension, not a DuckDB core function. `read_blob(url)`
+is the simpler path when only bytes are needed. Neither requires the removed
+`quackapi_fetch` function.
+
+For an outbound POST, both scalar receipts and the table form include
+`body_blob`, preserving bytes even when they are not valid UTF-8. The text
+`body` field is `NULL` for invalid UTF-8 and otherwise remains available:
+
+```sql
+-- Scalar receipt
+SELECT (quackapi_post('https://api.example.com/jobs', $body::VARCHAR,
+                      timeout_ms := 120000)).body_blob;
+
+-- Table form, which also yields the receipt as columns
+SELECT status, body_blob
+FROM quackapi_post('https://api.example.com/jobs', '{"run":true}',
+                   content_type := 'application/json', timeout_ms := 120000);
+```
+
+`timeout_ms` is a positive, keyword-only per-call cap and overrides
+`quackapi_http_timeout_ms` for that call. The caller's query deadline or a
+served route's `query_timeout_ms` remains an outer cap and wins if shorter.
 
 ### POST / partner call via community `http_client`
 
@@ -145,17 +182,17 @@ LOAD quackapi;
 
 -- Routes: method, path, handler_name, file, …
 SELECT method, path, handler_name
-FROM quack_from_fastapi('bridges/from_x/fixtures/fastapi_mini')
+FROM quack_from_routes('fastapi', 'bridges/from_x/fixtures/fastapi_mini')
 ORDER BY method, path;
 -- GET  /articles/{slug}  get_article
 -- POST /login            login
 
 -- Models → field IR (then BODY SCHEMA by hand or generator)
 SELECT model_name, field_name, field_type, is_required
-FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini');
+FROM quack_from_models('fastapi', 'bridges/from_x/fixtures/fastapi_mini');
 ```
 
-Siblings: `quack_from_rails`, `quack_from_express`, `quack_from_gin` (+ `_models`).
+Both functions accept `fastapi`, `rails`, `express`, or `gin` as the framework.
 
 **What is automatic vs not:**
 
@@ -202,14 +239,16 @@ FROM quack_query(
 );
 ```
 
-Auth bridge scalars on the **quackapi** side for RPC-style checks (used by
-quack-compatible setups; no extra process):
+REST auth can be inspected through `quackapi_verify_auth`. This does not
+configure authentication for the separate core Quack RPC server:
 
 ```sql
 SELECT (quackapi_verify_auth('site', 'k-secret')).ok;
-SELECT quackapi_authentication('sess', 'token', 'token');
-SELECT quackapi_authorization('sess', 'SELECT 1');
 ```
+
+Quack RPC uses DuckDB's `quack_authentication_function` and
+`quack_authorization_function` settings. Configure those core hooks explicitly
+when needed; `CREATE AUTH` and `quackapi_serve` do not modify them.
 
 quackapi still only listens with `quackapi_serve`. Mesh nodes are whatever quack
 servers you already run.
@@ -258,8 +297,6 @@ These are **out of scope** for quackapi composition stories and this guide:
 | GraphQL | Not a quackapi transport; stay REST + SQL |
 | Asio / custom async server rewrite | Inbound remains httplib |
 | `WITH HISTORY` / time-travel as a product feature | Ordinary DuckDB time-travel if *you* enable it; not a quackapi API |
-
-Also not invented here: public `quackapi_fetch` / `quackapi_post` SQL TVFs.
 
 ---
 

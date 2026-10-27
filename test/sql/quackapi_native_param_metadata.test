@@ -1,0 +1,74 @@
+# name: test/sql/quackapi_native_param_metadata.test
+# description: Parameter DDL uses native nested values without numeric/string encoding loss
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE native_ge GET '/native-ge' PARAM value DOUBLE GE 0.123456789 AS SELECT $value::DOUBLE AS value;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-ge?value=0.1234568');
+----
+200
+
+statement ok
+CREATE ROUTE native_le GET '/native-le' PARAM value DOUBLE LE 0.123456789 AS SELECT $value::DOUBLE AS value;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-le?value=0.1234568');
+----
+422
+
+statement ok
+CREATE ROUTE native_gt GET '/native-gt' PARAM value DOUBLE GT 0.123456789 AS SELECT $value::DOUBLE AS value;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-gt?value=0.1234568');
+----
+200
+
+statement ok
+CREATE ROUTE native_lt GET '/native-lt' PARAM value DOUBLE LT 0.123456789 AS SELECT $value::DOUBLE AS value;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-lt?value=0.1234568');
+----
+422
+
+statement ok
+CREATE ROUTE native_default GET '/native-default' PARAM value VARCHAR DEFAULT '50% café ''quoted''' AS SELECT $value::VARCHAR AS value;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/native-default');
+----
+200	[{"value":"50% café 'quoted'"}]
+
+statement ok
+CREATE ROUTE native_empty GET '/native-empty' PARAM value VARCHAR DEFAULT '' AS SELECT $value::VARCHAR AS value;
+
+query II
+SELECT status, decode(body) = '[{"value":""}]' FROM quackapi_request('GET', '/native-empty');
+----
+200	true
+
+statement ok
+CREATE ROUTE native_null GET '/native-null' PARAM value VARCHAR DEFAULT NULL AS SELECT $value::VARCHAR AS value;
+
+query II
+SELECT status, decode(body) = '[{"value":null}]' FROM quackapi_request('GET', '/native-null');
+----
+200	true
+
+statement ok
+CREATE ROUTE native_header GET '/native-header' PARAM value VARCHAR HEADER 'X-Native' MIN_LENGTH 2 MAX_LENGTH 3 AS SELECT $value AS value;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/native-header', headers := MAP {'X-Native': 'éé'});
+----
+200	[{"value":"éé"}]
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-header', headers := MAP {'X-Native': 'a'});
+----
+422

@@ -1,0 +1,112 @@
+# name: test/sql/quackapi_outbound_binary_timeout.test
+# description: Outbound POST preserves response bytes and scopes per-call timeouts
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE binary_post POST '/png' FORMAT binary AS
+  SELECT from_hex('89504E470D0A1A0A00FF80') AS body, 'image/png' AS content_type;
+
+statement ok
+CREATE ROUTE text_post POST '/text' AS SELECT 'hello' AS payload;
+
+statement ok
+CREATE ROUTE fast_post POST '/fast' AS SELECT 'ok' AS payload;
+
+statement ok
+CREATE ROUTE medium_post POST '/medium' AS SELECT sleep_ms(300) AS waited;
+
+statement ok
+CREATE ROUTE slow_post POST '/slow' AS SELECT sleep_ms(1500) AS waited;
+
+statement ok
+CREATE ROUTE outbound_deadline POST '/outbound-deadline' AS
+  SELECT (quackapi_post('http://127.0.0.1:29328/slow', '{}', timeout_ms := 5000)).status AS upstream_status;
+
+query I
+SELECT * FROM quackapi_serve(29328, host := '127.0.0.1', access_log := false);
+----
+http://127.0.0.1:29328
+
+# Invalid UTF-8 leaves the compatibility VARCHAR body NULL, while body_blob
+# retains the exact binary response. Check scalar and table-valued overloads.
+query III
+SELECT r.status, r.body IS NULL, hex(r.body_blob)
+FROM (SELECT quackapi_post('http://127.0.0.1:29328/png', '') AS r);
+----
+200	true	89504E470D0A1A0A00FF80
+
+query III
+SELECT status, body IS NULL, hex(body_blob)
+FROM quackapi_post('http://127.0.0.1:29328/png', '', timeout_ms := 2000);
+----
+200	true	89504E470D0A1A0A00FF80
+
+# For readable responses, body remains unchanged and body_blob is its UTF-8 encoding.
+query I
+SELECT r.status = 200 AND r.body IS NOT NULL AND r.body_blob = encode(r.body)
+FROM (SELECT quackapi_post('http://127.0.0.1:29328/text', '') AS r);
+----
+true
+
+# The named per-call timeout can exceed the configured default for both table
+# and scalar forms. A successful short call returns its pooled socket; the next
+# request reuses it with the default deadline, proving the short timeout did not leak.
+statement ok
+SET quackapi_http_timeout_ms = 100;
+
+query I
+SELECT status FROM quackapi_post('http://127.0.0.1:29328/medium', '{}', timeout_ms := 2000);
+----
+200
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29328/medium', '{}', timeout_ms := 2000)).status;
+----
+200
+
+statement ok
+SET quackapi_http_timeout_ms = 500;
+
+query I
+SELECT (quackapi_post('http://127.0.0.1:29328/fast', '{}', timeout_ms := 50)).reused_connection;
+----
+true
+
+query II
+SELECT (r).status, (r).reused_connection
+FROM (SELECT quackapi_post('http://127.0.0.1:29328/medium', '{}') AS r);
+----
+200	true
+
+# A request-specific HTTP timeout shorter than the peer fails as a receipt.
+query I
+SELECT (quackapi_post('http://127.0.0.1:29328/slow', '{}', timeout_ms := 100)).error IS NOT NULL;
+----
+true
+
+# But the larger per-call timeout does not extend the inbound request's total
+# query budget. The route asks for five seconds; this request only gets 300 ms.
+query I
+SELECT status FROM quackapi_request('POST', '/outbound-deadline', '{}', query_timeout_ms := 300);
+----
+504
+
+statement error
+SELECT quackapi_post('http://127.0.0.1:29328/fast', '{}', timeout_ms := 0);
+----
+timeout_ms must be > 0
+
+statement error
+SELECT * FROM quackapi_post('http://127.0.0.1:29328/fast', '{}', timeout_ms := -1);
+----
+timeout_ms must be > 0
+
+statement ok
+RESET quackapi_http_timeout_ms;
+
+query I
+SELECT * FROM quackapi_stop(29328);
+----
+Stopped quackapi server on port 29328

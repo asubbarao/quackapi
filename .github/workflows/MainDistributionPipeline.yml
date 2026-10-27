@@ -114,10 +114,28 @@ jobs:
         run: make release -j"$(nproc)"
 
       - name: Run quackapi SQLLogic
+        env:
+          DUCKDB_TEST_ON_INIT: "INSTALL nanoarrow FROM community; LOAD nanoarrow; INSTALL http_request FROM community; LOAD http_request; INSTALL sitting_duck FROM community; LOAD sitting_duck;"
         run: make test_release T='"test/sql/quackapi*"'
 
-      - name: Verify build without libpq
-        run: c++ -std=c++17 -fsyntax-only -isystem duckdb/src/include -Isrc/include src/quackapi_pg.cpp
+      - name: Verify embedded importer SQL
+        run: python3 test/test_from_x_sql_embed.py
+
+      - name: Verify native Quack integration
+        env:
+          DUCKDB_TEST_ON_INIT: "INSTALL quack; LOAD quack;"
+        run: make test_release T='"test/sql/quackapi_quack_bridge.test,test/sql/quackapi_native_protocol.test"'
+
+      - name: Verify socket write deadlines
+        run: python3 test/python/test_write_deadline.py build/release/duckdb build/release/extension/quackapi/quackapi.duckdb_extension
+
+      - name: Verify request body limits
+        run: python3 test/python/test_payload_limits.py build/release/duckdb build/release/extension/quackapi/quackapi.duckdb_extension
+
+      - name: Verify disconnect cancellation
+        run: |
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_disconnect_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-disconnect-test
+          /tmp/quackapi-disconnect-test
 
       - name: Verify request database lifetime
         run: |
@@ -141,6 +159,9 @@ jobs:
           bash bench/test_report.sh
           python3 test/conformance/test_driver.py
 
+      - name: Measure large JSON and Arrow responses
+        run: ./build/release/duckdb -no-agent -unsigned -bail -json -f bench/large_response.sql
+
       # run.sh decodes Arrow responses with pyarrow through uv.
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -150,7 +171,7 @@ jobs:
 
   publish-github-release:
     name: Publish GitHub Release assets
-    needs: [duckdb-stable-build]
+    needs: [duckdb-stable-build, code-quality-check, linux-amd64-pg-sqllogic]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

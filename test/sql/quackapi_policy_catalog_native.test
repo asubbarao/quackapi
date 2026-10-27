@@ -1,0 +1,99 @@
+# name: test/sql/quackapi_policy_catalog_native.test
+# description: Native catalog identities and per-request policy lookup
+# group: [sql]
+
+require quackapi
+
+# A decision about a view must not survive a catalog change between requests.
+statement ok
+CREATE TABLE native_policy_source (id INTEGER);
+
+statement ok
+INSERT INTO native_policy_source VALUES (1);
+
+statement ok
+CREATE ROW ACCESS POLICY native_policy_positive AS (id INTEGER) RETURNS BOOLEAN USING (id > 0);
+
+statement ok
+ALTER TABLE native_policy_source ADD ROW ACCESS POLICY native_policy_positive ON (id);
+
+statement ok
+CREATE VIEW native_policy_swap AS SELECT * FROM native_policy_source;
+
+statement ok
+CREATE ROUTE native_policy_swap_route GET '/native-policy-swap' AS SELECT id FROM native_policy_swap;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-policy-swap');
+----
+403
+
+statement ok
+DROP VIEW native_policy_swap;
+
+statement ok
+CREATE TABLE native_policy_swap (id INTEGER);
+
+statement ok
+INSERT INTO native_policy_swap VALUES (7);
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-policy-swap');
+----
+200
+
+# Schema-qualified lookup must identify the same protected table.
+statement ok
+CREATE SCHEMA native_policy_schema;
+
+statement ok
+CREATE TABLE native_policy_schema.protected_rows (id INTEGER);
+
+statement ok
+INSERT INTO native_policy_schema.protected_rows VALUES (1);
+
+statement ok
+ALTER TABLE native_policy_schema.protected_rows ADD ROW ACCESS POLICY native_policy_positive ON (id);
+
+statement ok
+CREATE ROUTE native_policy_schema_route GET '/native-policy-schema' AS SELECT id FROM native_policy_schema.protected_rows;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-policy-schema');
+----
+403
+
+# An attached catalog is a distinct identity; the same schema/table name in
+# main must not make a protected attached table appear unprotected.
+statement ok
+ATTACH ':memory:' AS native_attached;
+
+statement ok
+CREATE TABLE native_attached.main.protected_rows (id INTEGER);
+
+statement ok
+INSERT INTO native_attached.main.protected_rows VALUES (2);
+
+statement ok
+ALTER TABLE native_attached.main.protected_rows ADD ROW ACCESS POLICY native_policy_positive ON (id);
+
+statement ok
+CREATE ROUTE native_policy_attached_route GET '/native-policy-attached' AS SELECT id FROM native_attached.main.protected_rows;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-policy-attached');
+----
+403
+
+# Qualified scalar macros cannot hide a protected dependency from policy
+# enforcement. The dependency is rejected while binding the route request.
+statement ok
+CREATE MACRO native_policy_schema.hidden_count() AS (SELECT count(*) FROM native_policy_source);
+
+statement ok
+CREATE ROUTE native_policy_qualified_macro_route GET '/native-policy-qualified-macro' AS SELECT native_policy_schema.hidden_count() AS n;
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-policy-qualified-macro');
+----
+403

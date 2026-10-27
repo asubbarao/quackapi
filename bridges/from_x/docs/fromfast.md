@@ -1,3 +1,8 @@
+> Historical experiment report. Temporary scripts, corpus percentages and facade
+> demonstrations below are not current shipped entrypoints. The extension now
+> exposes `quack_from_routes(framework, path)` and `quack_from_models(framework, path)`
+> for metadata only; see [current bridge documentation](../README.md).
+
 # quack_from_fastapi — flagship one-caller (Task #26)
 
 **Date:** 2026-07-20  
@@ -5,7 +10,7 @@
 **Extensions used (existing only):** `quackapi`, `sitting_duck`, `parser_tools`, `json`  
 **No C++ / no src edits.** All artifacts under `/tmp/quackapi_fromfast/`.
 
-**Verdict (one line):** **partial** — `quack_from_fastapi('/path')` is a real one-call *driver* (shell + pure SQL) that clones/reads AST → IR → CREATE ROUTE + BODY SCHEMA → FIFO register → serve; next step is C++ `quack_from_fastapi(path)` table function so the name is a true SQL scalar/TVF inside one DuckDB session without a shell wrapper.
+**Verdict (one line):** the native SQL importers are `quack_from_routes('fastapi', '/path')` and `quack_from_models('fastapi', '/path')`; the shell driver below remains a separate end-to-end generate/register/serve workflow.
 
 ---
 
@@ -33,7 +38,7 @@ live HTTP  (path params + BODY SCHEMA validation)
 
 - `sitting_duck.read_ast` requires **literal** globs (no column-parameterized path).
 - quackapi `CREATE ROUTE` is a **parser extension** — must be fed via interactive/FIFO stdin, never `duckdb -c "a;b"`.
-- Therefore the one-caller is `quack_from_fastapi.sh /path [port] [serve|gen-only]`, which is the operational equivalent of `quack_from_fastapi('/path')`.
+- Therefore the one-caller is `quack_from_fastapi.sh /path [port] [serve|gen-only]`; it is a separate end-to-end driver, while the SQL table functions extract metadata only.
 
 ### Code locations
 
@@ -162,7 +167,7 @@ ROH models proven: `SuicidalIdeation`, `HomicidalIdeation`, `SelfCareJudgmentOut
 | Nested model recursion in BODY SCHEMA | Flat `type:object` for nested names | Same | One-level schema; no `$ref` graph |
 | Private models (`_Judgment`) | Skipped | Skipped | Intentional filter `NOT starts_with(name,'_')` |
 | Django/Flask routes | Not in this one-caller (FastAPI+Pydantic focus) | Django admin only — ignored | Separate corpus extractors exist |
-| True SQL `SELECT quack_from_fastapi(path)` | Shell wrapper | Shell wrapper | Needs C++ TVF (see punch list) |
+| Native SQL route/model extraction | `quack_from_routes('fastapi', path)` | `quack_from_models('fastapi', path)` | Implemented as framework-selectable table functions |
 
 **Import coverage summary**
 
@@ -173,11 +178,10 @@ ROH models proven: `SuicidalIdeation`, `HomicidalIdeation`, `SelfCareJudgmentOut
 
 ---
 
-## 4. C++ punch list (do **not** edit C++ in this task)
+## 4. Remaining C++ punch list
 
 | Priority | Item | Why |
 |----------|------|-----|
-| **P0** | `quack_from_fastapi(VARCHAR path)` table function / pragma | True one-SQL-call without shell; inject path into sitting_duck + FIFO-free CREATE ROUTE batch API |
 | **P0** | Batch `CREATE ROUTE` / `RegisterRoutes(list)` API usable from a single statement | Removes parser_extension one-statement FIFO gotcha for automation |
 | **P1** | Optional PARAM + defaults (`DEFAULT NULL` already partial; default literals) | Pydantic optionals dominate |
 | **P1** | BODY SCHEMA nested `$ref` + deeper property binding into `$params` | Embed + nested models |
@@ -206,7 +210,4 @@ ROH models proven: `SuicidalIdeation`, `HomicidalIdeation`, `SelfCareJudgmentOut
 
 ## 6. Final line
 
-**is `quack_from_fastapi('/path')` a real one-caller now?** → **partial**  
-(shell+SQL one-call works end-to-end with validation on both repos; not yet a single in-process SQL function)
-
-**Next step:** implement C++ `quack_from_fastapi(path)` (or `CALL quack_from_fastapi(...)`) that owns path→AST→register without FIFO/shell, reusing this SQL IR logic as the reference semantics.
+The SQL table functions extract route/model metadata; they do not register or serve the imported application. The shell driver remains the separate workflow for extraction through serving.

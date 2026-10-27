@@ -1,4 +1,4 @@
-quack_from_fastapi live transcript against the committed fixture
+FastAPI shell-driver live transcript against the committed fixture
 (bridges/from_x/fixtures/fastapi_mini), captured while homing the
 sitting_duck quack_from_x bridge on feat/from-x.
 

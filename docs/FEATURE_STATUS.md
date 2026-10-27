@@ -1,8 +1,10 @@
 # quackapi — Feature Ledger (authoritative)
 
-**Version:** 0.1.3 (repository `description.yml`)
-**Source of truth:** the current `main` source tree and versioned tests; cited report paths are historical evidence only.
-**Rule:** shipped claims below are backed by source or tests. Design studies and external packaging notes remain explicitly labelled.
+**Descriptor target:** 0.2.0 (release candidate; not a publication receipt)
+**Source of truth:** this checkout's source tree and versioned tests; cited report paths are historical evidence only.
+**Rule:** implemented claims below are backed by source or tests. Design studies and external packaging notes remain explicitly labelled.
+**Publication:** this ledger is not a release receipt. Community packages follow the separate registry pin and signed build pipeline; see [migration notes](MIGRATION.md).
+**Current validation:** [PR #58 CI](https://github.com/asubbarao/quackapi/actions/runs/40426089540) passed all five platform builds and 63 SQL suites with zero skips at application head `ee3034ca`. Historical 89-case and corpus figures below describe earlier experiments; the reviewed candidate also passed 93 conformance cases.
 
 **Evidence index**
 
@@ -20,7 +22,7 @@
 
 ---
 
-## 1. BUILT & MERGED
+## 1. Implemented in this source tree
 
 ### 1.1 Eight CREATE nouns (parser extensions)
 
@@ -31,7 +33,7 @@
 | 3 | **`CREATE [OR REPLACE] [API] GROUP`** | `src/quackapi_ddl.cpp` | `quackapi_groups()` | `test/sql/quackapi_group.test`, `test/http/group.test.sh` | `APIRouter(prefix=…, tags=…, dependencies=…)` |
 | 4 | **`CREATE [OR REPLACE] API FOR TABLE`** | `src/quackapi_table_api.cpp` | expands to routes → `quackapi_routes()` | `test/sql/quackapi_table_api.test` | FastAPI + SQLAlchemy list/get scaffold |
 | 5 | **`CREATE [OR REPLACE] QUEUE`** | `src/quackapi_queue.cpp` | `quackapi_queues()`, `quackapi_enqueue/dequeue/ack/nack`, table `quackapi_jobs` | `test/sql/quackapi_queue.test`, `test/http/queue.test.sh` | BackgroundTasks / Celery-shaped durable jobs (DB-native) |
-| 6 | **`CREATE [OR REPLACE] STREAM`** | `src/quackapi_stream.cpp` | `quackapi_streams()` | `test/sql/quackapi_stream.test`, `test/http/stream.test.sh` | SSE (`EventSourceResponse`); **WS rejected** (httplib) |
+| 6 | **`CREATE [OR REPLACE] STREAM`** | `src/quackapi_stream.cpp` | `quackapi_streams()` | `test/sql/quackapi_stream.test`, `test/http/stream.test.sh` | SSE (`EventSourceResponse`); WebSocket uses `CREATE STREAM … WS` |
 | 7 | **`CREATE [OR REPLACE] ROW ACCESS POLICY`** | `src/quackapi_policy.cpp` | `quackapi_policies()` | `test/sql/quackapi_policy.test`, `test/http/policy.test.sh` | No first-class FastAPI primitive (row filters / RLS) |
 | 8 | **`CREATE [OR REPLACE] MASKING POLICY`** | `src/quackapi_policy.cpp` | `quackapi_policies()` | same | No first-class FastAPI primitive (column mask) |
 
@@ -69,7 +71,7 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 
 | Feature | DDL / function | Versioned test | FastAPI equivalent |
 |---------|----------------|----------------|--------------------|
-| Serve / stop / inspect | `quackapi_serve` with lifecycle, health, access-log, compression, transport, client, Postgres, and resource-limit options; `quackapi_wait`, `quackapi_stop`, `quackapi_servers` | `quackapi_serve_block.test`, resource-limit and HTTP tests | `uvicorn` / `app` process |
+| Serve / stop / inspect | `quackapi_serve` with lifecycle, health, access-log, compression, transport, client, upload, cancellation, and resource-limit options; `quackapi_wait`, `quackapi_stop`, `quackapi_servers` | `quackapi_serve_block.test`, resource-limit and HTTP tests | `uvicorn` / `app` process |
 | **CORS** | `cors_origins` arg / `SET quackapi_cors_origins` | `test/sql/quackapi_cors.test`, `test/http/cors.test.sh` | `CORSMiddleware` |
 | **static_dir** unrouted GETs | `quackapi_serve(…, static_dir := …)` | description.yml / README | `StaticFiles` (mount; prefix sugar still SPEC) |
 | **Health routes** | built-in `/health` and `/healthz` when `health_routes := true` | health and HTTP tests | liveness/readiness probes |
@@ -82,22 +84,20 @@ DROP forms exist for ROUTE, AUTH, GROUP/API GROUP, QUEUE, STREAM, ROW ACCESS POL
 | **SSE stream** | `CREATE STREAM … GET '/path' AS <select>` | stream SQL + HTTP | `StreamingResponse` / SSE |
 | **WebSocket** | **built** — `CREATE STREAM … WS` (push rows, or reply per `$message`) | `quackapi_stream.test`, `test/cpp/quackapi_websocket_test.cpp` | `WebSocket` |
 | **Row access + masking policies** | CREATE … POLICY + ALTER TABLE bind | policy SQL + HTTP | — (DB-native leapfrog) |
-| Quack RPC auth bridge | `quackapi_authentication` / `quackapi_authorization` | `quackapi_quack_bridge.test` | N/A (DuckDB quack sibling) |
+| Quack RPC authentication | Native core Quack hooks/defaults; no REST auto-wiring | `quackapi_quack_bridge.test` | DuckDB core Quack |
 | Security / key hashing | auth + security tests | `quackapi_security.test` | secret storage patterns |
 
 ### 1.4 Registered SQL functions (live `duckdb_functions()`)
 
 ```
-quackapi_ack, quackapi_add_api_key, quackapi_authentication, quackapi_authorization,
-quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_exec, quackapi_fetch, quackapi_graphql_routes,
-quackapi_graphql_tables, quackapi_groups, quackapi_http_pool, quackapi_http_util_name,
-quackapi_last_write_timeout_sec, quackapi_middlewares, quackapi_nack, quackapi_policies,
-quackapi_parallel_fetch, quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,
+quackapi_ack, quackapi_add_api_key, quackapi_auths, quackapi_dequeue, quackapi_enqueue, quackapi_exec, quackapi_graphql_routes,
+quackapi_graphql_tables, quackapi_groups, quackapi_http_pool,
+quackapi_middlewares, quackapi_nack, quackapi_policies,
+quackapi_post, quackapi_queues, quackapi_renew, quackapi_request,
 quackapi_routes, quackapi_serve, quackapi_servers, quackapi_stop, quackapi_streams,
-quackapi_verify_auth, quackapi_wait,
-quack_from_fastapi, quack_from_fastapi_models, quack_from_rails, quack_from_rails_models,
-quack_from_express, quack_from_express_models, quack_from_gin, quack_from_gin_models,
-quack_from_x_sql, quack_from_x_sql_relpath
+quackapi_verify_auth, quackapi_wait, quackapi_requests,
+quackapi_telemetry_status, quackapi_telemetry_flush,
+quack_from_routes, quack_from_models
 ```
 
 Plus durable table **`quackapi_jobs`** (queue) created on first `CREATE QUEUE`.
@@ -215,17 +215,23 @@ Clean Pydantic fields (exclude Django false tags): **1568** fields / 188 model×
 
 OpenAPI-universal path (highest leverage): `/tmp/quackapi_corpus/SPEC.md` — `quack_from_openapi` / `quack_from_json_schema` design (petstore fixtures under `specs/`).
 
-### 3.2 Per-framework bridge status
+### 3.2 Framework metadata import
 
-| Bridge | Status | Proof | Next |
-|--------|--------|-------|------|
-| **`quack_from_fastapi`** | **partial one-caller** (shell + pure SQL, not in-tree C++ TF yet) | fastapi-realworld **pass=10 fail=0** (19 routes registered, 25 models); locus ROH **pass=10 fail=0** | C++ `quack_from_fastapi(path)` TVF | `/tmp/quackapi_fromfast.md` |
-| **`quack_from_rails`** | **proven one-caller (partial runtime fidelity)** | rails-realworld **pass=14 fail=0**; handlers = SQL façades not Ruby | `quack_from_express` | `/tmp/quackapi_rails_bridge.md` |
-| **`quack_from_openapi` / JSON Schema** | **designed + corpus specs**; highest-leverage multi-stack path | SPEC + petstore YAML fixtures | bulk emit + serve recipe | `/tmp/quackapi_corpus/SPEC.md` |
-| **Express / Nest / Koa / Fastify** | **IR only** (Node corpus 182 routes) | NODE.md | shell bridge not shipped as one-caller |
-| **Gin / Echo / Fiber / chi** | **IR only** (Go corpus 352 routes) | GO.md | `quack_from_gin` listed next after rails |
-| **DRF / Flask / Django** | **IR extracted** (Python 990 routes) | PYTHON.md | no dedicated one-caller beyond FastAPI path |
-| **Sinatra** | **IR + synthetic RealWorld** | RUBY.md | secondary to Rails |
+The two native table functions `quack_from_routes(framework, path)` and
+`quack_from_models(framework, path)` support `fastapi`, `rails`, `express`,
+and `gin`. They use sitting_duck ASTs and return route/model metadata, not
+translated handlers or an automatically served application. The old eight
+public names and importer SQL inspection helpers are removed.
+
+Versioned framework fixtures, `quackapi_from_x*.test`, and
+`quackapi_pydantic_contract.test` establish the current contract. FastAPI
+required/default extraction handles bare Field(), metadata-only Field(),
+ellipsis defaults and real defaults through AST structure.
+See [the import guide](from-fastapi.md) and [bridge sources](../bridges/from_x/README.md).
+
+Other frameworks and OpenAPI/JSON Schema import remain design/corpus work.
+Historical corpus facade results below do not establish current automatic
+translation coverage.
 
 ### 3.3 Pydantic → validation fidelity
 
@@ -333,17 +339,12 @@ The current built set declared by the repository's community descriptor includes
 | STREAM NDJSON + cancel-on-disconnect polish | M | completes streaming SPEC beyond SSE DDL |
 | radio-composed multi-node SSE bus docs/tests | S–M | HAVE-EXT radio |
 
-### Ships as companion (bridges — not blocking community submit)
+### Historical companion studies
 
-| Companion | Form | Status |
-|-----------|------|--------|
-| `quack_from_fastapi.sh` | shell + SQL, **homed in-repo**: `bridges/from_x/one_callers/` | partial one-caller, e2e green (corpus + fixture in `bridges/from_x/fixtures/fastapi_mini`, `test/sql/quackapi_from_x_bridge.test`) |
-| `quack_from_rails` | same shape, corpus proof homed in `bridges/from_x/docs/rails_bridge.md` | proven rails-realworld |
-| `quack_from_openapi` | pure SQL over OpenAPI/JSON Schema | designed + fixtures |
-| Pydantic → BODY SCHEMA emitter | SQL/scripts, extraction homed in `bridges/from_x/extract/extract_python_ir.sql` | ~81% feature map |
-| Future: express / gin / DRF one-callers | IR extractors homed in `bridges/from_x/extract/` (node/go); ruby extractor `bridges/from_x/extract/extract_ruby_ir.py` | not shipped as one-callers |
-
-**Promoted into-repo:** `bridges/from_x/` (branch `feat/from-x`) now carries the extraction SQL (Python/Node/Go/Ruby), the `quack_from_fastapi` one-caller driver, a committed fixture, and a passing sqllogictest — closing the "promote after v1" TODO below for the extraction half. The one-caller is still shell+SQL, not an in-tree C++ `quack_from_*(path)` TVF; that remains open (see `bridges/from_x/README.md` §4 and the P0 items in `bridges/from_x/docs/fromfast.md` §4).
+Original bridge reports remain in `bridges/from_x/docs/` as historical evidence.
+Temporary one-caller scripts and corpus extractors named by those reports are
+not shipped entrypoints. Current extraction SQL is maintained in `src/sql/`,
+embedded in the binary and exposed through the two metadata functions above.
 
 ### Blocked on transport
 

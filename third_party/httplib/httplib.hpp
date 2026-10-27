@@ -1,6 +1,7 @@
 // VENDORED by quackapi from duckdb/third_party/httplib at the pinned duckdb
 // submodule commit (v2.0.0, cpp-httplib 0.53.1). quackapi's changes, each
-// marked "quackapi" below: its own namespace, SocketStream::set_write_timeout
+// marked "quackapi" below: its own namespace, request-scoped payload limits,
+// SocketStream::set_write_timeout
 // for per-route IO deadlines, the file request handler running for HEAD and
 // 304s, and 0.56's server WebSocket read timeout (ws::Timeout).
 
@@ -1692,6 +1693,8 @@ struct Request {
   Headers headers;
   Headers trailers;
   std::string body;
+  // quackapi: per-request body ceiling, set by the header-phase setup hook.
+  size_t payload_max_length = CPPHTTPLIB_PAYLOAD_MAX_LENGTH;
 
   std::string remote_addr;
   int remote_port = -1;
@@ -12691,12 +12694,12 @@ inline bool Server::read_content(Stream &strm, Request &req, Response &res) {
               return false;
             }
 
-            // Limit decompressed body size to payload_max_length_ to protect
+            // Limit decompressed body size to the request ceiling to protect
             // against "zip bomb" attacks where a small compressed payload
             // decompresses to a massive size.
-            if (payload_max_length_ > 0 &&
-                (req.body.size() >= payload_max_length_ ||
-                 n > payload_max_length_ - req.body.size())) {
+            if (req.payload_max_length > 0 &&
+                (req.body.size() >= req.payload_max_length ||
+                 n > req.payload_max_length - req.body.size())) {
               return false;
             }
 
@@ -12787,8 +12790,8 @@ inline bool Server::read_content_core(
 #if !defined(CPPHTTPLIB_SSL_ENABLED)
   if (!req.has_header("Content-Length") &&
       !detail::is_chunked_transfer_encoding(req.headers)) {
-    if (!detail::is_connection_persistent(req) && payload_max_length_ > 0 &&
-        payload_max_length_ < (std::numeric_limits<size_t>::max)()) {
+    if (!detail::is_connection_persistent(req) && req.payload_max_length > 0 &&
+        req.payload_max_length < (std::numeric_limits<size_t>::max)()) {
       auto has_data = strm.is_readable();
       if (!has_data) {
         auto s = strm.socket();
@@ -12798,10 +12801,10 @@ inline bool Server::read_content_core(
       }
       if (has_data) {
         // Route through the same decompressing reader used by the
-        // length-framed and chunked paths below, so payload_max_length_ is
+        // length-framed and chunked paths below, so the request ceiling is
         // enforced on the decompressed size here too instead of only on the
         // compressed wire bytes.
-        return detail::read_content(strm, req, payload_max_length_, res.status,
+        return detail::read_content(strm, req, req.payload_max_length, res.status,
                                     nullptr, out, true);
       }
     }
@@ -12814,7 +12817,7 @@ inline bool Server::read_content_core(
   }
 #endif
 
-  if (!detail::read_content(strm, req, payload_max_length_, res.status, nullptr,
+  if (!detail::read_content(strm, req, req.payload_max_length, res.status, nullptr,
                             out, true)) {
     return false;
   }
@@ -13424,6 +13427,8 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   if (!line_reader.getline()) { return false; }
 
   Request req;
+  // quackapi: copy the server hard ceiling before the setup hook may lower it.
+  req.payload_max_length = payload_max_length_;
   req.start_time_ = std::chrono::steady_clock::now();
   req.remote_addr = remote_addr;
   req.remote_port = remote_port;
@@ -13521,6 +13526,16 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
   }
 
   if (setup_request) { setup_request(req); }
+
+  // quackapi: reject known oversized bodies before acknowledging Expect: 100-continue
+  // or allocating the request body. Chunked bodies remain bounded while streamed.
+  if (req.has_header("Content-Length") && req.payload_max_length > 0 &&
+      req.get_header_value_u64("Content-Length") > req.payload_max_length) {
+    connection_closed = true;
+    res.status = StatusCode::PayloadTooLarge_413;
+    output_error_log(Error::ExceedMaxPayloadSize, &req);
+    return write_response(strm, close_connection, req, res);
+  }
 
   if (req.get_header_value("Expect") == "100-continue") {
     int status = StatusCode::Continue_100;
@@ -13703,7 +13718,7 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
     } else {
       int dummy_status;
       if (!detail::read_content(
-              strm, req, payload_max_length_, dummy_status, nullptr,
+              strm, req, req.payload_max_length, dummy_status, nullptr,
               [](const char *, size_t, size_t, size_t) { return true; },
               false)) {
         connection_closed = true;

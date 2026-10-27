@@ -9,17 +9,17 @@ rows** via native C++ table functions that wrap `sitting_duck` (tree-sitter AST)
 LOAD quackapi;
 
 -- Routes: method, path, handler_name, file, start_line, evidence
-SELECT * FROM quack_from_fastapi('/path/to/app');
-SELECT * FROM quack_from_rails('/path/to/rails-app');
-SELECT * FROM quack_from_express('/path/to/express-app');
-SELECT * FROM quack_from_gin('/path/to/gin-app');
+SELECT * FROM quack_from_routes('fastapi', '/path/to/app');
+SELECT * FROM quack_from_routes('rails', '/path/to/rails-app');
+SELECT * FROM quack_from_routes('express', '/path/to/express-app');
+SELECT * FROM quack_from_routes('gin', '/path/to/gin-app');
 
 -- Models: model_name, field_name, field_type, is_required, is_optional,
 --         has_default, default_expr, file, field_line
-SELECT * FROM quack_from_fastapi_models('/path/to/app');
-SELECT * FROM quack_from_rails_models('/path/to/rails-app');
-SELECT * FROM quack_from_express_models('/path/to/express-app');
-SELECT * FROM quack_from_gin_models('/path/to/gin-app');
+SELECT * FROM quack_from_models('fastapi', '/path/to/app');
+SELECT * FROM quack_from_models('rails', '/path/to/rails-app');
+SELECT * FROM quack_from_models('express', '/path/to/express-app');
+SELECT * FROM quack_from_models('gin', '/path/to/gin-app');
 ```
 
 Each function **auto-`INSTALL`/`LOAD`s `sitting_duck` FROM community** on first use
@@ -42,8 +42,9 @@ src/sql/quack_from_gin_models.sql
 
 These are embedded into the binary as raw-string constants
 (`src/include/quackapi_from_x_sql.hpp`, regenerated via
-`python3 scripts/embed_from_x_sql.py`). A sqllogictest asserts disk SQL
-byte-matches the embedded constants via `quack_from_x_sql(framework, kind)`.
+`python3 scripts/embed_from_x_sql.py`). Run
+`python3 test/test_from_x_sql_embed.py` to verify all eight embedded queries
+match their source files byte for byte.
 
 ## Layout
 
@@ -68,10 +69,13 @@ test/sql/quackapi_from_x_*.test         sqllogictests
 
 ## What translates automatically
 
-1. **Routing** — decorator/DSL syntax → `(method, path, handler_name)` IR →
-   `CREATE ROUTE … AS SELECT …`
-2. **Request-body validation** — Pydantic / class-validator / Rails validates+
-   strong-params / Go struct tags → field IR → `BODY SCHEMA` JSON Schema
+1. **Routing metadata** — decorator/DSL syntax → `(method, path, handler_name)` IR.
+2. **Model metadata** — Pydantic / class-validator / Rails validates+
+   strong-params / Go struct tags → field IR.
+
+The functions return metadata only. Review the rows, map source types, and write
+`CREATE ROUTE` handlers and request validation separately. They do not generate
+or register a complete SQL application. See the [migration guide](../../docs/from-fastapi.md).
 
 ## Escape hatch
 

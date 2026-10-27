@@ -14,8 +14,7 @@ LOAD quackapi;
 
 -- Confirm the outbound client is MultiCurl (curl_httpfs default).
 SELECT curl_httpfs_http_util_name() AS curl_httpfs_util;
--- After applying the quackapi proposal:
--- SELECT quackapi_http_util_name() AS quackapi_util;
+-- QuackAPI's selected backend is also visible in quackapi_servers() after serve.
 
 -- Optional: libcurl verbose logs to stderr (proof that libcurl, not httplib, runs).
 -- SET curl_httpfs_enable_verbose_logging = true;
@@ -31,7 +30,7 @@ FROM read_text($url);
 
 -- Health / diagnostics route (no outbound I/O).
 CREATE OR REPLACE ROUTE http_util GET '/http_util' AS
-SELECT quackapi_http_util_name() AS http_util;
+SELECT curl_httpfs_http_util_name() AS http_util;
 
 SELECT * FROM quackapi_serve(18080, host := '127.0.0.1');
 

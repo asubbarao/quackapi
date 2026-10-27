@@ -1,0 +1,63 @@
+# name: test/sql/quackapi_large_json.test
+# description: JSON responses preserve chunks, headers, envelopes and exact byte limits
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE large_native GET '/large-native' AS SELECT range AS id FROM range(10000);
+
+query IIII
+SELECT status, octet_length(body), starts_with(decode(body), '[{"id":0},{"id":1},'), ends_with(decode(body), '{"id":9999}]') FROM quackapi_request('GET', '/large-native');
+----
+200	118891	true	true
+
+query I
+SELECT status FROM quackapi_request('GET', '/large-native', max_response_bytes := 118891);
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/large-native', max_response_bytes := 118890);
+----
+507
+
+statement ok
+CREATE ROUTE large_empty GET '/large-empty' EMPTY STATUS 404 AS SELECT range AS id FROM range(0);
+
+query I
+SELECT status FROM quackapi_request('GET', '/large-empty');
+----
+404
+
+statement ok
+CREATE ROUTE native_object GET '/native-object' ENVELOPE object AS SELECT 7 AS id;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/native-object');
+----
+200	{"id":7}
+
+statement ok
+CREATE ROUTE native_object_empty GET '/native-object-empty' ENVELOPE object AS SELECT range AS id FROM range(0);
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/native-object-empty');
+----
+200	null
+
+statement ok
+CREATE ROUTE native_object_many GET '/native-object-many' ENVELOPE object AS SELECT range AS id FROM range(2);
+
+query I
+SELECT status FROM quackapi_request('GET', '/native-object-many');
+----
+500
+
+statement ok
+CREATE ROUTE native_cookie GET '/native-cookie' AS SELECT 7 AS id, 'token=a' AS set_cookie;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/native-cookie');
+----
+200	[{"id":7}]

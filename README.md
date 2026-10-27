@@ -13,6 +13,12 @@ browser ──► DuckDB [ quackapi · pdf · tera · fakeit · webbed · … ]
 There is no app server, no ORM, and no schema re-declared in a second language.
 The query already types the response.
 
+This README documents the source in this checkout. Community installation uses
+the commit pinned in the [DuckDB extension registry](https://github.com/duckdb/community-extensions/blob/main/extensions/quackapi/description.yml),
+so new APIs become available there only after that descriptor is updated and
+its signed builds are published. See [migration notes](docs/MIGRATION.md) when
+upgrading an existing application.
+
 > **Thesis:** the backend *is* the database.  
 > Prior art: PostgREST, Datasette, Hasura, Oracle APEX. The novel part is one
 > **embedded OLAP** process as DB + HTTP framework + (optional) PDF/renderer,
@@ -146,7 +152,7 @@ loopback or behind `REQUIRE`.
 
 `quackapi_exec(sql)` returns the receipt `quackapi_post` gives for
 `POST {"sql": sql}` to an exec route — same `STRUCT(status, reason, body,
-headers, error, reused_connection)`, same status codes and bodies — but runs the
+headers, error, reused_connection, body_blob)`, same status codes and bodies — but runs the
 SQL on this process's own database, so no HTTP worker is involved:
 
 ```sql
@@ -180,7 +186,8 @@ An exec route with no `STATUS`, `EMPTY STATUS`, `ENVELOPE object` or non-JSON
 The table forms release the pipeline while work is pending:
 
 ```sql
-FROM quackapi_fetch('https://example.com');
+-- Native file readers replace the removed GET helper.
+SELECT content FROM read_text('https://example.com');
 FROM quackapi_post('https://example.com/api', '{"n":42}', content_type := 'application/json');
 FROM quackapi_exec('SELECT 42 AS answer');
 ```
@@ -237,9 +244,11 @@ a single-route registration with Query.Farm's native `cronjob` build when
 
 ### Response modes (column names)
 
-| Column name | Response |
+| Route mode or column | Response |
 |-------------|----------|
 | *(default)* | JSON **array of row objects** — types follow DuckDB column types |
+| `FORMAT ARROW` or Arrow `Accept` | Arrow IPC stream; `BLOB` columns are byte arrays in Arrow, not a raw file response |
+| `FORMAT binary` | Exact `BLOB` response body from one row (`body` plus optional `content_type`) |
 | single column `html` | `text/html; charset=utf-8` (raw string body) |
 | single column `text` | `text/plain; charset=utf-8` |
 | `location` | `Location` header (use with `STATUS 3xx` for redirects) |
@@ -351,11 +360,11 @@ the “PDF service” is a function call in the same address space — not an RP
 
 | Surface | Signature / form | Returns |
 |---------|------------------|---------|
-| `quackapi_serve` | `([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, pg_dsn := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_pending_requests := …)` | `listen_url` |
+| `quackapi_serve` | `([port], host := …, static_dir := …, cors_origins := …, memory_limit := …, log_level := …, access_log := …, enable_logging := …, health_routes := …, threads := …, preserve_insertion_order := …, enable_http_metadata_cache := …, worker_threads := …, keep_alive_max_count := …, keep_alive_timeout_sec := …, read_timeout_sec := …, write_timeout_sec := …, compression := …, compression_min_bytes := …, http_client := …, block := …, query_timeout_ms := …, max_response_bytes := …, max_request_bytes := …, cancel_on_disconnect := …, max_pending_requests := …)` | `listen_url` |
 | `quackapi_wait` | `(port [, timeout_ms], host := …)` — TCP readiness | `ready`, `listen_url` |
 | `quackapi_stop` | `([port])` — omit port to stop all | `status` |
 | `quackapi_telemetry_flush` | `([port])` — drain pending sink rows without stopping | `status` |
-| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule` |
+| `quackapi_routes` | `()` | `name, method, pattern, status, handler, require_auth, group_name, tags, format, envelope, empty_status, timeout_sec, schedule, max_request_bytes` |
 | `quackapi_servers` | `()` | `host, port, listen_url, http_client, http_client_reason` |
 | Setting | `SET quackapi_cors_origins = '*' \| 'https://a,https://b'` | empty = CORS off |
 | Setting | `SET quackapi_memory_limit = '4GB' \| '512MB' \| …` | empty = leave DuckDB `memory_limit` alone |
@@ -363,8 +372,8 @@ the “PDF service” is a function call in the same address space — not an RP
 | Setting | `SET quackapi_compression = 'auto' \| 'gzip' \| 'zstd' \| 'off'` | default `auto`; legacy booleans map to `auto`/`off` |
 | Setting | `SET quackapi_compression_min_bytes = N` | default `1024` |
 | Setting | `SET quackapi_http_client = 'auto' \| 'curl' \| 'httplib'` | auto=prefer+loud fallback; curl=require; httplib=force stock |
-| Setting | `SET quackapi_pg_dsn = 'postgresql://…'` | empty = DuckDB handler path |
 | Setting | `SET quackapi_query_timeout_ms = N` | default `30000` |
+| Setting | `SET quackapi_http_timeout_ms = N` | default `600000`; maximum outbound call duration absent a shorter outer deadline |
 | Setting | `SET quackapi_max_response_bytes = N` | default `16777216` uncompressed bytes |
 | Setting | `SET quackapi_max_pending_requests = N` | default `256` |
 | Setting | `SET quackapi_exec_max_threads = N` | default `256`; past it `quackapi_exec` rows run on the calling thread; `0` = always |
@@ -377,6 +386,21 @@ stopping the server. The queue uses 10,000 entries and reports overflow in
 `/healthz` as `access_log_overflow_count`. Compression defaults to `auto`,
 negotiates client q-values with zstd winning ties, skips bodies below 1024 bytes,
 and adds `Vary: Accept-Encoding` to responses eligible for compression.
+
+HTTP concurrency is server-wide: by default up to 32 requests are active at
+once (`worker_threads`), and up to 256 accepted connections can wait for a
+worker (`max_pending_requests`). These are configurable server-wide limits,
+not per-route limits; all routes share the same pool. Requests
+that arrive after the pending queue fills are closed at the connection
+admission layer, without a guaranteed HTTP error response. This is separate
+from DuckDB's `threads` setting, which controls query execution.
+
+Access-log headers are opt-in through the `log_headers` allowlist (empty by
+default). Sensitive names such as `Authorization`, `Cookie`, `Set-Cookie`,
+`X-API-Key`, and names containing `token`, `secret`, or `password` remain
+redacted even if allowlisted. Sensitive query keys are redacted when query
+logging is enabled. Avoid putting credentials in request bodies or paths, and
+only allowlist headers needed for operations.
 
 Built-in OpenAPI (not listed in `quackapi_routes()`):
 
@@ -406,7 +430,21 @@ SET memory_limit = '4GB';
 SELECT * FROM quackapi_serve(8000);
 ```
 
-Request body limit: **8 MiB** (`413` when exceeded).
+Default request body limit: **8 MiB** (`413` when exceeded).
+For a larger image upload, raise both the route limit and server ceiling; the
+effective cap is the smaller value:
+
+```sql
+CREATE ROUTE image_upload POST '/images' WITH (max_request_bytes := 33554432) AS
+  SELECT octet_length($file::BLOB) AS bytes;
+
+SELECT * FROM quackapi_serve(8000, max_request_bytes := 33554432);
+```
+
+Here `$file` is the multipart file part. The route option is still capped by
+the server option; raising the server ceiling alone leaves routes at the 8 MiB
+default. See the [request body guide](docs/guide/request-bodies.md) for the full
+limit semantics.
 
 ### Auth
 
@@ -420,8 +458,9 @@ SELECT * FROM quackapi_auths();   -- name, kind, header — never secrets/hashes
 ```
 
 Verified JWT/API-key claims bind as `$claims_<name>` (missing claim → SQL `NULL`,
-not 422). Bridge scalars for the core quack RPC: `quackapi_authentication`,
-`quackapi_authorization`, `quackapi_verify_auth`.
+not 422). REST credentials are verified with `quackapi_verify_auth`. Core Quack manages
+its own RPC authentication and authorization settings; serving REST does not
+override them.
 
 ### Route groups (APIRouter-style)
 
@@ -432,10 +471,27 @@ CREATE ROUTE items_list GET '/items' GROUP v1 AS SELECT …;
 SELECT * FROM quackapi_groups();
 ```
 
+### PostgreSQL through DuckDB
+
+```sql
+INSTALL postgres;
+LOAD postgres;
+ATTACH 'host=127.0.0.1 dbname=mydb' AS pg (TYPE postgres);
+CREATE ROUTE orders GET '/orders/:id' AS
+  SELECT * FROM pg.public.orders WHERE id = $id::BIGINT;
+```
+
+Configure credentials using DuckDB secrets or PostgreSQL environment variables.
+The former quackapi `pg_dsn` option and `quackapi_pg_dsn` setting are retired:
+nonempty values now fail explicitly. Attach the database with the PostgreSQL
+extension and use the attached catalog in route SQL. PostgreSQL-specific SQL can
+also use the extension's `postgres_query` and `postgres_execute` functions.
+
 ### Table API (read-only scaffold)
 
 ```sql
 CREATE API FOR TABLE documents [AT '/docs'] [KEY 'id'];
+-- GET /docs?limit=100&offset=0 (maximum limit 1000)
 -- registers GET /docs and GET /docs/:id only (no write routes)
 ```
 
@@ -462,6 +518,57 @@ FROM quackapi_dequeue('emails', 10);
 
 Worker = compose community `cronjob` (or a drain route). See [`docs/QUEUE.md`](docs/QUEUE.md).
 
+### Parquet file responses
+
+`FORMAT PARQUET` returns a complete Parquet file body with content type
+`application/vnd.apache.parquet`:
+
+```sql
+CREATE ROUTE export GET '/export.parquet' FORMAT PARQUET AS
+SELECT 42::BIGINT AS id, 'verified' AS label;
+```
+
+Save the HTTP body directly as a `.parquet` file and open it with `read_parquet`.
+The URL suffix is optional; `FORMAT PARQUET` selects the encoding. A browser
+attachment filename is configured separately through `Content-Disposition`.
+
+### Arrow responses and binary data
+
+A route can return an Arrow IPC stream, including `BLOB` values as binary data:
+
+```sql
+CREATE ROUTE image_rows GET '/images' FORMAT ARROW AS
+  SELECT image_bytes AS png FROM generated_images;
+```
+
+Alternatively, send `Accept: application/vnd.apache.arrow.stream` to a JSON-format
+route. The response is an Arrow stream, not a raw PNG: an Arrow client must decode
+it to obtain the bytes. `FORMAT ARROW` passes native DuckDB result batches to the
+vendored nanoarrow encoder without rebuilding rows. The HTTP body is still
+buffered, and the response cap is checked after each encoded batch. JSON rows
+are encoded once while fetching results. Run [the large-response benchmark](bench/large_response.sql)
+with this checkout's CLI to measure both paths. See
+[`docs/reference/ddl.md`](docs/reference/ddl.md) for negotiation and precedence.
+For a direct PNG response, use `FORMAT binary` and return one row with a BLOB
+named `body` and an optional `content_type`. DuckDB 2.0's `read_blob` reads a
+file as a `BLOB`, including remote files supported by the active filesystem:
+
+```sql
+CREATE ROUTE image GET '/image/:id' FORMAT binary AS
+  SELECT content AS body, 'image/png' AS content_type
+  FROM read_blob('/srv/images/' || $id::VARCHAR || '.png');
+```
+
+The response body is the exact BLOB bytes. Omitting `content_type` uses
+`application/octet-stream`; binary responses require exactly one row.
+For an upstream HTTP response where status and headers matter, load the
+community `http_request` extension and use its `http_get(...)` response fields;
+its `body` is a `BLOB`. `read_blob(url)` is simpler when only the bytes are
+needed. The removed `quackapi_fetch` is not needed for either case.
+
+This revision targets DuckDB **2.0.0**, not 1.5.5. Use an extension build matching
+the running host; see [`SUPPORTED_HOSTS.md`](SUPPORTED_HOSTS.md).
+
 ### SSE and WebSocket streams
 
 ```sql
@@ -471,6 +578,20 @@ SELECT * FROM quackapi_streams();
 ```
 
 See [`docs/guide/stream.md`](docs/guide/stream.md).
+
+An interval stream can report progress by polling a persisted status row while
+separate work updates it:
+
+```sql
+CREATE STREAM job_progress GET '/jobs/:job_id/events' WITH (interval='500ms') AS
+SELECT status, percent, updated_at
+FROM job_status
+WHERE job_id = $job_id::BIGINT;
+```
+
+This polls DuckDB state; `quackapi_post` waits for the complete upstream
+response and does not stream upstream tokens. Start long work independently
+(for example, through a queue worker) and update `job_status` as it proceeds.
 
 ### Row-access & masking policies
 
@@ -498,30 +619,71 @@ CREATE ROUTE ask POST '/ask' AS
 
 | Function | Role |
 |----------|------|
-| `quackapi_fetch(url[, headers])` | GET → `STRUCT(status, reason, body, headers, error, reused_connection)` |
-| `quackapi_post(url, body[, content_type[, headers]])` | POST, same result shape (`content_type` defaults to `application/json`) |
+| `quackapi_post(url, body[, content_type[, headers]], timeout_ms := …)` | Scalar or table POST (`content_type` defaults to `application/json`); both forms return exact `body_blob` bytes |
 | `quackapi_http_pool()` | per-origin `host, idle, dialed, reused` |
 | `quackapi_exec(sql)` | the receipt `quackapi_post` gives from an exec route, computed in-process — see [`quackapi_exec`](#quackapi_execsql-the-exec-route-without-http) |
 
-Why this exists: `HTTPUtil::Request(request)` — and the community `http_client`
-extension — build a fresh client per call and drop it, so connections are only
-reused *within* one query execution. A route handler is exactly one execution,
-so every request paid a full dial. Against an ollama endpoint whose floor is
-12.7ms/call that cost **39.1ms p50**; through the pool the same route measures
-**13.2ms p50 / 13.8ms p90**.
+The pool retains at most 64 idle clients per origin, 256 idle clients overall,
+and 256 origin entries; overflow clients are not retained for reuse.
+
+The plain-HTTP client keeps connections across route executions. An earlier
+benchmark against an Ollama endpoint measured **39.1ms p50** without pooling
+and **13.2ms p50 / 13.8ms p90** with it. See
+[`docs/EXTENSION_OVERLAP.md`](docs/EXTENSION_OVERLAP.md) for a comparison with
+DuckDB's remote readers and the community `http_request` extension.
 
 `http://` uses the vendored httplib client, which implements POST — no companion
 extension needed. `https://` goes through `HTTPUtil`, pooled the same way, so
 `LOAD curl_httpfs` (or `httpfs`) supplies TLS.
 
+Enable `quackapi_serve(..., cancel_on_disconnect := true)` to interrupt ordinary
+route SQL when the downstream socket closes and abort a blocked plain-HTTP POST.
+This is opt-in because socket EOF also includes a client deliberately half-closing
+its write side. The HTTPS `HTTPUtil` interface has no portable abort hook, so a
+blocked HTTPS call remains bounded by its configured timeout.
+
+Per-call outbound timeouts cap only the HTTP wait. They do not extend the
+enclosing query or route's `query_timeout_ms`; the earlier deadline wins. A
+client disconnect closes the response path, but does not guarantee that an
+already-submitted upstream job is cancelled. Call the upstream cancellation
+API when stopping remote work is required.
+
+Pass a keyword-only timeout in milliseconds to either the scalar or table form.
+An explicit value overrides `quackapi_http_timeout_ms` for that call, but still
+cannot exceed the outer deadline:
+
+```sql
+SELECT (quackapi_post('https://api.example.com/jobs', $body::VARCHAR,
+                      timeout_ms := 120000)).body_blob;
+
+SELECT status, body_blob
+FROM quackapi_post('https://api.example.com/jobs', '{"run":true}',
+                   content_type := 'application/json', timeout_ms := 120000);
+```
+
+`body_blob` always preserves the response bytes. The compatibility `body`
+field is `NULL` when those bytes are not valid UTF-8; otherwise it contains the
+same response decoded as text.
+
 Both are `VOLATILE`: DuckDB constant-folds a literal-argument call otherwise, and
 `FROM range(1000)` would issue one request while reporting 1000 rows.
 
+### Framework importers
+
+```sql
+SELECT * FROM quack_from_routes('fastapi', '/path/to/app');
+SELECT * FROM quack_from_models('fastapi', '/path/to/app');
+```
+
+Both functions accept `fastapi`, `rails`, `express`, or `gin`. They replace the
+framework-specific function names. See [the importer guide](bridges/from_x/README.md)
+for the route and model schemas.
+
 ### Diagnostics
 
-| Function | Role |
-|----------|------|
-| `quackapi_http_util_name()` | name of the active outbound HTTPUtil (`Built-In`, `MultiCurl` after `LOAD curl_httpfs`, …) |
+For the companion HTTP backend, load `curl_httpfs` and call its native
+`curl_httpfs_http_util_name()`. Quackapi's selected backend and fallback reason
+are also reported by `quackapi_servers()` and `/healthz`.
 
 Outbound HTTPS uses DuckDB’s shared `HTTPUtil` (no libcurl linked into quackapi).
 `quackapi_serve` **batteries prefer `curl_httpfs`** (pool + HTTP/2 + async).

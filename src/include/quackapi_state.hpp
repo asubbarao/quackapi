@@ -1,5 +1,7 @@
 #pragma once
 
+#include "duckdb/common/types/value.hpp"
+
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -63,13 +65,13 @@ struct QuackapiParamSpec {
 	//! Raw default literal (digits / true / false / unquoted text). Empty when default_is_null.
 	string default_raw;
 	bool has_ge = false;
-	double ge = 0;
+	Value ge;
 	bool has_gt = false;
-	double gt = 0;
+	Value gt;
 	bool has_le = false;
-	double le = 0;
+	Value le;
 	bool has_lt = false;
-	double lt = 0;
+	Value lt;
 	bool has_min_length = false;
 	idx_t min_length = 0;
 	bool has_max_length = false;
@@ -145,6 +147,8 @@ struct QuackapiRoute {
 	string group_name;
 	//! OpenAPI tags CSV (from group inheritance or future per-route tags).
 	string tags;
+	//! Optional per-route request-body ceiling in bytes. Zero inherits the 8 MiB default.
+	int64_t max_request_bytes = 0;
 	//! RATE LIMIT <n> PER <seconds> [BY ip|token|key]. n==0 disables.
 	int rate_limit_n = 0;
 	int rate_limit_per_sec = 0;
@@ -254,6 +258,7 @@ public:
 
 	//! CREATE [OR REPLACE] ROUTE. Throws on duplicate name unless or_replace.
 	void AddRoute(const QuackapiRoute &route, bool or_replace);
+	void AddRoutes(const vector<QuackapiRoute> &new_routes, bool or_replace);
 	//! DROP ROUTE. Returns false if no such route.
 	bool DropRoute(const string &name);
 	vector<QuackapiRoute> SnapshotRoutes();
@@ -371,22 +376,10 @@ public:
 	bool GetGraphqlRouteBySchemaPath(const string &path, QuackapiGraphqlRoute &out);
 	vector<QuackapiGraphqlRoute> SnapshotGraphqlRoutes();
 
-	//! Effective write deadline (seconds) applied to the most recent route
-	//! request. Seeded with serve write_timeout_sec; ApplyRouteIoTimeout
-	//! overwrites it only when it actually extends the socket deadlines.
-	//! Test/introspection seam — not a registry field.
-	void SetLastEffectiveWriteTimeoutSec(int32_t sec) {
-		last_effective_write_timeout_sec.store(sec, std::memory_order_relaxed);
-	}
-	int32_t GetLastEffectiveWriteTimeoutSec() const {
-		return last_effective_write_timeout_sec.load(std::memory_order_relaxed);
-	}
-
 private:
 	void PublishRoutes();
 	void PublishStreams();
 
-	std::atomic<int32_t> last_effective_write_timeout_sec {0};
 	struct RateLimitEntry {
 		int count = 0;
 		std::chrono::steady_clock::time_point expires;

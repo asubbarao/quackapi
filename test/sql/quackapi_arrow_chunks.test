@@ -1,0 +1,114 @@
+# name: test/sql/quackapi_arrow_chunks.test
+# description: Arrow IPC responses preserve typed rows across chunks and enforce byte caps
+# group: [sql]
+
+require quackapi
+
+require nanoarrow
+
+statement ok
+CREATE ROUTE arrow_cookie_limit GET '/arrow-cookie-limit' FORMAT ARROW AS
+SELECT range AS id, 'sid=changed' AS set_cookie FROM range(10000);
+
+query II
+SELECT status, map_contains(headers, 'Set-Cookie')::INTEGER
+FROM quackapi_request('GET', '/arrow-cookie-limit', max_response_bytes := 1024);
+----
+507	0
+
+query II
+SELECT status, map_contains(headers, 'Set-Cookie')::INTEGER
+FROM quackapi_request('GET', '/arrow-cookie-limit', max_response_bytes := 1048576);
+----
+200	1
+
+statement ok
+CREATE ROUTE arrow_chunks GET '/arrow-chunks' FORMAT ARROW AS
+SELECT i::BIGINT AS id,
+       (i % 7)::SMALLINT AS small_value,
+       (i * 1.25)::DECIMAL(12, 2) AS amount,
+       CASE WHEN i % 5 = 0 THEN NULL ELSE ('v' || i::VARCHAR)::VARCHAR END AS label,
+       (DATE '2024-01-01' + (i % 31)::INTEGER)::DATE AS day
+FROM range(12000) t(i);
+
+statement ok
+COPY (SELECT body FROM quackapi_request('GET', '/arrow-chunks'))
+TO '__TEST_DIR__/quackapi_arrow_chunks.ipc' (FORMAT BLOB);
+
+# Metadata is tested independently of the decoded row assertions.
+query II
+SELECT status, starts_with(content_type, 'application/vnd.apache.arrow.stream')
+FROM quackapi_request('GET', '/arrow-chunks');
+----
+200	true
+
+# Compare every decoded field with the expected typed row. The ID list detects
+# missing or duplicate rows, and bool_and detects any corrupted field.
+query II
+WITH decoded AS (
+    SELECT * FROM read_arrow('__TEST_DIR__/quackapi_arrow_chunks.ipc')
+), expected AS (
+    SELECT i::BIGINT AS id,
+           (i % 7)::SMALLINT AS small_value,
+           (i * 1.25)::DECIMAL(12, 2) AS amount,
+           CASE WHEN i % 5 = 0 THEN NULL ELSE ('v' || i::VARCHAR)::VARCHAR END AS label,
+           (DATE '2024-01-01' + (i % 31)::INTEGER)::DATE AS day
+    FROM range(12000) t(i)
+), compared AS (
+    SELECT decoded.id AS actual_id, expected.id AS expected_id,
+           decoded.small_value IS NOT DISTINCT FROM expected.small_value AS small_ok,
+           decoded.amount IS NOT DISTINCT FROM expected.amount AS amount_ok,
+           decoded.label IS NOT DISTINCT FROM expected.label AS label_ok,
+           decoded.day IS NOT DISTINCT FROM expected.day AS day_ok
+    FROM expected FULL OUTER JOIN decoded USING (id)
+)
+SELECT len(array_agg(actual_id)) = 12000,
+       bool_and(actual_id IS NOT DISTINCT FROM expected_id
+                AND small_ok AND amount_ok AND label_ok AND day_ok)
+FROM compared;
+----
+true	true
+
+query TTTTT
+WITH decoded AS (
+    SELECT * FROM read_arrow('__TEST_DIR__/quackapi_arrow_chunks.ipc')
+)
+SELECT typeof(id), typeof(small_value), typeof(amount), typeof(label), typeof(day)
+FROM decoded ORDER BY id LIMIT 1;
+----
+BIGINT	SMALLINT	DECIMAL(12,2)	VARCHAR	DATE
+
+statement ok
+CREATE ROUTE arrow_empty GET '/arrow-empty' FORMAT ARROW AS
+SELECT 7::INTEGER AS present_but_empty WHERE false;
+
+statement ok
+COPY (SELECT body FROM quackapi_request('GET', '/arrow-empty'))
+TO '__TEST_DIR__/quackapi_arrow_empty.ipc' (FORMAT BLOB);
+
+query I
+SELECT status FROM quackapi_request('GET', '/arrow-empty');
+----
+200
+
+query I
+SELECT coalesce(len(array_agg(present_but_empty)), 0)
+FROM read_arrow('__TEST_DIR__/quackapi_arrow_empty.ipc');
+----
+0
+
+query TTTTTT
+DESCRIBE SELECT * FROM read_arrow('__TEST_DIR__/quackapi_arrow_empty.ipc');
+----
+present_but_empty	INTEGER	YES	NULL	NULL	NULL
+
+query IT
+WITH response AS (
+    SELECT status, decode(body) AS body FROM quackapi_request(
+        'GET', '/arrow-chunks', max_response_bytes := 1024
+    )
+)
+SELECT status, contains(body, 'Response exceeds configured byte limit')
+FROM response;
+----
+507	true

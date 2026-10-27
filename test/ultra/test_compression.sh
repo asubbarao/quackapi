@@ -67,6 +67,23 @@ curl -sS --http1.1 -H 'Accept-Encoding: gzip, zstd' -D "$small_headers" -o "$sma
 [[ -z "$(header Content-Encoding "$small_headers")" ]]
 [[ -z "$(header Vary "$small_headers")" ]]
 
+check_image() {
+  local path="$1" expected_type="$2" name="$3"
+  local base_headers="${WORK}/${name}.identity.headers" base_body="${WORK}/${name}.identity.body"
+  curl -sS --http1.1 -D "$base_headers" -o "$base_body" "http://127.0.0.1:${PORT}${path}"
+  [[ "$(header Content-Type "$base_headers")" == "$expected_type" ]]
+  for encoding in gzip zstd; do
+    local headers="${WORK}/${name}.${encoding}.headers" body="${WORK}/${name}.${encoding}.body"
+    curl -sS --http1.1 -H "Accept-Encoding: ${encoding}" -D "$headers" -o "$body" \
+      "http://127.0.0.1:${PORT}${path}"
+    [[ -z "$(header Content-Encoding "$headers")" ]] || { echo "${name}/${encoding}: unexpectedly encoded"; return 1; }
+    cmp -s "$base_body" "$body" || { echo "${name}/${encoding}: body changed"; return 1; }
+  done
+}
+
+check_image /matrix/image.png image/png png
+check_image /matrix/image.jpg image/jpeg jpeg
+
 sse_headers="${WORK}/sse.headers"
 sse_body="${WORK}/sse.body"
 curl -sS --http1.1 -H 'Accept-Encoding: gzip, zstd' -D "$sse_headers" -o "$sse_body" \

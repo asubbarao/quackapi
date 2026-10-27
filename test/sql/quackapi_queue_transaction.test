@@ -1,0 +1,47 @@
+# name: test/sql/quackapi_queue_transaction.test
+# description: Transactional enqueue through the durable queue table
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE QUEUE txqueue;
+
+statement ok
+CREATE TABLE tx_orders (id INTEGER);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO tx_orders VALUES (42);
+
+statement ok
+INSERT INTO quackapi_jobs (id, queue, payload, status, attempts, max_attempts, visible_at, created_at, updated_at)
+VALUES (nextval('quackapi_job_seq'), 'txqueue', '{}', 'pending', 0, 3, now()::TIMESTAMP, now()::TIMESTAMP, now()::TIMESTAMP);
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM tx_orders), (SELECT count(*) FROM quackapi_jobs WHERE queue = 'txqueue');
+----
+0	0
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO tx_orders VALUES (43);
+
+statement ok
+INSERT INTO quackapi_jobs (id, queue, payload, status, attempts, max_attempts, visible_at, created_at, updated_at)
+VALUES (nextval('quackapi_job_seq'), 'txqueue', '{}', 'pending', 0, 3, now()::TIMESTAMP, now()::TIMESTAMP, now()::TIMESTAMP);
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM tx_orders), (SELECT count(*) FROM quackapi_dequeue('txqueue'));
+----
+1	1

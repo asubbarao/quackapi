@@ -6,6 +6,9 @@ require quackapi
 
 require json
 
+# This suite decodes a real Arrow IPC response; keep nanoarrow explicit in CI.
+require nanoarrow
+
 statement ok
 CREATE ROUTE variant_sql POST '/sql' AS $sql;
 
@@ -48,3 +51,66 @@ query I
 SELECT * FROM quackapi_stop(29324);
 ----
 Stopped quackapi server on port 29324
+
+# Dynamic VARIANT values are encoded in Arrow without collapsing their JSON types.
+statement ok
+CREATE ROUTE variant_arrow GET '/variant-arrow' FORMAT ARROW AS
+SELECT unnest([
+    '{"k":[1,true,null,"text"]}', '[1,"two",false,null]',
+    '42', '1.25', 'true', '"hello"', 'null'
+])::JSON::VARIANT AS value;
+
+statement ok
+COPY (SELECT body FROM quackapi_request('GET', '/variant-arrow'))
+TO '__TEST_DIR__/quackapi_variant_arrow.ipc' (FORMAT BLOB);
+
+query I
+SELECT status FROM quackapi_request('GET', '/variant-arrow');
+----
+200
+
+query II
+WITH decoded AS (
+    SELECT * FROM read_arrow('__TEST_DIR__/quackapi_variant_arrow.ipc')
+), expected AS (
+    SELECT unnest([
+        '{"k":[1,true,null,"text"]}', '[1,"two",false,null]',
+        '42', '1.25', 'true', '"hello"', 'null'
+    ])::JSON::VARIANT::JSON AS document
+), compared AS (
+    SELECT decoded.value AS actual_value, expected.document AS expected_value
+    FROM expected FULL OUTER JOIN decoded
+      ON decoded.value::JSON::VARIANT::JSON IS NOT DISTINCT FROM expected.document
+)
+SELECT len(array_agg(actual_value)) = 7,
+       bool_and(actual_value::JSON::VARIANT::JSON
+                IS NOT DISTINCT FROM expected_value)
+FROM compared;
+----
+true	true
+
+# Field names and nulls survive the native Arrow export.
+statement ok
+CREATE ROUTE arrow_special GET '/arrow-special' FORMAT ARROW AS
+SELECT 1::INTEGER AS "select",
+       'quoted'::VARCHAR AS "odd "" name",
+       NULL::VARCHAR AS "nullable",
+       'λ'::VARCHAR AS "café";
+
+statement ok
+COPY (SELECT body FROM quackapi_request('GET', '/arrow-special'))
+TO '__TEST_DIR__/quackapi_arrow_special.ipc' (FORMAT BLOB);
+
+query I
+SELECT status FROM quackapi_request('GET', '/arrow-special');
+----
+200
+
+query TTTT
+WITH decoded AS (
+    SELECT * FROM read_arrow('__TEST_DIR__/quackapi_arrow_special.ipc')
+)
+SELECT "select", "odd "" name", "nullable", "café"
+FROM decoded;
+----
+1	quoted	NULL	λ

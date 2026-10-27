@@ -5,6 +5,9 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/literal.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
 #include "quackapi_ddl.hpp"
@@ -46,6 +49,45 @@ bool IsParamTypeName(const string &tok) {
 	       u == "BOOLEAN" || u == "BOOL";
 }
 
+Value ParseNumericParamBound(const string &literal_text) {
+	try {
+		auto parser = Parser::GetBuiltinParser();
+		auto expression = parser.ParseSingleExpression(literal_text);
+		if (!expression->HasAlias() && expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
+			const auto &literal = expression->Cast<ConstantExpression>().GetLiteral();
+			if (literal.IsNumeric()) {
+				return literal.ToValue();
+			}
+		}
+	} catch (...) {
+	}
+	throw InvalidInputException("PARAM numeric bounds must be numeric literals");
+}
+
+idx_t ParseLengthParamBound(const string &literal_text) {
+	auto literal = ParseNumericParamBound(literal_text);
+	switch (literal.type().id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+		break;
+	default:
+		throw InvalidInputException("PARAM MIN_LENGTH/MAX_LENGTH must be non-negative integers");
+	}
+	auto unsigned_value = literal.DefaultTryCastAs(LogicalType::UBIGINT);
+	if (!unsigned_value) {
+		throw InvalidInputException("PARAM MIN_LENGTH/MAX_LENGTH must be non-negative integers");
+	}
+	return unsigned_value->GetValue<uint64_t>();
+}
+
 bool HasRoutePathParams(const string &pattern) {
 	idx_t start = 0;
 	while (start <= pattern.size()) {
@@ -81,152 +123,68 @@ bool ValidateRouteSchedule(const string &schedule, string &error) {
 	return true;
 }
 
-//! Serialize param specs for the apply_route table function (plan → exec).
-//! Format fields (FS=\x1f): name, type, has_def, def_null, def_raw, has_ge, ge, has_gt, gt,
-//! has_le, le, has_lt, lt, has_min, min, has_max, max, source, external_name
-//! Multiple specs separated by RS (\x1e). Text fields percent-encoded for RS/FS/%.
-string EncodeField(const string &s) {
-	string out;
-	out.reserve(s.size());
-	for (unsigned char c : s) {
-		if (c == '%' || c == '\x1e' || c == '\x1f') {
-			char buf[4];
-			snprintf(buf, sizeof(buf), "%%%02X", c);
-			out += buf;
-		} else {
-			out += static_cast<char>(c);
-		}
-	}
-	return out;
+//! Native LIST<STRUCT> payload for route parameter metadata across plan → exec.
+//! Nullable bounds encode absence directly; no delimiters, escapes or numeric text.
+const LogicalType &ParamSpecType() {
+	static const auto type = LogicalType::STRUCT({{"name", LogicalType::VARCHAR},
+	                                              {"type_name", LogicalType::VARCHAR},
+	                                              {"has_default", LogicalType::BOOLEAN},
+	                                              {"default_raw", LogicalType::VARCHAR},
+	                                              {"ge", LogicalType::VARIANT()},
+	                                              {"gt", LogicalType::VARIANT()},
+	                                              {"le", LogicalType::VARIANT()},
+	                                              {"lt", LogicalType::VARIANT()},
+	                                              {"min_length", LogicalType::UBIGINT},
+	                                              {"max_length", LogicalType::UBIGINT},
+	                                              {"source", LogicalType::UTINYINT},
+	                                              {"external_name", LogicalType::VARCHAR}});
+	return type;
 }
 
-string DecodeField(const string &s) {
-	string out;
-	out.reserve(s.size());
-	for (idx_t i = 0; i < s.size(); i++) {
-		if (s[i] == '%' && i + 2 < s.size()) {
-			unsigned int v = 0;
-			if (sscanf(s.c_str() + i + 1, "%02x", &v) == 1 || sscanf(s.c_str() + i + 1, "%02X", &v) == 1) {
-				out += static_cast<char>(v);
-				i += 2;
-				continue;
-			}
-		}
-		out += s[i];
+Value ParamSpecsValue(const vector<QuackapiParamSpec> &specs) {
+	vector<Value> entries;
+	entries.reserve(specs.size());
+	for (const auto &spec : specs) {
+		entries.push_back(
+		    Value::STRUCT(ParamSpecType(),
+		                  {Value(spec.name), Value(spec.type_name), Value::BOOLEAN(spec.has_default),
+		                   spec.default_is_null ? Value(LogicalType::VARCHAR) : Value(spec.default_raw),
+		                   spec.has_ge ? spec.ge.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		                   spec.has_gt ? spec.gt.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		                   spec.has_le ? spec.le.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		                   spec.has_lt ? spec.lt.DefaultCastAs(LogicalType::VARIANT()) : Value(LogicalType::VARIANT()),
+		                   spec.has_min_length ? Value::UBIGINT(spec.min_length) : Value(LogicalType::UBIGINT),
+		                   spec.has_max_length ? Value::UBIGINT(spec.max_length) : Value(LogicalType::UBIGINT),
+		                   Value::UTINYINT(static_cast<uint8_t>(spec.source)), Value(spec.external_name)}));
 	}
-	return out;
+	return Value::LIST(ParamSpecType(), std::move(entries));
 }
 
-string ParamSourceToString(QuackapiParamSource src) {
-	switch (src) {
-	case QuackapiParamSource::HEADER:
-		return "header";
-	case QuackapiParamSource::COOKIE:
-		return "cookie";
-	case QuackapiParamSource::QUERY:
-	default:
-		return "query";
-	}
-}
-
-QuackapiParamSource ParamSourceFromString(const string &s) {
-	auto u = StringUtil::Lower(s);
-	if (u == "header") {
-		return QuackapiParamSource::HEADER;
-	}
-	if (u == "cookie") {
-		return QuackapiParamSource::COOKIE;
-	}
-	return QuackapiParamSource::QUERY;
-}
-
-string SerializeParamSpecs(const vector<QuackapiParamSpec> &specs) {
-	string result;
-	for (idx_t i = 0; i < specs.size(); i++) {
-		if (i > 0) {
-			result += '\x1e';
-		}
-		auto &s = specs[i];
-		result += EncodeField(s.name);
-		result += '\x1f';
-		result += EncodeField(s.type_name);
-		result += '\x1f';
-		result += s.has_default ? "1" : "0";
-		result += '\x1f';
-		result += s.default_is_null ? "1" : "0";
-		result += '\x1f';
-		result += EncodeField(s.default_raw);
-		result += '\x1f';
-		result += s.has_ge ? "1" : "0";
-		result += '\x1f';
-		result += std::to_string(s.ge);
-		result += '\x1f';
-		result += s.has_gt ? "1" : "0";
-		result += '\x1f';
-		result += std::to_string(s.gt);
-		result += '\x1f';
-		result += s.has_le ? "1" : "0";
-		result += '\x1f';
-		result += std::to_string(s.le);
-		result += '\x1f';
-		result += s.has_lt ? "1" : "0";
-		result += '\x1f';
-		result += std::to_string(s.lt);
-		result += '\x1f';
-		result += s.has_min_length ? "1" : "0";
-		result += '\x1f';
-		result += std::to_string(s.min_length);
-		result += '\x1f';
-		result += s.has_max_length ? "1" : "0";
-		result += '\x1f';
-		result += std::to_string(s.max_length);
-		result += '\x1f';
-		result += ParamSourceToString(s.source);
-		result += '\x1f';
-		result += EncodeField(s.external_name);
-	}
-	return result;
-}
-
-vector<QuackapiParamSpec> DeserializeParamSpecs(const string &blob) {
+vector<QuackapiParamSpec> ParamSpecsFromValue(const Value &value) {
 	vector<QuackapiParamSpec> specs;
-	if (blob.empty()) {
-		return specs;
-	}
-	// char Split preserves empty fields (string Split drops them).
-	auto entries = StringUtil::Split(blob, '\x1e');
-	for (auto &entry : entries) {
-		if (entry.empty()) {
-			continue;
-		}
-		auto fields = StringUtil::Split(entry, '\x1f');
-		// Pad so we never index OOB on partial data (17 legacy + source + external).
-		while (fields.size() < 19) {
-			fields.push_back("");
-		}
-		QuackapiParamSpec s;
-		s.name = DecodeField(fields[0]);
-		s.type_name = DecodeField(fields[1]);
-		s.has_default = fields[2] == "1";
-		s.default_is_null = fields[3] == "1";
-		s.default_raw = DecodeField(fields[4]);
-		s.has_ge = fields[5] == "1";
-		s.ge = atof(fields[6].c_str());
-		s.has_gt = fields[7] == "1";
-		s.gt = atof(fields[8].c_str());
-		s.has_le = fields[9] == "1";
-		s.le = atof(fields[10].c_str());
-		s.has_lt = fields[11] == "1";
-		s.lt = atof(fields[12].c_str());
-		s.has_min_length = fields[13] == "1";
-		s.min_length = (idx_t)atoll(fields[14].c_str());
-		s.has_max_length = fields[15] == "1";
-		s.max_length = (idx_t)atoll(fields[16].c_str());
-		s.source = ParamSourceFromString(fields[17]);
-		s.external_name = DecodeField(fields[18]);
-		if (!s.name.empty()) {
-			specs.push_back(std::move(s));
-		}
+	for (const auto &entry : ListValue::GetChildren(value)) {
+		const auto &fields = StructValue::GetChildren(entry);
+		QuackapiParamSpec spec;
+		spec.name = fields[0].GetValue<string>();
+		spec.type_name = fields[1].GetValue<string>();
+		spec.has_default = fields[2].GetValue<bool>();
+		spec.default_is_null = fields[3].IsNull();
+		spec.default_raw = spec.default_is_null ? string() : fields[3].GetValue<string>();
+		spec.has_ge = !fields[4].IsNull();
+		spec.ge = spec.has_ge ? VariantValue::GetValue(fields[4]) : Value();
+		spec.has_gt = !fields[5].IsNull();
+		spec.gt = spec.has_gt ? VariantValue::GetValue(fields[5]) : Value();
+		spec.has_le = !fields[6].IsNull();
+		spec.le = spec.has_le ? VariantValue::GetValue(fields[6]) : Value();
+		spec.has_lt = !fields[7].IsNull();
+		spec.lt = spec.has_lt ? VariantValue::GetValue(fields[7]) : Value();
+		spec.has_min_length = !fields[8].IsNull();
+		spec.min_length = spec.has_min_length ? fields[8].GetValue<uint64_t>() : 0;
+		spec.has_max_length = !fields[9].IsNull();
+		spec.max_length = spec.has_max_length ? fields[9].GetValue<uint64_t>() : 0;
+		spec.source = static_cast<QuackapiParamSource>(fields[10].GetValue<uint8_t>());
+		spec.external_name = fields[11].GetValue<string>();
+		specs.push_back(std::move(spec));
 	}
 	return specs;
 }
@@ -314,16 +272,42 @@ bool ParseRouteTimeoutSec(const string &raw, int32_t &out_sec, string &err) {
 	return true;
 }
 
+bool ParseRouteRequestBytes(const string &raw, int64_t &out_bytes, string &err) {
+	if (raw.empty()) {
+		err = "must be a positive integer byte count";
+		return false;
+	}
+	for (auto c : raw) {
+		if (c < '0' || c > '9') {
+			err = "must be a positive integer byte count";
+			return false;
+		}
+	}
+	try {
+		size_t consumed = 0;
+		const auto parsed = std::stoll(raw, &consumed);
+		if (consumed != raw.size() || parsed <= 0) {
+			err = "must be a positive integer byte count";
+			return false;
+		}
+		out_bytes = parsed;
+		return true;
+	} catch (...) {
+		err = "must be a positive integer byte count no larger than 9223372036854775807";
+		return false;
+	}
+}
+
 //! Grammar:
 //!   CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
-//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow]
+//!     [STATUS <n>] [REQUIRE <auth>] [FORMAT json|ndjson|csv|parquet|arrow|binary]
 //!     [ENVELOPE array|object] [EMPTY STATUS <n> [BODY '<json>']]
 //!     [TIMEOUT <n>|'30s'|'5m'] [SCHEDULE '<6-field cron, seconds first>']
 //!     [GROUP <name> | IN GROUP <name>]
 //!     [BODY SCHEMA '<json-schema>'] [BODY TYPE '<duckdb-json-structure>']
 //!     [PARAM <name> [<type>] [HEADER|COOKIE [wire-name]]
 //!              [DEFAULT <lit>] [GE/GT/LE/LT/MIN_LENGTH/MAX_LENGTH <n>] ... ]
-//!     [WITH (timeout_sec [=|:=] <n>|'30s')]
+//!     [WITH (timeout_sec [=|:=] <n>|'30s', max_request_bytes [=|:=] <bytes>)]
 //!     AS <select>
 //!   DROP ROUTE <name>
 //!
@@ -414,6 +398,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	int empty_status = 0;
 	string empty_body;
 	int32_t timeout_sec = 0;
+	int64_t max_request_bytes = 0;
 	string schedule;
 	bool schedule_seen = false;
 	string schedule_error;
@@ -552,21 +537,22 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			rest = QuackapiTrim(rest.substr(token_end));
 			continue;
 		}
-		// [FORMAT json|ndjson|csv|parquet|arrow]
+		// [FORMAT json|ndjson|csv|parquet|arrow|binary]
 		if (StringUtil::StartsWith(rest_upper, "FORMAT") &&
 		    (rest.size() == 6 || StringUtil::CharacterIsSpace(rest[6]))) {
 			rest = QuackapiTrim(rest.substr(6));
 			auto token_end = NextTokenEnd(rest);
 			if (token_end == 0) {
-				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, parquet, or arrow");
+				return ParserExtensionParseResult("FORMAT expects json, ndjson, csv, parquet, arrow, or binary");
 			}
 			auto fmt = StringUtil::Lower(rest.substr(0, token_end));
 			// "arrows" is a friendly alias of the nanoarrow COPY format name.
 			if (fmt == "arrows") {
 				fmt = "arrow";
 			}
-			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow") {
-				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, parquet, or arrow");
+			if (fmt != "json" && fmt != "ndjson" && fmt != "csv" && fmt != "parquet" && fmt != "arrow" &&
+			    fmt != "binary") {
+				return ParserExtensionParseResult("FORMAT must be json, ndjson, csv, parquet, arrow, or binary");
 			}
 			response_format = fmt;
 			rest = QuackapiTrim(rest.substr(token_end));
@@ -912,13 +898,13 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 				}
 				spec.has_default = true;
 				if (after_key[0] == '\'') {
-					auto endq = after_key.find('\'', 1);
-					if (endq == string::npos) {
-						return ParserExtensionParseResult("Unterminated DEFAULT string");
-					}
-					spec.default_raw = after_key.substr(1, endq - 1);
+					auto tokens = Parser::Tokenize(after_key);
+					auto end = tokens.size() > 1 ? tokens[1].start : after_key.size();
+					auto parser = Parser::GetBuiltinParser();
+					auto expression = parser.ParseSingleExpression(after_key.substr(0, end));
+					spec.default_raw = expression->Cast<ConstantExpression>().GetLiteral().text;
 					spec.default_is_null = false;
-					rest = QuackapiTrim(after_key.substr(endq + 1));
+					rest = QuackapiTrim(after_key.substr(end));
 				} else {
 					auto lit_end = NextTokenEnd(after_key);
 					auto lit = after_key.substr(0, lit_end);
@@ -939,26 +925,30 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					return ParserExtensionParseResult("PARAM " + key + " expects a number");
 				}
 				auto num_end = NextTokenEnd(after_key);
+				if (after_key.substr(0, num_end) == "-" || after_key.substr(0, num_end) == "+") {
+					auto tokens = Parser::Tokenize(after_key);
+					num_end = tokens.size() > 2 ? tokens[2].start : after_key.size();
+				}
 				auto num = after_key.substr(0, num_end);
 				rest = QuackapiTrim(after_key.substr(num_end));
 				if (key == "GE") {
 					spec.has_ge = true;
-					spec.ge = atof(num.c_str());
+					spec.ge = ParseNumericParamBound(num);
 				} else if (key == "GT") {
 					spec.has_gt = true;
-					spec.gt = atof(num.c_str());
+					spec.gt = ParseNumericParamBound(num);
 				} else if (key == "LE") {
 					spec.has_le = true;
-					spec.le = atof(num.c_str());
+					spec.le = ParseNumericParamBound(num);
 				} else if (key == "LT") {
 					spec.has_lt = true;
-					spec.lt = atof(num.c_str());
+					spec.lt = ParseNumericParamBound(num);
 				} else if (key == "MIN_LENGTH") {
 					spec.has_min_length = true;
-					spec.min_length = (idx_t)atoll(num.c_str());
+					spec.min_length = ParseLengthParamBound(num);
 				} else {
 					spec.has_max_length = true;
-					spec.max_length = (idx_t)atoll(num.c_str());
+					spec.max_length = ParseLengthParamBound(num);
 				}
 				continue;
 			}
@@ -1024,7 +1014,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		rest_upper = StringUtil::Upper(rest);
 	}
 
-	// [WITH (timeout_sec [=|:=] <n>|'30s')] — may appear immediately before AS
+	// [WITH (timeout_sec [=|:=] <n>|'30s', max_request_bytes := <bytes>)] — before AS
 	if (StringUtil::StartsWith(rest_upper, "WITH") &&
 	    (rest.size() == 4 || StringUtil::CharacterIsSpace(rest[4]) || rest[4] == '(')) {
 		rest = QuackapiTrim(rest.substr(4));
@@ -1038,9 +1028,9 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		auto inner = QuackapiTrim(rest.substr(1, close - 1));
 		rest = QuackapiTrim(rest.substr(close + 1));
 		if (inner.empty()) {
-			return ParserExtensionParseResult("WITH (...) is empty — expected timeout_sec");
+			return ParserExtensionParseResult("WITH (...) is empty — expected timeout_sec or max_request_bytes");
 		}
-		// Split on commas for future options; only timeout_sec today.
+		// Split on commas; options remain independently optional.
 		idx_t part_start = 0;
 		while (part_start <= inner.size()) {
 			idx_t comma = inner.find(',', part_start);
@@ -1054,23 +1044,35 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 					sep_len = 1;
 				}
 				if (eq == string::npos) {
-					return ParserExtensionParseResult("WITH option must be timeout_sec [=|:=] <n> — got \"" + part +
-					                                  "\"");
+					return ParserExtensionParseResult("WITH option must be timeout_sec or max_request_bytes — got \"" +
+					                                  part + "\"");
 				}
 				auto key = StringUtil::Lower(QuackapiTrim(part.substr(0, eq)));
 				auto val = QuackapiTrim(part.substr(eq + sep_len));
-				if (key != "timeout_sec" && key != "timeout") {
-					return ParserExtensionParseResult("Unknown WITH option \"" + key + "\" — expected timeout_sec");
+				if (key == "timeout_sec" || key == "timeout") {
+					string terr;
+					int32_t sec = 0;
+					if (!ParseRouteTimeoutSec(val, sec, terr)) {
+						return ParserExtensionParseResult("timeout_sec: " + terr);
+					}
+					if (timeout_sec > 0) {
+						return ParserExtensionParseResult("TIMEOUT / timeout_sec specified more than once");
+					}
+					timeout_sec = sec;
+				} else if (key == "max_request_bytes") {
+					string bytes_error;
+					int64_t bytes = 0;
+					if (!ParseRouteRequestBytes(val, bytes, bytes_error)) {
+						return ParserExtensionParseResult("max_request_bytes: " + bytes_error);
+					}
+					if (max_request_bytes > 0) {
+						return ParserExtensionParseResult("max_request_bytes specified more than once");
+					}
+					max_request_bytes = bytes;
+				} else {
+					return ParserExtensionParseResult("Unknown WITH option \"" + key +
+					                                  "\" — expected timeout_sec or max_request_bytes");
 				}
-				string terr;
-				int32_t sec = 0;
-				if (!ParseRouteTimeoutSec(val, sec, terr)) {
-					return ParserExtensionParseResult("timeout_sec: " + terr);
-				}
-				if (timeout_sec > 0) {
-					return ParserExtensionParseResult("TIMEOUT / timeout_sec specified more than once");
-				}
-				timeout_sec = sec;
 			}
 			if (comma == string::npos) {
 				break;
@@ -1111,6 +1113,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.empty_status = empty_status;
 	data->route.empty_body = empty_body;
 	data->route.timeout_sec = timeout_sec;
+	data->route.max_request_bytes = max_request_bytes;
 	data->route.schedule = schedule;
 	return ParserExtensionParseResult(std::move(data));
 }
@@ -1137,7 +1140,7 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	bind_data->route.status = input.inputs[6].GetValue<int32_t>();
 	bind_data->route.require_auth = input.inputs[7].GetValue<string>();
 	if (input.inputs.size() > 8 && !input.inputs[8].IsNull()) {
-		bind_data->route.params = DeserializeParamSpecs(input.inputs[8].GetValue<string>());
+		bind_data->route.params = ParamSpecsFromValue(input.inputs[8]);
 	}
 	if (input.inputs.size() > 9 && !input.inputs[9].IsNull()) {
 		bind_data->route.body_schema = input.inputs[9].GetValue<string>();
@@ -1182,6 +1185,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	}
 	if (input.inputs.size() > 20 && !input.inputs[20].IsNull()) {
 		bind_data->route.schedule = input.inputs[20].GetValue<string>();
+	}
+	if (input.inputs.size() > 21 && !input.inputs[21].IsNull()) {
+		bind_data->route.max_request_bytes = input.inputs[21].GetValue<int64_t>();
 	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
@@ -1286,19 +1292,8 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 			                    ? unique_ptr<PreparedStatement>()
 			                    : con.Prepare(bind_data.route.handler_sql);
 			if (prepared && prepared->HasError()) {
-				// Native libpq path (pg_dsn): handler SQL is Postgres dialect and may
-				// not prepare under DuckDB (domains, DO, INSERT…RETURNING, …). Allow
-				// CREATE when pg_dsn is configured; request time uses libpq, else 500.
-				auto err = prepared->GetError();
-				auto el = StringUtil::Lower(err);
-				bool pg_returning = StringUtil::Contains(el, "returning clause not yet supported") &&
-				                    StringUtil::Contains(el, "postgres");
-				Value pg_dsn_setting;
-				bool has_pg_dsn = context.TryGetCurrentSetting("quackapi_pg_dsn", pg_dsn_setting) &&
-				                  !pg_dsn_setting.IsNull() && !pg_dsn_setting.GetValue<string>().empty();
-				if (!pg_returning && !has_pg_dsn) {
-					throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name, err);
-				}
+				throw InvalidInputException("Invalid handler SQL for route \"%s\": %s", bind_data.route.name,
+				                            prepared->GetError());
 			}
 		}
 		state.AddRoute(bind_data.route, bind_data.or_replace);
@@ -1316,15 +1311,17 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 
 TableFunction MakeApplyRouteFunction() {
 	// action, or_replace, name, method, pattern, handler, status, require_auth,
-	// params_json, body_schema, group_name, rate_n, rate_per, rate_by, format,
-	// envelope, empty_status, empty_body, timeout_sec, body_type, schedule
+	// params (LIST<STRUCT>), body_schema, group_name, rate_n, rate_per, rate_by, format,
+	// envelope, empty_status, empty_body, timeout_sec, body_type, schedule, max_request_bytes
 	return MakeApplyDdlFunction("quackapi_apply_route",
-	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR},
+	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::LIST(ParamSpecType()),
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
+	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::BIGINT},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
@@ -1341,7 +1338,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.route.handler_sql));
 	result.parameters.push_back(Value::INTEGER(data.route.status));
 	result.parameters.push_back(Value(data.route.require_auth));
-	result.parameters.push_back(Value(SerializeParamSpecs(data.route.params)));
+	result.parameters.push_back(ParamSpecsValue(data.route.params));
 	result.parameters.push_back(Value(data.route.body_schema));
 	result.parameters.push_back(Value(data.route.group_name));
 	result.parameters.push_back(Value::INTEGER(data.route.rate_limit_n));
@@ -1354,6 +1351,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::INTEGER(data.route.timeout_sec));
 	result.parameters.push_back(Value(data.route.body_type));
 	result.parameters.push_back(Value(data.route.schedule));
+	result.parameters.push_back(Value::BIGINT(data.route.max_request_bytes));
 	FinishDdlPlan(result);
 	return result;
 }

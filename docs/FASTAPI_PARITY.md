@@ -1,3 +1,5 @@
+> Historical note: the quackapi-specific `pg_dsn` / libpq path described below has been removed. PostgreSQL access now uses DuckDB’s `postgres` extension; old benchmarks need to be rerun.
+
 # quackapi ↔ FastAPI parity scorecard
 
 **Source of truth:** [fastapi.tiangolo.com](https://fastapi.tiangolo.com/)  

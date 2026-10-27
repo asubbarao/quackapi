@@ -365,7 +365,7 @@ string ApplyQuackapiServerDefaults(ClientContext &context, QuackapiServeOptions 
 	                                     "unbounded thread spawn under load)",
 	                                     opts.worker_threads));
 	applied.push_back(StringUtil::Format("http payload_max_length=%llu (WHY: body size DoS guard — 413 above cap)",
-	                                     (unsigned long long)QUACKAPI_PAYLOAD_MAX_LENGTH));
+	                                     (unsigned long long)opts.max_request_bytes));
 	const string access_log_destination =
 	    opts.access_log_table.empty() ? (opts.access_log ? "stderr" : "off") : opts.access_log_table;
 	applied.push_back(StringUtil::Format("access_log=%s log_level=%s (WHY: every request → structured access log "

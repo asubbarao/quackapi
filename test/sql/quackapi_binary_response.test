@@ -1,0 +1,37 @@
+# name: test/sql/quackapi_binary_response.test
+# description: Exact raw BLOB responses
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE binary_image GET '/binary-image' FORMAT binary AS SELECT unhex('89504E47000D0AFF') AS body, 'image/png' AS content_type;
+
+query III
+SELECT status, hex(body), content_type FROM quackapi_request('GET', '/binary-image');
+----
+200	89504E47000D0AFF	image/png
+
+statement ok
+CREATE ROUTE binary_default GET '/binary-default' FORMAT binary AS SELECT unhex('0001FF') AS body;
+
+query III
+SELECT status, hex(body), content_type FROM quackapi_request('GET', '/binary-default');
+----
+200	0001FF	application/octet-stream
+
+statement ok
+CREATE ROUTE binary_invalid GET '/binary-invalid' FORMAT binary AS SELECT 'not a blob' AS body;
+
+query I
+SELECT status FROM quackapi_request('GET', '/binary-invalid');
+----
+500
+
+statement ok
+CREATE ROUTE binary_multiple GET '/binary-multiple' FORMAT binary AS SELECT unhex('00') AS body FROM range(2);
+
+query I
+SELECT status FROM quackapi_request('GET', '/binary-multiple');
+----
+500

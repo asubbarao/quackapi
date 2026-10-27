@@ -158,7 +158,7 @@ Status vocabulary:
 |-------|--------|
 | **Status** | **EXISTS_PARTIAL** / **ALREADY_IN_QUACKAPI** (`quack_from_*`) |
 | **extension_name(s)** | **`sitting_duck`** — `read_ast` multi-language (used by `quack_from_fastapi` etc.). **`parser_tools`** — `parse_tables` / `parse_functions` / `is_parsable` on SQL. **`sazgar`** — dialect translate + remote route (not app-framework IR). **`urlpattern`** — URLPattern matching/build for path IR. |
-| **Compose** | `SELECT * FROM quack_from_fastapi('path')` → hand-write / generate `CREATE ROUTE`. parser_tools validates handler SQL. urlpattern for pattern tests outside quackapi’s path matcher. |
+| **Compose** | `SELECT * FROM quack_from_routes('fastapi', 'path')` → hand-write / generate `CREATE ROUTE`. parser_tools validates handler SQL. urlpattern for pattern tests outside quackapi’s path matcher. |
 | **Sample (catalog)** | ```sql<br>LOAD sitting_duck;<br>SELECT name, semantic_type AS signature, start_line<br>FROM read_ast('my_script.py', 'python', context := 'native')<br>WHERE is_function_definition(semantic_type);<br><br>INSTALL parser_tools FROM community; LOAD parser_tools;<br>SELECT * FROM parse_tables('SELECT * FROM MyTable');<br>SELECT * FROM parse_functions('SELECT count(*) FROM t');<br><br>SELECT urlpattern_test('/users/:id', 'https://example.com/users/456');<br>SELECT urlpattern_extract('/users/:id', 'https://example.com/users/456', 'id');<br>``` |
 | **Ship as** | **Recipe + bridge polish**. No second AST stack in C++. |
 
@@ -171,7 +171,7 @@ Status vocabulary:
 | **Status** | **EXISTS_COMPOSE** / **ALREADY_IN_QUACKAPI** (curl batteries) |
 | **extension_name(s)** | **`curl_httpfs`** — MultiCurl HTTPUtil for `read_text`/`read_json`/httpfs. **`http_client`** — experimental `http_get` / `http_post` (+ form). **`netquack`** — **URI/domain/IP parsing** (not an HTTP client). **`httpfs_timeout_retry`**, **`http_stats`**, **`crawler`**, **`cache_httpfs`** — quality/ops around HTTP I/O. |
 | **Compose** | GET proxy: `FROM read_text($url)` with curl batteries. Explicit POST: `http_client`. URL analytics: `netquack`. |
-| **Sample (catalog)** | ```sql<br>INSTALL http_client FROM community; LOAD http_client;<br>-- Functions documented under GET / POST / form (arity: confirm after LOAD)<br><br>INSTALL netquack FROM community; LOAD netquack;<br>SELECT * FROM ipcalc('192.168.1.0/24');<br><br>-- curl_httpfs: INSTALL/LOAD; product documents MultiCurl via quackapi_http_util_name()<br>``` |
+| **Sample (catalog)** | ```sql<br>INSTALL http_client FROM community; LOAD http_client;<br>-- Functions documented under GET / POST / form (arity: confirm after LOAD)<br><br>INSTALL netquack FROM community; LOAD netquack;<br>SELECT * FROM ipcalc('192.168.1.0/24');<br><br>-- curl_httpfs: INSTALL/LOAD; product documents MultiCurl via curl_httpfs_http_util_name()<br>``` |
 | **Ship as** | **Recipe** (already Recipe 1). Harden fail-loud when `http_client:='curl'` forced but missing — small product quality, not new stack. |
 
 ---

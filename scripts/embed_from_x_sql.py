@@ -24,7 +24,7 @@ def main() -> None:
         "#pragma once",
         "// AUTO-GENERATED from src/sql/*.sql — do not edit by hand.",
         "// Regenerate: python3 scripts/embed_from_x_sql.py",
-        "// Source of truth is src/sql/; a sqllogictest asserts byte-equality.",
+        "// Source of truth is src/sql/; test/test_from_x_sql_embed.py asserts byte-equality.",
         "",
         "#include <string>",
         "#include <utility>",

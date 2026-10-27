@@ -10,6 +10,16 @@ browser  ──►  DuckDB [ quackapi ]
 
 If you already know “routes,” you know enough to start.
 
+This guide follows the current source checkout. Community packages follow the
+separate [registry pin](https://github.com/duckdb/community-extensions/blob/main/extensions/quackapi/description.yml).
+Read the [migration notes](MIGRATION.md) when upgrading existing applications.
+
+DuckDB 2.0 native values carry route metadata and response data: numeric
+parameter limits retain their precision, JSON preserves `VARIANT`, and Arrow
+converts result batches directly. Large responses still buffer their HTTP body;
+see [response budgets](RESOURCE_LIMITS.md) and the
+[JSON/Arrow benchmark](../bench/large_response.sql).
+
 ---
 
 ## Five-line hello world
@@ -26,7 +36,7 @@ GEN=ninja make release
 In the DuckDB shell:
 
 ```sql
-LOAD quackapi;
+LOAD 'build/release/extension/quackapi/quackapi.duckdb_extension';
 
 CREATE ROUTE hello GET '/hello' AS SELECT 'world' AS msg;
 CREATE ROUTE item  GET '/items/:id' AS SELECT $id::INTEGER AS id;
@@ -174,8 +184,9 @@ Handler SQL is validated at `CREATE` time. Broken SQL fails at create — not on
 
 ### FastAPI readers
 
-- [FastAPI parity map (89/89)](fastapi-parity.md)  
-- [Coming from FastAPI (`quack_from_X`)](from-fastapi.md)
+- [FastAPI conformance map](fastapi-parity.md)
+- [Framework route/model metadata import](from-fastapi.md)
+- [Migration notes](MIGRATION.md)
 
 ### Feature ledger
 

@@ -509,7 +509,7 @@ record_env() {
     echo "stack_order: ${STACKS[*]}"
     echo "scenario_order: ${SCENARIOS[*]}"
     echo "resource_budget: w1=32_http_workers/32_pg_connections; w8=32_http_workers/32_pg_connections"
-    echo "pg_dsn: shared configured connection (credentials omitted)"
+    echo "postgres extension: shared configured connection (credentials omitted)"
     # pgEdge surface (required for the Postgres-backed comparison).
     pg_server_version="$(psql_q "SHOW server_version" 2>/dev/null || echo "unavailable")"
     pg_max_conn="$(psql_q "SHOW max_connections" 2>/dev/null || echo "unavailable")"

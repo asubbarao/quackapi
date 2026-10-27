@@ -1,5 +1,22 @@
 # LOC reduction
 
+## DuckDB 2.0 native-value cleanup (0.2.0 candidate)
+
+- Route parameter metadata uses native `LIST<STRUCT>` values instead of a
+  private percent-encoded string format. This also fixes rounded numeric limits.
+- Policy column/type arguments use native string lists. Policy identities,
+  view checks and scalar-macro lookups use the native catalog API, with caches
+  scoped to one request.
+- Server/request options share precedence and default handling. Function
+  overloads share named argument signatures.
+- JSON rows are encoded once during fetch; Arrow projects native vectors into
+  the converter. The row matrix and Arrow reconstruction loop are removed from
+  those paths. The final HTTP body remains buffered.
+
+Regression coverage lives in the native metadata, policy catalog, option
+precedence, large JSON, Arrow chunk and VARIANT SQL suites. Reproduce response
+timings with [bench/large_response.sql](../bench/large_response.sql).
+
 ## Pass 1 (merged #1 → `785e1df`)
 
 Based on review of the community submission (~11.9k C++): most bulk is

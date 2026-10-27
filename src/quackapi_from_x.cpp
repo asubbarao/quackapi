@@ -1,11 +1,8 @@
 #include "quackapi_from_x.hpp"
 #include "quackapi_from_x_sql.hpp"
-#include "quackapi_util.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/vector_operations/binary_executor.hpp"
-#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -119,9 +116,8 @@ string SubstituteRepo(const string &sql_template, const string &repo_path) {
 //===--------------------------------------------------------------------===//
 
 struct FromXFunctionInfo : public TableFunctionInfo {
-	string framework;
 	string kind; // "routes" | "models"
-	FromXFunctionInfo(string framework_p, string kind_p) : framework(std::move(framework_p)), kind(std::move(kind_p)) {
+	FromXFunctionInfo(string kind_p) : kind(std::move(kind_p)) {
 	}
 };
 
@@ -159,10 +155,21 @@ unique_ptr<FunctionData> FromXBind(ClientContext &, TableFunctionBindInput &inpu
                                    vector<Identifier> &names) {
 	auto &info = input.info->Cast<FromXFunctionInfo>();
 	auto data = make_uniq<FromXBindData>();
-	data->framework = info.framework;
+	if (input.inputs.size() != 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+		throw InvalidInputException("quack_from_%s(framework, path): framework and path must not be NULL", info.kind);
+	}
+	data->framework = StringUtil::Lower(input.inputs[0].GetValue<string>());
 	data->kind = info.kind;
 	data->is_routes = (info.kind == "routes");
-	data->path = input.inputs[0].GetValue<string>();
+	if (data->framework != "fastapi" && data->framework != "rails" && data->framework != "express" &&
+	    data->framework != "gin") {
+		throw InvalidInputException("quack_from_%s: unknown framework '%s' (expected fastapi, rails, express, or gin)",
+		                            info.kind, data->framework);
+	}
+	data->path = input.inputs[1].GetValue<string>();
+	if (data->path.empty()) {
+		throw InvalidInputException("quack_from_%s: path must be non-empty", info.kind);
+	}
 	if (data->is_routes) {
 		SetRouteReturnTypes(return_types, names);
 	} else {
@@ -271,66 +278,17 @@ void FromXExec(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	output.SetChildCardinality(count);
 }
 
-TableFunction MakeFromXFunction(const string &name, const string &framework, const string &kind) {
-	TableFunction tf(Identifier(name), {LogicalType::VARCHAR}, FromXExec, FromXBind, FromXInit);
-	tf.function_info = make_shared_ptr<FromXFunctionInfo>(framework, kind);
+TableFunction MakeFromXFunction(const string &name, const string &kind) {
+	TableFunction tf(Identifier(name), {LogicalType::VARCHAR, LogicalType::VARCHAR}, FromXExec, FromXBind, FromXInit);
+	tf.function_info = make_shared_ptr<FromXFunctionInfo>(kind);
 	return tf;
-}
-
-//===--------------------------------------------------------------------===//
-// quack_from_x_sql(framework, kind) — expose embedded SQL for drift tests
-//===--------------------------------------------------------------------===//
-
-void FromXSqlScalar(DataChunk &args, ExpressionState &, Vector &result) {
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t fw, string_t kind) {
-		    auto *sql = quackapi_from_x_sql::Lookup(fw.GetString().c_str(), kind.GetString().c_str());
-		    if (!sql) {
-			    throw InvalidInputException("quack_from_x_sql: unknown framework/kind '%s'/'%s' "
-			                                "(frameworks: fastapi|rails|express|gin; kind: routes|models)",
-			                                fw.GetString(), kind.GetString());
-		    }
-		    return StringVector::AddString(result, sql);
-	    });
-}
-
-//===--------------------------------------------------------------------===//
-// quack_from_x_sql_relpath(framework, kind) — disk path for drift tests
-//===--------------------------------------------------------------------===//
-
-void FromXSqlRelpathScalar(DataChunk &args, ExpressionState &, Vector &result) {
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    args.data[0], args.data[1], result, args.size(), [&](string_t fw, string_t kind) {
-		    for (const auto &e : quackapi_from_x_sql::All()) {
-			    if (std::string(e.framework) == fw.GetString() && std::string(e.kind) == kind.GetString()) {
-				    return StringVector::AddString(result, e.relpath);
-			    }
-		    }
-		    throw InvalidInputException("quack_from_x_sql_relpath: unknown '%s'/'%s'", fw.GetString(),
-		                                kind.GetString());
-	    });
 }
 
 } // namespace
 
 void RegisterQuackapiFromXFunctions(ExtensionLoader &loader) {
-	// Route extractors
-	loader.RegisterFunction(MakeFromXFunction("quack_from_fastapi", "fastapi", "routes"));
-	loader.RegisterFunction(MakeFromXFunction("quack_from_rails", "rails", "routes"));
-	loader.RegisterFunction(MakeFromXFunction("quack_from_express", "express", "routes"));
-	loader.RegisterFunction(MakeFromXFunction("quack_from_gin", "gin", "routes"));
-
-	// Model extractors
-	loader.RegisterFunction(MakeFromXFunction("quack_from_fastapi_models", "fastapi", "models"));
-	loader.RegisterFunction(MakeFromXFunction("quack_from_rails_models", "rails", "models"));
-	loader.RegisterFunction(MakeFromXFunction("quack_from_express_models", "express", "models"));
-	loader.RegisterFunction(MakeFromXFunction("quack_from_gin_models", "gin", "models"));
-
-	// Embed drift helpers
-	RegisterFallible(loader, ScalarFunction("quack_from_x_sql", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, FromXSqlScalar));
-	RegisterFallible(loader, ScalarFunction("quack_from_x_sql_relpath", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, FromXSqlRelpathScalar));
+	loader.RegisterFunction(MakeFromXFunction("quack_from_routes", "routes"));
+	loader.RegisterFunction(MakeFromXFunction("quack_from_models", "models"));
 }
 
 } // namespace duckdb

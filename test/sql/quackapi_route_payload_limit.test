@@ -1,0 +1,27 @@
+# name: test/sql/quackapi_route_payload_limit.test
+# description: route-specific request body limit DDL and registry metadata
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE upload POST '/upload' WITH (timeout_sec := 30, max_request_bytes := 12582912)
+AS SELECT length($body::VARCHAR) AS n;
+
+query I
+SELECT max_request_bytes FROM quackapi_routes() WHERE name = 'upload';
+----
+12582912
+
+statement error
+CREATE ROUTE invalid_upload POST '/invalid' WITH (max_request_bytes := 0) AS SELECT 1;
+----
+positive integer
+
+statement error
+CREATE ROUTE invalid_upload POST '/invalid' WITH (max_request_bytes := '12 MB') AS SELECT 1;
+----
+positive integer
+
+statement ok
+DROP ROUTE upload;

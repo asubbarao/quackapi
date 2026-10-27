@@ -221,7 +221,25 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	list_route.name = bind_data.table + "_list";
 	list_route.method = "GET";
 	list_route.pattern = base;
-	list_route.handler_sql = "SELECT * FROM " + quoted_table;
+	list_route.handler_sql =
+	    "SELECT * FROM " + quoted_table + " ORDER BY " + quoted_key + " LIMIT $limit OFFSET $offset";
+	QuackapiParamSpec limit;
+	limit.name = "limit";
+	limit.type_name = "INTEGER";
+	limit.has_default = true;
+	limit.default_raw = "100";
+	limit.has_ge = true;
+	limit.ge = Value::INTEGER(1);
+	limit.has_le = true;
+	limit.le = Value::INTEGER(1000);
+	QuackapiParamSpec offset;
+	offset.name = "offset";
+	offset.type_name = "BIGINT";
+	offset.has_default = true;
+	offset.default_raw = "0";
+	offset.has_ge = true;
+	offset.ge = Value::INTEGER(0);
+	list_route.params = {limit, offset};
 	list_route.status = 200;
 
 	// GET <base>/:<key>  -> by key
@@ -248,8 +266,7 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 		}
 	}
 
-	state.AddRoute(list_route, bind_data.or_replace);
-	state.AddRoute(get_route, bind_data.or_replace);
+	state.AddRoutes({list_route, get_route}, bind_data.or_replace);
 
 	EmitOneShotStatus(output, bind_data.finished,
 	                  StringUtil::Format("API for %s: GET %s, GET %s/:%s", bind_data.table, base, base, bind_data.key));

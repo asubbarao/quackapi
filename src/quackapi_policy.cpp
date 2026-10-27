@@ -2,6 +2,9 @@
 
 #include <algorithm>
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -12,6 +15,7 @@
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -451,43 +455,22 @@ ParserExtensionParseResult PolicyDdlParse(ParserExtensionInfo *, const string &q
 	// ---- ALTER TABLE … ----
 	if (StringUtil::StartsWith(upper, "ALTER TABLE ")) {
 		auto rest = QuackapiTrim(q.substr(12));
-		// table name
-		string table;
-		if (rest.empty()) {
+		auto tokens = Parser::Tokenize(rest);
+		if (tokens.empty()) {
 			return ParserExtensionParseResult();
 		}
-		if (rest[0] == '"') {
-			// quoted
-			idx_t i = 1;
-			string result;
-			while (i < rest.size()) {
-				if (rest[i] == '"') {
-					if (i + 1 < rest.size() && rest[i + 1] == '"') {
-						result += '"';
-						i += 2;
-						continue;
-					}
-					table = result;
-					rest = QuackapiTrim(rest.substr(i + 1));
-					break;
-				}
-				result += rest[i];
-				i++;
-			}
-			if (table.empty()) {
-				return ParserExtensionParseResult();
-			}
-		} else {
-			idx_t i = 0;
-			while (i < rest.size() && IsIdentChar(rest[i])) {
-				i++;
-			}
-			if (i == 0) {
-				return ParserExtensionParseResult();
-			}
-			table = rest.substr(0, i);
-			rest = QuackapiTrim(rest.substr(i));
+		idx_t name_tokens = 1;
+		while (name_tokens + 1 < tokens.size() && rest[tokens[name_tokens].start] == '.') {
+			name_tokens += 2;
 		}
+		auto name_end = name_tokens < tokens.size() ? tokens[name_tokens].start : rest.size();
+		QualifiedName name;
+		string name_error;
+		if (!QualifiedName::TryParse(QuackapiTrim(rest.substr(0, name_end)), name, name_error)) {
+			return ParserExtensionParseResult();
+		}
+		auto table = name.ToString();
+		rest = QuackapiTrim(rest.substr(name_end));
 		auto ru = StringUtil::Upper(rest);
 
 		// ADD [OR REPLACE] ROW ACCESS POLICY <p> ON (<cols>)
@@ -603,30 +586,13 @@ struct ApplyPolicyBindData : public TableFunctionData {
 	bool or_replace = false;
 	string name;
 	string value_type;
-	string arg_columns_csv; // comma-separated
-	string arg_types_csv;
+	vector<string> arg_columns;
+	vector<string> arg_types;
 	string expression;
 	string table_name;
 	string column_name;
 	bool finished = false;
 };
-
-vector<string> SplitCsv(const string &csv) {
-	vector<string> out;
-	if (csv.empty()) {
-		return out;
-	}
-	idx_t i = 0;
-	while (i < csv.size()) {
-		idx_t j = i;
-		while (j < csv.size() && csv[j] != ',') {
-			j++;
-		}
-		out.push_back(QuackapiTrim(csv.substr(i, j - i)));
-		i = j < csv.size() ? j + 1 : j;
-	}
-	return out;
-}
 
 unique_ptr<FunctionData> ApplyPolicyBind(ClientContext &, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
@@ -635,8 +601,15 @@ unique_ptr<FunctionData> ApplyPolicyBind(ClientContext &, TableFunctionBindInput
 	bind_data->or_replace = input.inputs[1].GetValue<bool>();
 	bind_data->name = input.inputs[2].GetValue<string>();
 	bind_data->value_type = input.inputs[3].GetValue<string>();
-	bind_data->arg_columns_csv = input.inputs[4].GetValue<string>();
-	bind_data->arg_types_csv = input.inputs[5].GetValue<string>();
+	auto strings = [](const Value &value) {
+		vector<string> result;
+		for (const auto &entry : ListValue::GetChildren(value)) {
+			result.push_back(entry.GetValue<string>());
+		}
+		return result;
+	};
+	bind_data->arg_columns = strings(input.inputs[4]);
+	bind_data->arg_types = strings(input.inputs[5]);
 	bind_data->expression = input.inputs[6].GetValue<string>();
 	bind_data->table_name = input.inputs[7].GetValue<string>();
 	bind_data->column_name = input.inputs[8].GetValue<string>();
@@ -651,8 +624,8 @@ void ApplyPolicyExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	}
 	auto &state = QuackapiState::Get(*context.db);
 	string message;
-	auto cols = SplitCsv(bind_data.arg_columns_csv);
-	auto types = SplitCsv(bind_data.arg_types_csv);
+	const auto &cols = bind_data.arg_columns;
+	const auto &types = bind_data.arg_types;
 
 	if (bind_data.action == "CREATE_ROW") {
 		QuackapiRowAccessPolicy p;
@@ -716,11 +689,11 @@ void ApplyPolicyExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 }
 
 TableFunction MakeApplyPolicyFunction() {
-	// action, or_replace, name, value_type, arg_columns_csv, arg_types_csv, expression, table, column
+	// action, or_replace, name, value_type, arg_columns, arg_types, expression, table, column
 	return MakeApplyDdlFunction("quackapi_apply_policy",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR},
+	                             LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR),
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                            ApplyPolicyExec, ApplyPolicyBind);
 }
 
@@ -733,8 +706,15 @@ ParserExtensionPlanResult PolicyDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value::BOOLEAN(data.or_replace));
 	result.parameters.push_back(Value(data.name));
 	result.parameters.push_back(Value(data.value_type));
-	result.parameters.push_back(Value(JoinComma(data.arg_columns)));
-	result.parameters.push_back(Value(JoinComma(data.arg_types)));
+	auto strings = [](const vector<string> &entries) {
+		vector<Value> values;
+		for (const auto &entry : entries) {
+			values.emplace_back(entry);
+		}
+		return Value::LIST(LogicalType::VARCHAR, std::move(values));
+	};
+	result.parameters.push_back(strings(data.arg_columns));
+	result.parameters.push_back(strings(data.arg_types));
 	result.parameters.push_back(Value(data.expression));
 	result.parameters.push_back(Value(data.table_name));
 	result.parameters.push_back(Value(data.column_name));
@@ -899,21 +879,8 @@ bool SameCatalogIdentifier(const string &left, const string &right) {
 	return StringUtil::Lower(left) == StringUtil::Lower(right);
 }
 
-string CurrentCatalog(Connection &con) {
-	auto result = con.Query("SELECT current_database()");
-	if (result->HasError()) {
-		return string();
-	}
-	auto chunk = result->Fetch();
-	if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).IsNull()) {
-		return string();
-	}
-	return chunk->GetValue(0, 0).ToString();
-}
-
-PolicyTableIdentity IdentityFromBaseRef(const BaseTableRef &ref, const string &default_catalog) {
+PolicyTableIdentity IdentityFromName(const QualifiedName &name, const string &default_catalog) {
 	PolicyTableIdentity identity;
-	auto &name = ref.GetQualifiedName();
 	identity.catalog = name.Catalog().empty() ? default_catalog : name.Catalog().GetIdentifierName();
 	identity.schema = name.Schema().empty() ? "main" : name.Schema().GetIdentifierName();
 	identity.table = name.Name().GetIdentifierName();
@@ -921,25 +888,13 @@ PolicyTableIdentity IdentityFromBaseRef(const BaseTableRef &ref, const string &d
 }
 
 bool ParsePolicyTableIdentity(const string &table_name, const string &default_catalog, PolicyTableIdentity &identity) {
-	try {
-		auto parser = Parser::GetBuiltinParser();
-		parser.ParseQuery("SELECT * FROM " + table_name);
-		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-			return false;
-		}
-		auto &select = parser.statements[0]->Cast<SelectStatement>();
-		if (!select.node || select.node->type != QueryNodeType::SELECT_NODE) {
-			return false;
-		}
-		auto &node = select.node->Cast<SelectNode>();
-		if (!node.from_table || node.from_table->type != TableReferenceType::BASE_TABLE) {
-			return false;
-		}
-		identity = IdentityFromBaseRef(node.from_table->Cast<BaseTableRef>(), default_catalog);
-		return !identity.table.empty();
-	} catch (...) {
+	QualifiedName name;
+	string error;
+	if (!QualifiedName::TryParse(table_name, name, error)) {
 		return false;
 	}
+	identity = IdentityFromName(name, default_catalog);
+	return !identity.table.empty();
 }
 
 bool SamePolicyTableIdentity(const PolicyTableIdentity &left, const PolicyTableIdentity &right) {
@@ -953,7 +908,7 @@ string QuotePolicyTableIdentity(const PolicyTableIdentity &identity) {
 }
 
 //! Replace a policy signature argument without touching SQL string literals.
-string ReplacePolicyIdentifier(const string &expr, const string &from, const string &to) {
+string ReplacePolicyIdentifiers(const string &expr, const vector<string> &from, const vector<string> &to) {
 	string out;
 	bool in_str = false;
 	for (idx_t i = 0; i < expr.size();) {
@@ -975,13 +930,51 @@ string ReplacePolicyIdentifier(const string &expr, const string &from, const str
 			out += expr[i++];
 			continue;
 		}
+		if (expr[i] == '"') {
+			idx_t begin = i++;
+			string token;
+			while (i < expr.size()) {
+				if (expr[i] == '"') {
+					if (i + 1 < expr.size() && expr[i + 1] == '"') {
+						token += '"';
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				token += expr[i++];
+			}
+			bool replaced = false;
+			for (idx_t j = 0; j < from.size() && j < to.size(); j++) {
+				if (SameCatalogIdentifier(token, from[j])) {
+					out += QuoteCatalogIdentifier(to[j]);
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) {
+				out += expr.substr(begin, i - begin);
+			}
+			continue;
+		}
 		if (IsIdentStart(expr[i])) {
 			idx_t end = i + 1;
 			while (end < expr.size() && IsIdentChar(expr[end])) {
 				end++;
 			}
 			auto token = expr.substr(i, end - i);
-			out += SameCatalogIdentifier(token, from) ? to : token;
+			bool replaced = false;
+			for (idx_t j = 0; j < from.size() && j < to.size(); j++) {
+				if (SameCatalogIdentifier(token, from[j])) {
+					out += QuoteCatalogIdentifier(to[j]);
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) {
+				out += token;
+			}
 			i = end;
 			continue;
 		}
@@ -1000,11 +993,28 @@ struct PolicyRewriteContext {
 	bool deny_unauthenticated = false;
 	string error;
 	unordered_map<string, bool> view_cache;
+	unordered_map<string, bool> macro_cache;
+	vector<string> cte_names;
+	unordered_map<string, PolicyTableIdentity> binding_identities;
+
+	const PolicyTableIdentity *BindingIdentity(const string &table_name) {
+		auto found = binding_identities.find(table_name);
+		if (found != binding_identities.end()) {
+			return &found->second;
+		}
+		PolicyTableIdentity identity;
+		if (!ParsePolicyTableIdentity(table_name, default_catalog, identity)) {
+			Reject("policy binding has an invalid catalog identity");
+			return nullptr;
+		}
+		return &binding_identities.emplace(table_name, std::move(identity)).first->second;
+	}
 
 	PolicyRewriteContext(DatabaseInstance &db_p, const vector<QuackapiRowAccessBinding> &rap_bindings_p,
 	                     const vector<QuackapiMaskingBinding> &mask_bindings_p, bool authenticated_p)
 	    : db(db_p), con(db_p), rap_bindings(rap_bindings_p), mask_bindings(mask_bindings_p),
-	      authenticated(authenticated_p), default_catalog(CurrentCatalog(con)) {
+	      authenticated(authenticated_p),
+	      default_catalog(DatabaseManager::GetDefaultDatabase(*con.context).GetIdentifierName()) {
 	}
 
 	void Reject(const string &reason) {
@@ -1025,14 +1035,17 @@ bool IsCatalogView(PolicyRewriteContext &ctx, const PolicyTableIdentity &identit
 		is_view = cached->second;
 		return true;
 	}
-	auto result = ctx.con.Query(
-	    "SELECT 1 FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ? LIMIT 1",
-	    Value(identity.catalog), Value(identity.schema), Value(identity.table));
-	if (result->HasError()) {
+	try {
+		auto entry =
+		    Catalog::GetEntry(*ctx.con.context,
+		                      EntryLookupInfo(CatalogType::TABLE_ENTRY,
+		                                      QualifiedName(Identifier(identity.catalog), Identifier(identity.schema),
+		                                                    Identifier(identity.table))),
+		                      OnEntryNotFound::RETURN_NULL);
+		is_view = entry && entry->type == CatalogType::VIEW_ENTRY;
+	} catch (...) {
 		return false;
 	}
-	auto chunk = result->Fetch();
-	is_view = chunk && chunk->size() > 0;
 	ctx.view_cache.emplace(std::move(key), is_view);
 	return true;
 }
@@ -1063,6 +1076,25 @@ bool RewritePolicyExpression(ParsedExpression &expression, PolicyRewriteContext 
 		return false;
 	}
 	try {
+		if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expression.Cast<FunctionExpression>();
+			auto name = function.GetQualifiedName().ToString();
+			auto cached = ctx.macro_cache.find(name);
+			bool is_macro;
+			if (cached == ctx.macro_cache.end()) {
+				auto entry = Catalog::GetEntry(
+				    *ctx.con.context, EntryLookupInfo(CatalogType::SCALAR_FUNCTION_ENTRY, function.GetQualifiedName()),
+				    OnEntryNotFound::RETURN_NULL);
+				is_macro = entry && entry->type == CatalogType::MACRO_ENTRY;
+				ctx.macro_cache.emplace(name, is_macro);
+			} else {
+				is_macro = cached->second;
+			}
+			if (is_macro) {
+				ctx.Reject("policy enforcement rejects scalar macro dependencies");
+				return false;
+			}
+		}
 		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 			auto &subquery = expression.Cast<SubqueryExpression>();
 			if (!subquery.Subquery() || !RewritePolicySelect(*subquery.SubqueryMutable(), ctx)) {
@@ -1115,7 +1147,15 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 	switch (ref->type) {
 	case TableReferenceType::BASE_TABLE: {
 		auto &base = ref->Cast<BaseTableRef>();
-		auto identity = IdentityFromBaseRef(base, ctx.default_catalog);
+		const auto &name = base.GetQualifiedName();
+		if (name.Schema().empty() && name.Catalog().empty()) {
+			for (auto it = ctx.cte_names.rbegin(); it != ctx.cte_names.rend(); ++it) {
+				if (SameCatalogIdentifier(*it, name.Name().GetIdentifierName())) {
+					return true;
+				}
+			}
+		}
+		auto identity = IdentityFromName(base.GetQualifiedName(), ctx.default_catalog);
 		bool is_view = false;
 		if (!IsCatalogView(ctx, identity, is_view)) {
 			ctx.Reject("policy enforcement could not resolve catalog object identity");
@@ -1131,23 +1171,21 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 		const QuackapiRowAccessBinding *rap_binding = nullptr;
 		const QuackapiMaskingBinding *first_mask = nullptr;
 		for (auto &binding : ctx.rap_bindings) {
-			PolicyTableIdentity bound;
-			if (!ParsePolicyTableIdentity(binding.table_name, ctx.default_catalog, bound)) {
-				ctx.Reject("policy binding has an invalid catalog identity");
+			auto bound = ctx.BindingIdentity(binding.table_name);
+			if (!bound) {
 				return false;
 			}
-			if (SamePolicyTableIdentity(identity, bound)) {
+			if (SamePolicyTableIdentity(identity, *bound)) {
 				rap_binding = &binding;
 				break;
 			}
 		}
 		for (auto &binding : ctx.mask_bindings) {
-			PolicyTableIdentity bound;
-			if (!ParsePolicyTableIdentity(binding.table_name, ctx.default_catalog, bound)) {
-				ctx.Reject("policy binding has an invalid catalog identity");
+			auto bound = ctx.BindingIdentity(binding.table_name);
+			if (!bound) {
 				return false;
 			}
-			if (SamePolicyTableIdentity(identity, bound)) {
+			if (SamePolicyTableIdentity(identity, *bound)) {
 				first_mask = &binding;
 				break;
 			}
@@ -1169,24 +1207,18 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 				ctx.Reject("row-access policy binding references a missing policy");
 				return false;
 			}
-			where_expr = rap_storage.expression;
-			for (idx_t i = 0; i < rap_storage.arg_columns.size() && i < rap_binding->columns.size(); i++) {
-				if (!SameCatalogIdentifier(rap_storage.arg_columns[i], rap_binding->columns[i])) {
-					where_expr =
-					    ReplacePolicyIdentifier(where_expr, rap_storage.arg_columns[i], rap_binding->columns[i]);
-				}
-			}
+			where_expr =
+			    ReplacePolicyIdentifiers(rap_storage.expression, rap_storage.arg_columns, rap_binding->columns);
 			rap = &rap_storage;
 		}
 
 		vector<std::pair<string, string>> masked;
 		for (auto &binding : ctx.mask_bindings) {
-			PolicyTableIdentity bound;
-			if (!ParsePolicyTableIdentity(binding.table_name, ctx.default_catalog, bound)) {
-				ctx.Reject("policy binding has an invalid catalog identity");
+			auto bound = ctx.BindingIdentity(binding.table_name);
+			if (!bound) {
 				return false;
 			}
-			if (!SamePolicyTableIdentity(identity, bound)) {
+			if (!SamePolicyTableIdentity(identity, *bound)) {
 				continue;
 			}
 			QuackapiMaskingPolicy mask;
@@ -1256,11 +1288,21 @@ bool RewritePolicyTableRef(unique_ptr<TableRef> &ref, PolicyRewriteContext &ctx)
 }
 
 bool RewritePolicyQueryNode(QueryNode &node, PolicyRewriteContext &ctx) {
+	struct CteScope {
+		vector<string> &names;
+		idx_t size;
+		~CteScope() {
+			names.resize(size);
+		}
+	} scope {ctx.cte_names, ctx.cte_names.size()};
 	for (auto &entry : node.cte_map.map) {
 		if (!entry.second || !entry.second->query_node || !RewritePolicyQueryNode(*entry.second->query_node, ctx)) {
 			ctx.Reject("policy enforcement could not inspect a common table expression");
 			return false;
 		}
+		// DuckDB binds a non-recursive definition with only preceding CTEs
+		// visible. Its own name (and later names) may still refer to base tables.
+		ctx.cte_names.push_back(entry.first.GetIdentifierName());
 	}
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
@@ -1321,7 +1363,7 @@ bool RewriteHandlerWithPoliciesAst(DatabaseInstance &db, const string &handler_s
 			ctx.Reject("policy enforcement supports one SELECT statement per handler");
 		} else {
 			auto &select = parser.statements[0]->Cast<SelectStatement>();
-			RewritePolicySelect(select, ctx);
+			ctx.con.context->RunFunctionInTransaction([&]() { RewritePolicySelect(select, ctx); });
 			if (ctx.error.empty() && !ctx.deny_unauthenticated) {
 				rewritten_sql = select.ToString();
 			}

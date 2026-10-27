@@ -13,7 +13,7 @@ CREATE [OR REPLACE] ROUTE <name> <METHOD> '<pattern>'
   [STATUS <n>]
   [REQUIRE <auth>]
   [RATE LIMIT <n> PER <seconds> [BY ip|token|key]]
-  [FORMAT json|ndjson|csv|parquet|arrow]
+  [FORMAT json|ndjson|csv|parquet|arrow|binary]
   [ENVELOPE array|object]
   [EMPTY STATUS <n> [BODY '<json>']]
   [TIMEOUT <n>|'30s'|'5m'|'1h']
@@ -35,7 +35,7 @@ DROP ROUTE <name>;
 | **STATUS** | Integer 100–599. Default 200 |
 | **REQUIRE** | Auth scheme name (checked at request time) |
 | **RATE LIMIT** | Fixed-window limit; `BY ip` is the default, and `BY token` / `BY key` use the authenticated subject or credential digest. Exceeding the limit returns `429` with `Retry-After`. |
-| **FORMAT** | Response body for row data: `json` (default, array of objects), `ndjson` (`application/x-ndjson`), `csv` (`text/csv`), `parquet` (`application/vnd.apache.parquet` file bytes, magic `PAR1`), `arrow` (Arrow IPC stream via community `nanoarrow` `FORMAT ARROWS`, `application/vnd.apache.arrow.stream`, magic `0xFFFFFFFF`). Explicit `ndjson`/`csv`/`parquet`/`arrow` win over `Accept`; default/`json` allows Accept negotiation (`application/x-ndjson`, `application/jsonl`, `text/csv`, `application/vnd.apache.parquet`, `application/parquet`, `application/vnd.apache.arrow.stream`, `application/vnd.apache.arrow.file`). Column modes `html`/`text` still win. |
+| **FORMAT** | Response body for row data: `json` (default, array of objects), `ndjson` (`application/x-ndjson`), `csv` (`text/csv`), `parquet` (`application/vnd.apache.parquet` file bytes, magic `PAR1`), `arrow` (Arrow IPC stream using the vendored nanoarrow encoder, `application/vnd.apache.arrow.stream`, magic `0xFFFFFFFF`). Explicit `ndjson`/`csv`/`parquet`/`arrow` win over `Accept`; default/`json` allows Accept negotiation (`application/x-ndjson`, `application/jsonl`, `text/csv`, `application/vnd.apache.parquet`, `application/parquet`, `application/vnd.apache.arrow.stream`, `application/vnd.apache.arrow.file`). `binary` sends one row’s `body` BLOB unchanged, with optional `content_type` (default `application/octet-stream`). It requires exactly one row and rejects invalid content types. Column modes `html`/`text` apply to other formats. |
 | **ENVELOPE** | JSON shape for `FORMAT json`: `array` (default, `[{…}]`) or `object` (exactly one row → `{…}`; 0 rows → `null` unless `EMPTY STATUS`; >1 rows → 500). Only valid with `FORMAT json`. OpenAPI advertises `type: object` when set. |
 | **EMPTY STATUS** | When the handler returns **0 rows**, respond with this HTTP status instead of success `STATUS` + `[]`/`null`. Optional `BODY '<json>'` (default `{"detail":"Not Found"}`). Works with array or object envelope. Listed in OpenAPI responses. |
 | **TIMEOUT** / **WITH (timeout_sec)** | Per-request httplib socket read/write deadline in seconds (also `'30s'` / `'5m'` / `'1h'`, max 24h). Default omit/`0` = serve defaults (`quackapi_serve` `read_timeout_sec`/`write_timeout_sec`, usually 30). When set, the matched request extends `SocketStream` select timeouts and `SO_RCVTIMEO`/`SO_SNDTIMEO` on that connection through handler + response write. Synonyms: `TIMEOUT 180` or `WITH (timeout_sec := 180)`. |
@@ -142,6 +142,11 @@ CREATE ROUTE items_list GET '/items' GROUP v1 AS SELECT 1 AS id;
 
 ## 4. CREATE API FOR TABLE
 
+The generated list endpoint orders by the configured key and accepts `limit`
+(default 100, maximum 1000) and `offset` (default 0). Use a unique key for
+stable pagination. This bounds generated list responses; existing clients that
+need more than 100 rows must request subsequent pages.
+
 ```sql
 CREATE [OR REPLACE] API FOR TABLE <table>
   [AT '<base_path>']
@@ -156,7 +161,7 @@ CREATE [OR REPLACE] API FOR TABLE <table>
 
 Expands to:
 
-- `GET <base>` → `SELECT * FROM <table>`
+- `GET <base>` → `SELECT * FROM <table> ORDER BY <key> LIMIT $limit OFFSET $offset`
 - `GET <base>/:<key>` → `SELECT * FROM <table> WHERE <key> = $<key>`
 
 Read-only. Generated names: `<table>_list`, `<table>_get`.

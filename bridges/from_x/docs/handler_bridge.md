@@ -1,3 +1,8 @@
+> Historical experiment report. Temporary scripts, corpus percentages and facade
+> demonstrations below are not current shipped entrypoints. The extension now
+> exposes `quack_from_routes(framework, path)` and `quack_from_models(framework, path)`
+> for metadata only; see [current bridge documentation](../README.md).
+
 # quackapi handler bridge — what FastAPI bodies actually do
 
 **Date:** 2026-07-19  
@@ -458,7 +463,7 @@ SELECT * FROM evaluate_roh_tree($review);
 
 ### 4.3 Realistic “% of a real FastAPI app”
 
-**Headline: ~85–95% of a CRUD-centric FastAPI app** (routes + validation + handler A + handler B) is in automatic reach of `quack_from_fastapi` **without new C++**, given existing extensions.
+**Headline: ~85–95% of a CRUD-centric FastAPI app** (routes + validation + handler A + handler B) is in automatic reach of the FastAPI bridge workflow; native metadata extraction is available via `quack_from_routes('fastapi', path)` and `quack_from_models('fastapi', path)`.
 
 Breakdown for a RealWorld-shaped app:
 

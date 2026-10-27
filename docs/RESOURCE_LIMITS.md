@@ -27,20 +27,18 @@ positive; their maximum values are one day, 1 GiB, and 100,000 pending requests.
 A shared watchdog interrupts an active DuckDB connection when its budget
 expires. Middleware and GraphQL inherit the request budget; outbound HTTP
 workers inherit the current deadline. An expired ordinary request returns 504.
-An oversized ordinary response returns 507. Row serialization stops when its
-running size estimate exceeds the cap, and the completed uncompressed body is
+An oversized ordinary response returns 507. JSON rows are encoded once while
+fetching DuckDB result chunks, with the exact JSON byte count checked before
+each row is appended. Arrow responses project the native chunk vectors into
+DuckDB's Arrow converter and check the encoded size after each record batch.
+Both formats retain the completed HTTP body in memory; Arrow IPC stream format
+does not imply progressive network delivery. The completed uncompressed body is
 checked before compression. The response cap does not replace DuckDB's
 `memory_limit`: query operators and materialized results can allocate memory
 before serialization.
 
-The optional native PostgreSQL path uses nonblocking connection/query polling
-under the same deadline and assembles capped JSON as rows arrive. It retains a
-bounded session statement timeout without adding a `SET` round trip to every
-ordinary request. PostgreSQL execution or transport failures return a sanitized
-502 (504 for timeout). A failed PostgreSQL command is never replayed against
-DuckDB; only a handler identified as inapplicable to native execution can fall
-back. A connection failure after a write was sent can leave the write outcome
-unknown, so applications should use idempotency keys when retrying writes.
+PostgreSQL access uses DuckDB's `postgres` extension and its connection and
+query controls. The former quackapi-specific `pg_dsn` execution path is removed.
 
 The HTTP worker pool rejects enqueue attempts when its bounded connection queue is
 full. Rejected connections are closed; the admission mechanism does not promise
@@ -72,3 +70,33 @@ still have separate quotas; this is not a distributed rate limiter.
 
 See `test/sql/quackapi_resource_limits.test` for timeout, post-cancellation
 recovery, response-size, configuration, and credential-normalization regressions.
+
+Outbound keep-alive pooling retains at most 256 idle clients across at most
+256 host entries, with a five-minute idle expiry checked on pool activity.
+These are idle-pool limits; they do not cap all concurrently active outbound
+requests or the size of an upstream response.
+
+## Upload limits and disconnects
+
+The server `max_request_bytes` option (or `quackapi_max_request_bytes` setting)
+is a hard ceiling, default 8 MiB and maximum 1 GiB. A route may opt into a larger
+or smaller limit with `WITH (max_request_bytes := ...)`. Its effective limit is
+the smaller of the route limit and server ceiling. Routes with no override keep
+8 MiB even when the server ceiling is raised. The header/body reader enforces
+this for Content-Length and chunked transfers; supported request decompression
+is also bounded. Unsupported request content encodings return 415.
+
+`cancel_on_disconnect := true` on `quackapi_serve` enables ordinary-route
+cancellation on downstream socket EOF. The default is false to preserve clients
+that intentionally half-close writes before reading their response. A shared
+watchdog interrupts the query and shuts down an active pooled plain-HTTP POST
+socket; it does not allocate a thread for each request. HTTPS backends have no
+portable abort method in DuckDB's public HTTPClient interface and remain bounded
+by their per-call timeout. A closed upstream connection does not guarantee that
+a remote generation job stops; use the upstream job-cancellation API for that.
+
+The community `httpfs_timeout_retry` extension controls filesystem operations
+(open/read/write, listing and metadata). It does not wrap quackapi's direct
+pooled POST calls. Use `timeout_ms` on `quackapi_post` for those, with an outer
+query budget large enough for generation. Its explicit value overrides the
+session's outbound default but never extends the outer budget.

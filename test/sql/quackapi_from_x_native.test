@@ -1,5 +1,5 @@
 # name: test/sql/quackapi_from_x_native.test
-# description: Native quack_from_* table functions — fixtures + embed drift
+# description: Framework-selectable route and model importers
 # group: [sql]
 
 require quackapi
@@ -9,7 +9,7 @@ require quackapi
 # ---------------------------------------------------------------------------
 query III
 SELECT method, path, handler_name
-FROM quack_from_fastapi('bridges/from_x/fixtures/fastapi_mini')
+FROM quack_from_routes('fastapi', 'bridges/from_x/fixtures/fastapi_mini')
 ORDER BY method, path;
 ----
 GET	/articles/{slug}	get_article
@@ -20,7 +20,7 @@ POST	/login	login
 # ---------------------------------------------------------------------------
 query IIIII
 SELECT model_name, field_name, field_type, is_required, has_default
-FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini')
+FROM quack_from_models('fastapi', 'bridges/from_x/fixtures/fastapi_mini')
 ORDER BY field_line, field_name;
 ----
 UserInLogin	email	str	true	false
@@ -28,7 +28,7 @@ UserInLogin	password	str	true	false
 UserInLogin	remember_me	bool	false	true
 
 query I
-SELECT default_expr FROM quack_from_fastapi_models('bridges/from_x/fixtures/fastapi_mini')
+SELECT default_expr FROM quack_from_models('fastapi', 'bridges/from_x/fixtures/fastapi_mini')
 WHERE field_name = 'remember_me';
 ----
 False
@@ -38,7 +38,7 @@ False
 # ---------------------------------------------------------------------------
 query III
 SELECT method, path, handler_name
-FROM quack_from_rails('bridges/from_x/fixtures/rails_mini')
+FROM quack_from_routes('rails', 'bridges/from_x/fixtures/rails_mini')
 ORDER BY method, path;
 ----
 GET	/api/articles/:slug	articles#show
@@ -49,7 +49,7 @@ POST	/api/login	sessions#create
 # ---------------------------------------------------------------------------
 query IIIII
 SELECT model_name, field_name, field_type, is_required, has_default
-FROM quack_from_rails_models('bridges/from_x/fixtures/rails_mini')
+FROM quack_from_models('rails', 'bridges/from_x/fixtures/rails_mini')
 ORDER BY field_name;
 ----
 User	email	presence	true	false
@@ -61,7 +61,7 @@ User	remember_me	allow_blank,inclusion	false	false
 # ---------------------------------------------------------------------------
 query III
 SELECT method, path, handler_name
-FROM quack_from_express('bridges/from_x/fixtures/express_mini')
+FROM quack_from_routes('express', 'bridges/from_x/fixtures/express_mini')
 ORDER BY method, path;
 ----
 GET	/articles/:slug	getArticle
@@ -72,7 +72,7 @@ POST	/login	login
 # ---------------------------------------------------------------------------
 query IIIII
 SELECT model_name, field_name, field_type, is_required, has_default
-FROM quack_from_express_models('bridges/from_x/fixtures/express_mini')
+FROM quack_from_models('express', 'bridges/from_x/fixtures/express_mini')
 ORDER BY field_line, field_name;
 ----
 UserInLogin	email	string	true	false
@@ -80,7 +80,7 @@ UserInLogin	password	string	true	false
 UserInLogin	remember_me	boolean	false	true
 
 query I
-SELECT default_expr FROM quack_from_express_models('bridges/from_x/fixtures/express_mini')
+SELECT default_expr FROM quack_from_models('express', 'bridges/from_x/fixtures/express_mini')
 WHERE field_name = 'remember_me';
 ----
 false
@@ -90,7 +90,7 @@ false
 # ---------------------------------------------------------------------------
 query III
 SELECT method, path, handler_name
-FROM quack_from_gin('bridges/from_x/fixtures/gin_mini')
+FROM quack_from_routes('gin', 'bridges/from_x/fixtures/gin_mini')
 ORDER BY method, path;
 ----
 GET	/api/articles/:slug	GetArticle
@@ -101,7 +101,7 @@ POST	/api/login	Login
 # ---------------------------------------------------------------------------
 query IIIII
 SELECT model_name, field_name, field_type, is_required, has_default
-FROM quack_from_gin_models('bridges/from_x/fixtures/gin_mini')
+FROM quack_from_models('gin', 'bridges/from_x/fixtures/gin_mini')
 ORDER BY field_line, field_name;
 ----
 UserInLogin	Email	string	true	false
@@ -109,54 +109,41 @@ UserInLogin	Password	string	true	false
 UserInLogin	RememberMe	bool	false	false
 
 # ---------------------------------------------------------------------------
-# Embed drift: on-disk src/sql/*.sql must byte-match embedded constants.
-# (unittest cwd is the extension repo root. read_text needs literal paths —
-# no lateral column params — so each pair is checked separately.)
+
 # ---------------------------------------------------------------------------
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_fastapi_routes.sql'))
-     = quack_from_x_sql('fastapi', 'routes');
+# Argument validation happens during binding, before sitting_duck bootstrap.
+# ---------------------------------------------------------------------------
+statement error
+SELECT * FROM quack_from_routes(NULL, 'bridges/from_x/fixtures/fastapi_mini');
 ----
-true
+framework and path must not be NULL
 
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_fastapi_models.sql'))
-     = quack_from_x_sql('fastapi', 'models');
+statement error
+SELECT * FROM quack_from_models('unknown', 'bridges/from_x/fixtures/fastapi_mini');
 ----
-true
+unknown framework
 
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_rails_routes.sql'))
-     = quack_from_x_sql('rails', 'routes');
+statement error
+SELECT * FROM quack_from_routes('fastapi', NULL);
 ----
-true
+framework and path must not be NULL
 
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_rails_models.sql'))
-     = quack_from_x_sql('rails', 'models');
+statement error
+SELECT * FROM quack_from_models('fastapi', '');
 ----
-true
+path must be non-empty
 
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_express_routes.sql'))
-     = quack_from_x_sql('express', 'routes');
+statement error
+SELECT * FROM quack_from_fastapi('bridges/from_x/fixtures/fastapi_mini');
 ----
-true
+does not exist
 
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_express_models.sql'))
-     = quack_from_x_sql('express', 'models');
+statement error
+SELECT quack_from_x_sql('fastapi', 'routes');
 ----
-true
+does not exist
 
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_gin_routes.sql'))
-     = quack_from_x_sql('gin', 'routes');
+statement error
+SELECT quack_from_x_sql_relpath('fastapi', 'routes');
 ----
-true
-
-query I
-SELECT (SELECT content FROM read_text('src/sql/quack_from_gin_models.sql'))
-     = quack_from_x_sql('gin', 'models');
-----
-true
+does not exist

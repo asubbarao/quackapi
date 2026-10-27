@@ -5,8 +5,7 @@
 
 namespace duckdb {
 
-//! Register quack_from_{fastapi,rails,express,gin}[+_models] table functions
-//! and quack_from_x_sql(framework, kind) for embed-drift tests.
+//! Register quack_from_routes(framework, path) and quack_from_models(framework, path).
 void RegisterQuackapiFromXFunctions(ExtensionLoader &loader);
 
 } // namespace duckdb

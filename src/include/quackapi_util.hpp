@@ -71,15 +71,19 @@ inline void AddNamedParameter(TableFunction &fn, const char *name, const Logical
 	}
 }
 
-//! The same function without positional parameters, keeping its named ones (the zero-argument overload).
-inline TableFunction WithoutPositionalArguments(TableFunction fn) {
-	FunctionSignature signature(vector<LogicalType> {}, fn.GetSignature().GetReturnType());
+//! Reuse an overload's implementation and typed keyword schema with different positional parameters.
+inline TableFunction WithPositionalArguments(TableFunction fn, vector<LogicalType> arguments) {
+	FunctionSignature signature(std::move(arguments), fn.GetSignature().GetReturnType());
 	auto kwargs = fn.GetSignature().GetTypedKwargs();
 	if (kwargs) {
 		signature.AddTypedKwargs("options", *kwargs);
 	}
 	fn.GetSignature() = std::move(signature);
 	return fn;
+}
+
+inline TableFunction WithoutPositionalArguments(TableFunction fn) {
+	return WithPositionalArguments(std::move(fn), {});
 }
 
 //! DuckDB 2.0 reports an exception from a scalar that is not marked fallible as an INTERNAL error.

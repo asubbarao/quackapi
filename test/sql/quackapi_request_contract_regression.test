@@ -1,0 +1,82 @@
+# name: test/sql/quackapi_request_contract_regression.test
+# description: Sources, form precedence, and explicit string types
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE contract_header GET '/contract-header' PARAM token VARCHAR HEADER AS SELECT $token AS token;
+
+query I
+SELECT status FROM quackapi_request('GET', '/contract-header?token=wrong-source');
+----
+422
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/contract-header', headers := MAP {'token': 'correct'});
+----
+200	[{"token":"correct"}]
+
+statement ok
+CREATE ROUTE contract_string GET '/contract-string' PARAM value VARCHAR AS SELECT $value AS value;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/contract-string?value=1.5');
+----
+200	[{"value":"1.5"}]
+
+statement ok
+CREATE ROUTE contract_alias GET '/contract-alias' PARAM value VARCHAR QUERY external_value AS SELECT $value AS value;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('GET', '/contract-alias?external_value=hello');
+----
+200	[{"value":"hello"}]
+
+statement ok
+CREATE ROUTE contract_path POST '/contract-path/:id' AS SELECT $id::INTEGER AS id;
+
+query II
+SELECT status, decode(body) FROM quackapi_request('POST', '/contract-path/7', 'id=9', headers := MAP {'Content-Type': 'application/x-www-form-urlencoded'});
+----
+200	[{"id":7}]
+
+statement ok
+CREATE ROUTE contract_body POST '/contract-body' BODY TYPE '{"n":"INTEGER"}' AS SELECT $n AS n;
+
+query I
+SELECT status FROM quackapi_request('POST', '/contract-body', 'n=nope', headers := MAP {'Content-Type': 'application/x-www-form-urlencoded'});
+----
+422
+
+statement ok
+CREATE ROUTE contract_unicode GET '/contract-unicode' PARAM value VARCHAR MAX_LENGTH 1 AS SELECT $value AS value;
+
+query I
+SELECT status FROM quackapi_request('GET', '/contract-unicode?value=%C3%A9');
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/contract-unicode?value=ab');
+----
+422
+
+statement ok
+CREATE ROUTE contract_budget GET '/contract-budget' AS SELECT '' AS value FROM range(1000);
+
+query I
+SELECT status FROM quackapi_request('GET', '/contract-budget', max_response_bytes := 100);
+----
+507
+
+statement ok
+CREATE ROUTE head_wild GET '/head-match/:id' STATUS 201 AS SELECT 1 AS x;
+
+statement ok
+CREATE ROUTE head_exact GET '/head-match/me' STATUS 202 AS SELECT 2 AS x;
+
+query II
+SELECT (SELECT status FROM quackapi_request('GET', '/head-match/me')), (SELECT status FROM quackapi_request('HEAD', '/head-match/me'));
+----
+202	202

@@ -1,0 +1,26 @@
+# name: test/sql/quackapi_pg_migration.test
+# description: Removed native PostgreSQL options fail explicitly
+# group: [sql]
+
+require quackapi
+
+statement error
+SELECT * FROM quackapi_request('GET', '/', pg_dsn := 'postgresql://example');
+----
+pg_dsn was removed
+
+statement error
+SELECT * FROM quackapi_serve(29991, pg_dsn := 'postgresql://example');
+----
+pg_dsn was removed
+
+statement ok
+SET quackapi_pg_dsn = 'postgresql://example';
+
+statement error
+SELECT * FROM quackapi_request('GET', '/');
+----
+pg_dsn was removed
+
+statement ok
+SET quackapi_pg_dsn = '';
