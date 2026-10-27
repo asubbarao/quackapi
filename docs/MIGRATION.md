@@ -17,9 +17,11 @@ to the community CDN.
 ## POST receipts and deadlines
 
 `quackapi_post` remains available in scalar and table forms. Its receipt is
-`STRUCT(status, reason, body, headers, error, reused_connection, body_blob)`.
+`STRUCT(status, reason, body, headers, error, reused_connection, body_blob, columns, rows)`.
 Use `body_blob` for exact bytes; `body` is NULL for invalid UTF-8. Callers that
-unpack the entire STRUCT must account for the added field.
+unpack the entire STRUCT must account for all three added fields. Raw/default
+POST leaves `columns` and `rows` NULL; `response_format := 'arrow'|'parquet'`
+decodes native values into those fields.
 
 ```sql
 SELECT status, body_blob

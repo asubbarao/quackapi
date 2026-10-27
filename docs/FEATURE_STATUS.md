@@ -4,7 +4,7 @@
 **Source of truth:** this checkout's source tree and versioned tests; cited report paths are historical evidence only.
 **Rule:** implemented claims below are backed by source or tests. Design studies and external packaging notes remain explicitly labelled.
 **Publication:** this ledger is not a release receipt. Community packages follow the separate registry pin and signed build pipeline; see [migration notes](MIGRATION.md).
-**Current validation:** [PR #58 CI](https://github.com/asubbarao/quackapi/actions/runs/40426089540) passed all five platform builds and 63 SQL suites with zero skips at application head `ee3034ca`. Historical 89-case and corpus figures below describe earlier experiments; the reviewed candidate also passed 93 conformance cases.
+**Current validation:** [PR #59 checks](https://github.com/asubbarao/quackapi/pull/59/checks) track the current candidate across five platforms and the PostgreSQL/HTTP integration job. The versioned SQL suite contains 72 files, including native typed receipts, VARIANT inputs and Parquet. Historical 89-case and corpus figures below describe earlier experiments; the current HTTP conformance harness has 93 cases.
 
 **Evidence index**
 
@@ -12,7 +12,7 @@
 |----------|----------------|
 | `rg 'CREATE …' src/` + registered functions in `src/` | 8 CREATE nouns plus the lifecycle, request, auth, queue, HTTP, GraphQL, middleware, policy, stream, and bridge functions |
 | `ls test/sql test/http test/conformance` | Versioned tests for each surface |
-| `bash test/conformance/run.sh` → `/tmp/quackapi_conformance_rerun/` | **Live** FastAPI harness: **89/89 PASS (100%)** |
+| `bash test/conformance/run.sh` → `/tmp/quackapi_conformance_rerun/` | Historical FastAPI harness run: **89/89 PASS**; use the current CI HTTP contract step for current evidence |
 | `/tmp/quackapi_fastapi_eq/SCORECARD.md` | **Stale** baseline: **62/89 (69.7%)** pre body/form/multipart/cookies/headers/redirect/openapi/redoc |
 | `/tmp/quackapi_corpus/{PYTHON,RUBY,GO,NODE,SPEC}.md` + IR parquets | 1576 routes · 4204 model fields · 36 repos |
 | `/tmp/quackapi_{fromfast,rails_bridge,pydantic_bridge,handler_bridge}.md` | Bridge status + fidelity |
@@ -297,7 +297,7 @@ now shipped, while the remaining rows are partial or not built.
 
 | Report | Takeaway |
 |--------|----------|
-| `/tmp/quackapi_arrow.md` | Arrow/ADBC/Airport are **client** codecs/Flight clients — compose `nanoarrow` for FORMAT ARROW, do not embed Flight server in quackapi |
+| `/tmp/quackapi_arrow.md` | Historical client-composition notes. Current FORMAT ARROW and typed POST use native DuckDB conversion and vendored nanoarrow IPC; no Flight server is embedded |
 | `/tmp/quackapi_scope9.md` | **2/9 USEFUL-NOW** (netquack, inflector); skip false friends (http_stats, harbor-as-lib, nsv, query_condition_cache-as-HTTP-cache) |
 | `/tmp/quackapi_scope_free.md` | **`ai`** + **`duckdb_mcp`** USEFUL-NOW for route AI tasks / MCP gateway without reinventing FastAPI-mcp |
 

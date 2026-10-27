@@ -425,7 +425,7 @@ server, registry, auth, queue, and outbound HTTP surfaces above.
 
 | Function | Signature / returns |
 |----------|--------------------|
-| `quackapi_request` | `quackapi_request(method VARCHAR, path VARCHAR [, body VARCHAR], headers := MAP, access_log := ANY, log_headers := VARCHAR, log_query := BOOLEAN, query_timeout_ms := BIGINT, max_response_bytes := BIGINT)` → `status INTEGER, body BLOB, content_type VARCHAR, headers MAP(VARCHAR, VARCHAR)`; no TCP listener is required |
+| `quackapi_request` | `quackapi_request(method VARCHAR, path VARCHAR [, body VARCHAR], headers := MAP, access_log := ANY, log_level := VARCHAR, slow_request_ms := BIGINT, log_headers := VARCHAR, log_query := BOOLEAN, query_timeout_ms := BIGINT, max_response_bytes := BIGINT)` → `status INTEGER, body BLOB, content_type VARCHAR, headers MAP(VARCHAR, VARCHAR)`; no TCP listener is required. Access logging defaults to off; `true` enables stderr JSON and a table name selects a table sink. `log_level` inherits the session setting (default `info`); the default slow threshold is `1000` ms |
 | `quackapi_middlewares()` | → `name, phase, group_name, handler_sql, registration_order` |
 | `quackapi_graphql_tables()` | → `mode, table_name` |
 | `quackapi_graphql_routes()` | → `name, method, path, tables, require_auth, limit` |

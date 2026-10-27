@@ -1,5 +1,13 @@
 # Gemini brainstorm × `ext_catalog_clean` — composition map
 
+This is a historical design/catalog snapshot from July 29, 2026, not the current
+API reference. Arrow, Parquet and WebSocket support have since been implemented;
+typed HTTP replies now decode directly in `quackapi_post`, using native DuckDB
+conversion and vendored nanoarrow IPC. Use the [function reference](reference/functions.md),
+[DDL reference](reference/ddl.md) and [migration guide](MIGRATION.md) for the
+current API and dependencies. Proposals and status tables below retain their
+original research context.
+
 **Source:** live quack `:9494` `ext_catalog_clean` (2026-07-29).  
 **Method:** `ILIKE` on `extension_name` / `content`; samples only from `query IS NOT NULL` or README blocks — no invented signatures.  
 **Thesis:** compose first. Prefer a **recipe** (LOAD + `CREATE ROUTE` / `CREATE STREAM` / `CREATE QUEUE`) over new C++. Thin C++ only when the wire format or registry lives inside quackapi.
