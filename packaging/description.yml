@@ -59,7 +59,7 @@ docs:
 
     -- Serve (background threads; shell stays usable)
     -- Optional: static_dir for unrouted GETs; cors_origins for browser CORS
-    SELECT * FROM quackapi_serve(8000, static_dir := './static');
+    SELECT * FROM quackapi_serve(8000);
 
     -- curl http://127.0.0.1:8000/hello          → [{"msg":"world"}]
     -- curl http://127.0.0.1:8000/items/42       → [{"id":42}]
