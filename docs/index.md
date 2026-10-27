@@ -178,7 +178,7 @@ Handler SQL is validated at `CREATE` time. Broken SQL fails at create — not on
 
 ### FastAPI readers
 
-- [FastAPI parity map (89/89)](fastapi-parity.md)  
+- [FastAPI conformance map](fastapi-parity.md)
 - [Framework route/model metadata import](from-fastapi.md)
 - [Migration notes](MIGRATION.md)
 

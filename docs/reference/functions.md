@@ -434,6 +434,7 @@ not application-facing functions.
 | `SET quackapi_pg_dsn = '…'` | Retired; a nonempty value triggers a migration error. Use `ATTACH … (TYPE postgres)`. |
 | `SET quackapi_query_timeout_ms = N` | Query execution budget; default `30000` |
 | `SET quackapi_max_response_bytes = N` | Uncompressed response cap; default `16777216` |
+| `SET quackapi_max_request_bytes = N` | Server upload ceiling; default `8388608`, maximum `1073741824`; routes without an explicit override still use 8 MiB |
 | `SET quackapi_max_pending_requests = N` | Pending request cap; default `256` |
 | `SET quackapi_exec_max_threads = N` | Process-wide scalar exec task admission cap (no private worker threads); exhausted admission runs inline; default `256`, `0` always inline |
 | `SET quackapi_graphql_allow_all = true\|false` | Legacy global GraphQL open mode; default `false` |
