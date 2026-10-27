@@ -340,9 +340,13 @@ Repo workflow: `duckdb/extension-ci-tools` pinned to
 `fe955ed3a046b0324cac2c691e73d8d776a7d5cc`, `duckdb_version: v2.0.0`,
 same `exclude_archs` as `description.yml`.
 
-The repository workflow builds and tests all five target architectures. Community
-publication separately requires an accepted descriptor update and successful
-signing; a repository CI result alone does not update the hosted package.
+The repository workflow builds all five target architectures. The pinned upstream
+workflow runs runtime tests on Linux AMD64, native macOS ARM64 and Windows AMD64;
+Linux ARM64 and macOS AMD64 distribution jobs build without runtime tests. The
+separate Linux AMD64 integration job exercises PostgreSQL, native byte budgets,
+cancellation, WebSockets and real HTTP contracts. Community publication separately
+requires an accepted descriptor update and successful signing; a repository CI
+result alone does not update the hosted package.
 
 ---
 

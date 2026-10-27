@@ -16,3 +16,8 @@ The extension uses DuckDB 2.0 native query submission, asynchronous tasks, VARIA
 values and the PEG parser token API. Other host versions need their own build.
 
 CI and GitHub Release assets target **v2.0.0** × linux_amd64/arm64, osx_amd64/arm64, windows_amd64.
+
+The pinned upstream workflow runs runtime tests on Linux AMD64, native macOS
+ARM64 and Windows AMD64. Its Linux ARM64 and macOS AMD64 distribution jobs
+build without runtime tests. The separate Linux AMD64 integration job runs the
+PostgreSQL/network SQL suites, C++ regressions and real HTTP contract checks.
