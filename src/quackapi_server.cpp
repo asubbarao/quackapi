@@ -21,6 +21,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -33,6 +34,8 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/literal.hpp"
 
 #include "quackapi_auth.hpp"
 #include "quackapi_graphql.hpp"
@@ -931,40 +934,50 @@ bool CheckParamConstraints(const QuackapiParamSpec &spec, const string &raw, con
 	if (bound.IsNull()) {
 		return true;
 	}
-	// Numeric constraints need a number.
-	double num = 0;
-	if (IsNumericType(bound.type()) || bound.type().id() == LogicalTypeId::BOOLEAN) {
-		Value dbl;
-		string cerr;
-		if (!QuackapiTryCast(bound, LogicalType::DOUBLE, dbl, &cerr) || dbl.IsNull()) {
-			return true; // non-numeric bound — skip numeric constraints
-		}
-		num = dbl.GetValue<double>();
-	} else {
-		// Try parse raw as double for VARCHAR-bound numbers
+	// Keep the request's native numeric type for exact comparisons. VARCHAR
+	// parameters may still carry numeric text; parse only a single numeric
+	// literal, using DuckDB's own parser and literal conversion.
+	Value numeric = bound;
+	if (bound.type().id() == LogicalTypeId::BOOLEAN) {
+		numeric = bound.DefaultCastAs(LogicalType::TINYINT);
+	} else if (!IsNumericType(bound.type())) {
 		try {
-			num = std::stod(raw);
+			auto parser = Parser::GetBuiltinParser();
+			auto expression = parser.ParseSingleExpression(raw);
+			if (expression->HasAlias() || expression->GetExpressionClass() != ExpressionClass::CONSTANT) {
+				throw InvalidInputException("Expected a numeric literal");
+			}
+			const auto &literal = expression->Cast<ConstantExpression>().GetLiteral();
+			if (!literal.IsNumeric()) {
+				throw InvalidInputException("Expected a numeric literal");
+			}
+			numeric = literal.ToValue();
 		} catch (...) {
-			return true;
+			msg = "Input should be a valid number";
+			err_type = "type_error";
+			return false;
 		}
 	}
-	if (spec.has_ge && !(num >= spec.ge)) {
-		msg = StringUtil::Format("Input should be greater than or equal to %g", spec.ge);
+	if (numeric.IsNull()) {
+		return true;
+	}
+	if (spec.has_ge && !ValueOperations::GreaterThanEquals(numeric, spec.ge)) {
+		msg = "Input should be greater than or equal to " + spec.ge.ToString();
 		err_type = "greater_than_equal";
 		return false;
 	}
-	if (spec.has_gt && !(num > spec.gt)) {
-		msg = StringUtil::Format("Input should be greater than %g", spec.gt);
+	if (spec.has_gt && !ValueOperations::GreaterThan(numeric, spec.gt)) {
+		msg = "Input should be greater than " + spec.gt.ToString();
 		err_type = "greater_than";
 		return false;
 	}
-	if (spec.has_le && !(num <= spec.le)) {
-		msg = StringUtil::Format("Input should be less than or equal to %g", spec.le);
+	if (spec.has_le && !ValueOperations::LessThanEquals(numeric, spec.le)) {
+		msg = "Input should be less than or equal to " + spec.le.ToString();
 		err_type = "less_than_equal";
 		return false;
 	}
-	if (spec.has_lt && !(num < spec.lt)) {
-		msg = StringUtil::Format("Input should be less than %g", spec.lt);
+	if (spec.has_lt && !ValueOperations::LessThan(numeric, spec.lt)) {
+		msg = "Input should be less than " + spec.lt.ToString();
 		err_type = "less_than";
 		return false;
 	}
@@ -1548,30 +1561,6 @@ string ValueToCsvCell(const Value &value) {
 	return value.ToString();
 }
 
-string SerializeRowsJsonArray(const vector<string> &names, const vector<idx_t> &data_cols,
-                              const vector<vector<Value>> &rows) {
-	string body = "[";
-	bool first_row = true;
-	for (auto &cols : rows) {
-		if (!first_row) {
-			body += ",";
-		}
-		first_row = false;
-		body += "{";
-		bool first_col = true;
-		for (auto col : data_cols) {
-			if (!first_col) {
-				body += ",";
-			}
-			first_col = false;
-			body += "\"" + QuackapiJsonEscape(names[col]) + "\":" + ValueToJson(cols[col]);
-		}
-		body += "}";
-	}
-	body += "]";
-	return body;
-}
-
 //! Single-row JSON object (ENVELOPE object). Caller guarantees rows.size() == 1.
 string SerializeRowJsonObject(const vector<string> &names, const vector<idx_t> &data_cols, const vector<Value> &cols) {
 	string body = "{";
@@ -1750,8 +1739,11 @@ string SerializeRowsParquet(Connection &con, const vector<string> &names, const 
 //! converter and the vendored nanoarrow IPC encoder. Magic is 0xFFFFFFFF
 //! stream continuation (not ARROW1 file). Content-Type:
 //! application/vnd.apache.arrow.stream.
-string SerializeRowsArrow(Connection &con, const vector<string> &names, const vector<LogicalType> &types,
-                          const vector<idx_t> &data_cols, const vector<vector<Value>> &rows) {
+struct ResponseTooLarge {};
+
+string SerializeResultArrow(Connection &con, QueryResult &result, const vector<string> &names,
+                            const vector<LogicalType> &types, const vector<idx_t> &data_cols, idx_t max_response_bytes,
+                            idx_t &row_count, const std::function<void(DataChunk &)> &visit) {
 	if (data_cols.empty()) {
 		throw InvalidInputException("arrow serialize: no data columns");
 	}
@@ -1790,18 +1782,18 @@ string SerializeRowsArrow(Connection &con, const vector<string> &names, const ve
 		check_arrow(ArrowIpcEncoderEncodeSchema(&encoder, &schema, &error), "schema encode");
 		check_arrow(ArrowIpcEncoderFinalizeBuffer(&encoder, 1, &output), "schema finalize");
 
-		for (idx_t offset = 0; offset < rows.size(); offset += STANDARD_VECTOR_SIZE) {
-			idx_t batch_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, rows.size() - offset);
-			DataChunk input;
-			input.Initialize(*con.context, arrow_types, batch_size);
-			for (idx_t row = 0; row < batch_size; row++) {
-				for (idx_t col = 0; col < data_cols.size(); col++) {
-					auto source_col = data_cols[col];
-					input.data[col].SetValue(
-					    row, source_col < rows[offset + row].size() ? rows[offset + row][source_col] : Value());
-				}
+		if (static_cast<idx_t>(output.size_bytes) + 8 > max_response_bytes) {
+			throw ResponseTooLarge {};
+		}
+		while (auto chunk = result.Fetch()) {
+			if (chunk->size() == 0) {
+				break;
 			}
-			input.SetChildCardinality(batch_size);
+			row_count += chunk->size();
+			visit(*chunk);
+			DataChunk input;
+			input.InitializeEmpty(arrow_types);
+			input.ReferenceColumns(*chunk, data_cols);
 
 			ArrowArray array;
 			array.Init();
@@ -1816,6 +1808,9 @@ string SerializeRowsArrow(Connection &con, const vector<string> &names, const ve
 				check_arrow(ArrowIpcEncoderEncodeSimpleRecordBatch(&encoder, &view, &body, &error),
 				            "record batch encode");
 				check_arrow(ArrowIpcEncoderFinalizeBuffer(&encoder, 1, &output), "record batch finalize");
+				if (static_cast<idx_t>(output.size_bytes + body.size_bytes) + 8 > max_response_bytes) {
+					throw ResponseTooLarge {};
+				}
 				check_arrow(ArrowBufferAppend(&output, body.data, body.size_bytes), "record batch append");
 			} catch (...) {
 				if (view_initialized) {
@@ -1989,87 +1984,73 @@ QuackapiExecResponse QuackapiExecErrorResponse(const string &error) {
 
 QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_bytes) {
 	QuackapiExecResponse out;
-	auto set_json = [&out](int status, string body) {
-		out = ExecJsonResponse(status, std::move(body));
-	};
 	try {
 		auto names = QuackapiNames(result.GetNames());
 		vector<idx_t> data_cols;
-		idx_t location_col = names.size();
-		idx_t set_cookie_col = names.size();
-		for (idx_t c = 0; c < names.size(); c++) {
-			auto lower = StringUtil::Lower(names[c]);
-			if (lower == "location") {
-				location_col = c;
-			} else if (lower == "set_cookie" || lower == "set-cookie") {
-				set_cookie_col = c;
-			} else {
-				data_cols.push_back(c);
-			}
-		}
-		vector<vector<Value>> rows;
-		idx_t response_value_bytes = 0;
-		while (true) {
-			auto chunk = result.Fetch();
-			if (!chunk || chunk->size() == 0) {
-				break;
-			}
-			for (idx_t row = 0; row < chunk->size(); row++) {
-				vector<Value> cols(chunk->ColumnCount());
-				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-					cols[col] = chunk->GetValue(col, row);
-					response_value_bytes += cols[col].ToString().size();
-					if (response_value_bytes > max_response_bytes) {
-						set_json(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
-						return out;
-					}
-				}
-				rows.push_back(std::move(cols));
-			}
-		}
-		out.rows = rows.size();
-		if (data_cols.empty() && location_col == names.size() && set_cookie_col == names.size()) {
-			// A final SET / PRAGMA / BEGIN has no columns: the exec route answers [].
-			set_json(200, "[]");
-			if (out.body.size() > max_response_bytes) {
-				return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
-			}
-			return out;
-		}
 		vector<string> data_names;
-		for (auto c : data_cols) {
-			data_names.push_back(names[c]);
+		idx_t location_col = names.size(), set_cookie_col = names.size();
+		for (idx_t col = 0; col < names.size(); col++) {
+			auto lower = StringUtil::Lower(names[col]);
+			if (lower == "location") {
+				location_col = col;
+			} else if (lower == "set_cookie" || lower == "set-cookie") {
+				set_cookie_col = col;
+			} else {
+				data_cols.push_back(col);
+				data_names.push_back(names[col]);
+			}
 		}
 		auto mode = ResponseModeFor(data_names);
-		out.status = 200;
-		if (data_cols.empty()) {
-			// Redirect / cookie-only response: no body, no Content-Type.
-		} else if (mode == ResponseMode::JSON) {
-			set_json(200, SerializeRowsJsonArray(names, data_cols, rows));
-		} else {
-			for (auto &cols : rows) {
-				if (!cols[data_cols[0]].IsNull()) {
-					out.body += cols[data_cols[0]].ToString();
-				}
-			}
+		const bool json = mode == ResponseMode::JSON && !data_cols.empty();
+		if (json) {
+			out.body = "[";
+			out.headers.emplace_back("Content-Type", "application/json");
+		} else if (!data_cols.empty()) {
 			out.headers.emplace_back("Content-Type", mode == ResponseMode::HTML ? "text/html; charset=utf-8"
 			                                                                    : "text/plain; charset=utf-8");
 		}
-		string location_value;
-		for (auto &cols : rows) {
-			if (location_col < cols.size() && !cols[location_col].IsNull() && location_value.empty()) {
-				location_value = cols[location_col].ToString();
-			}
-			if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
-				out.headers.emplace_back("Set-Cookie", cols[set_cookie_col].ToString());
+		string location;
+		while (auto chunk = result.Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> cols;
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					cols.push_back(chunk->GetValue(col, row));
+				}
+				if (json) {
+					auto encoded = SerializeRowJsonObject(names, data_cols, cols);
+					if (out.body.size() + encoded.size() + (out.rows ? 1 : 0) + 1 > max_response_bytes) {
+						return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+					}
+					if (out.rows) {
+						out.body += ',';
+					}
+					out.body += encoded;
+				} else if (!data_cols.empty() && !cols[data_cols[0]].IsNull()) {
+					out.body += cols[data_cols[0]].ToString();
+				}
+				if (location_col < cols.size() && !cols[location_col].IsNull() && location.empty()) {
+					location = cols[location_col].ToString();
+				}
+				if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
+					out.headers.emplace_back("Set-Cookie", cols[set_cookie_col].ToString());
+				}
+				out.rows++;
+				if (out.body.size() > max_response_bytes) {
+					return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+				}
 			}
 		}
-		if (!location_value.empty()) {
-			out.headers.emplace_back("Location", location_value);
+		if (json) {
+			out.body += ']';
+		} else if (names.empty()) {
+			out = ExecJsonResponse(200, "[]");
+		}
+		if (!location.empty()) {
+			out.headers.emplace_back("Location", location);
 		}
 	} catch (std::exception &ex) {
 		fprintf(stderr, "quackapi: internal error: %s\n", ex.what());
-		set_json(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
+		out = ExecJsonResponse(500, "{\"detail\":\"" + QuackapiJsonEscape(ex.what()) + "\"}");
 	}
 	if (out.body.size() > max_response_bytes) {
 		return ExecJsonResponse(507, "{\"detail\":\"Response exceeds configured byte limit\"}");
@@ -5200,8 +5181,58 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		const bool count_json_bytes =
 		    body_format == BodyFormat::JSON && mode == ResponseMode::JSON && !data_cols.empty();
 
-		// Materialize rows once so we can apply headers then serialize body.
+		if (body_format == BodyFormat::ARROW && mode == ResponseMode::JSON && !data_cols.empty()) {
+			idx_t row_count = 0;
+			string location;
+			vector<string> cookies;
+			auto visit = [&](DataChunk &chunk) {
+				for (idx_t row = 0; row < chunk.size(); row++) {
+					if (location_col < names.size() && location.empty()) {
+						auto value = chunk.GetValue(location_col, row);
+						if (!value.IsNull()) {
+							location = value.ToString();
+						}
+					}
+					if (set_cookie_col < names.size()) {
+						auto value = chunk.GetValue(set_cookie_col, row);
+						if (!value.IsNull()) {
+							cookies.push_back(value.ToString());
+						}
+					}
+				}
+			};
+			string body;
+			try {
+				body = SerializeResultArrow(con, *result, names, result->GetTypes(), data_cols,
+				                            options.max_response_bytes, row_count, visit);
+			} catch (const ResponseTooLarge &) {
+				SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
+				finish();
+				return;
+			}
+			rows_out = static_cast<int64_t>(row_count);
+			for (const auto &cookie : cookies) {
+				res.set_header("Set-Cookie", cookie);
+			}
+			if (!location.empty()) {
+				res.set_header("Location", location);
+			}
+			if (row_count == 0 && match.route.empty_status != 0) {
+				SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
+			} else {
+				res.status = match.route.status;
+				res.set_content(std::move(body), "application/vnd.apache.arrow.stream");
+			}
+			finish();
+			return;
+		}
+
+		// Encode JSON as native chunks are fetched; retain row Values only for other formats.
 		vector<vector<Value>> rows;
+		string json_body = object_envelope ? string() : "[";
+		string location_value;
+		vector<string> set_cookie_values;
+		idx_t row_count = 0;
 		idx_t response_value_bytes = count_json_bytes && !object_envelope ? 2 : 0;
 		while (true) {
 			auto chunk = result->Fetch();
@@ -5225,31 +5256,34 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 					}
 				}
 				if (count_json_bytes) {
-					response_value_bytes += SerializeRowJsonObject(names, data_cols, cols).size();
-					if (!object_envelope && !rows.empty())
+					auto encoded_row = SerializeRowJsonObject(names, data_cols, cols);
+					response_value_bytes += encoded_row.size();
+					if (!object_envelope && row_count != 0)
 						response_value_bytes++;
 					if (response_value_bytes > static_cast<idx_t>(options.max_response_bytes)) {
 						SetJson(res, 507, "{\"detail\":\"Response exceeds configured byte limit\"}");
 						finish();
 						return;
 					}
+					if (!object_envelope && row_count != 0) {
+						json_body += ',';
+					}
+					json_body += encoded_row;
 				}
-				rows.push_back(std::move(cols));
+				if (location_col < cols.size() && !cols[location_col].IsNull() && location_value.empty()) {
+					location_value = cols[location_col].ToString();
+				}
+				if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
+					set_cookie_values.push_back(cols[set_cookie_col].ToString());
+				}
+				row_count++;
+				if (!count_json_bytes) {
+					rows.push_back(std::move(cols));
+				}
 			}
 		}
-		rows_out = static_cast<int64_t>(rows.size());
+		rows_out = static_cast<int64_t>(row_count);
 
-		// Apply Location / Set-Cookie from first (or each) row.
-		string location_value;
-		vector<string> set_cookie_values;
-		for (auto &cols : rows) {
-			if (location_col < cols.size() && !cols[location_col].IsNull() && location_value.empty()) {
-				location_value = cols[location_col].ToString();
-			}
-			if (set_cookie_col < cols.size() && !cols[set_cookie_col].IsNull()) {
-				set_cookie_values.push_back(cols[set_cookie_col].ToString());
-			}
-		}
 		if (!location_value.empty()) {
 			res.set_header("Location", location_value);
 		}
@@ -5259,7 +5293,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		}
 
 		// 0-row EMPTY STATUS: override success STATUS (any FORMAT / html/text).
-		if (rows.empty() && match.route.empty_status != 0) {
+		if (row_count == 0 && match.route.empty_status != 0) {
 			SetJson(res, match.route.empty_status, EmptyResultBody(match.route));
 			finish();
 			return;
@@ -5350,29 +5384,26 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		} else if (body_format == BodyFormat::PARQUET) {
 			body = SerializeRowsParquet(con, names, result->GetTypes(), data_cols, rows);
 			content_type = "application/vnd.apache.parquet";
-		} else if (body_format == BodyFormat::ARROW) {
-			body = SerializeRowsArrow(con, names, result->GetTypes(), data_cols, rows);
-			// nanoarrow FORMAT ARROWS produces IPC *stream* (0xFFFFFFFF magic).
-			content_type = "application/vnd.apache.arrow.stream";
 		} else if (object_envelope) {
-			if (rows.size() > 1) {
+			if (row_count > 1) {
 				SetJson(res, 500,
-				        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(rows.size()) +
+				        "{\"detail\":\"ENVELOPE object requires exactly one row, got " + std::to_string(row_count) +
 				            "\"}");
 				finish();
 				return;
 			}
-			if (rows.empty()) {
+			if (row_count == 0) {
 				// No EMPTY STATUS → JSON null (array default remains []).
 				body = "null";
 			} else {
-				body = SerializeRowJsonObject(names, data_cols, rows[0]);
+				body = std::move(json_body);
 			}
 			SetJson(res, match.route.status, body);
 			finish();
 			return;
 		} else {
-			body = SerializeRowsJsonArray(names, data_cols, rows);
+			json_body += ']';
+			body = std::move(json_body);
 			SetJson(res, match.route.status, body);
 			finish();
 			return;

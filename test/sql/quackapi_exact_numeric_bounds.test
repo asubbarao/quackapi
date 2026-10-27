@@ -1,0 +1,102 @@
+# name: test/sql/quackapi_exact_numeric_bounds.test
+# description: Exact typed numeric PARAM bounds
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE numeric_bound_text GET '/numeric-bound-text' PARAM x VARCHAR GE 10 AS SELECT $x AS x;
+
+query I
+SELECT status FROM quackapi_request('GET', '/numeric-bound-text?x=not-a-number');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('GET', '/numeric-bound-text?x=11suffix');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('GET', '/numeric-bound-text?x=11');
+----
+200
+
+statement ok
+CREATE ROUTE ordinary_text GET '/ordinary-text' PARAM x VARCHAR AS SELECT $x AS x;
+
+query I
+SELECT status FROM quackapi_request('GET', '/ordinary-text?x=not-a-number');
+----
+200
+
+statement ok
+CREATE ROUTE exact_bound_bigint GET '/exact-bound-bigint' PARAM x BIGINT GE 9007199254740993 AS SELECT $x AS x;
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-bigint?x=9007199254740992');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-bigint?x=9007199254740993');
+----
+200
+
+statement ok
+CREATE ROUTE exact_bound_decimal GET '/exact-bound-decimal' PARAM x DECIMAL GE 12345678901234567890.1234 AS SELECT $x::DECIMAL(38, 4) AS x;
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-decimal?x=12345678901234567890.1233');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-decimal?x=12345678901234567890.1234');
+----
+200
+
+statement ok
+CREATE ROUTE exact_bound_fraction GET '/exact-bound-fraction' PARAM x INTEGER GE 1.5 AS SELECT $x AS x;
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-fraction?x=1');
+----
+422
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-fraction?x=2');
+----
+200
+
+statement ok
+CREATE ROUTE exact_bound_exponent GET '/exact-bound-exponent' PARAM x DOUBLE GE -1.25 LT 1e2 AS SELECT $x AS x;
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-exponent?x=-1.25');
+----
+200
+
+query I
+SELECT status FROM quackapi_request('GET', '/exact-bound-exponent?x=100');
+----
+422
+
+statement error
+CREATE ROUTE invalid_bound_prefix GET '/invalid-bound-prefix' PARAM x BIGINT GE 1suffix AS SELECT $x AS x;
+----
+Unknown PARAM option
+
+statement error
+CREATE ROUTE invalid_bound_string GET '/invalid-bound-string' PARAM x BIGINT GE '1' AS SELECT $x AS x;
+----
+numeric literals
+
+# Check the original JSON bytes: parsing decimal JSON numbers through DOUBLE
+# would itself discard the precision this response must preserve.
+query II
+SELECT contains(decode(body), '"minimum":9007199254740993'),
+       contains(decode(body), '"minimum":12345678901234567890.1234')
+FROM quackapi_request('GET', '/openapi.json');
+----
+true	true

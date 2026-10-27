@@ -27,8 +27,12 @@ positive; their maximum values are one day, 1 GiB, and 100,000 pending requests.
 A shared watchdog interrupts an active DuckDB connection when its budget
 expires. Middleware and GraphQL inherit the request budget; outbound HTTP
 workers inherit the current deadline. An expired ordinary request returns 504.
-An oversized ordinary response returns 507. Row serialization stops when its
-running size estimate exceeds the cap, and the completed uncompressed body is
+An oversized ordinary response returns 507. JSON rows are encoded once while
+fetching DuckDB result chunks, with the exact JSON byte count checked before
+each row is appended. Arrow responses project the native chunk vectors into
+DuckDB's Arrow converter and check the encoded size after each record batch.
+Both formats retain the completed HTTP body in memory; Arrow IPC stream format
+does not imply progressive network delivery. The completed uncompressed body is
 checked before compression. The response cap does not replace DuckDB's
 `memory_limit`: query operators and materialized results can allocate memory
 before serialization.

@@ -49,6 +49,17 @@ outbound POST waits for a complete response and does not relay token streams.
   Exec routes and `quackapi_exec` fail closed while policies are bound.
 - Explicit parameter sources are respected. Length constraints count Unicode
   code points. `BODY TYPE` binds typed values and OpenAPI uses the same types.
+  Route parameter metadata uses native DuckDB lists and structs internally;
+  numeric limits retain native integer/decimal types through `VARIANT` fields
+  instead of a rounded text or double representation. Quoted defaults retain
+  percent signs, Unicode and SQL quotes. Numeric bounds must be numeric literals;
+  string-length bounds must be non-negative integer literals.
+- Policy table identities and scalar macros use DuckDB's catalog API. Lookup
+  caches live for one request, so replacing a view or table takes effect on the
+  next request. Schema- and catalog-qualified policy bindings are supported.
+- JSON responses encode each row once as result chunks arrive. Arrow responses
+  convert native chunk vectors directly, including native `VARIANT` values.
+  Both still buffer the complete HTTP body; see [request budgets](RESOURCE_LIMITS.md).
 - FastAPI model extraction treats `Field()`, metadata-only `Field(...)`, and
   `default=...` as required. Real defaults/default factories are distinguished
   structurally; extraction does not execute Python factories or validators.

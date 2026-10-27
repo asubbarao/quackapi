@@ -529,7 +529,11 @@ CREATE ROUTE image_rows GET '/images' FORMAT ARROW AS
 
 Alternatively, send `Accept: application/vnd.apache.arrow.stream` to a JSON-format
 route. The response is an Arrow stream, not a raw PNG: an Arrow client must decode
-it to obtain the bytes. `FORMAT ARROW` uses the vendored nanoarrow encoder. See
+it to obtain the bytes. `FORMAT ARROW` passes native DuckDB result batches to the
+vendored nanoarrow encoder without rebuilding rows. The HTTP body is still
+buffered, and the response cap is checked after each encoded batch. JSON rows
+are encoded once while fetching results. Run [the large-response benchmark](bench/large_response.sql)
+with this checkout's CLI to measure both paths. See
 [`docs/reference/ddl.md`](docs/reference/ddl.md) for negotiation and precedence.
 For a direct PNG response, use `FORMAT binary` and return one row with a BLOB
 named `body` and an optional `content_type`. DuckDB 2.0's `read_blob` reads a

@@ -115,7 +115,7 @@ jobs:
 
       - name: Run quackapi SQLLogic
         env:
-          DUCKDB_TEST_ON_INIT: "INSTALL http_request FROM community; LOAD http_request; INSTALL sitting_duck FROM community; LOAD sitting_duck;"
+          DUCKDB_TEST_ON_INIT: "INSTALL nanoarrow FROM community; LOAD nanoarrow; INSTALL http_request FROM community; LOAD http_request; INSTALL sitting_duck FROM community; LOAD sitting_duck;"
         run: make test_release T='"test/sql/quackapi*"'
 
       - name: Verify embedded importer SQL
@@ -158,6 +158,9 @@ jobs:
           bash bench/test_harness.sh
           bash bench/test_report.sh
           python3 test/conformance/test_driver.py
+
+      - name: Measure large JSON and Arrow responses
+        run: ./build/release/duckdb -no-agent -unsigned -bail -json -f bench/large_response.sql
 
       # run.sh decodes Arrow responses with pyarrow through uv.
       - name: Install uv

@@ -14,6 +14,12 @@ This guide follows the current source checkout. Community packages follow the
 separate [registry pin](https://github.com/duckdb/community-extensions/blob/main/extensions/quackapi/description.yml).
 Read the [migration notes](MIGRATION.md) when upgrading existing applications.
 
+DuckDB 2.0 native values carry route metadata and response data: numeric
+parameter limits retain their precision, JSON preserves `VARIANT`, and Arrow
+converts result batches directly. Large responses still buffer their HTTP body;
+see [response budgets](RESOURCE_LIMITS.md) and the
+[JSON/Arrow benchmark](../bench/large_response.sql).
+
 ---
 
 ## Five-line hello world

@@ -105,6 +105,10 @@ docs:
     - Default JSON response is an **array of row objects** (SQL result-set
       semantics). A single column named `html` or `text` returns raw HTML/text;
       `location` / `set_cookie` set response headers.
+    - Native `VARIANT` objects, lists, scalars and nulls retain their JSON types.
+      JSON rows are encoded once during fetch; Arrow IPC responses convert native
+      DuckDB result vectors directly. Both buffer the complete HTTP body and
+      enforce the configured response-byte cap.
     - `quackapi_serve([port], host := …, static_dir := …, cors_origins := …, memory_limit := …)`
       uses DuckDB's bundled httplib (background listener + workers).
     - Built-in OpenAPI: `GET /openapi.json`, `GET /docs`, `GET /redoc`.

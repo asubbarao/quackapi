@@ -309,13 +309,13 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 				return schema;
 			schema.pop_back();
 			if (spec->has_ge)
-				schema += ",\"minimum\":" + std::to_string(spec->ge);
+				schema += ",\"minimum\":" + spec->ge.ToString();
 			if (spec->has_gt)
-				schema += ",\"exclusiveMinimum\":" + std::to_string(spec->gt);
+				schema += ",\"exclusiveMinimum\":" + spec->gt.ToString();
 			if (spec->has_le)
-				schema += ",\"maximum\":" + std::to_string(spec->le);
+				schema += ",\"maximum\":" + spec->le.ToString();
 			if (spec->has_lt)
-				schema += ",\"exclusiveMaximum\":" + std::to_string(spec->lt);
+				schema += ",\"exclusiveMaximum\":" + spec->lt.ToString();
 			if (spec->has_min_length)
 				schema += ",\"minLength\":" + std::to_string(spec->min_length);
 			if (spec->has_max_length)

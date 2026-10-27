@@ -1,5 +1,7 @@
 #pragma once
 
+#include "duckdb/common/types/value.hpp"
+
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -63,13 +65,13 @@ struct QuackapiParamSpec {
 	//! Raw default literal (digits / true / false / unquoted text). Empty when default_is_null.
 	string default_raw;
 	bool has_ge = false;
-	double ge = 0;
+	Value ge;
 	bool has_gt = false;
-	double gt = 0;
+	Value gt;
 	bool has_le = false;
-	double le = 0;
+	Value le;
 	bool has_lt = false;
-	double lt = 0;
+	Value lt;
 	bool has_min_length = false;
 	idx_t min_length = 0;
 	bool has_max_length = false;

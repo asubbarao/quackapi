@@ -7,6 +7,7 @@
 #include <chrono>
 #include <csignal>
 #include <thread>
+#include <type_traits>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -158,19 +159,33 @@ static string AccessLogValueString(const Value &value) {
 	return value.ToString();
 }
 
+//! Resolve a named option before its matching setting, keeping the option's native type.
+template <class T>
+static T BindOptionValue(ClientContext &context, TableFunctionBindInput &input, const string &name,
+                         const string &setting_name, T fallback, bool empty_setting_is_default = false) {
+	auto named = input.named_parameters.find(Identifier(name));
+	if (named != input.named_parameters.end()) {
+		if (named->second.IsNull()) {
+			throw InvalidInputException("%s must not be NULL", name);
+		}
+		return named->second.GetValue<T>();
+	}
+	Value setting;
+	if (!context.TryGetCurrentSetting(Identifier(setting_name), setting) || setting.IsNull()) {
+		return fallback;
+	}
+	auto value = setting.GetValue<T>();
+	if constexpr (std::is_same<T, string>::value) {
+		if (empty_setting_is_default && value.empty()) {
+			return fallback;
+		}
+	}
+	return value;
+}
+
 static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
 	auto read = [&](const string &name, int64_t fallback, int64_t maximum) {
-		Value setting;
-		int64_t value = fallback;
-		auto named = input.named_parameters.find(Identifier(name));
-		if (named != input.named_parameters.end()) {
-			if (named->second.IsNull()) {
-				throw InvalidInputException("%s must not be NULL", name);
-			}
-			value = named->second.GetValue<int64_t>();
-		} else if (context.TryGetCurrentSetting(Identifier("quackapi_" + name), setting) && !setting.IsNull()) {
-			value = setting.GetValue<int64_t>();
-		}
+		int64_t value = BindOptionValue<int64_t>(context, input, name, "quackapi_" + name, fallback);
 		if (value <= 0 || value > maximum) {
 			throw InvalidInputException("%s must be between 1 and %lld", name, maximum);
 		}
@@ -185,30 +200,8 @@ static void BindResourceLimits(ClientContext &context, TableFunctionBindInput &i
 }
 
 static void BindAccessLogPrivacy(ClientContext &context, TableFunctionBindInput &input, QuackapiServeOptions &opts) {
-	auto headers_entry = input.named_parameters.find("log_headers");
-	if (headers_entry != input.named_parameters.end()) {
-		if (headers_entry->second.IsNull()) {
-			throw InvalidInputException("log_headers must not be NULL");
-		}
-		opts.log_headers = headers_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_log_headers", setting) && !setting.IsNull()) {
-			opts.log_headers = setting.GetValue<string>();
-		}
-	}
-	auto query_entry = input.named_parameters.find("log_query");
-	if (query_entry != input.named_parameters.end()) {
-		if (query_entry->second.IsNull()) {
-			throw InvalidInputException("log_query must not be NULL");
-		}
-		opts.log_query = query_entry->second.GetValue<bool>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_log_query", setting) && !setting.IsNull()) {
-			opts.log_query = setting.GetValue<bool>();
-		}
-	}
+	opts.log_headers = BindOptionValue<string>(context, input, "log_headers", "quackapi_log_headers", opts.log_headers);
+	opts.log_query = BindOptionValue<bool>(context, input, "log_query", "quackapi_log_query", opts.log_query);
 }
 
 static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionBindInput &input,
@@ -230,50 +223,14 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	if (static_entry != input.named_parameters.end()) {
 		bind_data->static_dir = static_entry->second.GetValue<string>();
 	}
-	// cors_origins named param wins; else fall back to SET quackapi_cors_origins.
-	auto cors_entry = input.named_parameters.find("cors_origins");
-	if (cors_entry != input.named_parameters.end()) {
-		bind_data->cors_origins = cors_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_cors_origins", setting) && !setting.IsNull()) {
-			bind_data->cors_origins = setting.GetValue<string>();
-		}
-	}
+	bind_data->cors_origins = BindOptionValue<string>(context, input, "cors_origins", "quackapi_cors_origins", "");
 	// memory_limit named param wins; else fall back to SET quackapi_memory_limit.
 	// Empty means "not provided" — ApplyQuackapiServerDefaults leaves memory_limit alone.
-	auto mem_entry = input.named_parameters.find("memory_limit");
-	if (mem_entry != input.named_parameters.end()) {
-		bind_data->memory_limit = mem_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_memory_limit", setting) && !setting.IsNull()) {
-			bind_data->memory_limit = setting.GetValue<string>();
-		}
-	}
+	bind_data->memory_limit = BindOptionValue<string>(context, input, "memory_limit", "quackapi_memory_limit", "");
 	// log_level named param wins; else SET quackapi_log_level.
-	auto log_entry = input.named_parameters.find("log_level");
-	if (log_entry != input.named_parameters.end()) {
-		bind_data->log_level = log_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_log_level", setting) && !setting.IsNull()) {
-			auto s = setting.GetValue<string>();
-			if (!s.empty()) {
-				bind_data->log_level = s;
-			}
-		}
-	}
+	bind_data->log_level = BindOptionValue<string>(context, input, "log_level", "quackapi_log_level", "info", true);
 	// request_ring named param wins; else SET quackapi_request_ring.
-	auto ring_entry = input.named_parameters.find("request_ring");
-	if (ring_entry != input.named_parameters.end()) {
-		bind_data->request_ring = ring_entry->second.GetValue<int64_t>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_request_ring", setting) && !setting.IsNull()) {
-			bind_data->request_ring = setting.GetValue<int64_t>();
-		}
-	}
+	bind_data->request_ring = BindOptionValue<int64_t>(context, input, "request_ring", "quackapi_request_ring", 10000);
 	// The ring is allocated up front at serve time, so bound it to keep a typo from exhausting memory.
 	if (bind_data->request_ring < 0 || bind_data->request_ring > 1000000) {
 		throw InvalidInputException("quackapi_serve: request_ring must be between 0 and 1000000");
@@ -332,9 +289,11 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 	if (wrt_entry != input.named_parameters.end()) {
 		bind_data->write_timeout_sec = wrt_entry->second.GetValue<int32_t>();
 	}
-	// compression named param wins; else SET quackapi_compression (default auto).
 	auto comp_entry = input.named_parameters.find("compression");
 	if (comp_entry != input.named_parameters.end()) {
+		if (comp_entry->second.IsNull()) {
+			throw InvalidInputException("compression must not be NULL");
+		}
 		if (comp_entry->second.type().id() == LogicalTypeId::BOOLEAN) {
 			// Preserve the pre-enum boolean API: true means auto, false means off.
 			bind_data->compression = comp_entry->second.GetValue<bool>() ? "auto" : "off";
@@ -342,10 +301,7 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 			bind_data->compression = comp_entry->second.GetValue<string>();
 		}
 	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_compression", setting) && !setting.IsNull()) {
-			bind_data->compression = setting.GetValue<string>();
-		}
+		bind_data->compression = BindOptionValue<string>(context, input, "compression", "quackapi_compression", "auto");
 	}
 	// compression_min_bytes named param wins; else SET (default 1024).
 	// Keep legacy options recognizable, but never silently change their backend.
@@ -369,28 +325,15 @@ static unique_ptr<FunctionData> ServeBind(ClientContext &context, TableFunctionB
 		}
 		bind_data->compression_min_bytes = static_cast<idx_t>(v);
 	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_compression_min_bytes", setting) && !setting.IsNull()) {
-			auto v = setting.GetValue<int64_t>();
-			if (v < 0) {
-				throw InvalidInputException("quackapi_serve: compression_min_bytes must be >= 0");
-			}
-			bind_data->compression_min_bytes = static_cast<idx_t>(v);
+		auto v =
+		    BindOptionValue<int64_t>(context, input, "compression_min_bytes", "quackapi_compression_min_bytes", 1024);
+		if (v < 0) {
+			throw InvalidInputException("quackapi_serve: compression_min_bytes must be >= 0");
 		}
+		bind_data->compression_min_bytes = static_cast<idx_t>(v);
 	}
-	// http_client named param wins; else SET quackapi_http_client (default auto).
-	auto hc_entry = input.named_parameters.find("http_client");
-	if (hc_entry != input.named_parameters.end()) {
-		bind_data->http_client = hc_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_http_client", setting) && !setting.IsNull()) {
-			auto s = setting.GetValue<string>();
-			if (!s.empty()) {
-				bind_data->http_client = s;
-			}
-		}
-	}
+	bind_data->http_client =
+	    BindOptionValue<string>(context, input, "http_client", "quackapi_http_client", "auto", true);
 	auto cancel_entry = input.named_parameters.find("cancel_on_disconnect");
 	if (cancel_entry != input.named_parameters.end()) {
 		if (cancel_entry->second.IsNull()) {
@@ -671,19 +614,7 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 		string table;
 		ParseAccessLogString(bind_data->access_log, enabled, table);
 	}
-	// log_level named param wins; otherwise use SET quackapi_log_level.
-	auto log_entry = input.named_parameters.find("log_level");
-	if (log_entry != input.named_parameters.end()) {
-		bind_data->log_level = log_entry->second.GetValue<string>();
-	} else {
-		Value setting;
-		if (context.TryGetCurrentSetting("quackapi_log_level", setting) && !setting.IsNull()) {
-			auto s = setting.GetValue<string>();
-			if (!s.empty()) {
-				bind_data->log_level = s;
-			}
-		}
-	}
+	bind_data->log_level = BindOptionValue<string>(context, input, "log_level", "quackapi_log_level", "info", true);
 	// body is BLOB so parquet/arrow (and any non-UTF8) round-trip without
 	// "Invalid unicode" on Value(string). JSON/text clients: decode(body).
 	return_types.emplace_back(LogicalType::INTEGER);
@@ -1234,10 +1165,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AddNamedParameter(wait1, "host", LogicalType::VARCHAR);
 	AddNamedParameter(wait1, "timeout_ms", LogicalType::BIGINT);
 	wait_set.AddFunction(wait1);
-	TableFunction wait2("quackapi_wait", {LogicalType::INTEGER, LogicalType::BIGINT}, WaitExec, WaitBind);
-	AddNamedParameter(wait2, "host", LogicalType::VARCHAR);
-	AddNamedParameter(wait2, "timeout_ms", LogicalType::BIGINT);
-	wait_set.AddFunction(wait2);
+	wait_set.AddFunction(WithPositionalArguments(wait1, {LogicalType::INTEGER, LogicalType::BIGINT}));
 	loader.RegisterFunction(wait_set);
 
 	// quackapi_request — SQLLogic TestClient (no TCP, no .sh).
@@ -1253,18 +1181,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AddNamedParameter(request2, "query_timeout_ms", LogicalType::BIGINT);
 	AddNamedParameter(request2, "max_response_bytes", LogicalType::BIGINT);
 	request_set.AddFunction(request2);
-	TableFunction request3("quackapi_request", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                       RequestExec, RequestBind);
-	AddNamedParameter(request3, "headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
-	AddNamedParameter(request3, "access_log", LogicalType::ANY);
-	AddNamedParameter(request3, "log_level", LogicalType::VARCHAR);
-	AddNamedParameter(request3, "slow_request_ms", LogicalType::BIGINT);
-	AddNamedParameter(request3, "log_headers", LogicalType::VARCHAR);
-	AddNamedParameter(request3, "log_query", LogicalType::BOOLEAN);
-	AddNamedParameter(request3, "pg_dsn", LogicalType::VARCHAR);
-	AddNamedParameter(request3, "query_timeout_ms", LogicalType::BIGINT);
-	AddNamedParameter(request3, "max_response_bytes", LogicalType::BIGINT);
-	request_set.AddFunction(request3);
+	request_set.AddFunction(
+	    WithPositionalArguments(request2, {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
 	loader.RegisterFunction(request_set);
 
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));

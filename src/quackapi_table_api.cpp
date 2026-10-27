@@ -229,16 +229,16 @@ void ApplyApiExec(ClientContext &context, TableFunctionInput &data_p, DataChunk 
 	limit.has_default = true;
 	limit.default_raw = "100";
 	limit.has_ge = true;
-	limit.ge = 1;
+	limit.ge = Value::INTEGER(1);
 	limit.has_le = true;
-	limit.le = 1000;
+	limit.le = Value::INTEGER(1000);
 	QuackapiParamSpec offset;
 	offset.name = "offset";
 	offset.type_name = "BIGINT";
 	offset.has_default = true;
 	offset.default_raw = "0";
 	offset.has_ge = true;
-	offset.ge = 0;
+	offset.ge = Value::INTEGER(0);
 	list_route.params = {limit, offset};
 	list_route.status = 200;
 

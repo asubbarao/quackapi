@@ -118,7 +118,12 @@ Query.Farm on DuckDB 2.0; see [request bodies](guide/request-bodies.md) for setu
 | Column `location` | sets `Location` (pair with `STATUS 3xx`) |
 | Column `set_cookie` / `set-cookie` | sets `Set-Cookie` (stripped from JSON) |
 
-JSON types follow DuckDB column types (numbers, booleans, nulls, nested lists/structs).
+JSON types follow DuckDB column types, including native `VARIANT` objects,
+lists, scalars and nulls. JSON rows are encoded once as chunks are fetched;
+Arrow converts native chunk vectors without rebuilding each row. Both formats
+buffer the complete HTTP body and enforce the configured response cap. See
+[request budgets](RESOURCE_LIMITS.md) and the
+[large-response benchmark](../bench/large_response.sql).
 
 ### Error shapes (verified)
 

@@ -24,7 +24,7 @@ test_reldebug: native_companions_reldebug
 endif
 
 INSTALL_NATIVE_COMPANIONS = ./build/$(1)/duckdb -no-agent -c \
-	"SET extension_directory = '$(PROJ_DIR)build/$(1)/repository'; INSTALL httpfs; INSTALL quack;"
+	"SET extension_directory = '$(PROJ_DIR)build/$(1)/repository'; INSTALL httpfs; INSTALL quack; INSTALL nanoarrow FROM community;"
 
 native_companions_release:
 	$(call INSTALL_NATIVE_COMPANIONS,release)
