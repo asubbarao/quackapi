@@ -370,3 +370,50 @@ execution paths that are intentionally separate.
 | Routes, auth, groups, queues (options), streams, policies | **No** — re-run DDL after reopen (instance registry) |
 | `quackapi_jobs` rows | **Yes** — normal table in your `.db` file |
 | Table data | **Yes** |
+
+### Raw request bytes
+
+`BODY BLOB` explicitly declares raw request input for POST, PUT or PATCH. The
+request must use `Content-Type: application/octet-stream` (415 otherwise). The
+reserved `$body` binds the exact native BLOB, including empty bodies, NUL, invalid
+UTF-8 and literal backslashes; it never parses JSON or decodes BLOB escapes.
+Path/query/header values named `body` cannot replace it. `PARAM body`, executable
+SQL handlers, and combinations with `BODY TYPE` or `BODY SCHEMA` are rejected.
+Authentication, middleware and request-size ceilings still apply. Other body
+formats keep their existing validation. Octet-stream does not assert an image
+media type; image metadata/validation belongs to the application's own contract.
+
+```sql
+CREATE ROUTE raw_put PUT '/raw/:hash' BODY BLOB AS
+INSERT INTO raw_assets SELECT $hash, $body WHERE sha256($body) = $hash
+RETURNING hash, octet_length(body) AS bytes;
+```
+
+The native HTTP regression links the newly built host library (not an installed
+loadable extension). It verifies exact upload/storage/download bytes and SHA256,
+body-spoof precedence, route/global limits, auth and middleware, and existing JSON,
+form and multipart behavior. Run it from the extension checkout:
+
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=4 MAKEFLAGS=-j4 make release \
+  QUACKAPI_BUILT_VERSION="$(git rev-parse --short=10 HEAD)" \
+  EXPECTED_QUACKAPI_VERSION="$(git rev-parse --short=10 HEAD)"
+make format-ci QUACKAPI_BUILT_VERSION="$(git rev-parse --short=10 HEAD)" \
+  EXPECTED_QUACKAPI_VERSION="$(git rev-parse --short=10 HEAD)"
+c++ -std=c++17 -pthread -Wall -Wextra -Werror \
+  -isystem duckdb/src/include -isystem duckdb/third_party/re2 -Ithird_party/httplib \
+  test/cpp/quackapi_raw_blob_test.cpp -Lbuild/release/src -lduckdb \
+  -Wl,-rpath,"$PWD/build/release/src" -o build/quackapi_raw_blob_test
+mkdir -p build/raw-blob-test-home
+HOME="$PWD/build/raw-blob-test-home" build/quackapi_raw_blob_test
+env -u DUCKDB_TEST_AUTOLOADING HOME="$PWD/build/raw-blob-test-home" \
+  build/release/test/unittest 'test/sql/quackapi_raw_blob.test'
+```
+
+For actual HTTP `BODY SCHEMA` negative/positive checks too, pass
+`--schema-init /absolute/path/to/signed-schema-init.sql` to the native test.
+That explicitly supplied SQL must load the signed `json_schema` dependency into
+the test connection; without it, the test reports those checks as skipped rather
+than implying coverage. No unsigned extension-loading option is needed or used.
+The native linked-host test is not a claim that the separate loadable build
+artifact has been signed or is approved for installation.

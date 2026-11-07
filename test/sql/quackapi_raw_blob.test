@@ -1,0 +1,56 @@
+# name: test/sql/quackapi_raw_blob.test
+# description: explicit raw BLOB declarations do not relax JSON body contracts
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE raw_blob_length PUT '/raw-blob-length' BODY BLOB AS SELECT octet_length($body) AS bytes;
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-blob-length','plain',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+200
+
+query I
+SELECT decode(body) FROM quackapi_request('PUT','/raw-blob-length','',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+[{"bytes":0}]
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-blob-length','{}',headers:=MAP {'Content-Type':'application/json'});
+----
+415
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY BLOB BODY TYPE '{"n":"INTEGER"}' AS SELECT 1;
+----
+BODY BLOB cannot be combined
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY SCHEMA '{}' BODY BLOB AS SELECT 1;
+----
+BODY BLOB cannot be combined
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY BLOB PARAM body VARCHAR HEADER 'body' AS SELECT 1;
+----
+BODY BLOB reserves
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY BLOB AS $body;
+----
+BODY BLOB cannot supply executable SQL
+
+statement ok
+CREATE ROUTE raw_json_guard POST '/raw-json-guard' BODY TYPE '{"n":"INTEGER"}' AS SELECT $n AS n;
+
+query I
+SELECT status FROM quackapi_request('POST','/raw-json-guard','abc',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+422
+
+query I
+SELECT status FROM quackapi_request('POST','/raw-json-guard','{"n":"bad"}',headers:=MAP {'Content-Type':'application/json'});
+----
+422

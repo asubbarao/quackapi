@@ -714,16 +714,28 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	// may appear before PARAM or after PARAM blocks. BODY TYPE is DuckDB's
 	// json_transform structure syntax, not a second application-model language.
 	// Returns false and sets err on syntax error; true when clause absent or consumed.
+	bool body_blob = false;
 	auto TryConsumeBodySchema = [&](string &err_out) -> bool {
 		if (!(StringUtil::StartsWith(rest_upper, "BODY") && rest.size() > 4 && StringUtil::CharacterIsSpace(rest[4]))) {
 			return true; // not present
 		}
 		string after_body = QuackapiTrim(rest.substr(4));
 		auto after_upper = StringUtil::Upper(after_body);
+		if (after_upper == "BLOB" || (StringUtil::StartsWith(after_upper, "BLOB") && after_body.size() > 4 &&
+		                              StringUtil::CharacterIsSpace(after_body[4]))) {
+			if (body_blob) {
+				err_out = "BODY BLOB specified more than once";
+				return false;
+			}
+			body_blob = true;
+			rest = QuackapiTrim(after_body.substr(4));
+			rest_upper = StringUtil::Upper(rest);
+			return true;
+		}
 		bool is_schema = StringUtil::StartsWith(after_upper, "SCHEMA");
 		bool is_type = StringUtil::StartsWith(after_upper, "TYPE");
 		if (!is_schema && !is_type) {
-			err_out = "Expected BODY SCHEMA '<json-schema>' or BODY TYPE '<duckdb-json-structure>'";
+			err_out = "Expected BODY BLOB, BODY SCHEMA '<json-schema>' or BODY TYPE '<duckdb-json-structure>'";
 			return false;
 		}
 		const idx_t keyword_size = is_schema ? 6 : 4;
@@ -988,6 +1000,18 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 	}
 
+	if (body_blob && (!body_schema.empty() || !body_type.empty())) {
+		return ParserExtensionParseResult("BODY BLOB cannot be combined with BODY TYPE or BODY SCHEMA");
+	}
+	if (body_blob && method != "POST" && method != "PUT" && method != "PATCH") {
+		return ParserExtensionParseResult("BODY BLOB requires POST, PUT or PATCH");
+	}
+	for (auto &param : params) {
+		if (body_blob && StringUtil::CIEquals(param.name, "body")) {
+			return ParserExtensionParseResult("BODY BLOB reserves $body; PARAM body is not allowed");
+		}
+	}
+
 	// SCHEDULE may also follow PARAM/BODY clauses.
 	rest_upper = StringUtil::Upper(rest);
 	if (TryConsumeSchedule()) {
@@ -1118,6 +1142,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	data->route.params = std::move(params);
 	data->route.body_schema = std::move(body_schema);
 	data->route.body_type = std::move(body_type);
+	data->route.body_blob = body_blob;
 	data->route.group_name = group_name;
 	data->route.rate_limit_n = rate_limit_n;
 	data->route.rate_limit_per_sec = rate_limit_per_sec;
@@ -1202,6 +1227,9 @@ unique_ptr<FunctionData> ApplyRouteBind(ClientContext &, TableFunctionBindInput 
 	}
 	if (input.inputs.size() > 21 && !input.inputs[21].IsNull()) {
 		bind_data->route.max_request_bytes = input.inputs[21].GetValue<int64_t>();
+	}
+	if (input.inputs.size() > 22 && !input.inputs[22].IsNull()) {
+		bind_data->route.body_blob = input.inputs[22].GetValue<bool>();
 	}
 	BindStatusColumn(return_types, names);
 	return std::move(bind_data);
@@ -1302,6 +1330,9 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 				}
 			}
 			string exec_param;
+			if (bind_data.route.body_blob && QuackapiExecRouteParam(bind_data.route.handler_sql, exec_param)) {
+				throw InvalidInputException("BODY BLOB cannot supply executable SQL");
+			}
 			auto prepared = QuackapiExecRouteParam(bind_data.route.handler_sql, exec_param)
 			                    ? unique_ptr<PreparedStatement>()
 			                    : con.Prepare(bind_data.route.handler_sql);
@@ -1326,7 +1357,7 @@ void ApplyRouteExec(ClientContext &context, TableFunctionInput &data_p, DataChun
 TableFunction MakeApplyRouteFunction() {
 	// action, or_replace, name, method, pattern, handler, status, require_auth,
 	// params (LIST<STRUCT>), body_schema, group_name, rate_n, rate_per, rate_by, format,
-	// envelope, empty_status, empty_body, timeout_sec, body_type, schedule, max_request_bytes
+	// envelope, empty_status, empty_body, timeout_sec, body_type, schedule, max_request_bytes, body_blob
 	return MakeApplyDdlFunction("quackapi_apply_route",
 	                            {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
@@ -1335,7 +1366,7 @@ TableFunction MakeApplyRouteFunction() {
 	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR,
 	                             LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::BIGINT},
+	                             LogicalType::BIGINT,  LogicalType::BOOLEAN},
 	                            ApplyRouteExec, ApplyRouteBind);
 }
 
@@ -1366,6 +1397,7 @@ ParserExtensionPlanResult RouteDdlPlan(ParserExtensionInfo *, ClientContext &,
 	result.parameters.push_back(Value(data.route.body_type));
 	result.parameters.push_back(Value(data.route.schedule));
 	result.parameters.push_back(Value::BIGINT(data.route.max_request_bytes));
+	result.parameters.push_back(Value::BOOLEAN(data.route.body_blob));
 	FinishDdlPlan(result);
 	return result;
 }
