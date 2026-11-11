@@ -388,6 +388,7 @@ formats keep their existing validation. Octet-stream does not assert an image
 media type; image metadata/validation belongs to the application's own contract.
 
 ```sql
+-- INSERT, not CTAS: each request appends one upload to an existing table.
 CREATE ROUTE raw_put PUT '/raw/:hash' BODY BLOB WITH (max_request_bytes := 33554432) AS
 INSERT INTO raw_assets SELECT $hash, $body WHERE sha256($body) = $hash
 RETURNING hash, octet_length(body) AS bytes;
@@ -395,7 +396,12 @@ RETURNING hash, octet_length(body) AS bytes;
 SELECT * FROM quackapi_serve(9495, max_request_bytes := 33554432);
 ```
 
-From SQL, `quackapi_request` also takes a BLOB body:
-`quackapi_request('PUT', '/raw/' || hash, (SELECT content FROM read_blob('still.jpg')), headers := MAP {'Content-Type': 'application/octet-stream'})`.
+From SQL, `quackapi_request` also takes a BLOB body, sent as the exact bytes:
+
+```sql
+SELECT status, decode(body) AS receipt
+FROM quackapi_request('PUT', '/raw/a90a10503fbfc95789ff38a1bb5039cb71869ab9c0eb1cb51c4a9099f2933c6b',
+                      '\x00\xFF\x41'::BLOB, headers := MAP {'Content-Type': 'application/octet-stream'});
+```
 
 Middleware on a `BODY BLOB` route also sees `$body` as the exact BLOB.
