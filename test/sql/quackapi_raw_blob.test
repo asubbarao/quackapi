@@ -18,6 +18,11 @@ SELECT decode(body) FROM quackapi_request('PUT','/raw-blob-length','',headers:=M
 [{"bytes":0}]
 
 query I
+SELECT decode(body) FROM quackapi_request('PUT','/raw-blob-length','\x00\xFF\x41'::BLOB,headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+[{"bytes":3}]
+
+query I
 SELECT status FROM quackapi_request('PUT','/raw-blob-length','{}',headers:=MAP {'Content-Type':'application/json'});
 ----
 415

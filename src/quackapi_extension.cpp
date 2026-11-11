@@ -583,7 +583,8 @@ static unique_ptr<FunctionData> RequestBind(ClientContext &context, TableFunctio
 	bind_data->method = input.inputs[0].ToString();
 	bind_data->path = input.inputs[1].ToString();
 	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
-		bind_data->body = input.inputs[2].ToString();
+		// Exact bytes for both VARCHAR and BLOB bodies (ToString would escape a BLOB).
+		bind_data->body = StringValue::Get(input.inputs[2]);
 	}
 	auto header_it = input.named_parameters.find("headers");
 	if (header_it != input.named_parameters.end() && !header_it->second.IsNull()) {
@@ -1184,6 +1185,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	request_set.AddFunction(request2);
 	request_set.AddFunction(
 	    WithPositionalArguments(request2, {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	// Raw bytes for BODY BLOB routes, e.g. quackapi_request('PUT', path, (SELECT content FROM read_blob(f))).
+	request_set.AddFunction(
+	    WithPositionalArguments(request2, {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BLOB}));
 	loader.RegisterFunction(request_set);
 
 	loader.RegisterFunction(TableFunction("quackapi_routes", {}, RoutesExec, RoutesBind, RoutesInit));

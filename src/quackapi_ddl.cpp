@@ -36,6 +36,12 @@ struct RouteDdlParseData : public ParserExtensionParseData {
 	}
 };
 
+//! `upper` begins with the keyword `word`, followed by whitespace or the end of input.
+bool QuackapiStartsWithKeyword(const string &upper, const string &word) {
+	return StringUtil::StartsWith(upper, word) &&
+	       (upper.size() == word.size() || StringUtil::CharacterIsSpace(upper[word.size()]));
+}
+
 bool IsHttpMethod(const string &method) {
 	return method == "GET" || method == "POST" || method == "PUT" || method == "DELETE" || method == "PATCH" ||
 	       method == "HEAD";
@@ -599,15 +605,12 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			after_empty = QuackapiTrim(after_empty.substr(status_end));
 			auto after_status_u = StringUtil::Upper(after_empty);
 			// Optional BODY '<…>' — not BODY SCHEMA/BLOB/TYPE (those clauses are separate).
-			auto starts_with_word = [](const string &upper, const string &word) {
-				return StringUtil::StartsWith(upper, word) &&
-				       (upper.size() == word.size() || StringUtil::CharacterIsSpace(upper[word.size()]));
-			};
 			auto after_status_body_u =
 			    after_empty.size() > 4 ? StringUtil::Upper(QuackapiTrim(after_empty.substr(4))) : string();
 			if (StringUtil::StartsWith(after_status_u, "BODY") && after_empty.size() > 4 &&
-			    StringUtil::CharacterIsSpace(after_empty[4]) && !starts_with_word(after_status_body_u, "BLOB") &&
-			    !starts_with_word(after_status_body_u, "TYPE")) {
+			    StringUtil::CharacterIsSpace(after_empty[4]) &&
+			    !QuackapiStartsWithKeyword(after_status_body_u, "BLOB") &&
+			    !QuackapiStartsWithKeyword(after_status_body_u, "TYPE")) {
 				string after_body = QuackapiTrim(after_empty.substr(4));
 				auto after_body_u = StringUtil::Upper(after_body);
 				if (StringUtil::StartsWith(after_body_u, "SCHEMA")) {
@@ -728,8 +731,7 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 		}
 		string after_body = QuackapiTrim(rest.substr(4));
 		auto after_upper = StringUtil::Upper(after_body);
-		if (after_upper == "BLOB" || (StringUtil::StartsWith(after_upper, "BLOB") && after_body.size() > 4 &&
-		                              StringUtil::CharacterIsSpace(after_body[4]))) {
+		if (QuackapiStartsWithKeyword(after_upper, "BLOB")) {
 			if (body_blob) {
 				err_out = "BODY BLOB specified more than once";
 				return false;

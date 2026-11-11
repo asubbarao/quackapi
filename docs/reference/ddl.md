@@ -391,6 +391,11 @@ media type; image metadata/validation belongs to the application's own contract.
 CREATE ROUTE raw_put PUT '/raw/:hash' BODY BLOB WITH (max_request_bytes := 33554432) AS
 INSERT INTO raw_assets SELECT $hash, $body WHERE sha256($body) = $hash
 RETURNING hash, octet_length(body) AS bytes;
+-- The server's hard limit also defaults to 8 MiB; raise it too.
+SELECT * FROM quackapi_serve(9495, max_request_bytes := 33554432);
 ```
+
+From SQL, `quackapi_request` also takes a BLOB body:
+`quackapi_request('PUT', '/raw/' || hash, (SELECT content FROM read_blob('still.jpg')), headers := MAP {'Content-Type': 'application/octet-stream'})`.
 
 Middleware on a `BODY BLOB` route also sees `$body` as the exact BLOB.
