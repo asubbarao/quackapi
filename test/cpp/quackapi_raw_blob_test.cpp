@@ -177,7 +177,7 @@ int main(int argc, char **argv) {
 		Expect(multipart && multipart->status == 200, "multipart behavior retained");
 		auto unauthorized = http.Put("/auth-raw", "abc", "application/octet-stream");
 		Expect(unauthorized && unauthorized->status == 401, "raw body does not bypass auth");
-		auto counts = con.Query("SELECT count(*) FROM raw_assets");
+		auto counts = con.Query("SELECT count(hash) FROM raw_assets");
 		Expect(counts->Fetch()->GetValue(0, 0).GetValue<int64_t>() == int64_t(fixtures.size()),
 		       "only valid fixtures persisted");
 		Run(con, "SELECT * FROM quackapi_stop(9541)");
