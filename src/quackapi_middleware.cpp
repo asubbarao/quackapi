@@ -472,6 +472,10 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 				return false;
 			}
 
+			if (context.body_blob) {
+				// Untyped $body cannot resolve overloads such as octet_length(BLOB|BIT).
+				handler_sql = QuackapiRewriteTypedBody(handler_sql, "BLOB");
+			}
 			auto prepared = connection.Prepare(handler_sql);
 			if (prepared->HasError()) {
 				SetMiddlewareFailure(context);
@@ -511,7 +515,8 @@ bool ExecuteQuackapiMiddleware(Connection &connection, DatabaseInstance &db, Qua
 				} else if (lower == "query_json") {
 					values[Identifier(name)] = BoundParameterData(Value(context.query_json));
 				} else if (lower == "body") {
-					values[Identifier(name)] = BoundParameterData(Value(context.request_body));
+					values[Identifier(name)] = BoundParameterData(
+					    context.body_blob ? Value::BLOB_RAW(context.request_body) : Value(context.request_body));
 				} else if (lower == "status") {
 					values[Identifier(name)] = context.status == 0 ? BoundParameterData(Value())
 					                                               : BoundParameterData(Value::INTEGER(context.status));

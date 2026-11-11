@@ -1,0 +1,87 @@
+# name: test/sql/quackapi_raw_blob.test
+# description: explicit raw BLOB declarations do not relax JSON body contracts
+# group: [sql]
+
+require quackapi
+
+statement ok
+CREATE ROUTE raw_blob_length PUT '/raw-blob-length' BODY BLOB AS SELECT octet_length($body) AS bytes;
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-blob-length','plain',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+200
+
+query I
+SELECT decode(body) FROM quackapi_request('PUT','/raw-blob-length','',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+[{"bytes":0}]
+
+query I
+SELECT decode(body) FROM quackapi_request('PUT','/raw-blob-length','\x00\xFF\x41'::BLOB,headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+[{"bytes":3}]
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-blob-length','{}',headers:=MAP {'Content-Type':'application/json'});
+----
+415
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY BLOB BODY TYPE '{"n":"INTEGER"}' AS SELECT 1;
+----
+BODY BLOB cannot be combined
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY SCHEMA '{}' BODY BLOB AS SELECT 1;
+----
+BODY BLOB cannot be combined
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY BLOB PARAM body VARCHAR HEADER 'body' AS SELECT 1;
+----
+BODY BLOB reserves
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad' BODY BLOB AS $body;
+----
+BODY BLOB cannot supply executable SQL
+
+statement error
+CREATE ROUTE raw_bad PUT '/bad/:body' BODY BLOB AS SELECT 1;
+----
+a path capture named body is not allowed
+
+statement ok
+CREATE ROUTE raw_tiny PUT '/raw-tiny' BODY BLOB WITH (max_request_bytes := 4) AS SELECT octet_length($body) AS bytes;
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-tiny','1234',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+200
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-tiny','12345',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+413
+
+statement ok
+CREATE ROUTE raw_empty_first PUT '/raw-empty-first' EMPTY STATUS 404 BODY BLOB AS SELECT octet_length($body) AS bytes WHERE false;
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-empty-first','abc',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+404
+
+statement ok
+CREATE ROUTE raw_json_guard POST '/raw-json-guard' BODY TYPE '{"n":"INTEGER"}' AS SELECT $n AS n;
+
+query I
+SELECT status FROM quackapi_request('POST','/raw-json-guard','abc',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+422
+
+query I
+SELECT status FROM quackapi_request('POST','/raw-json-guard','{"n":"bad"}',headers:=MAP {'Content-Type':'application/json'});
+----
+422

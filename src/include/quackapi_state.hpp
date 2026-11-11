@@ -145,6 +145,8 @@ struct QuackapiRoute {
 	//! is checked by json_transform_strict, and lets $body bind as STRUCT/LIST
 	//! without a duplicate application model. Empty = no typed body transform.
 	string body_type;
+	//! Explicit BODY BLOB: reserved $body binds exact application/octet-stream bytes.
+	bool body_blob = false;
 	//! Group this route joined (empty if none). Pattern/auth already expanded.
 	string group_name;
 	//! OpenAPI tags CSV (from group inheritance or future per-route tags).

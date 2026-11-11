@@ -370,3 +370,38 @@ execution paths that are intentionally separate.
 | Routes, auth, groups, queues (options), streams, policies | **No** — re-run DDL after reopen (instance registry) |
 | `quackapi_jobs` rows | **Yes** — normal table in your `.db` file |
 | Table data | **Yes** |
+
+### Raw request bytes
+
+`BODY BLOB` explicitly declares raw request input for POST, PUT or PATCH. The
+request must use `Content-Type: application/octet-stream` (415 otherwise). The
+reserved `$body` binds the exact native BLOB, including empty bodies, NUL, invalid
+UTF-8 and literal backslashes; it never parses JSON or decodes BLOB escapes.
+Path/query/header values named `body` cannot replace it. `PARAM body`, executable
+SQL handlers, and combinations with `BODY TYPE` or `BODY SCHEMA` are rejected.
+Authentication, middleware and request-size ceilings still apply: a route
+inherits the 8 MiB default, and a larger upload opts in with
+`WITH (max_request_bytes := <bytes>)`, bounded by the server's hard limit
+(`quackapi_serve(..., max_request_bytes := <bytes>)` or
+`SET quackapi_max_request_bytes`, up to 1 GiB). Other body
+formats keep their existing validation. Octet-stream does not assert an image
+media type; image metadata/validation belongs to the application's own contract.
+
+```sql
+-- INSERT, not CTAS: each request appends one upload to an existing table.
+CREATE ROUTE raw_put PUT '/raw/:hash' BODY BLOB WITH (max_request_bytes := 33554432) AS
+INSERT INTO raw_assets SELECT $hash, $body WHERE sha256($body) = $hash
+RETURNING hash, octet_length(body) AS bytes;
+-- The server's hard limit also defaults to 8 MiB; raise it too.
+SELECT * FROM quackapi_serve(9495, max_request_bytes := 33554432);
+```
+
+From SQL, `quackapi_request` also takes a BLOB body, sent as the exact bytes:
+
+```sql
+SELECT status, decode(body) AS receipt
+FROM quackapi_request('PUT', '/raw/a90a10503fbfc95789ff38a1bb5039cb71869ab9c0eb1cb51c4a9099f2933c6b',
+                      '\x00\xFF\x41'::BLOB, headers := MAP {'Content-Type': 'application/octet-stream'});
+```
+
+Middleware on a `BODY BLOB` route also sees `$body` as the exact BLOB.

@@ -152,6 +152,11 @@ jobs:
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_selfdispatch_interrupt_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-exec-interrupt-test
           /tmp/quackapi-exec-interrupt-test
 
+      - name: Verify explicit raw BLOB request bytes
+        run: |
+          c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include -isystem duckdb/third_party/re2 -Ithird_party/httplib test/cpp/quackapi_raw_blob_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-raw-blob-test
+          /tmp/quackapi-raw-blob-test
+
       - name: Verify WebSocket streams
         run: |
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include -isystem duckdb/third_party/re2 -Ithird_party/httplib test/cpp/quackapi_websocket_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-websocket-test

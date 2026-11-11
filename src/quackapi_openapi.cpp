@@ -447,6 +447,9 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 			               "}";
 		}
 		for (auto &n : named_params) {
+			if (route.body_blob && StringUtil::CIEquals(n, "body")) {
+				continue;
+			}
 			if (IsClaimsParamName(n) || ListContains(path_params, n)) {
 				continue;
 			}
@@ -506,10 +509,15 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		// STRUCT/LIST/scalar shape and retain the exact declaration for
 		// DuckDB-aware clients.
 		string request_body_json;
+		if (route.body_blob) {
+			request_body_json =
+			    "\"requestBody\":{\"required\":true,\"content\":{\"application/octet-stream\":{\"schema\":"
+			    "{\"type\":\"string\",\"format\":\"binary\"}}}},";
+		}
 		string variant_body_overlay;
 		vector<string> variant_body_required_props;
 		bool has_required_variant_input = false;
-		if (body_capable) {
+		if (body_capable && !route.body_blob) {
 			string properties = "{";
 			bool first_property = true;
 			for (const auto &spec : route.params) {

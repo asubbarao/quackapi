@@ -434,10 +434,11 @@ string PairsToJsonObject(const PairRange &pairs) {
 }
 
 //! The json_schema extension includes an RFC 6901 pointer in failures (for
-//! example, "At /items/0/qty: ..."). Surface it as FastAPI's typed loc array
-//! instead of losing the field path behind a synthetic _schema member.
+//! example, "At /items/0/qty: ..."; json_schema 837f39dcd9 says "JSON document
+//! does not match the schema: /items/0/qty: ..."). Surface it as FastAPI's typed
+//! loc array instead of losing the field path behind a synthetic _schema member.
 string ValidationErrorJsonSchema(const string &msg, const string &type, const string &raw_body) {
-	const string markers[] = {"At /", "at /"};
+	const string markers[] = {"At /", "at /", "schema: /"};
 	for (auto &marker : markers) {
 		auto start_marker = msg.find(marker);
 		if (start_marker == string::npos) {
@@ -2131,6 +2132,10 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 }
 
 } // namespace
+
+string QuackapiRewriteTypedBody(const string &sql, const string &sql_type) {
+	return RewriteTypedBodyParameter(sql, sql_type);
+}
 
 static QuackapiExecResponse ExecJsonResponse(int status, string body) {
 	QuackapiExecResponse out;
@@ -4651,6 +4656,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			context->group_name = match.route.group_name;
 			context->request_id = request_id;
 			context->request_body = req.body;
+			context->body_blob = match.route.body_blob;
 			context->client_ip = req.remote_addr;
 			auto subject = auth_result.claims.find("sub");
 			if (subject != auth_result.claims.end()) {
@@ -4809,7 +4815,15 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			}
 		}
 
-		if (body_method) {
+		if (match.route.body_blob) {
+			if (media != "application/octet-stream") {
+				SetJson(
+				    res, 415,
+				    ValidationErrorJsonBody("BODY BLOB requires application/octet-stream", "unsupported_media_type"));
+				finish();
+				return;
+			}
+		} else if (body_method) {
 			if (IsJsonMediaType(media) ||
 			    (media.empty() && !req.body.empty() && (req.body[0] == '{' || req.body[0] == '['))) {
 				if (req.body.empty() && !needs_body_fields && match.route.body_schema.empty() &&
@@ -4921,7 +4935,9 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		// Fresh DuckDB prepare every request:
 		// no SQL-keyed body/plan cache — mutable tables and volatile functions
 		// (now/uuid) must re-execute.
-		if (has_body_named && !match.route.body_type.empty() && !exec_route) {
+		if (has_body_named && match.route.body_blob && !exec_route) {
+			handler_sql = RewriteTypedBodyParameter(handler_sql, "BLOB");
+		} else if (has_body_named && !match.route.body_type.empty() && !exec_route) {
 			string body_sql_type = has_validated_typed_body ? validated_typed_body.type().ToString() : string();
 			if (body_sql_type.empty()) {
 				string type_error;
@@ -4961,6 +4977,12 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 
 		for (auto &entry : prepared->GetNamedParameterMap()) {
 			auto &param_name = entry.first.GetIdentifierName();
+			if (match.route.body_blob && StringUtil::CIEquals(param_name, "body")) {
+				// No text cast, UTF-8 check or escape decoding. Reserved binding wins
+				// over path/query/header names, including for a zero-byte request.
+				named_values[Identifier(param_name)] = BoundParameterData(Value::BLOB_RAW(req.body));
+				continue;
+			}
 
 			string claim_key;
 			if (IsClaimsParam(param_name, claim_key)) {
