@@ -434,10 +434,11 @@ string PairsToJsonObject(const PairRange &pairs) {
 }
 
 //! The json_schema extension includes an RFC 6901 pointer in failures (for
-//! example, "At /items/0/qty: ..."). Surface it as FastAPI's typed loc array
-//! instead of losing the field path behind a synthetic _schema member.
+//! example, "At /items/0/qty: ..."; json_schema 837f39dcd9 says "JSON document
+//! does not match the schema: /items/0/qty: ..."). Surface it as FastAPI's typed
+//! loc array instead of losing the field path behind a synthetic _schema member.
 string ValidationErrorJsonSchema(const string &msg, const string &type, const string &raw_body) {
-	const string markers[] = {"At /", "at /"};
+	const string markers[] = {"At /", "at /", "schema: /"};
 	for (auto &marker : markers) {
 		auto start_marker = msg.find(marker);
 		if (start_marker == string::npos) {
