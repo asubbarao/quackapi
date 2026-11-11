@@ -2132,6 +2132,10 @@ bool MethodListContains(const vector<string> &list, const string &method) {
 
 } // namespace
 
+string QuackapiRewriteTypedBody(const string &sql, const string &sql_type) {
+	return RewriteTypedBodyParameter(sql, sql_type);
+}
+
 static QuackapiExecResponse ExecJsonResponse(int status, string body) {
 	QuackapiExecResponse out;
 	out.status = status;
@@ -4651,6 +4655,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 			context->group_name = match.route.group_name;
 			context->request_id = request_id;
 			context->request_body = req.body;
+			context->body_blob = match.route.body_blob;
 			context->client_ip = req.remote_addr;
 			auto subject = auth_result.claims.find("sub");
 			if (subject != auth_result.claims.end()) {

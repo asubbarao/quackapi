@@ -62,7 +62,8 @@ int main(int argc, char **argv) {
 		         "ON CONFLICT DO NOTHING RETURNING hash,octet_length(body) AS bytes");
 		Run(con, "CREATE ROUTE raw_get GET '/raw/:hash' FORMAT binary EMPTY STATUS 404 BODY '{}' AS "
 		         "SELECT body,'application/octet-stream' AS content_type FROM raw_assets WHERE hash=$hash");
-		Run(con, "CREATE ROUTE spoof PUT '/spoof/:body' FORMAT binary BODY BLOB AS SELECT $body AS body");
+		Run(con, "CREATE ROUTE spoof PUT '/spoof/:tag' FORMAT binary BODY BLOB AS SELECT $body AS body");
+		Run(con, "CREATE ROUTE empty_first PUT '/empty-first' EMPTY STATUS 404 BODY BLOB AS SELECT $body AS body");
 		Run(con, "CREATE ROUTE tiny PUT '/tiny' BODY BLOB WITH (max_request_bytes := 4) AS SELECT octet_length($body) "
 		         "AS bytes");
 		// Large stills: a route may opt above the 8 MiB default up to the server's hard limit.
@@ -77,6 +78,12 @@ int main(int argc, char **argv) {
 		    "CREATE ROUTE guarded_raw PUT '/raw' GROUP raw_guard BODY BLOB AS SELECT octet_length($body) AS bytes");
 		Run(con, "CREATE MIDDLEWARE raw_block BEFORE GROUP raw_guard AS SELECT false AS allow,429::INTEGER AS "
 		         "status,'{\"error\":\"fixture-block\"}' AS body");
+		Run(con, "CREATE GROUP raw_reader WITH (prefix='/reads-body')");
+		Run(con, "CREATE ROUTE read_raw PUT '/raw' GROUP raw_reader BODY BLOB AS SELECT octet_length($body) AS bytes");
+		Run(con, "CREATE MIDDLEWARE raw_body_reader BEFORE GROUP raw_reader AS SELECT ok AS allow,"
+		         "CASE WHEN NOT ok THEN 422 END::INTEGER AS status,"
+		         "CASE WHEN NOT ok THEN '{\"error\":\"middleware-saw-wrong-bytes\"}' END AS body FROM "
+		         "(SELECT octet_length($body)=3 AND $body='\\x00\\xFF\\x41'::BLOB AS ok)");
 		Run(con, "CREATE MIDDLEWARE raw_after AFTER AS SELECT true AS allow,'X-Raw-Test' AS header_name,'passed' AS "
 		         "header_value");
 		Run(con, "CREATE AUTH raw_key AS API_KEY");
@@ -90,6 +97,7 @@ int main(int argc, char **argv) {
 		Reject(con, "CREATE ROUTE bad PUT '/bad' BODY SCHEMA '{}' BODY BLOB AS SELECT 1");
 		Reject(con, "CREATE ROUTE bad PUT '/bad' BODY BLOB PARAM body VARCHAR HEADER 'body' AS SELECT 1");
 		Reject(con, "CREATE ROUTE bad PUT '/bad' BODY BLOB AS $body");
+		Reject(con, "CREATE ROUTE bad PUT '/bad/:body' BODY BLOB AS SELECT 1");
 		Run(con, "SELECT * FROM quackapi_serve(9541,host:='127.0.0.1',access_log:=false,max_request_bytes:=67108864)");
 		quackapi_httplib::Client http("127.0.0.1", 9541);
 		http.set_read_timeout(10, 0);
@@ -156,6 +164,9 @@ int main(int argc, char **argv) {
 		}
 		auto blocked = http.Put("/middleware/raw", std::string("\0\xff\x41", 3), "application/octet-stream");
 		Expect(blocked && blocked->status == 429, "BEFORE middleware still blocks raw routes");
+		auto read_by_middleware = http.Put("/reads-body/raw", std::string("\0\xff\x41", 3), "application/octet-stream");
+		Expect(read_by_middleware && read_by_middleware->status == 200,
+		       "middleware reading $body sees the exact non-UTF-8 BLOB bytes");
 		auto authorized = http.Put("/auth-raw", {{"X-API-Key", "fixture-only-key"}}, std::string("\0\xff\x41", 3),
 		                           "application/octet-stream");
 		Expect(authorized && authorized->status == 200, "authenticated raw bytes retain normal auth behavior");

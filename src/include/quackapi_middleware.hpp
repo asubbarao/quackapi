@@ -34,6 +34,9 @@ struct QuackapiMiddleware {
 	uint64_t registration_order = 0;
 };
 
+//! Types every unprotected `$body` reference as `($body::<sql_type>)` (quackapi_server.cpp).
+string QuackapiRewriteTypedBody(const string &sql, const string &sql_type);
+
 //! Request/response values exposed to the middleware executor. Server code
 //! populates request fields after routing and authentication, and applies the
 //! mutable response fields if ExecuteQuackapiMiddleware returns false.
@@ -44,6 +47,8 @@ struct QuackapiMiddlewareContext {
 	string group_name;
 	string request_id;
 	string request_body;
+	//! The matched route declared BODY BLOB: $body binds as exact BLOB bytes, not text.
+	bool body_blob = false;
 	string headers_json;
 	string query_json;
 	string client_ip;

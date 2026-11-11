@@ -510,8 +510,9 @@ string BuildOpenApiDocument(DatabaseInstance &db, const string &server_url) {
 		// DuckDB-aware clients.
 		string request_body_json;
 		if (route.body_blob) {
-			request_body_json = "\"requestBody\":{\"content\":{\"application/octet-stream\":{\"schema\":"
-			                    "{\"type\":\"string\",\"format\":\"binary\"}}}},";
+			request_body_json =
+			    "\"requestBody\":{\"required\":true,\"content\":{\"application/octet-stream\":{\"schema\":"
+			    "{\"type\":\"string\",\"format\":\"binary\"}}}},";
 		}
 		string variant_body_overlay;
 		vector<string> variant_body_required_props;

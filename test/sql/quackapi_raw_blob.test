@@ -42,6 +42,32 @@ CREATE ROUTE raw_bad PUT '/bad' BODY BLOB AS $body;
 ----
 BODY BLOB cannot supply executable SQL
 
+statement error
+CREATE ROUTE raw_bad PUT '/bad/:body' BODY BLOB AS SELECT 1;
+----
+a path capture named body is not allowed
+
+statement ok
+CREATE ROUTE raw_tiny PUT '/raw-tiny' BODY BLOB WITH (max_request_bytes := 4) AS SELECT octet_length($body) AS bytes;
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-tiny','1234',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+200
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-tiny','12345',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+413
+
+statement ok
+CREATE ROUTE raw_empty_first PUT '/raw-empty-first' EMPTY STATUS 404 BODY BLOB AS SELECT octet_length($body) AS bytes WHERE false;
+
+query I
+SELECT status FROM quackapi_request('PUT','/raw-empty-first','abc',headers:=MAP {'Content-Type':'application/octet-stream'});
+----
+404
+
 statement ok
 CREATE ROUTE raw_json_guard POST '/raw-json-guard' BODY TYPE '{"n":"INTEGER"}' AS SELECT $n AS n;
 

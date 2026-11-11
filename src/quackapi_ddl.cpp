@@ -598,9 +598,16 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 			}
 			after_empty = QuackapiTrim(after_empty.substr(status_end));
 			auto after_status_u = StringUtil::Upper(after_empty);
-			// Optional BODY '<…>' — not BODY SCHEMA (that clause is separate).
+			// Optional BODY '<…>' — not BODY SCHEMA/BLOB/TYPE (those clauses are separate).
+			auto starts_with_word = [](const string &upper, const string &word) {
+				return StringUtil::StartsWith(upper, word) &&
+				       (upper.size() == word.size() || StringUtil::CharacterIsSpace(upper[word.size()]));
+			};
+			auto after_status_body_u =
+			    after_empty.size() > 4 ? StringUtil::Upper(QuackapiTrim(after_empty.substr(4))) : string();
 			if (StringUtil::StartsWith(after_status_u, "BODY") && after_empty.size() > 4 &&
-			    StringUtil::CharacterIsSpace(after_empty[4])) {
+			    StringUtil::CharacterIsSpace(after_empty[4]) && !starts_with_word(after_status_body_u, "BLOB") &&
+			    !starts_with_word(after_status_body_u, "TYPE")) {
 				string after_body = QuackapiTrim(after_empty.substr(4));
 				auto after_body_u = StringUtil::Upper(after_body);
 				if (StringUtil::StartsWith(after_body_u, "SCHEMA")) {
@@ -1009,6 +1016,13 @@ ParserExtensionParseResult RouteDdlParse(ParserExtensionInfo *, const string &qu
 	for (auto &param : params) {
 		if (body_blob && StringUtil::CIEquals(param.name, "body")) {
 			return ParserExtensionParseResult("BODY BLOB reserves $body; PARAM body is not allowed");
+		}
+	}
+	if (body_blob) {
+		for (auto &segment : StringUtil::Split(pattern, '/')) {
+			if (StringUtil::CIEquals(segment, ":body") || StringUtil::CIEquals(segment, "{body}")) {
+				return ParserExtensionParseResult("BODY BLOB reserves $body; a path capture named body is not allowed");
+			}
 		}
 	}
 
