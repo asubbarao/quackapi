@@ -65,6 +65,9 @@ int main(int argc, char **argv) {
 		Run(con, "CREATE ROUTE spoof PUT '/spoof/:body' FORMAT binary BODY BLOB AS SELECT $body AS body");
 		Run(con, "CREATE ROUTE tiny PUT '/tiny' BODY BLOB WITH (max_request_bytes := 4) AS SELECT octet_length($body) "
 		         "AS bytes");
+		// Large stills: a route may opt above the 8 MiB default up to the server's hard limit.
+		Run(con, "CREATE ROUTE big PUT '/big' FORMAT csv BODY BLOB WITH (max_request_bytes := 33554432) AS "
+		         "SELECT octet_length($body) AS bytes, sha256($body) AS hash");
 		Run(con, "CREATE ROUTE plain POST '/plain' BODY TYPE '{\"n\":\"INTEGER\"}' AS SELECT $n AS n");
 		Run(con, "CREATE ROUTE json_text POST '/json-text' AS SELECT $n::INTEGER AS n");
 		Run(con, "CREATE ROUTE form POST '/form' AS SELECT $n::INTEGER AS n");
@@ -87,7 +90,7 @@ int main(int argc, char **argv) {
 		Reject(con, "CREATE ROUTE bad PUT '/bad' BODY SCHEMA '{}' BODY BLOB AS SELECT 1");
 		Reject(con, "CREATE ROUTE bad PUT '/bad' BODY BLOB PARAM body VARCHAR HEADER 'body' AS SELECT 1");
 		Reject(con, "CREATE ROUTE bad PUT '/bad' BODY BLOB AS $body");
-		Run(con, "SELECT * FROM quackapi_serve(9541,host:='127.0.0.1',access_log:=false)");
+		Run(con, "SELECT * FROM quackapi_serve(9541,host:='127.0.0.1',access_log:=false,max_request_bytes:=67108864)");
 		quackapi_httplib::Client http("127.0.0.1", 9541);
 		http.set_read_timeout(10, 0);
 		const std::vector<std::string> fixtures = {std::string("\0\xff\x41", 3), std::string("\xff\xfe\x80", 3),
@@ -112,6 +115,16 @@ int main(int argc, char **argv) {
 		Expect(tiny_bad && tiny_bad->status == 413, "one byte over route size limit rejected");
 		auto huge = http.Put("/raw/huge", std::string(8 * 1024 * 1024 + 1, 'x'), "application/octet-stream");
 		Expect(huge && huge->status == 413, "one byte over inherited 8MiB limit rejected");
+		std::string large(20 * 1024 * 1024, '\0');
+		for (size_t i = 0; i < large.size(); i++) {
+			large[i] = static_cast<char>((i * 2654435761u) >> 13);
+		}
+		auto big_ok = http.Put("/big", large, "application/octet-stream");
+		Expect(big_ok && big_ok->status == 200 &&
+		           big_ok->body.find(std::to_string(large.size()) + "," + Hash(con, large)) != std::string::npos,
+		       "20MiB raw body above the 8MiB default arrives intact (length and SHA256) on an opted-in route");
+		auto big_bad = http.Put("/big", std::string(32 * 1024 * 1024 + 1, 'x'), "application/octet-stream");
+		Expect(big_bad && big_bad->status == 413, "one byte over the opted-in route limit rejected");
 		for (const auto &ct : {"application/json", "text/plain", "application/x-www-form-urlencoded"}) {
 			auto wrong = http.Put("/raw/wrong", "{}", ct);
 			Expect(wrong && wrong->status == 415, "raw route rejects other content type");

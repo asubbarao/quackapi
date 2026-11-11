@@ -379,12 +379,16 @@ reserved `$body` binds the exact native BLOB, including empty bodies, NUL, inval
 UTF-8 and literal backslashes; it never parses JSON or decodes BLOB escapes.
 Path/query/header values named `body` cannot replace it. `PARAM body`, executable
 SQL handlers, and combinations with `BODY TYPE` or `BODY SCHEMA` are rejected.
-Authentication, middleware and request-size ceilings still apply. Other body
+Authentication, middleware and request-size ceilings still apply: a route
+inherits the 8 MiB default, and a larger upload opts in with
+`WITH (max_request_bytes := <bytes>)`, bounded by the server's hard limit
+(`quackapi_serve(..., max_request_bytes := <bytes>)` or
+`SET quackapi_max_request_bytes`, up to 1 GiB). Other body
 formats keep their existing validation. Octet-stream does not assert an image
 media type; image metadata/validation belongs to the application's own contract.
 
 ```sql
-CREATE ROUTE raw_put PUT '/raw/:hash' BODY BLOB AS
+CREATE ROUTE raw_put PUT '/raw/:hash' BODY BLOB WITH (max_request_bytes := 33554432) AS
 INSERT INTO raw_assets SELECT $hash, $body WHERE sha256($body) = $hash
 RETURNING hash, octet_length(body) AS bytes;
 ```
