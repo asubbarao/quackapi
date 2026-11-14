@@ -11,6 +11,9 @@ It emits statement.total_time, statement.sql, statement.success, and an optional
 statement.error when a begun statement finishes. Timing uses a monotonic clock;
 UTC start/end and native connection/query IDs remain attached to the event.
 This does not enable the operator profiler or change caller profiler settings.
+Statements carry their submission ID and immutable parent connection/query IDs.
+Parent metadata is captured before scheduling, so it does not retain a caller.
+A completed or failed submission clears its context before connection reuse.
 
 HTTP SQL batches and native self-dispatch also emit request.total_time,
 request.sql, request.success, request.origin, and an optional request.error.

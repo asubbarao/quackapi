@@ -1,4 +1,5 @@
 #include "quackapi_server.hpp"
+#include "quackapi_query_log.hpp"
 
 #include <condition_variable>
 #include <chrono>
@@ -1193,13 +1194,31 @@ bool ExecuteRequestSqlInternal(Connection &con, const string &sql, unique_ptr<Qu
 
 bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
                        const std::function<bool()> &stop, const string &origin = "quackapi") {
+	QuackapiBeginSqlSubmission(con, origin);
+	auto state = con.context->registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+	struct ResetSubmission {
+		shared_ptr<QuackapiSqlSubmissionState> state;
+		~ResetSubmission() {
+			state->Reset();
+		}
+	} reset {state};
 	auto begin = Timestamp::GetCurrentTimestamp();
 	auto started = std::chrono::steady_clock::now();
-	bool success = ExecuteRequestSqlInternal(con, sql, result, error, stop);
-	QuackapiLogSqlSubmission(con, sql, begin,
-	                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(), origin,
-	                         success, error);
-	return success;
+	auto finish = [&](bool success) {
+		QuackapiLogSqlSubmission(con, sql, begin,
+		                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+		                         origin, success, error);
+	};
+	try {
+		bool success = ExecuteRequestSqlInternal(con, sql, result, error, stop);
+		finish(success);
+		return success;
+	} catch (std::exception &ex) {
+		error = ErrorData(ex).Message();
+		if (state->id != DConstants::INVALID_INDEX)
+			finish(false);
+		throw;
+	}
 }
 
 //! Resolve the native DuckDB type represented by a BODY TYPE declaration.
@@ -2278,13 +2297,30 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 	}
 }
 
+void QuackapiBeginSqlSubmission(Connection &con, const string &origin, idx_t parent_query_id,
+                                idx_t parent_connection_id) {
+	auto &context = *con.context;
+	auto state = context.registered_state->GetOrCreate<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+	if (state->id != DConstants::INVALID_INDEX)
+		return;
+	state->id = context.db->GetDatabaseManager().GetNewQueryNumber();
+	state->origin = origin;
+	state->parent_query_id = parent_query_id;
+	state->parent_connection_id = parent_connection_id;
+}
+
 void QuackapiLogSqlSubmission(Connection &con, const string &sql, timestamp_t started_at, double duration,
                               const string &origin, bool success, const string &error) {
 	auto &context = *con.context;
 	auto &manager = LogManager::Get(context);
 	LoggingContext log_context(LogContextScope::CONNECTION);
 	log_context.connection_id = context.GetConnectionId();
-	log_context.query_id = context.db->GetDatabaseManager().GetNewQueryNumber();
+	QuackapiBeginSqlSubmission(con, origin);
+	auto state = context.registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+	log_context.query_id = state->id;
+	auto parent_query_id = state->parent_query_id;
+	auto parent_connection_id = state->parent_connection_id;
+	state->Reset();
 	auto logger = manager.CreateLogger(log_context, true);
 	if (!logger->ShouldLog(MetricsLogType::NAME, MetricsLogType::LEVEL))
 		return;
@@ -2296,6 +2332,14 @@ void QuackapiLogSqlSubmission(Connection &con, const string &sql, timestamp_t st
 	                 MetricsLogType::ConstructLogMessage("request.sql", Value(sql)));
 	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
 	                 MetricsLogType::ConstructLogMessage("request.origin", Value(origin)));
+	if (parent_query_id != DConstants::INVALID_INDEX)
+		logger->WriteLog(
+		    MetricsLogType::NAME, MetricsLogType::LEVEL,
+		    MetricsLogType::ConstructLogMessage("request.parent_query_id", Value::UBIGINT(parent_query_id)));
+	if (parent_connection_id != DConstants::INVALID_INDEX)
+		logger->WriteLog(
+		    MetricsLogType::NAME, MetricsLogType::LEVEL,
+		    MetricsLogType::ConstructLogMessage("request.parent_connection_id", Value::UBIGINT(parent_connection_id)));
 	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
 	                 MetricsLogType::ConstructLogMessage("request.success", Value::BOOLEAN(success)));
 	if (!success)

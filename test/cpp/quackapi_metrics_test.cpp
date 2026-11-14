@@ -1,4 +1,6 @@
 #include "duckdb.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "quackapi_query_log.hpp"
 #include <iostream>
 #include <stdexcept>
 using namespace duckdb;
@@ -60,6 +62,42 @@ SELECT CASE WHEN count_if(sql='SELECT 43126 AS scalar_origin_probe' AND origin='
 		Run(control, "SELECT CASE WHEN count(message)<1 THEN error('parser error missing') END FROM duckdb_logs WHERE "
 		             "type='Metrics' AND parse_duckdb_log_message('Metrics',message).metric='request.error' AND "
 		             "contains(parse_duckdb_log_message('Metrics',message).value,'Parser Error')");
+		Run(control, R"SQL(WITH events AS (
+ SELECT connection_id,query_id,parse_duckdb_log_message('Metrics',message) AS event FROM duckdb_logs WHERE type='Metrics'
+)
+SELECT CASE WHEN count(child.query_id)<>2 THEN error('exact native parent lineage missing') END
+FROM events child JOIN events link ON child.query_id=link.query_id AND child.connection_id=link.connection_id
+JOIN events parent ON parent.query_id=try_cast(link.event.value AS UBIGINT)
+WHERE child.event.metric='statement.sql' AND child.event.value IN ('SELECT 43126 AS scalar_origin_probe','SELECT 43124 AS nested_metrics_probe')
+AND link.event.metric='statement.parent_query_id' AND parent.event.metric='statement.sql'
+AND contains(parent.event.value,child.event.value))SQL");
+		Run(control, R"SQL(WITH events AS (
+ SELECT connection_id,query_id,parse_duckdb_log_message('Metrics',message) AS event FROM duckdb_logs WHERE type='Metrics'
+)
+SELECT CASE WHEN count(child.query_id)<>2 THEN error('native submission identity missing') END
+FROM events child JOIN events link ON child.query_id=link.query_id AND child.connection_id=link.connection_id
+JOIN events submitted ON submitted.query_id=try_cast(link.event.value AS UBIGINT) AND submitted.connection_id=child.connection_id
+WHERE child.event.metric='statement.sql' AND child.event.value IN ('SELECT 43126 AS scalar_origin_probe','SELECT 43124 AS nested_metrics_probe')
+AND link.event.metric='statement.submission_id' AND submitted.event.metric='request.sql'
+AND submitted.event.value=child.event.value)SQL");
+		{
+			Connection reused(db);
+			auto stale =
+			    reused.context->registered_state->GetOrCreate<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+			stale->parent_query_id = 123;
+			stale->parent_connection_id = 456;
+			stale->origin = "stale";
+			Run(reused, "SELECT 43128 AS inactive_submission_probe");
+		}
+		Run(control, R"SQL(WITH events AS (
+ SELECT connection_id,query_id,parse_duckdb_log_message('Metrics',message) AS event FROM duckdb_logs WHERE type='Metrics'
+)
+SELECT CASE WHEN count(stale.query_id)<>0 THEN error('inactive submission leaked provenance') END
+FROM events statement JOIN events stale ON statement.query_id=stale.query_id AND statement.connection_id=stale.connection_id
+WHERE statement.event.metric='statement.sql' AND statement.event.value='SELECT 43128 AS inactive_submission_probe'
+AND stale.event.metric IN ('statement.parent_query_id','statement.parent_connection_id','statement.origin','statement.submission_id'))SQL");
+		Run(control, R"SQL(SELECT quackapi_selfdispatch($program$-- duckstack:tag_probe
+SELECT 43129 AS tagged_probe$program$).status)SQL");
 		if (argc == 3) {
 			string target;
 			for (char ch : string(argv[2])) {

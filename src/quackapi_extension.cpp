@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "quackapi_extension.hpp"
+#include "quackapi_query_log.hpp"
 #include "quackapi_middleware.hpp"
 
 #include <atomic>
@@ -1052,6 +1053,13 @@ public:
 			return;
 		}
 		sql = context.GetCurrentQuery();
+		auto submission = context.registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+		if (submission && submission->id == DConstants::INVALID_INDEX)
+			submission.reset();
+		submission_id = submission ? submission->id : DConstants::INVALID_INDEX;
+		origin = submission ? submission->origin : string();
+		parent_query_id = submission ? submission->parent_query_id : DConstants::INVALID_INDEX;
+		parent_connection_id = submission ? submission->parent_connection_id : DConstants::INVALID_INDEX;
 		started_at = Timestamp::GetCurrentTimestamp();
 		started = std::chrono::steady_clock::now();
 	}
@@ -1071,6 +1079,21 @@ public:
 			logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
 			                 MetricsLogType::ConstructLogMessage(
 			                     "statement.error", error ? Value(error->Message()) : Value(LogicalType::VARCHAR)));
+		if (submission_id != DConstants::INVALID_INDEX) {
+			logger->WriteLog(
+			    MetricsLogType::NAME, MetricsLogType::LEVEL,
+			    MetricsLogType::ConstructLogMessage("statement.submission_id", Value::UBIGINT(submission_id)));
+			logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+			                 MetricsLogType::ConstructLogMessage("statement.origin", Value(origin)));
+		}
+		if (parent_query_id != DConstants::INVALID_INDEX) {
+			logger->WriteLog(
+			    MetricsLogType::NAME, MetricsLogType::LEVEL,
+			    MetricsLogType::ConstructLogMessage("statement.parent_query_id", Value::UBIGINT(parent_query_id)));
+			logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+			                 MetricsLogType::ConstructLogMessage("statement.parent_connection_id",
+			                                                     Value::UBIGINT(parent_connection_id)));
+		}
 		logger->Flush();
 		logger.reset();
 		sql.clear();
@@ -1078,6 +1101,10 @@ public:
 
 private:
 	shared_ptr<Logger> logger;
+	idx_t submission_id = DConstants::INVALID_INDEX;
+	idx_t parent_query_id = DConstants::INVALID_INDEX;
+	idx_t parent_connection_id = DConstants::INVALID_INDEX;
+	string origin;
 	string sql;
 	timestamp_t started_at;
 	std::chrono::steady_clock::time_point started;

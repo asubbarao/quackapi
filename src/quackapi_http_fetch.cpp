@@ -2,6 +2,7 @@
 #include "quackapi_limits.hpp"
 #include "quackapi_util.hpp"
 #include "quackapi_server.hpp"
+#include "quackapi_query_log.hpp"
 #include "quackapi_state.hpp"
 
 #include <atomic>
@@ -981,6 +982,8 @@ idx_t ReserveExecTasks(idx_t wanted, int64_t cap) {
 //! One quackapi_selfdispatch call, retained by its native tasks, so a caller that
 //! gives up (interrupt, deadline) returns while a row is still blocked in a host call.
 struct ExecCall {
+	idx_t parent_query_id = DConstants::INVALID_INDEX;
+	idx_t parent_connection_id = DConstants::INVALID_INDEX;
 	shared_ptr<DatabaseInstance> db;
 	vector<string> sqls;
 	vector<bool> skip;
@@ -1004,6 +1007,8 @@ struct ExecCall {
 std::shared_ptr<ExecCall> NewExecCall(ClientContext &context, idx_t count) {
 	auto call = std::make_shared<ExecCall>();
 	call->db = context.db;
+	call->parent_query_id = context.transaction.GetActiveQuery();
+	call->parent_connection_id = context.GetConnectionId();
 	call->sqls.resize(count);
 	call->skip.assign(count, false);
 	call->out.resize(count);
@@ -1094,6 +1099,7 @@ void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
 			call.running.insert(&con);
 		}
 		Registration registration {call, &con};
+		QuackapiBeginSqlSubmission(con, "selfdispatch", call.parent_query_id, call.parent_connection_id);
 		QuackapiQueryDeadline deadline(con, call.deadline, parent);
 		auto cancelled = [&call, parent]() {
 			return call.cancelled || (parent && parent->IsInterrupted());
@@ -1160,6 +1166,8 @@ public:
 			}
 			if (!connection) {
 				connection = make_uniq<Connection>(*call.db);
+				QuackapiBeginSqlSubmission(*connection, "selfdispatch", call.parent_query_id,
+				                           call.parent_connection_id);
 				if (call.serving_timeout_ms > 0) {
 					QuackapiSetServingBudget(*connection, call.serving_timeout_ms, call.serving_max_response_bytes);
 				}
@@ -1219,8 +1227,10 @@ public:
 
 private:
 	bool Finish(QuackapiExecResponse response) {
-		if (!connection)
+		if (!connection) {
 			connection = make_uniq<Connection>(*call.db);
+			QuackapiBeginSqlSubmission(*connection, "selfdispatch", call.parent_query_id, call.parent_connection_id);
+		}
 		QuackapiLogSqlSubmission(*connection, call.sqls[row], started_at,
 		                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
 		                         "selfdispatch", response.status < 400, response.body);

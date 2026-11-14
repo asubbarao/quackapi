@@ -152,3 +152,10 @@ install(
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 add_executable(quackapi_metrics_test test/cpp/quackapi_metrics_test.cpp)
 target_link_libraries(quackapi_metrics_test duckdb)
+if(WIN32)
+  add_custom_command(
+    TARGET quackapi_metrics_test
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:duckdb>
+            $<TARGET_FILE_DIR:quackapi_metrics_test>)
+endif()
