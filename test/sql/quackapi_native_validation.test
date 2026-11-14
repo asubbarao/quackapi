@@ -111,6 +111,25 @@ DROP ROUTE numeric_object_key;
 ----
 Dropped route numeric_object_key
 
+# Both json_schema message formats preserve payload-aware array indexes.
+query I
+CREATE ROUTE schema_array_index POST '/schema-array-index'
+  BODY SCHEMA '{"type":"array","items":{"type":"integer","maximum":1}}'
+  AS SELECT 1 AS ok;
+----
+Route schema_array_index: POST /schema-array-index
+
+query II
+SELECT status, CASE WHEN contains(decode(body), '"loc":["body",0]') THEN true ELSE error(decode(body)) END
+FROM quackapi_request('POST', '/schema-array-index', '[2]');
+----
+422	true
+
+query I
+DROP ROUTE schema_array_index;
+----
+Dropped route schema_array_index
+
 # Error-location parsing bounds its own JSON walk. A hostile deeply nested body
 # still returns a normal 422 instead of recursing on the request stack.
 query I
