@@ -452,7 +452,7 @@ string PairsToJsonObject(const PairRange &pairs) {
 //! example, "At /items/0/qty: ..."). Surface it as FastAPI's typed loc array
 //! instead of losing the field path behind a synthetic _schema member.
 string ValidationErrorJsonSchema(const string &msg, const string &type, const string &raw_body) {
-	const string markers[] = {"At /", "at /"};
+	const string markers[] = {"At /", "at /", "schema: /"};
 	for (auto &marker : markers) {
 		auto start_marker = msg.find(marker);
 		if (start_marker == string::npos) {
