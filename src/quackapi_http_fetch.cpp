@@ -19,6 +19,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_result_stream.hpp"
@@ -1097,8 +1098,8 @@ void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
 		auto cancelled = [&call, parent]() {
 			return call.cancelled || (parent && parent->IsInterrupted());
 		};
-		receipt = ExecReceipt(
-		    QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql", cancelled, true));
+		receipt = ExecReceipt(QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql",
+		                                      cancelled, true, "selfdispatch"));
 	} catch (std::exception &e) {
 		receipt.request_error = e.what();
 	} catch (...) {
@@ -1218,12 +1219,19 @@ public:
 
 private:
 	bool Finish(QuackapiExecResponse response) {
+		if (!connection)
+			connection = make_uniq<Connection>(*call.db);
+		QuackapiLogSqlSubmission(*connection, call.sqls[row], started_at,
+		                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+		                         "selfdispatch", response.status < 400, response.body);
 		std::lock_guard<std::mutex> guard(call.mutex);
 		call.out[row] = ExecReceipt(std::move(response));
 		call.done[row] = true;
 		finished = true;
 		return true;
 	}
+	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+	timestamp_t started_at = Timestamp::GetCurrentTimestamp();
 	ExecCall &call;
 	idx_t row;
 	ClientContext *parent;

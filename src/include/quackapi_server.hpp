@@ -33,6 +33,8 @@ class Connection;
 class DatabaseInstance;
 class QuackapiQueryDeadline;
 class Value;
+void QuackapiLogSqlSubmission(Connection &con, const string &sql, timestamp_t started_at, double duration,
+                              const string &origin, bool success, const string &error);
 
 //! Max request body accepted by quackapi (8 MiB). Larger bodies get 413.
 static constexpr size_t QUACKAPI_PAYLOAD_MAX_LENGTH = 8ull * 1024ull * 1024ull;
@@ -379,7 +381,8 @@ struct QuackapiExecResponse {
 //! `cancelled` answers true before a statement, that statement and the rest never run.
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
                                      const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
-                                     const std::function<bool()> &cancelled = nullptr, bool collect_typed_rows = false);
+                                     const std::function<bool()> &cancelled = nullptr, bool collect_typed_rows = false,
+                                     const string &origin = "quackapi");
 //! The 504 an exec route answers past its deadline.
 QuackapiExecResponse QuackapiExecTimeoutResponse();
 //! The 403 an exec route answers while any row access or masking policy is bound.

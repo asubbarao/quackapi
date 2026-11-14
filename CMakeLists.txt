@@ -150,3 +150,5 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+add_executable(quackapi_metrics_test test/cpp/quackapi_metrics_test.cpp)
+target_link_libraries(quackapi_metrics_test duckdb)

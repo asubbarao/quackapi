@@ -30,6 +30,11 @@
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/profiler/gathered_metrics.hpp"
+#include "duckdb/logging/log_type.hpp"
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -1144,8 +1149,8 @@ bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
 //! answers with the first statement that produces rows, a batch such as
 //! `CREATE …; INSERT …; SELECT …` answers with its final SELECT. When `stop` answers
 //! true before a statement, that statement and the rest never run.
-bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
-                       const std::function<bool()> &stop) {
+bool ExecuteRequestSqlInternal(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
+                               const std::function<bool()> &stop) {
 	// DuckDB's statement extraction truncates at the first null byte, which
 	// would silently drop the tail of the batch while executing the prefix.
 	// Null bytes are never legitimate in request SQL text.
@@ -1184,6 +1189,17 @@ bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResul
 		result = std::move(statement_result);
 	}
 	return true;
+}
+
+bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
+                       const std::function<bool()> &stop, const string &origin = "quackapi") {
+	auto begin = Timestamp::GetCurrentTimestamp();
+	auto started = std::chrono::steady_clock::now();
+	bool success = ExecuteRequestSqlInternal(con, sql, result, error, stop);
+	QuackapiLogSqlSubmission(con, sql, begin,
+	                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(), origin,
+	                         success, error);
+	return success;
 }
 
 //! Resolve the native DuckDB type represented by a BODY TYPE declaration.
@@ -2244,14 +2260,14 @@ QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_
 static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, idx_t max_response_bytes,
                                             const QuackapiQueryDeadline &deadline, const string &loc,
                                             const string &param, const std::function<bool()> &cancelled,
-                                            bool collect_typed_rows) {
+                                            bool collect_typed_rows, const string &origin) {
 	unique_ptr<QueryResult> result;
 	string error;
 	auto stop = [&]() {
 		return deadline.Expired() || (cancelled && cancelled());
 	};
 	try {
-		if (!ExecuteRequestSql(con, sql, result, error, stop)) {
+		if (!ExecuteRequestSql(con, sql, result, error, stop, origin)) {
 			return deadline.Expired() ? QuackapiExecTimeoutResponse()
 			                          : ExecJsonResponse(422, ValidationErrorJson(loc, param, error, "value_error"));
 		}
@@ -2262,10 +2278,38 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 	}
 }
 
+void QuackapiLogSqlSubmission(Connection &con, const string &sql, timestamp_t started_at, double duration,
+                              const string &origin, bool success, const string &error) {
+	auto &context = *con.context;
+	auto &manager = LogManager::Get(context);
+	LoggingContext log_context(LogContextScope::CONNECTION);
+	log_context.connection_id = context.GetConnectionId();
+	log_context.query_id = context.db->GetDatabaseManager().GetNewQueryNumber();
+	auto logger = manager.CreateLogger(log_context, true);
+	if (!logger->ShouldLog(MetricsLogType::NAME, MetricsLogType::LEVEL))
+		return;
+	MetricTiming timing;
+	timing.Add(0, started_at, Timestamp::GetCurrentTimestamp());
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.total_time", Value::DOUBLE(duration), &timing));
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.sql", Value(sql)));
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.origin", Value(origin)));
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.success", Value::BOOLEAN(success)));
+	if (!success)
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("request.error", Value(error)));
+	logger->Flush();
+}
+
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
                                      const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
-                                     const std::function<bool()> &cancelled, bool collect_typed_rows) {
-	auto out = ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled, collect_typed_rows);
+                                     const std::function<bool()> &cancelled, bool collect_typed_rows,
+                                     const string &origin) {
+	auto out =
+	    ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled, collect_typed_rows, origin);
 	// What a served route checks last, after serialization: values under the cap can
 	// serialize past it, and the deadline can pass while they do.
 	if (deadline.Expired()) {

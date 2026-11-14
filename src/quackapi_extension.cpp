@@ -13,6 +13,16 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/connection_manager.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
+#include "duckdb/main/profiler/gathered_metrics.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include <chrono>
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/logging/log_type.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -1029,10 +1039,65 @@ static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_
 // Load
 //===--------------------------------------------------------------------===//
 
+class QuackapiStatementMetrics : public ClientContextState {
+public:
+	void QueryBegin(ClientContext &context) override {
+		LoggingContext logging_context(LogContextScope::CONNECTION);
+		logging_context.connection_id = context.GetConnectionId();
+		logging_context.transaction_id = context.transaction.ActiveTransaction().global_transaction_id;
+		logging_context.query_id = context.transaction.GetActiveQuery();
+		logger = LogManager::Get(context).CreateLogger(logging_context, true);
+		if (!logger->ShouldLog(MetricsLogType::NAME, MetricsLogType::LEVEL)) {
+			logger.reset();
+			return;
+		}
+		sql = context.GetCurrentQuery();
+		started_at = Timestamp::GetCurrentTimestamp();
+		started = std::chrono::steady_clock::now();
+	}
+	void QueryEnd(ClientContext &, optional_ptr<ErrorData> error) override {
+		if (!logger)
+			return;
+		auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+		MetricTiming timing;
+		timing.Add(0, started_at, Timestamp::GetCurrentTimestamp());
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("statement.total_time", Value::DOUBLE(elapsed), &timing));
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("statement.sql", Value(sql)));
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("statement.success", Value::BOOLEAN(!error)));
+		if (error)
+			logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+			                 MetricsLogType::ConstructLogMessage(
+			                     "statement.error", error ? Value(error->Message()) : Value(LogicalType::VARCHAR)));
+		logger->Flush();
+		logger.reset();
+		sql.clear();
+	}
+
+private:
+	shared_ptr<Logger> logger;
+	string sql;
+	timestamp_t started_at;
+	std::chrono::steady_clock::time_point started;
+};
+
+class QuackapiQueryMetrics : public ExtensionCallback {
+public:
+	void OnConnectionOpened(ClientContext &context) override {
+		context.registered_state->GetOrCreate<QuackapiStatementMetrics>("quackapi.statement_metrics");
+	}
+};
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// SET quackapi_cors_origins = '*' | 'https://app.example,https://admin.example'
 	// Default empty = CORS off. Serve-time cors_origins := '…' overrides this SET.
 	auto &db = loader.GetDatabaseInstance();
+	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<QuackapiQueryMetrics>());
+	for (auto &context : ConnectionManager::Get(db).GetConnectionList()) {
+		context->registered_state->GetOrCreate<QuackapiStatementMetrics>("quackapi.statement_metrics");
+	}
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("quackapi_cors_origins",
 	                          "CORS allowed origins for quackapi_serve (* or comma-separated list). "
