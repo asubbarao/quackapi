@@ -34,3 +34,11 @@ Build and run the candidate regression with make query_metrics_release after
 building quackapi_metrics_test and quackapi_loadable_extension. It loads the
 explicit candidate path and exercises existing/new connections, nested native
 dispatch, binding failures, parser rejection, and recorded submission origin.
+
+## Owning CLI shutdown
+
+`FROM quackapi_stop(wait:=true)` permanently closes admission for this database,
+waits for active and already-retired HTTP servers, and drains admitted native SQL
+work. Run it directly on the owning CLI before closing stdin. HTTP handlers and
+self-dispatch reject this blocking form so they cannot wait on themselves.
+The ordinary nonblocking stop forms retain their existing behavior.
