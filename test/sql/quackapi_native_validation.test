@@ -101,7 +101,7 @@ CREATE ROUTE numeric_object_key POST '/numeric-object-key'
 Route numeric_object_key: POST /numeric-object-key
 
 query II
-SELECT status, contains(decode(body), '"loc":["body","01"]')
+SELECT status, CASE WHEN contains(decode(body), '"loc":["body","01"]') THEN true ELSE error(decode(body)) END
 FROM quackapi_request('POST', '/numeric-object-key', '{"01":2}');
 ----
 422	true
