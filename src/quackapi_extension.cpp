@@ -471,7 +471,8 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	string message;
 	if (bind_data.wait) {
 		auto submission = context.registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
-		if (QuackapiInRequest() || (submission && submission->id != DConstants::INVALID_INDEX))
+		auto request = context.registered_state->Get<QuackapiHttpRequestState>("quackapi.http_request");
+		if (request || QuackapiInRequest() || (submission && submission->id != DConstants::INVALID_INDEX))
 			throw InvalidInputException("Blocking shutdown must run outside HTTP and self-dispatch");
 		state.Shutdown();
 		message = "Drained all quackapi servers and native SQL calls";

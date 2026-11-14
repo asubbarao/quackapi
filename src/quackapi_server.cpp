@@ -4483,6 +4483,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 
 			// Bind path + query (+ Last-Event-ID → $last_id) before installing provider.
 			auto con = make_shared_ptr<Connection>(*db);
+			con->context->registered_state->GetOrCreate<QuackapiHttpRequestState>("quackapi.http_request");
 			QuackapiQueryDeadline initial_deadline(*con, options.query_timeout_ms);
 			QuackapiSetServingBudget(*con, options.query_timeout_ms, options.max_response_bytes);
 			auto prepared = con->Prepare(stream_sql);
@@ -4733,6 +4734,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		// TLS has been destroyed, causing a shutdown use-after-free.
 		// TEMP/SET and prepared plans also remain strictly request-local.
 		Connection con(*db);
+		con.context->registered_state->GetOrCreate<QuackapiHttpRequestState>("quackapi.http_request");
 		const auto elapsed_ms =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 		QuackapiQueryDeadline deadline(con, std::max<int64_t>(1, options.query_timeout_ms - elapsed_ms));
@@ -4779,6 +4781,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
 				        .count();
 				Connection middleware_connection(*db);
+				middleware_connection.context->registered_state->GetOrCreate<QuackapiHttpRequestState>(
+				    "quackapi.http_request");
 				if (!ExecuteQuackapiMiddleware(middleware_connection, *db, QuackapiMiddlewarePhase::AFTER,
 				                               context->group_name, *context, authenticated, claims)) {
 					SetJson(res, context->status, context->response_body);

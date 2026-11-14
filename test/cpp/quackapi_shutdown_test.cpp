@@ -61,6 +61,7 @@ int main(int argc, char **argv) {
 				candidate += ch;
 		}
 		Run(control, "LOAD '" + candidate + "'");
+		Run(control, "SET threads=4");
 		Run(control, "CREATE ROUTE guard GET '/shutdown-guard' AS SELECT * FROM quackapi_stop(wait:=true)");
 		Run(control, "SELECT CASE WHEN NOT contains(decode(body),'Blocking shutdown must run outside') THEN "
 		             "error(decode(body)) END FROM quackapi_request('GET','/shutdown-guard')");

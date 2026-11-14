@@ -3,6 +3,8 @@
 #include "duckdb/common/constants.hpp"
 namespace duckdb {
 class Connection;
+// Request-local connections retain ownership across DuckDB worker threads.
+struct QuackapiHttpRequestState : public ClientContextState {};
 struct QuackapiSqlSubmissionState : public ClientContextState {
 	idx_t id = DConstants::INVALID_INDEX;
 	idx_t parent_query_id = DConstants::INVALID_INDEX;
