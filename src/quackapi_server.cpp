@@ -71,6 +71,15 @@ namespace {
 //! matched CREATE ROUTE … TIMEOUT can extend SocketStream + SO_*TIMEO deadlines.
 thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
 thread_local quackapi_httplib::Stream *quackapi_tls_stream = nullptr;
+thread_local idx_t quackapi_request_depth = 0;
+struct ScopedQuackapiRequest {
+	ScopedQuackapiRequest() {
+		quackapi_request_depth++;
+	}
+	~ScopedQuackapiRequest() {
+		quackapi_request_depth--;
+	}
+};
 
 //! A WS stream bound before its upgrade. httplib runs the pre-routing handler
 //! and the WebSocket handler for one request on the same worker thread, so the
@@ -2348,6 +2357,10 @@ void QuackapiLogSqlSubmission(Connection &con, const string &sql, timestamp_t st
 	logger->Flush();
 }
 
+bool QuackapiInRequest() {
+	return quackapi_request_depth > 0;
+}
+
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
                                      const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
                                      const std::function<bool()> &cancelled, bool collect_typed_rows,
@@ -3918,6 +3931,7 @@ void QuackapiHttpServer::HandleWebSocket(const quackapi_httplib::Request &req, q
 }
 
 void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
+	ScopedQuackapiRequest request_scope;
 	// Always attach CORS headers when configured (including error responses).
 	// Stamp X-Request-ID + emit structured access log on every exit path.
 	// Applied once at the end via a small RAII-ish pattern: call ApplyCors on

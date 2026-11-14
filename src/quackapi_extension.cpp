@@ -438,6 +438,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 //===--------------------------------------------------------------------===//
 
 struct StopBindData : public TableFunctionData {
+	bool wait = false;
 	int32_t port = 0; // 0 = all
 	bool finished = false;
 };
@@ -445,6 +446,14 @@ struct StopBindData : public TableFunctionData {
 static unique_ptr<FunctionData> StopBind(ClientContext &, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<StopBindData>();
+	auto wait = input.named_parameters.find("wait");
+	if (wait != input.named_parameters.end()) {
+		if (wait->second.IsNull())
+			throw InvalidInputException("wait must be true or false");
+		bind_data->wait = wait->second.GetValue<bool>();
+	}
+	if (bind_data->wait && !input.inputs.empty())
+		throw InvalidInputException("Blocking shutdown drains all servers; omit port");
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
 	}
@@ -460,7 +469,13 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	}
 	auto &state = QuackapiState::Get(*context.db);
 	string message;
-	if (bind_data.port == 0) {
+	if (bind_data.wait) {
+		auto submission = context.registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+		if (QuackapiInRequest() || (submission && submission->id != DConstants::INVALID_INDEX))
+			throw InvalidInputException("Blocking shutdown must run outside HTTP and self-dispatch");
+		state.Shutdown();
+		message = "Drained all quackapi servers and native SQL calls";
+	} else if (bind_data.port == 0) {
 		state.StopAllServers();
 		message = "Stopped all quackapi servers";
 	} else if (state.StopServer(bind_data.port)) {
@@ -1248,6 +1263,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quackapi_stop() / quackapi_stop(port)
 	TableFunctionSet stop_set("quackapi_stop");
 	TableFunction stop("quackapi_stop", {LogicalType::INTEGER}, StopExec, StopBind);
+	AddNamedParameter(stop, "wait", LogicalType::BOOLEAN);
 	stop_set.AddFunction(stop);
 	stop_set.AddFunction(WithoutPositionalArguments(stop));
 	loader.RegisterFunction(stop_set);

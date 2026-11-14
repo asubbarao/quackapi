@@ -33,6 +33,7 @@ class Connection;
 class DatabaseInstance;
 class QuackapiQueryDeadline;
 class Value;
+bool QuackapiInRequest();
 void QuackapiLogSqlSubmission(Connection &con, const string &sql, timestamp_t started_at, double duration,
                               const string &origin, bool success, const string &error);
 

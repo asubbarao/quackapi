@@ -3,6 +3,8 @@
 #include "duckdb/common/types/value.hpp"
 
 #include <atomic>
+#include <condition_variable>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <tuple>
@@ -317,6 +319,11 @@ public:
 	bool StopServer(int port);
 	//! Stop all servers (used at teardown).
 	void StopAllServers();
+	//! Permanently reject new work, then drain HTTP closers and admitted native SQL calls.
+	void Shutdown();
+	//! Admission is balanced by EndNativeSqlCall after all child tasks have finished.
+	void BeginNativeSqlCall();
+	void EndNativeSqlCall();
 	//! True when a quackapi server is registered on this port (any host).
 	bool HasServerOnPort(int port);
 	//! Host for the server on port, if any. Returns false if none.
@@ -426,6 +433,13 @@ private:
 
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackapiHttpServer>> servers;
+	//! Promise-backed futures do not join their producers during state destruction.
+	vector<std::shared_future<void>> server_closers;
+	std::condition_variable native_sql_drained;
+	idx_t native_sql_calls = 0;
+	bool draining = false;
+	//! Called only while servers_mutex is held; the detached closer owns no registry reference.
+	void RetireServer(unique_ptr<QuackapiHttpServer> server);
 };
 
 } // namespace duckdb
