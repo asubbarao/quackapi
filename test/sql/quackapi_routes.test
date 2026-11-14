@@ -230,7 +230,7 @@ Route with_schema: POST /with-schema
 
 # Schema maximum violated (would bind fine as INTEGER) → 422
 query II
-SELECT status, contains(decode(body), '"loc":["body","n"]')
+SELECT status, CASE WHEN contains(decode(body), '"loc":["body","n"]') THEN true ELSE error(decode(body)) END
 FROM quackapi_request('POST', '/with-schema', '{"n":100}');
 ----
 422	true
