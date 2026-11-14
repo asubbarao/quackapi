@@ -58,3 +58,10 @@ format-ci-check:
 	$(FORMAT_WITH_CI_TOOLS) --check --directories src test
 
 .PHONY: format-ci format-ci-check
+ifneq ($(SKIP_TESTS),1)
+test_release: query_metrics_release
+endif
+query_metrics_release:
+	./build/release/extension/quackapi/quackapi_metrics_test ./build/release/extension/quackapi/quackapi.duckdb_extension
+	./build/release/extension/quackapi/quackapi_shutdown_test ./build/release/extension/quackapi/quackapi.duckdb_extension
+.PHONY: query_metrics_release

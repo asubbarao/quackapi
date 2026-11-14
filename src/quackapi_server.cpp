@@ -1,4 +1,5 @@
 #include "quackapi_server.hpp"
+#include "quackapi_query_log.hpp"
 
 #include <condition_variable>
 #include <chrono>
@@ -30,6 +31,11 @@
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/profiler/gathered_metrics.hpp"
+#include "duckdb/logging/log_type.hpp"
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -65,6 +71,15 @@ namespace {
 //! matched CREATE ROUTE … TIMEOUT can extend SocketStream + SO_*TIMEO deadlines.
 thread_local socket_t quackapi_tls_sock = INVALID_SOCKET;
 thread_local quackapi_httplib::Stream *quackapi_tls_stream = nullptr;
+thread_local idx_t quackapi_request_depth = 0;
+struct ScopedQuackapiRequest {
+	ScopedQuackapiRequest() {
+		quackapi_request_depth++;
+	}
+	~ScopedQuackapiRequest() {
+		quackapi_request_depth--;
+	}
+};
 
 //! A WS stream bound before its upgrade. httplib runs the pre-routing handler
 //! and the WebSocket handler for one request on the same worker thread, so the
@@ -437,7 +452,7 @@ string PairsToJsonObject(const PairRange &pairs) {
 //! example, "At /items/0/qty: ..."). Surface it as FastAPI's typed loc array
 //! instead of losing the field path behind a synthetic _schema member.
 string ValidationErrorJsonSchema(const string &msg, const string &type, const string &raw_body) {
-	const string markers[] = {"At /", "at /"};
+	const string markers[] = {"At /", "at /", "schema: /"};
 	for (auto &marker : markers) {
 		auto start_marker = msg.find(marker);
 		if (start_marker == string::npos) {
@@ -1144,8 +1159,8 @@ bool ValidateRequestSql(Connection &con, const string &sql, string &error) {
 //! answers with the first statement that produces rows, a batch such as
 //! `CREATE …; INSERT …; SELECT …` answers with its final SELECT. When `stop` answers
 //! true before a statement, that statement and the rest never run.
-bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
-                       const std::function<bool()> &stop) {
+bool ExecuteRequestSqlInternal(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
+                               const std::function<bool()> &stop) {
 	// DuckDB's statement extraction truncates at the first null byte, which
 	// would silently drop the tail of the batch while executing the prefix.
 	// Null bytes are never legitimate in request SQL text.
@@ -1184,6 +1199,35 @@ bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResul
 		result = std::move(statement_result);
 	}
 	return true;
+}
+
+bool ExecuteRequestSql(Connection &con, const string &sql, unique_ptr<QueryResult> &result, string &error,
+                       const std::function<bool()> &stop, const string &origin = "quackapi") {
+	QuackapiBeginSqlSubmission(con, origin);
+	auto state = con.context->registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+	struct ResetSubmission {
+		shared_ptr<QuackapiSqlSubmissionState> state;
+		~ResetSubmission() {
+			state->Reset();
+		}
+	} reset {state};
+	auto begin = Timestamp::GetCurrentTimestamp();
+	auto started = std::chrono::steady_clock::now();
+	auto finish = [&](bool success) {
+		QuackapiLogSqlSubmission(con, sql, begin,
+		                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+		                         origin, success, error);
+	};
+	try {
+		bool success = ExecuteRequestSqlInternal(con, sql, result, error, stop);
+		finish(success);
+		return success;
+	} catch (std::exception &ex) {
+		error = ErrorData(ex).Message();
+		if (state->id != DConstants::INVALID_INDEX)
+			finish(false);
+		throw;
+	}
 }
 
 //! Resolve the native DuckDB type represented by a BODY TYPE declaration.
@@ -2244,14 +2288,14 @@ QuackapiExecResponse QuackapiExecResult(QueryResult &result, idx_t max_response_
 static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, idx_t max_response_bytes,
                                             const QuackapiQueryDeadline &deadline, const string &loc,
                                             const string &param, const std::function<bool()> &cancelled,
-                                            bool collect_typed_rows) {
+                                            bool collect_typed_rows, const string &origin) {
 	unique_ptr<QueryResult> result;
 	string error;
 	auto stop = [&]() {
 		return deadline.Expired() || (cancelled && cancelled());
 	};
 	try {
-		if (!ExecuteRequestSql(con, sql, result, error, stop)) {
+		if (!ExecuteRequestSql(con, sql, result, error, stop, origin)) {
 			return deadline.Expired() ? QuackapiExecTimeoutResponse()
 			                          : ExecJsonResponse(422, ValidationErrorJson(loc, param, error, "value_error"));
 		}
@@ -2262,10 +2306,67 @@ static QuackapiExecResponse ExecSqlResponse(Connection &con, const string &sql, 
 	}
 }
 
+void QuackapiBeginSqlSubmission(Connection &con, const string &origin, idx_t parent_query_id,
+                                idx_t parent_connection_id) {
+	auto &context = *con.context;
+	auto state = context.registered_state->GetOrCreate<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+	if (state->id != DConstants::INVALID_INDEX)
+		return;
+	state->id = context.db->GetDatabaseManager().GetNewQueryNumber();
+	state->origin = origin;
+	state->parent_query_id = parent_query_id;
+	state->parent_connection_id = parent_connection_id;
+}
+
+void QuackapiLogSqlSubmission(Connection &con, const string &sql, timestamp_t started_at, double duration,
+                              const string &origin, bool success, const string &error) {
+	auto &context = *con.context;
+	auto &manager = LogManager::Get(context);
+	LoggingContext log_context(LogContextScope::CONNECTION);
+	log_context.connection_id = context.GetConnectionId();
+	QuackapiBeginSqlSubmission(con, origin);
+	auto state = context.registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+	log_context.query_id = state->id;
+	auto parent_query_id = state->parent_query_id;
+	auto parent_connection_id = state->parent_connection_id;
+	state->Reset();
+	auto logger = manager.CreateLogger(log_context, true);
+	if (!logger->ShouldLog(MetricsLogType::NAME, MetricsLogType::LEVEL))
+		return;
+	MetricTiming timing;
+	timing.Add(0, started_at, Timestamp::GetCurrentTimestamp());
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.total_time", Value::DOUBLE(duration), &timing));
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.sql", Value(sql)));
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.origin", Value(origin)));
+	if (parent_query_id != DConstants::INVALID_INDEX)
+		logger->WriteLog(
+		    MetricsLogType::NAME, MetricsLogType::LEVEL,
+		    MetricsLogType::ConstructLogMessage("request.parent_query_id", Value::UBIGINT(parent_query_id)));
+	if (parent_connection_id != DConstants::INVALID_INDEX)
+		logger->WriteLog(
+		    MetricsLogType::NAME, MetricsLogType::LEVEL,
+		    MetricsLogType::ConstructLogMessage("request.parent_connection_id", Value::UBIGINT(parent_connection_id)));
+	logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+	                 MetricsLogType::ConstructLogMessage("request.success", Value::BOOLEAN(success)));
+	if (!success)
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("request.error", Value(error)));
+	logger->Flush();
+}
+
+bool QuackapiInRequest() {
+	return quackapi_request_depth > 0;
+}
+
 QuackapiExecResponse QuackapiExecSql(Connection &con, const string &sql, idx_t max_response_bytes,
                                      const QuackapiQueryDeadline &deadline, const string &loc, const string &param,
-                                     const std::function<bool()> &cancelled, bool collect_typed_rows) {
-	auto out = ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled, collect_typed_rows);
+                                     const std::function<bool()> &cancelled, bool collect_typed_rows,
+                                     const string &origin) {
+	auto out =
+	    ExecSqlResponse(con, sql, max_response_bytes, deadline, loc, param, cancelled, collect_typed_rows, origin);
 	// What a served route checks last, after serialization: values under the cap can
 	// serialize past it, and the deadline can pass while they do.
 	if (deadline.Expired()) {
@@ -3830,6 +3931,7 @@ void QuackapiHttpServer::HandleWebSocket(const quackapi_httplib::Request &req, q
 }
 
 void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, quackapi_httplib::Response &res) {
+	ScopedQuackapiRequest request_scope;
 	// Always attach CORS headers when configured (including error responses).
 	// Stamp X-Request-ID + emit structured access log on every exit path.
 	// Applied once at the end via a small RAII-ish pattern: call ApplyCors on
@@ -4381,6 +4483,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 
 			// Bind path + query (+ Last-Event-ID → $last_id) before installing provider.
 			auto con = make_shared_ptr<Connection>(*db);
+			con->context->registered_state->GetOrCreate<QuackapiHttpRequestState>("quackapi.http_request");
 			QuackapiQueryDeadline initial_deadline(*con, options.query_timeout_ms);
 			QuackapiSetServingBudget(*con, options.query_timeout_ms, options.max_response_bytes);
 			auto prepared = con->Prepare(stream_sql);
@@ -4631,6 +4734,7 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 		// TLS has been destroyed, causing a shutdown use-after-free.
 		// TEMP/SET and prepared plans also remain strictly request-local.
 		Connection con(*db);
+		con.context->registered_state->GetOrCreate<QuackapiHttpRequestState>("quackapi.http_request");
 		const auto elapsed_ms =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 		QuackapiQueryDeadline deadline(con, std::max<int64_t>(1, options.query_timeout_ms - elapsed_ms));
@@ -4677,6 +4781,8 @@ void QuackapiHttpServer::HandleRequest(const quackapi_httplib::Request &req, qua
 				    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
 				        .count();
 				Connection middleware_connection(*db);
+				middleware_connection.context->registered_state->GetOrCreate<QuackapiHttpRequestState>(
+				    "quackapi.http_request");
 				if (!ExecuteQuackapiMiddleware(middleware_connection, *db, QuackapiMiddlewarePhase::AFTER,
 				                               context->group_name, *context, authenticated, claims)) {
 					SetJson(res, context->status, context->response_body);

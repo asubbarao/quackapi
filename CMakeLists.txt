@@ -150,3 +150,21 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+add_executable(quackapi_metrics_test test/cpp/quackapi_metrics_test.cpp)
+target_link_libraries(quackapi_metrics_test duckdb)
+if(WIN32)
+  add_custom_command(
+    TARGET quackapi_metrics_test
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:duckdb>
+            $<TARGET_FILE_DIR:quackapi_metrics_test>)
+endif()
+add_executable(quackapi_shutdown_test test/cpp/quackapi_shutdown_test.cpp)
+target_link_libraries(quackapi_shutdown_test duckdb)
+if(WIN32)
+  add_custom_command(
+    TARGET quackapi_shutdown_test
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:duckdb>
+            $<TARGET_FILE_DIR:quackapi_shutdown_test>)
+endif()
