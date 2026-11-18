@@ -111,6 +111,16 @@ UserInLogin	RememberMe	bool	false	false
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Named Go fields belong to the type_spec scope, not the struct_type node.
+query III
+SELECT field_name, is_required, is_optional
+FROM quack_from_models('gin', 'bridges/from_x/fixtures/gin_mini/main.go')
+ORDER BY field_line, field_name;
+----
+Email	true	false
+Password	true	false
+RememberMe	false	true
+
 # Argument validation happens during binding, before sitting_duck bootstrap.
 # ---------------------------------------------------------------------------
 statement error

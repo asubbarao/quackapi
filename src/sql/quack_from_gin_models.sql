@@ -7,7 +7,7 @@ ast AS (
   SELECT * FROM read_ast('__REPO__', 'go', ignore_errors := true, peek := 300)
 ),
 type_specs AS (
-  SELECT ts.file_path, ts.name AS model_name, st.node_id AS struct_id
+  SELECT ts.file_path, ts.name AS model_name, ts.node_id AS struct_id
   FROM ast ts
   JOIN ast st ON st.file_path=ts.file_path AND st.parent_id=ts.node_id
              AND st.type='struct_type'
