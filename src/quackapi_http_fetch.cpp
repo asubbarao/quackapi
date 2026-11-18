@@ -2,6 +2,7 @@
 #include "quackapi_limits.hpp"
 #include "quackapi_util.hpp"
 #include "quackapi_server.hpp"
+#include "quackapi_query_log.hpp"
 #include "quackapi_state.hpp"
 
 #include <atomic>
@@ -19,6 +20,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_result_stream.hpp"
@@ -979,7 +981,21 @@ idx_t ReserveExecTasks(idx_t wanted, int64_t cap) {
 
 //! One quackapi_selfdispatch call, retained by its native tasks, so a caller that
 //! gives up (interrupt, deadline) returns while a row is still blocked in a host call.
+struct NativeSqlCallLease {
+	shared_ptr<DatabaseInstance> db;
+	~NativeSqlCallLease() {
+		if (db)
+			QuackapiState::Get(*db).EndNativeSqlCall();
+	}
+	void Acquire(shared_ptr<DatabaseInstance> instance) {
+		QuackapiState::Get(*instance).BeginNativeSqlCall();
+		db = std::move(instance);
+	}
+};
+
 struct ExecCall {
+	idx_t parent_query_id = DConstants::INVALID_INDEX;
+	idx_t parent_connection_id = DConstants::INVALID_INDEX;
 	shared_ptr<DatabaseInstance> db;
 	vector<string> sqls;
 	vector<bool> skip;
@@ -1003,6 +1019,8 @@ struct ExecCall {
 std::shared_ptr<ExecCall> NewExecCall(ClientContext &context, idx_t count) {
 	auto call = std::make_shared<ExecCall>();
 	call->db = context.db;
+	call->parent_query_id = context.transaction.GetActiveQuery();
+	call->parent_connection_id = context.GetConnectionId();
 	call->sqls.resize(count);
 	call->skip.assign(count, false);
 	call->out.resize(count);
@@ -1093,12 +1111,13 @@ void RunExecRow(ExecCall &call, idx_t i, ClientContext *parent) {
 			call.running.insert(&con);
 		}
 		Registration registration {call, &con};
+		QuackapiBeginSqlSubmission(con, "selfdispatch", call.parent_query_id, call.parent_connection_id);
 		QuackapiQueryDeadline deadline(con, call.deadline, parent);
 		auto cancelled = [&call, parent]() {
 			return call.cancelled || (parent && parent->IsInterrupted());
 		};
-		receipt = ExecReceipt(
-		    QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql", cancelled, true));
+		receipt = ExecReceipt(QuackapiExecSql(con, call.sqls[i], call.max_response_bytes, deadline, "body", "sql",
+		                                      cancelled, true, "selfdispatch"));
 	} catch (std::exception &e) {
 		receipt.request_error = e.what();
 	} catch (...) {
@@ -1159,6 +1178,8 @@ public:
 			}
 			if (!connection) {
 				connection = make_uniq<Connection>(*call.db);
+				QuackapiBeginSqlSubmission(*connection, "selfdispatch", call.parent_query_id,
+				                           call.parent_connection_id);
 				if (call.serving_timeout_ms > 0) {
 					QuackapiSetServingBudget(*connection, call.serving_timeout_ms, call.serving_max_response_bytes);
 				}
@@ -1218,12 +1239,21 @@ public:
 
 private:
 	bool Finish(QuackapiExecResponse response) {
+		if (!connection) {
+			connection = make_uniq<Connection>(*call.db);
+			QuackapiBeginSqlSubmission(*connection, "selfdispatch", call.parent_query_id, call.parent_connection_id);
+		}
+		QuackapiLogSqlSubmission(*connection, call.sqls[row], started_at,
+		                         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+		                         "selfdispatch", response.status < 400, response.body);
 		std::lock_guard<std::mutex> guard(call.mutex);
 		call.out[row] = ExecReceipt(std::move(response));
 		call.done[row] = true;
 		finished = true;
 		return true;
 	}
+	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+	timestamp_t started_at = Timestamp::GetCurrentTimestamp();
 	ExecCall &call;
 	idx_t row;
 	ClientContext *parent;
@@ -1237,8 +1267,9 @@ private:
 
 class ExecExecutorTask : public BaseExecutorTask {
 public:
-	ExecExecutorTask(TaskExecutor &executor, std::shared_ptr<ExecCall> call)
-	    : BaseExecutorTask(executor), call(std::move(call)) {
+	ExecExecutorTask(TaskExecutor &executor, std::shared_ptr<ExecCall> call,
+	                 std::shared_ptr<NativeSqlCallLease> ownership)
+	    : BaseExecutorTask(executor), native_ownership(std::move(ownership)), call(std::move(call)) {
 	}
 	~ExecExecutorTask() override {
 		Settle();
@@ -1287,6 +1318,7 @@ private:
 		call->tasks_done++;
 		call->finished.notify_one();
 	}
+	std::shared_ptr<NativeSqlCallLease> native_ownership;
 	std::shared_ptr<ExecCall> call;
 	unique_ptr<ExecOperation> operation;
 	bool settled = false;
@@ -1303,6 +1335,8 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	const auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 
+	auto native_ownership = std::make_shared<NativeSqlCallLease>();
+	native_ownership->Acquire(context.db);
 	auto call = NewExecCall(context, count);
 	idx_t active = 0;
 	for (idx_t i = 0; i < count; i++) {
@@ -1350,7 +1384,7 @@ void ExecScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (; started < reserved;) {
 		unique_ptr<ExecExecutorTask> task;
 		try {
-			task = make_uniq<ExecExecutorTask>(*call->executor, call);
+			task = make_uniq<ExecExecutorTask>(*call->executor, call, native_ownership);
 			started++;
 			call->executor->ScheduleTask(std::move(task));
 		} catch (std::exception &) {

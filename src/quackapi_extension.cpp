@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "quackapi_extension.hpp"
+#include "quackapi_query_log.hpp"
 #include "quackapi_middleware.hpp"
 
 #include <atomic>
@@ -13,6 +14,16 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/connection_manager.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
+#include "duckdb/main/profiler/gathered_metrics.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include <chrono>
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/logging/log_type.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -427,6 +438,7 @@ static void ServeExec(ClientContext &context, TableFunctionInput &data_p, DataCh
 //===--------------------------------------------------------------------===//
 
 struct StopBindData : public TableFunctionData {
+	bool wait = false;
 	int32_t port = 0; // 0 = all
 	bool finished = false;
 };
@@ -434,6 +446,14 @@ struct StopBindData : public TableFunctionData {
 static unique_ptr<FunctionData> StopBind(ClientContext &, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<StopBindData>();
+	auto wait = input.named_parameters.find("wait");
+	if (wait != input.named_parameters.end()) {
+		if (wait->second.IsNull())
+			throw InvalidInputException("wait must be true or false");
+		bind_data->wait = wait->second.GetValue<bool>();
+	}
+	if (bind_data->wait && !input.inputs.empty())
+		throw InvalidInputException("Blocking shutdown drains all servers; omit port");
 	if (!input.inputs.empty()) {
 		bind_data->port = input.inputs[0].GetValue<int32_t>();
 	}
@@ -449,7 +469,14 @@ static void StopExec(ClientContext &context, TableFunctionInput &data_p, DataChu
 	}
 	auto &state = QuackapiState::Get(*context.db);
 	string message;
-	if (bind_data.port == 0) {
+	if (bind_data.wait) {
+		auto submission = context.registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+		auto request = context.registered_state->Get<QuackapiHttpRequestState>("quackapi.http_request");
+		if (request || QuackapiInRequest() || (submission && submission->id != DConstants::INVALID_INDEX))
+			throw InvalidInputException("Blocking shutdown must run outside HTTP and self-dispatch");
+		state.Shutdown();
+		message = "Drained all quackapi servers and native SQL calls";
+	} else if (bind_data.port == 0) {
 		state.StopAllServers();
 		message = "Stopped all quackapi servers";
 	} else if (state.StopServer(bind_data.port)) {
@@ -1029,10 +1056,91 @@ static void TelemetryFlushExec(ClientContext &context, TableFunctionInput &data_
 // Load
 //===--------------------------------------------------------------------===//
 
+class QuackapiStatementMetrics : public ClientContextState {
+public:
+	void QueryBegin(ClientContext &context) override {
+		LoggingContext logging_context(LogContextScope::CONNECTION);
+		logging_context.connection_id = context.GetConnectionId();
+		logging_context.transaction_id = context.transaction.ActiveTransaction().global_transaction_id;
+		logging_context.query_id = context.transaction.GetActiveQuery();
+		logger = LogManager::Get(context).CreateLogger(logging_context, true);
+		if (!logger->ShouldLog(MetricsLogType::NAME, MetricsLogType::LEVEL)) {
+			logger.reset();
+			return;
+		}
+		sql = context.GetCurrentQuery();
+		auto submission = context.registered_state->Get<QuackapiSqlSubmissionState>("quackapi.sql_submission");
+		if (submission && submission->id == DConstants::INVALID_INDEX)
+			submission.reset();
+		submission_id = submission ? submission->id : DConstants::INVALID_INDEX;
+		origin = submission ? submission->origin : string();
+		parent_query_id = submission ? submission->parent_query_id : DConstants::INVALID_INDEX;
+		parent_connection_id = submission ? submission->parent_connection_id : DConstants::INVALID_INDEX;
+		started_at = Timestamp::GetCurrentTimestamp();
+		started = std::chrono::steady_clock::now();
+	}
+	void QueryEnd(ClientContext &, optional_ptr<ErrorData> error) override {
+		if (!logger)
+			return;
+		auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+		MetricTiming timing;
+		timing.Add(0, started_at, Timestamp::GetCurrentTimestamp());
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("statement.total_time", Value::DOUBLE(elapsed), &timing));
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("statement.sql", Value(sql)));
+		logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+		                 MetricsLogType::ConstructLogMessage("statement.success", Value::BOOLEAN(!error)));
+		if (error)
+			logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+			                 MetricsLogType::ConstructLogMessage(
+			                     "statement.error", error ? Value(error->Message()) : Value(LogicalType::VARCHAR)));
+		if (submission_id != DConstants::INVALID_INDEX) {
+			logger->WriteLog(
+			    MetricsLogType::NAME, MetricsLogType::LEVEL,
+			    MetricsLogType::ConstructLogMessage("statement.submission_id", Value::UBIGINT(submission_id)));
+			logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+			                 MetricsLogType::ConstructLogMessage("statement.origin", Value(origin)));
+		}
+		if (parent_query_id != DConstants::INVALID_INDEX) {
+			logger->WriteLog(
+			    MetricsLogType::NAME, MetricsLogType::LEVEL,
+			    MetricsLogType::ConstructLogMessage("statement.parent_query_id", Value::UBIGINT(parent_query_id)));
+			logger->WriteLog(MetricsLogType::NAME, MetricsLogType::LEVEL,
+			                 MetricsLogType::ConstructLogMessage("statement.parent_connection_id",
+			                                                     Value::UBIGINT(parent_connection_id)));
+		}
+		logger->Flush();
+		logger.reset();
+		sql.clear();
+	}
+
+private:
+	shared_ptr<Logger> logger;
+	idx_t submission_id = DConstants::INVALID_INDEX;
+	idx_t parent_query_id = DConstants::INVALID_INDEX;
+	idx_t parent_connection_id = DConstants::INVALID_INDEX;
+	string origin;
+	string sql;
+	timestamp_t started_at;
+	std::chrono::steady_clock::time_point started;
+};
+
+class QuackapiQueryMetrics : public ExtensionCallback {
+public:
+	void OnConnectionOpened(ClientContext &context) override {
+		context.registered_state->GetOrCreate<QuackapiStatementMetrics>("quackapi.statement_metrics");
+	}
+};
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// SET quackapi_cors_origins = '*' | 'https://app.example,https://admin.example'
 	// Default empty = CORS off. Serve-time cors_origins := '…' overrides this SET.
 	auto &db = loader.GetDatabaseInstance();
+	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<QuackapiQueryMetrics>());
+	for (auto &context : ConnectionManager::Get(db).GetConnectionList()) {
+		context->registered_state->GetOrCreate<QuackapiStatementMetrics>("quackapi.statement_metrics");
+	}
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("quackapi_cors_origins",
 	                          "CORS allowed origins for quackapi_serve (* or comma-separated list). "
@@ -1156,6 +1264,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// quackapi_stop() / quackapi_stop(port)
 	TableFunctionSet stop_set("quackapi_stop");
 	TableFunction stop("quackapi_stop", {LogicalType::INTEGER}, StopExec, StopBind);
+	AddNamedParameter(stop, "wait", LogicalType::BOOLEAN);
 	stop_set.AddFunction(stop);
 	stop_set.AddFunction(WithoutPositionalArguments(stop));
 	loader.RegisterFunction(stop_set);

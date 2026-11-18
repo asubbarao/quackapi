@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <thread>
 #include <tuple>
 
@@ -370,77 +371,93 @@ vector<QuackapiQueue> QuackapiState::SnapshotQueues() {
 }
 
 void QuackapiState::StartServer(DatabaseInstance &db, const string &host, int port, const QuackapiServeOptions &opts) {
-	// Mirrors QuackStorageExtensionInfo::CreateServer (duckdb-quack
-	// src/quack_storage.cpp): lock map → reject duplicate key → construct
-	// (bind happens in ctor so EADDRINUSE propagates) → emplace.
 	auto key = host + ":" + std::to_string(port);
 	std::lock_guard<std::mutex> lock(servers_mutex);
+	if (draining) {
+		throw InvalidInputException("quackapi is shutting down");
+	}
 	if (servers.find(key) != servers.end()) {
 		throw InvalidInputException("quackapi already serving on %s", key);
 	}
 	servers.emplace(key, make_uniq<QuackapiHttpServer>(db, host, port, opts));
 }
 
-bool QuackapiState::StopServer(int port) {
-	// Mirrors QuackStorageExtensionInfo::StopServer (duckdb-quack
-	// src/quack_storage.cpp): under lock move out of map; StopAccepting
-	// (socket only); full destroy on a detached thread so httplib worker-pool
-	// join never runs under servers_mutex or on a request-handler thread.
-	unique_ptr<QuackapiHttpServer> to_destroy;
-	{
-		std::lock_guard<std::mutex> lock(servers_mutex);
-		for (auto it = servers.begin(); it != servers.end(); ++it) {
-			if (it->second->Port() == port) {
-				to_destroy = std::move(it->second);
-				servers.erase(it);
-				break;
-			}
-		}
-	}
-	if (!to_destroy) {
-		return false;
-	}
-	// Close pooled outbound keep-alives first so Server worker join is not
-	// blocked by idle clients still holding the listen-side connection open.
-	QuackapiHttpFetch::ResetPool();
-	to_destroy->StopAccepting();
-	// Brief delay so a self-stop from inside a route can finish its response
-	// before ~Server joins the thread pool.
+void QuackapiState::RetireServer(unique_ptr<QuackapiHttpServer> server) {
+	// The registry lock keeps removal and completion publication atomic with Shutdown.
+	server_closers.erase(std::remove_if(server_closers.begin(), server_closers.end(),
+	                                    [](const std::shared_future<void> &closer) {
+		                                    return closer.wait_for(std::chrono::seconds(0)) ==
+		                                           std::future_status::ready;
+	                                    }),
+	                     server_closers.end());
+	auto completed = std::make_shared<std::promise<void>>();
+	server_closers.push_back(completed->get_future().share());
+	server->StopAccepting();
 	std::thread(
-	    [](unique_ptr<QuackapiHttpServer> srv) {
+	    [](unique_ptr<QuackapiHttpServer> srv, std::shared_ptr<std::promise<void>> completion) {
+		    // A route may stop its own listener before writing its response.
 		    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		    srv.reset();
+		    completion->set_value();
 	    },
-	    std::move(to_destroy))
+	    std::move(server), std::move(completed))
 	    .detach();
-	return true;
+}
+
+void QuackapiState::BeginNativeSqlCall() {
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	if (draining) {
+		throw InvalidInputException("quackapi is shutting down");
+	}
+	native_sql_calls++;
+}
+
+void QuackapiState::EndNativeSqlCall() {
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	D_ASSERT(native_sql_calls > 0);
+	native_sql_calls--;
+	native_sql_drained.notify_all();
+}
+
+void QuackapiState::Shutdown() {
+	{
+		std::lock_guard<std::mutex> lock(servers_mutex);
+		draining = true;
+	}
+	StopAllServers();
+	vector<std::shared_future<void>> closers;
+	{
+		std::lock_guard<std::mutex> lock(servers_mutex);
+		closers = server_closers;
+	}
+	for (auto &closer : closers) {
+		closer.wait();
+	}
+	std::unique_lock<std::mutex> lock(servers_mutex);
+	native_sql_drained.wait(lock, [this] { return native_sql_calls == 0; });
+}
+
+bool QuackapiState::StopServer(int port) {
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	for (auto it = servers.begin(); it != servers.end(); ++it) {
+		if (it->second->Port() == port) {
+			QuackapiHttpFetch::ResetPool();
+			RetireServer(std::move(it->second));
+			servers.erase(it);
+			return true;
+		}
+	}
+	return false;
 }
 
 void QuackapiState::StopAllServers() {
-	vector<unique_ptr<QuackapiHttpServer>> to_destroy;
-	{
-		std::lock_guard<std::mutex> lock(servers_mutex);
-		for (auto &kv : servers) {
-			to_destroy.push_back(std::move(kv.second));
-		}
-		servers.clear();
-	}
-	// Same as StopServer: drain free-list before joining httplib workers.
+	// Idle outbound keep-alives must close before the listener pool can finish.
 	QuackapiHttpFetch::ResetPool();
-	for (auto &srv : to_destroy) {
-		if (srv) {
-			srv->StopAccepting();
-		}
+	std::lock_guard<std::mutex> lock(servers_mutex);
+	for (auto &entry : servers) {
+		RetireServer(std::move(entry.second));
 	}
-	for (auto &srv : to_destroy) {
-		std::thread(
-		    [](unique_ptr<QuackapiHttpServer> s) {
-			    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			    s.reset();
-		    },
-		    std::move(srv))
-		    .detach();
-	}
+	servers.clear();
 }
 
 bool QuackapiState::HasServerOnPort(int port) {
