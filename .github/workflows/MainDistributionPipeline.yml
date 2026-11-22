@@ -135,9 +135,11 @@ jobs:
       - name: Set up uv for HTTP pool shutdown
         uses: astral-sh/setup-uv@v6
 
+      # Core httpfs: the community repository has no v2.0.0 httpfs build, and
+      # the SQLLogic steps above already autoinstall core httpfs into ~/.duckdb.
       - name: Run HTTP pool shutdown regression
         run: |
-          uv run --with duckdb==2.0.0 python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpfs FROM community'); con.close()"
+          uv run --with duckdb==2.0.0 python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpfs'); con.close()"
           uv run --with duckdb==2.0.0 python test/python/test_http_pool_shutdown.py build/release/extension/quackapi/quackapi.duckdb_extension
 
       - name: Verify disconnect cancellation
