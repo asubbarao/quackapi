@@ -374,8 +374,9 @@ struct HostPool {
 
 struct ConnectionPool {
 	static ConnectionPool &Get() {
-		static ConnectionPool instance;
-		return instance;
+		// Keep clients and their synchronization primitives alive through process teardown.
+		static auto *instance = new ConnectionPool();
+		return *instance;
 	}
 
 	std::mutex lock;
