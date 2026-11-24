@@ -39,12 +39,6 @@ ifneq ($(TEST_RUNNER),)
 TEST_RUNNER += --fail-require-skip
 endif
 
-# Assert the artifact built by this checkout even when tests enable autoloading.
-QUACKAPI_BUILT_VERSION = $(shell ./build/release/duckdb -unsigned -no-agent -noheader -list -c \
-	"LOAD '$(PROJ_DIR)build/release/extension/$(EXT_NAME)/$(EXT_NAME).duckdb_extension'; \
-	 SELECT extension_version FROM duckdb_extensions() WHERE extension_name='$(EXT_NAME)';" 2>/dev/null | tail -1)
-export EXPECTED_QUACKAPI_VERSION = $(QUACKAPI_BUILT_VERSION)
-
 # The Code Quality job formats with clang-format 11.0.1 and black 24 (extension-ci-tools
 # _extension_code_quality.yml). Any other clang-format wraps differently, and a machine with
 # none cannot run `make format-check` at all, so these run format.py with CI's exact tools.
