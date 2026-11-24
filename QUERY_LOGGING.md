@@ -3,7 +3,7 @@
 Enable DuckDB's Metrics log type to collect SQL execution history:
 
 ```sql
-CALL enable_logging(['QueryLog','Metrics','HTTP','Quack'], storage := 'stdout');
+CALL enable_logging(['QueryLog','Metrics','HTTP'], storage := 'stdout');
 ```
 
 QuackAPI attaches a small ClientContextState to existing and future connections.
