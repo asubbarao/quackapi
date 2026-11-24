@@ -132,6 +132,16 @@ jobs:
       - name: Verify request body limits
         run: python3 test/python/test_payload_limits.py build/release/duckdb build/release/extension/quackapi/quackapi.duckdb_extension
 
+      - name: Set up uv for HTTP pool shutdown
+        uses: astral-sh/setup-uv@v6
+
+      # Core httpfs: the community repository has no v2.0.0 httpfs build, and
+      # the SQLLogic steps above already autoinstall core httpfs into ~/.duckdb.
+      - name: Run HTTP pool shutdown regression
+        run: |
+          uv run --with duckdb==2.0.0 python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpfs'); con.close()"
+          uv run --with duckdb==2.0.0 python test/python/test_http_pool_shutdown.py build/release/extension/quackapi/quackapi.duckdb_extension
+
       - name: Verify disconnect cancellation
         run: |
           c++ -std=c++17 -pthread -Wall -Wextra -Werror -isystem duckdb/src/include test/cpp/quackapi_disconnect_test.cpp -Lbuild/release/src -lduckdb -Wl,-rpath,"$PWD/build/release/src" -o /tmp/quackapi-disconnect-test
